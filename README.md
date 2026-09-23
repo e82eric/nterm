@@ -30,6 +30,11 @@ contains the C boundary, `painter.rs` presents Ghostty's OpenGL textures,
 `input.rs` translates egui input, and `search.rs` owns search state and
 matching. `main.rs` only collects process arguments and starts the app.
 
+Search matching runs on a dedicated Rust worker thread over immutable,
+application-owned snapshot rows. Ghostty snapshot access and highlight updates
+remain on the UI thread. Snapshot generations and per-query revisions prevent
+completed work for an older snapshot or query from replacing current results.
+
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> on Windows and Linux to
 open the search overlay. Search queries, result highlighting, match selection,
 and viewport movement are owned by the Rust egui application. It asks Ghostty

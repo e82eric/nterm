@@ -10,7 +10,7 @@ pub(crate) struct GlFrame {
     pub(crate) texture: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) generation: u64,
+    pub(crate) frame_generation: u64,
 }
 
 #[repr(C)]
@@ -45,18 +45,22 @@ unsafe extern "C" {
         usb: u32,
         unshifted: u32,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_begin(host: *mut Host, generation: *mut u64) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_end(host: *mut Host, generation: u64) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_begin(
+        host: *mut Host,
+        snapshot_generation: *mut u64,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_end(host: *mut Host, snapshot_generation: u64)
+    -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_size(
         host: *mut Host,
-        generation: u64,
+        snapshot_generation: u64,
         columns: *mut u32,
         screen_rows: *mut u32,
         total_rows: *mut u64,
     ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_read_row(
         host: *mut Host,
-        generation: u64,
+        snapshot_generation: u64,
         columns: u32,
         row: u32,
         text: *mut *mut c_char,
@@ -65,7 +69,7 @@ unsafe extern "C" {
     pub(crate) fn ghostty_egui_host_snapshot_free_text(text: *mut c_char);
     pub(crate) fn ghostty_egui_host_snapshot_set_highlights(
         host: *mut Host,
-        generation: u64,
+        snapshot_generation: u64,
         ranges: *const SnapshotRange,
         count: usize,
         selected: *const SnapshotRange,

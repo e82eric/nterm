@@ -1,7 +1,7 @@
 use crate::ffi::{self, GlFrame, Host};
 use crate::input;
 use crate::painter::TerminalPainter;
-use crate::search::{SearchEvents, SearchUi};
+use crate::search::{SearchEvents, SearchUi, SearchWorker};
 use glow::HasContext as _;
 use std::ffi::{c_char, c_void};
 use std::sync::{
@@ -64,6 +64,7 @@ pub(crate) struct TerminalView {
     scale: f32,
     focused: bool,
     search: SearchUi,
+    search_worker: SearchWorker,
 }
 
 impl TerminalView {
@@ -104,12 +105,14 @@ impl TerminalView {
             scale: 0.0,
             focused: false,
             search: SearchUi::default(),
+            search_worker: SearchWorker::new(egui_ctx.clone()),
         }
     }
 
     pub(crate) fn update(&mut self, ui: &mut egui::Ui) {
         unsafe { ffi::ghostty_egui_host_tick(self.host) };
         self.apply_search_events();
+        self.apply_search_result();
 
         let rect = ui.max_rect();
         let scale = ui.ctx().pixels_per_point();
@@ -205,8 +208,8 @@ impl TerminalView {
     fn open_search(&mut self, needle: String) {
         self.close_search();
 
-        let mut generation = 0;
-        if !unsafe { ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) } {
+        let mut snapshot_generation = 0;
+        if !unsafe { ffi::ghostty_egui_host_snapshot_begin(self.host, &mut snapshot_generation) } {
             return;
         }
 
@@ -216,7 +219,7 @@ impl TerminalView {
         if !unsafe {
             ffi::ghostty_egui_host_snapshot_size(
                 self.host,
-                generation,
+                snapshot_generation,
                 &mut columns,
                 &mut screen_rows,
                 &mut total_rows,
@@ -224,7 +227,7 @@ impl TerminalView {
         } || columns == 0
             || total_rows > u32::MAX as u64
         {
-            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
             return;
         }
 
@@ -234,10 +237,15 @@ impl TerminalView {
             let mut len = 0;
             if !unsafe {
                 ffi::ghostty_egui_host_snapshot_read_row(
-                    self.host, generation, columns, row, &mut text, &mut len,
+                    self.host,
+                    snapshot_generation,
+                    columns,
+                    row,
+                    &mut text,
+                    &mut len,
                 )
             } {
-                unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+                unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
                 return;
             }
             let value = String::from_utf8_lossy(unsafe {
@@ -252,25 +260,48 @@ impl TerminalView {
         self.search = SearchUi {
             active: true,
             query: needle,
-            generation: Some(generation),
+            snapshot_generation: Some(snapshot_generation),
             columns,
-            rows,
+            rows: rows.into(),
             matches: Vec::new(),
             selected: None,
             focus_requested: true,
+            query_revision: 0,
         };
-        self.rebuild_search_matches();
+        self.queue_search();
     }
 
     fn close_search(&mut self) {
-        if let Some(generation) = self.search.generation.take() {
-            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+        self.search_worker.cancel();
+        if let Some(snapshot_generation) = self.search.snapshot_generation.take() {
+            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
         }
         self.search = SearchUi::default();
     }
 
-    fn rebuild_search_matches(&mut self) {
-        self.search.rebuild_matches();
+    fn queue_search(&mut self) {
+        let Some(snapshot_generation) = self.search.snapshot_generation else {
+            return;
+        };
+        self.search.query_revision = self.search_worker.submit(
+            snapshot_generation,
+            self.search.query.clone(),
+            self.search.columns,
+            Arc::clone(&self.search.rows),
+        );
+    }
+
+    fn apply_search_result(&mut self) {
+        let Some(result) = self.search_worker.take_latest_result() else {
+            return;
+        };
+        if !self.search.active
+            || self.search.snapshot_generation != Some(result.snapshot_generation)
+            || self.search.query_revision != result.query_revision
+        {
+            return;
+        }
+        self.search.apply_result(result.matches);
         self.publish_search_matches();
     }
 
@@ -280,7 +311,7 @@ impl TerminalView {
     }
 
     fn publish_search_matches(&self) {
-        let Some(generation) = self.search.generation else {
+        let Some(snapshot_generation) = self.search.snapshot_generation else {
             return;
         };
         let selected = self.search.selected_range();
@@ -292,7 +323,7 @@ impl TerminalView {
         unsafe {
             ffi::ghostty_egui_host_snapshot_set_highlights(
                 self.host,
-                generation,
+                snapshot_generation,
                 ranges,
                 self.search.matches.len(),
                 selected.map_or(std::ptr::null(), std::ptr::from_ref),
@@ -382,7 +413,7 @@ impl TerminalView {
             });
 
         if query_changed {
-            self.rebuild_search_matches();
+            self.queue_search();
         }
         if let Some(previous) = navigate {
             self.navigate_search(previous);

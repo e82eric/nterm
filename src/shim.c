@@ -184,22 +184,22 @@ bool ghostty_egui_host_key(
 ) {
     return ghostty_surface_key_usb(host->surface, action_value, mods, usb, unshifted);
 }
-bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *generation) {
-    return ghostty_surface_snapshot_begin(host->surface, generation);
+bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *snapshot_generation) {
+    return ghostty_surface_snapshot_begin(host->surface, snapshot_generation);
 }
-bool ghostty_egui_host_snapshot_end(GhosttyEguiHost *host, uint64_t generation) {
-    return ghostty_surface_snapshot_end(host->surface, generation);
+bool ghostty_egui_host_snapshot_end(GhosttyEguiHost *host, uint64_t snapshot_generation) {
+    return ghostty_surface_snapshot_end(host->surface, snapshot_generation);
 }
 bool ghostty_egui_host_snapshot_size(
     GhosttyEguiHost *host,
-    uint64_t generation,
+    uint64_t snapshot_generation,
     uint32_t *columns,
     uint32_t *screen_rows,
     uint64_t *total_rows
 ) {
     return ghostty_surface_snapshot_size(
         host->surface,
-        generation,
+        snapshot_generation,
         columns,
         screen_rows,
         total_rows
@@ -207,7 +207,7 @@ bool ghostty_egui_host_snapshot_size(
 }
 bool ghostty_egui_host_snapshot_read_row(
     GhosttyEguiHost *host,
-    uint64_t generation,
+    uint64_t snapshot_generation,
     uint32_t columns,
     uint32_t row,
     char **result,
@@ -218,7 +218,7 @@ bool ghostty_egui_host_snapshot_read_row(
     const GhosttyEguiRange range = {0, row, columns - 1, row};
     if (!ghostty_surface_snapshot_read_text(
             host->surface,
-            generation,
+            snapshot_generation,
             snapshot_selection(range),
             &text))
         return false;
@@ -238,7 +238,7 @@ bool ghostty_egui_host_snapshot_read_row(
 void ghostty_egui_host_snapshot_free_text(char *text) { free(text); }
 bool ghostty_egui_host_snapshot_set_highlights(
     GhosttyEguiHost *host,
-    uint64_t generation,
+    uint64_t snapshot_generation,
     const GhosttyEguiRange *ranges,
     size_t count,
     const GhosttyEguiRange *selected
@@ -258,7 +258,7 @@ bool ghostty_egui_host_snapshot_set_highlights(
     }
     const bool result = ghostty_surface_snapshot_set_highlights(
         host->surface,
-        generation,
+        snapshot_generation,
         selections,
         count,
         selected_ptr
