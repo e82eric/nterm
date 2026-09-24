@@ -1,4 +1,5 @@
 use crate::ffi::{self, SnapshotCell, SnapshotCellRange, SnapshotTextChunk};
+use regex::{Regex, RegexBuilder};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -16,6 +17,8 @@ pub(crate) struct SearchEvents {
 pub(crate) struct SearchUi {
     pub(crate) active: bool,
     pub(crate) query: String,
+    pub(crate) regex: bool,
+    pub(crate) error: Option<String>,
     pub(crate) snapshot_generation: Option<u64>,
     pub(crate) cursor: usize,
     pub(crate) matches: Vec<SnapshotCellRange>,
@@ -25,9 +28,10 @@ pub(crate) struct SearchUi {
 }
 
 impl SearchUi {
-    pub(crate) fn apply_result(&mut self, matches: Vec<SnapshotCellRange>) {
+    pub(crate) fn apply_result(&mut self, matches: Vec<SnapshotCellRange>, error: Option<String>) {
         self.matches = matches;
         self.selected = (!self.matches.is_empty()).then_some(0);
+        self.error = error;
     }
 
     pub(crate) fn navigate(&mut self, previous: bool) {
@@ -59,12 +63,14 @@ pub(crate) struct SearchResult {
     pub(crate) snapshot_generation: u64,
     pub(crate) query_revision: u64,
     pub(crate) matches: Vec<SnapshotCellRange>,
+    pub(crate) error: Option<String>,
 }
 
 struct SearchRequest {
     snapshot_generation: u64,
     query_revision: u64,
     query: String,
+    regex: bool,
     cursor: usize,
 }
 
@@ -101,12 +107,19 @@ impl SearchWorker {
         }
     }
 
-    pub(crate) fn submit(&mut self, snapshot_generation: u64, query: String, cursor: usize) -> u64 {
+    pub(crate) fn submit(
+        &mut self,
+        snapshot_generation: u64,
+        query: String,
+        regex: bool,
+        cursor: usize,
+    ) -> u64 {
         let query_revision = self.advance_query_revision();
         let _ = self.commands.send(SearchCommand::Search(SearchRequest {
             snapshot_generation,
             query_revision,
             query,
+            regex,
             cursor,
         }));
         query_revision
@@ -186,9 +199,11 @@ fn worker_loop(
         if latest_query_revision.load(Ordering::Acquire) != query_revision {
             continue;
         }
-        let Some(matches) = find_search_matches_cancellable(request.cursor, &request.query, || {
-            latest_query_revision.load(Ordering::Acquire) != query_revision
-        }) else {
+        let Some(outcome) =
+            find_search_matches_cancellable(request.cursor, &request.query, request.regex, || {
+                latest_query_revision.load(Ordering::Acquire) != query_revision
+            })
+        else {
             continue;
         };
         if latest_query_revision.load(Ordering::Acquire) != query_revision {
@@ -198,7 +213,8 @@ fn worker_loop(
             .send(SearchResult {
                 snapshot_generation: request.snapshot_generation,
                 query_revision,
-                matches,
+                matches: outcome.matches,
+                error: outcome.error,
             })
             .is_err()
         {
@@ -211,12 +227,27 @@ fn worker_loop(
 fn find_search_matches_cancellable(
     cursor: usize,
     query: &str,
+    regex: bool,
     cancelled: impl Fn() -> bool,
-) -> Option<Vec<SnapshotCellRange>> {
-    let mut scan = StreamScan::new(query);
+) -> Option<SearchOutcome> {
     if query.is_empty() {
-        return Some(Vec::new());
+        return Some(SearchOutcome::default());
     }
+    let pattern = if regex {
+        query.to_owned()
+    } else {
+        regex::escape(query)
+    };
+    let matcher = match RegexBuilder::new(&pattern).case_insensitive(!regex).build() {
+        Ok(matcher) => matcher,
+        Err(error) => {
+            return Some(SearchOutcome {
+                matches: Vec::new(),
+                error: Some(error.to_string()),
+            });
+        }
+    };
+    let mut scan = LineScan::new(matcher);
     if !unsafe { ffi::ghostty_egui_host_snapshot_cursor_reset(cursor as *mut _) } {
         return None;
     }
@@ -234,27 +265,33 @@ fn find_search_matches_cancellable(
         let points = unsafe { std::slice::from_raw_parts(chunk.points, chunk.len) };
         scan.feed(bytes, points, chunk.row_base, chunk.start_y, &cancelled)?;
     }
+    scan.finish(&cancelled)?;
     scan.matches.reverse();
-    Some(scan.matches)
+    Some(SearchOutcome {
+        matches: scan.matches,
+        error: None,
+    })
 }
 
-struct StreamScan {
-    query: Vec<u8>,
-    tail_bytes: Vec<u8>,
-    tail_cells: Vec<SnapshotCell>,
-    byte_base: u64,
-    next_allowed: u64,
+#[derive(Default)]
+struct SearchOutcome {
+    matches: Vec<SnapshotCellRange>,
+    error: Option<String>,
+}
+
+struct LineScan {
+    matcher: Regex,
+    line: Vec<u8>,
+    cells: Vec<SnapshotCell>,
     matches: Vec<SnapshotCellRange>,
 }
 
-impl StreamScan {
-    fn new(query: &str) -> Self {
+impl LineScan {
+    fn new(matcher: Regex) -> Self {
         Self {
-            query: query.as_bytes().to_vec(),
-            tail_bytes: Vec::new(),
-            tail_cells: Vec::new(),
-            byte_base: 0,
-            next_allowed: 0,
+            matcher,
+            line: Vec::new(),
+            cells: Vec::new(),
             matches: Vec::new(),
         }
     }
@@ -270,65 +307,57 @@ impl StreamScan {
         if chunk.len() != points.len() {
             return None;
         }
-        let tail_len = self.tail_bytes.len();
-        let first = self.byte_base - tail_len as u64;
-        let mut bytes = std::mem::take(&mut self.tail_bytes);
-        let old_cells = std::mem::take(&mut self.tail_cells);
-        bytes.extend_from_slice(chunk);
-        let cell_at = |i: usize| -> Option<SnapshotCell> {
-            if i < tail_len {
-                return old_cells.get(i).copied();
+        for (i, (&byte, point)) in chunk.iter().zip(points).enumerate() {
+            if i & 0xfff == 0 && cancelled() {
+                return None;
             }
-            let point = points.get(i - tail_len)?;
-            Some(SnapshotCell {
+            if byte == b'\n' {
+                self.finish_line(cancelled)?;
+                continue;
+            }
+            self.line.push(byte);
+            self.cells.push(SnapshotCell {
                 x: u32::from(point.x),
                 y: row_base + u64::from(point.y.checked_sub(u32::from(start_y))?),
-            })
-        };
-        let q = self.query.len();
-        if q > 0 && bytes.len() >= q {
-            for i in 0..=bytes.len() - q {
-                if i & 0xfff == 0 && cancelled() {
-                    return None;
-                }
-                let at = first + i as u64;
-                if at < self.next_allowed || bytes[i] & 0xc0 == 0x80 {
-                    continue;
-                }
-                let end = i + q;
-                if end < bytes.len() && bytes[end] & 0xc0 == 0x80 {
-                    continue;
-                }
-                if bytes[i..end].eq_ignore_ascii_case(&self.query) {
-                    self.matches.push(SnapshotCellRange {
-                        start: cell_at(i)?,
-                        end: cell_at(end - 1)?,
-                    });
-                    self.next_allowed = at + q as u64;
-                }
+            });
+        }
+        Some(())
+    }
+
+    fn finish(&mut self, cancelled: &impl Fn() -> bool) -> Option<()> {
+        self.finish_line(cancelled)
+    }
+
+    fn finish_line(&mut self, cancelled: &impl Fn() -> bool) -> Option<()> {
+        if cancelled() {
+            return None;
+        }
+        let line = std::str::from_utf8(&self.line).ok()?;
+        for found in self.matcher.find_iter(line) {
+            if cancelled() {
+                return None;
             }
+            if found.is_empty() {
+                continue;
+            }
+            self.matches.push(SnapshotCellRange {
+                start: *self.cells.get(found.start())?,
+                end: *self.cells.get(found.end() - 1)?,
+            });
         }
-        self.byte_base += chunk.len() as u64;
-        let keep = bytes.len().min(q.saturating_sub(1));
-        let mut next_cells = Vec::with_capacity(keep);
-        for i in bytes.len() - keep..bytes.len() {
-            next_cells.push(cell_at(i)?);
-        }
-        let tail_start = bytes.len() - keep;
-        bytes.copy_within(tail_start.., 0);
-        bytes.truncate(keep);
-        self.tail_bytes = bytes;
-        self.tail_cells = next_cells;
+        self.line.clear();
+        self.cells.clear();
         Some(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::StreamScan;
+    use super::{LineScan, find_search_matches_cancellable};
     use crate::ffi::{SnapshotCell, SnapshotCellRange, SnapshotTextPoint};
+    use regex::{Regex, RegexBuilder};
 
-    fn feed(scan: &mut StreamScan, text: &str, row_base: u64) {
+    fn feed(scan: &mut LineScan, text: &str, row_base: u64) {
         let points: Vec<_> = (0..text.len())
             .map(|x| SnapshotTextPoint { x: x as u16, y: 0 })
             .collect();
@@ -337,10 +366,15 @@ mod tests {
     }
 
     #[test]
-    fn matches_cross_chunks_and_keep_cell_locations() {
-        let mut scan = StreamScan::new("界x");
+    fn literal_matches_across_chunks_and_preserves_cell_locations() {
+        let matcher = RegexBuilder::new(&regex::escape("界x"))
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let mut scan = LineScan::new(matcher);
         feed(&mut scan, "a界", 0);
         feed(&mut scan, "x and 界x", 1);
+        scan.finish(&|| false).unwrap();
         assert_eq!(
             scan.matches,
             vec![
@@ -357,17 +391,22 @@ mod tests {
     }
 
     #[test]
-    fn ascii_search_is_case_insensitive_and_nonoverlapping() {
-        let mut scan = StreamScan::new("aa");
-        feed(&mut scan, "aAaA", 0);
+    fn unicode_literal_search_is_case_insensitive_and_nonoverlapping() {
+        let matcher = RegexBuilder::new(&regex::escape("éa"))
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let mut scan = LineScan::new(matcher);
+        feed(&mut scan, "ÉaéA", 0);
+        scan.finish(&|| false).unwrap();
         assert_eq!(scan.matches.len(), 2);
         assert_eq!(scan.matches[0].start.x, 0);
-        assert_eq!(scan.matches[1].start.x, 2);
+        assert_eq!(scan.matches[1].start.x, 3);
     }
 
     #[test]
     fn utf8_match_can_span_chunks_without_losing_its_cell() {
-        let mut scan = StreamScan::new("界");
+        let mut scan = LineScan::new(Regex::new("界").unwrap());
         let first = [
             SnapshotTextPoint { x: 0, y: 0 },
             SnapshotTextPoint { x: 1, y: 0 },
@@ -378,6 +417,7 @@ mod tests {
         ];
         scan.feed(&[b'a', 0xe7], &first, 0, 0, &|| false).unwrap();
         scan.feed(&[0x95, 0x8c], &second, 0, 0, &|| false).unwrap();
+        scan.finish(&|| false).unwrap();
         assert_eq!(
             scan.matches,
             vec![SnapshotCellRange {
@@ -385,5 +425,45 @@ mod tests {
                 end: SnapshotCell { x: 1, y: 0 },
             }]
         );
+    }
+
+    #[test]
+    fn regex_search_stays_within_logical_lines() {
+        let mut scan = LineScan::new(Regex::new(r"a.+b").unwrap());
+        feed(&mut scan, "a1b\na", 0);
+        feed(&mut scan, "2b\na3\nb", 1);
+        scan.finish(&|| false).unwrap();
+        assert_eq!(scan.matches.len(), 2);
+        assert_eq!(scan.matches[0].start, SnapshotCell { x: 0, y: 0 });
+        assert_eq!(scan.matches[1].end, SnapshotCell { x: 1, y: 1 });
+    }
+
+    #[test]
+    fn literal_metacharacters_are_escaped() {
+        let matcher = RegexBuilder::new(&regex::escape("a.b"))
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let mut scan = LineScan::new(matcher);
+        feed(&mut scan, "a-b A.B", 0);
+        scan.finish(&|| false).unwrap();
+        assert_eq!(scan.matches.len(), 1);
+        assert_eq!(scan.matches[0].start.x, 4);
+    }
+
+    #[test]
+    fn zero_width_regex_matches_have_no_highlight() {
+        let mut scan = LineScan::new(Regex::new(r"^|b").unwrap());
+        feed(&mut scan, "abc", 0);
+        scan.finish(&|| false).unwrap();
+        assert_eq!(scan.matches.len(), 1);
+        assert_eq!(scan.matches[0].start.x, 1);
+    }
+
+    #[test]
+    fn invalid_regex_returns_an_error_without_accessing_the_cursor() {
+        let outcome = find_search_matches_cancellable(0, "(", true, || false).unwrap();
+        assert!(outcome.matches.is_empty());
+        assert!(outcome.error.is_some());
     }
 }

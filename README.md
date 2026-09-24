@@ -52,8 +52,13 @@ for the worker to stop reading before releasing the snapshot.
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> on Windows and Linux to
 open the search overlay. Search queries, result highlighting, match selection,
 and viewport movement are owned by the Rust egui application. It asks Ghostty
-for a frozen copy of the complete scrollback, performs literal matching over
-its streamed UTF-8 text, and sends matching cell ranges back through the snapshot API.
+for a frozen copy of the complete scrollback, performs Unicode-aware,
+case-insensitive literal matching over its streamed UTF-8 text, and sends
+matching cell ranges back through the snapshot API. Press <kbd>Ctrl</kbd>+<kbd>R</kbd>
+in the search field to toggle regex mode. Regexes are case-sensitive by default;
+use `(?i)` for case-insensitive regex matching. Search is scoped to logical
+lines, so patterns do not span newlines. Invalid regexes appear in the search
+bar. Canonically equivalent Unicode spellings are not normalized.
 Ghostty only renders that presentation state. PTY output
 continues updating the live terminal behind the snapshot. Press Enter or use
 <kbd>Ctrl</kbd>+<kbd>N</kbd> for the next older result, Shift+Enter or

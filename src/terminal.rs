@@ -331,6 +331,7 @@ impl TerminalView {
         self.search.query_revision = self.search_worker.submit(
             snapshot_generation,
             self.search.query.clone(),
+            self.search.regex,
             self.search.cursor,
         );
     }
@@ -345,7 +346,7 @@ impl TerminalView {
         {
             return;
         }
-        self.search.apply_result(result.matches);
+        self.search.apply_result(result.matches, result.error);
         self.publish_search_matches(true);
     }
 
@@ -396,6 +397,7 @@ impl TerminalView {
         }
 
         let mut query_changed = false;
+        let mut mode_changed = false;
         let mut navigate = None;
         let mut close = false;
         let available_width = ctx.content_rect().width();
@@ -435,11 +437,18 @@ impl TerminalView {
 
                         let match_label = if self.pending_search_snapshot.is_some() {
                             "…".to_owned()
+                        } else if self.search.error.is_some() {
+                            "INVALID REGEX".to_owned()
                         } else {
                             self.search.match_label()
                         };
                         let match_label = if available_width >= 600.0 {
-                            format!("{match_label}   ·   SNAPSHOT")
+                            let mode = if self.search.regex {
+                                "REGEX"
+                            } else {
+                                "LITERAL"
+                            };
+                            format!("{match_label}   ·   {mode}")
                         } else {
                             match_label
                         };
@@ -463,19 +472,34 @@ impl TerminalView {
                         }
                         query_changed = response.changed();
 
-                        let (count_rect, _) = ui.allocate_exact_size(
+                        let (count_rect, count_response) = ui.allocate_exact_size(
                             egui::vec2(match_width, response.rect.height()),
                             egui::Sense::hover(),
                         );
+                        if let Some(error) = &self.search.error {
+                            count_response.on_hover_text(error);
+                        }
+                        let match_color = if self.search.error.is_some() {
+                            accent
+                        } else {
+                            muted_text
+                        };
                         ui.painter().text(
                             count_rect.right_center(),
                             egui::Align2::RIGHT_CENTER,
                             match_label,
                             egui::FontId::monospace(14.0),
-                            muted_text,
+                            match_color,
                         );
 
                         if response.has_focus() {
+                            if ui.input(|input| {
+                                input.modifiers.ctrl && input.key_pressed(egui::Key::R)
+                            }) {
+                                self.search.regex = !self.search.regex;
+                                self.search.error = None;
+                                mode_changed = true;
+                            }
                             let search_key = ui.input(|input| {
                                 if input.modifiers.ctrl && input.key_pressed(egui::Key::N) {
                                     Some(false)
@@ -505,7 +529,7 @@ impl TerminalView {
                 );
             });
 
-        if query_changed {
+        if query_changed || mode_changed {
             self.queue_search();
         }
         if let Some(previous) = navigate {
