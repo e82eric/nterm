@@ -9,10 +9,11 @@ pub(crate) fn forward(
     ui: &egui::Ui,
     rect: egui::Rect,
     scale: f32,
+    modal_input_blocked: bool,
 ) -> bool {
     let events = ui.input(|input| input.events.clone());
     let pointer_owned = ui.ctx().egui_wants_pointer_input();
-    let keyboard_owned = ui.ctx().egui_wants_keyboard_input();
+    let keyboard_owned = modal_input_blocked || ui.ctx().egui_wants_keyboard_input();
     let mut scrolled = false;
 
     for event in events {
@@ -49,7 +50,9 @@ pub(crate) fn forward(
                 ghostty_egui_host_preedit(host, "".as_ptr().cast(), 0);
                 ghostty_egui_host_text(host, text.as_ptr().cast(), text.len());
             },
-            egui::Event::PointerMoved(pos) if !pointer_owned && rect.contains(pos) => unsafe {
+            egui::Event::PointerMoved(pos)
+                if !pointer_owned && !modal_input_blocked && rect.contains(pos) =>
+            unsafe {
                 ghostty_egui_host_mouse_pos(
                     host,
                     ((pos.x - rect.left()) * scale) as f64,
@@ -62,7 +65,7 @@ pub(crate) fn forward(
                 button,
                 pressed,
                 modifiers,
-            } if !pointer_owned && rect.contains(pos) => {
+            } if !pointer_owned && !modal_input_blocked && rect.contains(pos) => {
                 let button = match button {
                     egui::PointerButton::Primary => 1,
                     egui::PointerButton::Secondary => 2,

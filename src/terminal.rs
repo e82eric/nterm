@@ -1,5 +1,6 @@
 use crate::app::UserEvent;
-use crate::ffi::{self, GlFrame, Host};
+use crate::copy_mode::{CopyMode, Motion};
+use crate::ffi::{self, GlFrame, Host, SnapshotCell, SnapshotCopyState, SnapshotCopyView};
 use crate::input;
 use crate::painter::TerminalPainter;
 use crate::search::{SearchEvents, SearchUi, SearchWorker};
@@ -87,6 +88,7 @@ pub(crate) struct TerminalView {
     pending_search_snapshot: Option<u64>,
     next_search_open: u64,
     search_worker: SearchWorker,
+    copy_mode: CopyMode,
 }
 
 impl TerminalView {
@@ -139,6 +141,7 @@ impl TerminalView {
             pending_search_snapshot: None,
             next_search_open: 0,
             search_worker: SearchWorker::new(egui_ctx.clone()),
+            copy_mode: CopyMode::default(),
         }
     }
 
@@ -182,6 +185,7 @@ impl TerminalView {
             if self.search.snapshot_generation.is_some() {
                 self.close_search();
             }
+            self.close_copy_mode();
             self.size = [width, height];
             self.scale = scale;
             unsafe { ffi::ghostty_egui_host_resize(self.host, width, height, scale as f64) };
@@ -198,8 +202,9 @@ impl TerminalView {
             callback: self.paint_callback.clone(),
         });
 
+        let keyboard_blocked = self.handle_copy_keys(ui);
         self.show_search_overlay(ui.ctx());
-        let scrolled = input::forward(self.host, self.size, ui, rect, scale);
+        let scrolled = input::forward(self.host, self.size, ui, rect, scale, keyboard_blocked);
         if (scrolled || resized)
             && let Some(snapshot_generation) = self.search.snapshot_generation
             && unsafe {
@@ -220,7 +225,11 @@ impl TerminalView {
                 .interactable(false)
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.small("egui shell · Ghostty OpenGL texture");
+                        if self.copy_mode.generation.is_some() {
+                            ui.small("COPY · hjkl / arrows · H M L · PgUp/PgDn · Ctrl+U/D · Esc");
+                        } else {
+                            ui.small("egui shell · Ghostty OpenGL texture");
+                        }
                     });
                 });
         }
@@ -252,6 +261,7 @@ impl TerminalView {
 
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
         self.close_search();
+        self.close_copy_mode();
         self.painter.lock().destroy(gl);
         unsafe { ffi::ghostty_egui_host_destroy(self.host) };
         self.host = std::ptr::null_mut();
@@ -276,6 +286,7 @@ impl TerminalView {
     }
 
     fn open_search(&mut self, needle: String) {
+        self.close_copy_mode();
         self.close_search();
 
         self.search = SearchUi {
@@ -322,6 +333,107 @@ impl TerminalView {
             unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
         }
         self.search = SearchUi::default();
+    }
+
+    fn open_copy_mode(&mut self) {
+        self.close_search();
+        let mut generation = 0;
+        if !unsafe { ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) } {
+            eprintln!("copy mode: failed to create terminal snapshot");
+            return;
+        }
+        let mut state = SnapshotCopyState::default();
+        let mut actual = SnapshotCell::default();
+        let ready = unsafe {
+            ffi::ghostty_egui_host_snapshot_copy_cursor_origin(self.host, generation, &mut state)
+                && ffi::ghostty_egui_host_snapshot_copy_cursor_set(
+                    self.host,
+                    generation,
+                    state.cell,
+                    false,
+                    &mut actual,
+                )
+        };
+        if !ready {
+            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+            eprintln!("copy mode: failed to initialize snapshot cursor");
+            return;
+        }
+        state.cell = actual;
+        self.copy_mode.start(generation, state);
+        self.wake.context.request_repaint();
+    }
+
+    fn close_copy_mode(&mut self) {
+        if let Some(generation) = self.copy_mode.generation {
+            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+            self.copy_mode = CopyMode::default();
+            self.wake.context.request_repaint();
+        }
+    }
+
+    fn handle_copy_keys(&mut self, ui: &egui::Ui) -> bool {
+        let was_active = self.copy_mode.generation.is_some();
+        let events = ui.input(|input| input.events.clone());
+        let mut handled = false;
+        for event in events {
+            if self.copy_mode.generation.is_none() {
+                if !self.search.active && is_copy_mode_shortcut(&event) {
+                    self.open_copy_mode();
+                    handled = true;
+                }
+                continue;
+            }
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            handled = true;
+            if key == egui::Key::Escape {
+                self.close_copy_mode();
+                break;
+            }
+            let Some(motion) = copy_motion(key, modifiers) else {
+                continue;
+            };
+            let generation = self.copy_mode.generation.expect("copy mode is active");
+            let view = if motion.needs_view() {
+                let mut view = SnapshotCopyView::default();
+                if !unsafe {
+                    ffi::ghostty_egui_host_snapshot_copy_view(self.host, generation, &mut view)
+                } {
+                    self.close_copy_mode();
+                    break;
+                }
+                Some(view)
+            } else {
+                None
+            };
+            let Some((requested, snap_right)) = self.copy_mode.move_to(motion, view) else {
+                continue;
+            };
+            let mut actual = SnapshotCell::default();
+            if unsafe {
+                ffi::ghostty_egui_host_snapshot_copy_cursor_set(
+                    self.host,
+                    generation,
+                    requested,
+                    snap_right,
+                    &mut actual,
+                )
+            } {
+                self.copy_mode.moved(motion, actual);
+            } else {
+                self.close_copy_mode();
+                break;
+            }
+        }
+        was_active || self.copy_mode.generation.is_some() || handled
     }
 
     fn queue_search(&mut self) {
@@ -538,6 +650,126 @@ impl TerminalView {
         if close {
             self.close_search();
         }
+    }
+}
+
+fn is_copy_mode_shortcut(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Key {
+        key: egui::Key::M,
+        pressed: true,
+        modifiers,
+        ..
+    } if modifiers.ctrl && modifiers.shift)
+}
+
+fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
+    use egui::Key;
+    if modifiers.alt || modifiers.mac_cmd {
+        return None;
+    }
+    if modifiers.ctrl {
+        return if modifiers.shift {
+            None
+        } else {
+            match key {
+                Key::U => Some(Motion::HalfPageUp),
+                Key::D => Some(Motion::HalfPageDown),
+                _ => None,
+            }
+        };
+    }
+    if modifiers.command {
+        return None;
+    }
+    if modifiers.shift {
+        return match key {
+            Key::H => Some(Motion::ViewportTop),
+            Key::M => Some(Motion::ViewportMiddle),
+            Key::L => Some(Motion::ViewportBottom),
+            _ => None,
+        };
+    }
+    match key {
+        Key::H | Key::ArrowLeft => Some(Motion::Left),
+        Key::J | Key::ArrowDown => Some(Motion::Down),
+        Key::K | Key::ArrowUp => Some(Motion::Up),
+        Key::L | Key::ArrowRight => Some(Motion::Right),
+        Key::PageUp => Some(Motion::PageUp),
+        Key::PageDown => Some(Motion::PageDown),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod copy_shortcut_tests {
+    use super::{copy_motion, is_copy_mode_shortcut};
+
+    #[test]
+    fn copy_mode_shortcut_requires_ctrl_shift_m() {
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let key_event = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        assert!(is_copy_mode_shortcut(&key_event(egui::Key::M, ctrl_shift)));
+        assert!(!is_copy_mode_shortcut(&key_event(
+            egui::Key::M,
+            egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        )));
+        assert!(!is_copy_mode_shortcut(&key_event(egui::Key::X, ctrl_shift)));
+        assert!(!is_copy_mode_shortcut(&egui::Event::Cut));
+    }
+
+    #[test]
+    fn viewport_and_page_keys_respect_modifiers() {
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            copy_motion(egui::Key::H, shift),
+            Some(crate::copy_mode::Motion::ViewportTop)
+        ));
+        assert!(matches!(
+            copy_motion(egui::Key::M, shift),
+            Some(crate::copy_mode::Motion::ViewportMiddle)
+        ));
+        assert!(matches!(
+            copy_motion(egui::Key::L, shift),
+            Some(crate::copy_mode::Motion::ViewportBottom)
+        ));
+        assert!(matches!(
+            copy_motion(egui::Key::PageUp, egui::Modifiers::NONE),
+            Some(crate::copy_mode::Motion::PageUp)
+        ));
+        assert!(matches!(
+            copy_motion(egui::Key::PageDown, egui::Modifiers::NONE),
+            Some(crate::copy_mode::Motion::PageDown)
+        ));
+        assert!(matches!(
+            copy_motion(egui::Key::U, ctrl),
+            Some(crate::copy_mode::Motion::HalfPageUp)
+        ));
+        assert!(matches!(
+            copy_motion(egui::Key::D, ctrl),
+            Some(crate::copy_mode::Motion::HalfPageDown)
+        ));
+        assert!(copy_motion(egui::Key::H, ctrl).is_none());
     }
 }
 

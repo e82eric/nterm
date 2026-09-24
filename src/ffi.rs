@@ -21,6 +21,23 @@ pub(crate) struct SnapshotCell {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SnapshotCopyState {
+    pub(crate) cell: SnapshotCell,
+    pub(crate) columns: u32,
+    pub(crate) rows: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SnapshotCopyView {
+    pub(crate) viewport_top: u64,
+    pub(crate) total_rows: u64,
+    pub(crate) viewport_rows: u32,
+    pub(crate) columns: u32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SnapshotCellRange {
     pub(crate) start: SnapshotCell,
@@ -73,6 +90,23 @@ unsafe extern "C" {
     ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_end(host: *mut Host, snapshot_generation: u64)
     -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_copy_cursor_origin(
+        host: *mut Host,
+        generation: u64,
+        state: *mut SnapshotCopyState,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_copy_view(
+        host: *mut Host,
+        generation: u64,
+        view: *mut SnapshotCopyView,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_copy_cursor_set(
+        host: *mut Host,
+        generation: u64,
+        requested: SnapshotCell,
+        snap_right: bool,
+        actual: *mut SnapshotCell,
+    ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_cursor_new(
         host: *mut Host,
         generation: u64,

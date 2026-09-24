@@ -72,6 +72,17 @@ match.
 Clipboard paste is forwarded to Ghostty when the terminal has keyboard focus.
 When the search field is focused, paste remains within the search query.
 
+Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter the initial copy
+mode. Ghostty freezes the visible terminal and scrollback while the live PTY
+keeps running. A steady block cursor starts at the terminal's insertion point;
+move it with <kbd>h</kbd>/<kbd>j</kbd>/<kbd>k</kbd>/<kbd>l</kbd> or the arrow
+keys. <kbd>H</kbd>/<kbd>M</kbd>/<kbd>L</kbd> move to the top, middle, or bottom
+visible row. Page Up/Down move a full screen, and <kbd>Ctrl</kbd>+<kbd>U</kbd>/
+<kbd>Ctrl</kbd>+<kbd>D</kbd> move half a screen. Movement scrolls the frozen
+viewport when necessary. Press Escape to
+return to the live terminal. Selection and copying are not part of this first
+version.
+
 The native C Win32 sample remains available through
 `zig build win32-sample -Doptimize=ReleaseFast`.
 

@@ -1,4 +1,5 @@
 mod app;
+mod copy_mode;
 mod ffi;
 mod frame_trace;
 mod input;

@@ -169,6 +169,18 @@ bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *snapshot_
 bool ghostty_egui_host_snapshot_end(GhosttyEguiHost *host, uint64_t snapshot_generation) {
     return ghostty_surface_snapshot_end(host->surface, snapshot_generation);
 }
+bool ghostty_egui_host_snapshot_copy_cursor_origin(
+    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_copy_state_s *state
+) { return ghostty_surface_snapshot_copy_cursor_origin(host->surface, generation, state); }
+bool ghostty_egui_host_snapshot_copy_view(
+    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_copy_view_s *view
+) { return ghostty_surface_snapshot_copy_view(host->surface, generation, view); }
+bool ghostty_egui_host_snapshot_copy_cursor_set(
+    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_cell_s requested,
+    bool snap_right, ghostty_snapshot_cell_s *actual
+) { return ghostty_surface_snapshot_copy_cursor_set(
+    host->surface, generation, requested, snap_right, actual
+); }
 ghostty_snapshot_text_cursor_t ghostty_egui_host_snapshot_cursor_new(
     GhosttyEguiHost *host, uint64_t generation
 ) { return ghostty_surface_snapshot_text_cursor_new(host->surface, generation); }
