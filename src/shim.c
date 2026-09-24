@@ -169,58 +169,31 @@ bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *snapshot_
 bool ghostty_egui_host_snapshot_end(GhosttyEguiHost *host, uint64_t snapshot_generation) {
     return ghostty_surface_snapshot_end(host->surface, snapshot_generation);
 }
-bool ghostty_egui_host_snapshot_read_all_text(
-    GhosttyEguiHost *host,
-    uint64_t snapshot_generation,
-    const char **result,
-    size_t *result_len
-) {
-    if (!result || !result_len) return false;
-    ghostty_text_s text = {0};
-    if (!ghostty_surface_snapshot_read_all_text(
-            host->surface, snapshot_generation, &text))
-        return false;
-    *result = text.text;
-    *result_len = text.text_len;
-    return true;
+ghostty_snapshot_text_cursor_t ghostty_egui_host_snapshot_cursor_new(
+    GhosttyEguiHost *host, uint64_t generation
+) { return ghostty_surface_snapshot_text_cursor_new(host->surface, generation); }
+void ghostty_egui_host_snapshot_cursor_free(ghostty_snapshot_text_cursor_t cursor) {
+    ghostty_surface_snapshot_text_cursor_free(cursor);
 }
-void ghostty_egui_host_snapshot_free_text(
-    GhosttyEguiHost *host,
-    const char *text,
-    size_t len
-) {
-    ghostty_text_s value = { .text = text, .text_len = len };
-    ghostty_surface_free_text(host->surface, &value);
+bool ghostty_egui_host_snapshot_cursor_reset(ghostty_snapshot_text_cursor_t cursor) {
+    return ghostty_surface_snapshot_text_cursor_reset(cursor);
 }
-bool ghostty_egui_host_snapshot_set_highlights(
-    GhosttyEguiHost *host,
-    uint64_t snapshot_generation,
-    const ghostty_snapshot_text_range_s *ranges,
-    size_t count,
-    const ghostty_snapshot_text_range_s *selected,
-    bool reveal_selected
-) {
-    return ghostty_surface_snapshot_set_ordered_text_highlights(
-        host->surface, snapshot_generation, ranges, count, selected, reveal_selected
-    );
-}
-bool ghostty_egui_host_snapshot_select_highlight(
-    GhosttyEguiHost *host,
-    uint64_t snapshot_generation,
-    ghostty_snapshot_text_range_s selected
-) {
-    return ghostty_surface_snapshot_select_text_highlight(
-        host->surface, snapshot_generation, selected
-    );
-}
-bool ghostty_egui_host_snapshot_highlights_need_refresh(
-    GhosttyEguiHost *host,
-    uint64_t snapshot_generation
-) {
-    return ghostty_surface_snapshot_text_highlights_need_refresh(
-        host->surface, snapshot_generation
-    );
-}
+int ghostty_egui_host_snapshot_cursor_next(
+    ghostty_snapshot_text_cursor_t cursor, ghostty_snapshot_text_chunk_s *chunk
+) { return ghostty_surface_snapshot_text_cursor_next(cursor, chunk); }
+bool ghostty_egui_host_snapshot_set_cell_highlights(
+    GhosttyEguiHost *host, uint64_t generation,
+    const ghostty_snapshot_cell_range_s *ranges, size_t count,
+    const ghostty_snapshot_cell_range_s *selected, bool reveal_selected
+) { return ghostty_surface_snapshot_set_ordered_cell_highlights(
+    host->surface, generation, ranges, count, selected, reveal_selected
+); }
+bool ghostty_egui_host_snapshot_select_cell_highlight(
+    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_cell_range_s selected
+) { return ghostty_surface_snapshot_select_cell_highlight(host->surface, generation, selected); }
+bool ghostty_egui_host_snapshot_cell_highlights_need_refresh(
+    GhosttyEguiHost *host, uint64_t generation
+) { return ghostty_surface_snapshot_cell_highlights_need_refresh(host->surface, generation); }
 void ghostty_egui_host_text(GhosttyEguiHost *host, const char *text, size_t len) {
     ghostty_surface_text(host->surface, text, len);
 }

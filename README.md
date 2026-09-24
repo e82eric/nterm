@@ -41,18 +41,19 @@ and caret blinking) are detected by comparing egui drawing commands, without
 copying or comparing terminal pixels. A separate cleanup deadline polls GPU
 fences and returns old textures without running egui or swapping buffers.
 
-Search matching runs on a dedicated Rust worker thread over immutable,
-application-owned snapshot text. Ghostty supplies the exact UTF-8 text and
-retains page boundaries. The worker returns byte ranges, and Ghostty maps
-visible matches to cells from the frozen pages on demand. Snapshot generations and
-per-query revisions prevent completed work for an older snapshot or query from
-replacing current results.
+Search matching runs on a dedicated Rust worker thread. It reads the frozen
+Ghostty snapshot one page-sized text chunk at a time. Each chunk includes the
+corresponding terminal cell for every UTF-8 byte, so the worker can return cell
+ranges directly without exporting or indexing the complete scrollback text.
+Snapshot generations and per-query revisions prevent completed work for an
+older snapshot or query from replacing current results. Closing search waits
+for the worker to stop reading before releasing the snapshot.
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> on Windows and Linux to
 open the search overlay. Search queries, result highlighting, match selection,
 and viewport movement are owned by the Rust egui application. It asks Ghostty
 for a frozen copy of the complete scrollback, performs literal matching over
-its UTF-8 text, and sends matching byte ranges back through the snapshot API.
+its streamed UTF-8 text, and sends matching cell ranges back through the snapshot API.
 Ghostty only renders that presentation state. PTY output
 continues updating the live terminal behind the snapshot. Press Enter or use
 <kbd>Ctrl</kbd>+<kbd>N</kbd> for the next older result, Shift+Enter or

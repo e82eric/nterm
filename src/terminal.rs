@@ -177,6 +177,11 @@ impl TerminalView {
         let height = (rect.height() * scale).round().max(1.0) as u32;
         let resized = self.size != [width, height] || self.scale != scale;
         if resized {
+            // Ghostty ends presentation snapshots during resize. Stop the
+            // worker before that can free the pages its cursor reads.
+            if self.search.snapshot_generation.is_some() {
+                self.close_search();
+            }
             self.size = [width, height];
             self.scale = scale;
             unsafe { ffi::ghostty_egui_host_resize(self.host, width, height, scale as f64) };
@@ -198,7 +203,7 @@ impl TerminalView {
         if (scrolled || resized)
             && let Some(snapshot_generation) = self.search.snapshot_generation
             && unsafe {
-                ffi::ghostty_egui_host_snapshot_highlights_need_refresh(
+                ffi::ghostty_egui_host_snapshot_cell_highlights_need_refresh(
                     self.host,
                     snapshot_generation,
                 )
@@ -292,38 +297,27 @@ impl TerminalView {
             return;
         }
 
-        let mut text: *const c_char = std::ptr::null();
-        let mut len = 0;
-        if !unsafe {
-            ffi::ghostty_egui_host_snapshot_read_all_text(
-                self.host,
-                snapshot_generation,
-                &mut text,
-                &mut len,
-            )
-        } {
+        let cursor =
+            unsafe { ffi::ghostty_egui_host_snapshot_cursor_new(self.host, snapshot_generation) };
+        if cursor.is_null() {
             unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
             self.close_search();
             return;
         }
-        let value =
-            std::str::from_utf8(unsafe { std::slice::from_raw_parts(text.cast::<u8>(), len) })
-                .map(str::to_owned);
-        unsafe { ffi::ghostty_egui_host_snapshot_free_text(self.host, text, len) };
-        let Ok(value) = value else {
-            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
-            self.close_search();
-            return;
-        };
 
         self.search.snapshot_generation = Some(snapshot_generation);
-        self.search.text = value.into();
+        self.search.cursor = cursor as usize;
         self.queue_search();
     }
 
     fn close_search(&mut self) {
         self.pending_search_snapshot = None;
-        self.search_worker.cancel();
+        if self.search.cursor != 0 {
+            self.search_worker.cancel_and_wait();
+            unsafe { ffi::ghostty_egui_host_snapshot_cursor_free(self.search.cursor as *mut _) };
+        } else {
+            self.search_worker.cancel();
+        }
         if let Some(snapshot_generation) = self.search.snapshot_generation.take() {
             unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
         }
@@ -337,7 +331,7 @@ impl TerminalView {
         self.search.query_revision = self.search_worker.submit(
             snapshot_generation,
             self.search.query.clone(),
-            Arc::clone(&self.search.text),
+            self.search.cursor,
         );
     }
 
@@ -364,7 +358,7 @@ impl TerminalView {
             return;
         };
         if !unsafe {
-            ffi::ghostty_egui_host_snapshot_select_highlight(
+            ffi::ghostty_egui_host_snapshot_select_cell_highlight(
                 self.host,
                 snapshot_generation,
                 *selected,
@@ -385,7 +379,7 @@ impl TerminalView {
             self.search.matches.as_ptr()
         };
         unsafe {
-            ffi::ghostty_egui_host_snapshot_set_highlights(
+            ffi::ghostty_egui_host_snapshot_set_cell_highlights(
                 self.host,
                 snapshot_generation,
                 ranges,

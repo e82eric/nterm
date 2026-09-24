@@ -14,10 +14,34 @@ pub(crate) struct GlFrame {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotTextRange {
-    pub(crate) start_byte: u64,
-    pub(crate) end_byte: u64,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotCell {
+    pub(crate) x: u32,
+    pub(crate) y: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotCellRange {
+    pub(crate) start: SnapshotCell,
+    pub(crate) end: SnapshotCell,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SnapshotTextPoint {
+    pub(crate) x: u16,
+    pub(crate) y: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct SnapshotTextChunk {
+    pub(crate) text: *const u8,
+    pub(crate) points: *const SnapshotTextPoint,
+    pub(crate) len: usize,
+    pub(crate) row_base: u64,
+    pub(crate) start_y: u16,
 }
 
 unsafe extern "C" {
@@ -49,33 +73,32 @@ unsafe extern "C" {
     ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_end(host: *mut Host, snapshot_generation: u64)
     -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_read_all_text(
+    pub(crate) fn ghostty_egui_host_snapshot_cursor_new(
         host: *mut Host,
-        snapshot_generation: u64,
-        text: *mut *const c_char,
-        len: *mut usize,
-    ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_free_text(
+        generation: u64,
+    ) -> *mut c_void;
+    pub(crate) fn ghostty_egui_host_snapshot_cursor_free(cursor: *mut c_void);
+    pub(crate) fn ghostty_egui_host_snapshot_cursor_reset(cursor: *mut c_void) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_cursor_next(
+        cursor: *mut c_void,
+        chunk: *mut SnapshotTextChunk,
+    ) -> i32;
+    pub(crate) fn ghostty_egui_host_snapshot_set_cell_highlights(
         host: *mut Host,
-        text: *const c_char,
-        len: usize,
-    );
-    pub(crate) fn ghostty_egui_host_snapshot_set_highlights(
-        host: *mut Host,
-        snapshot_generation: u64,
-        ranges: *const SnapshotTextRange,
+        generation: u64,
+        ranges: *const SnapshotCellRange,
         count: usize,
-        selected: *const SnapshotTextRange,
+        selected: *const SnapshotCellRange,
         reveal_selected: bool,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_select_highlight(
+    pub(crate) fn ghostty_egui_host_snapshot_select_cell_highlight(
         host: *mut Host,
-        snapshot_generation: u64,
-        selected: SnapshotTextRange,
+        generation: u64,
+        selected: SnapshotCellRange,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_highlights_need_refresh(
+    pub(crate) fn ghostty_egui_host_snapshot_cell_highlights_need_refresh(
         host: *mut Host,
-        snapshot_generation: u64,
+        generation: u64,
     ) -> bool;
     pub(crate) fn ghostty_egui_host_text(host: *mut Host, text: *const c_char, len: usize);
     pub(crate) fn ghostty_egui_host_preedit(host: *mut Host, text: *const c_char, len: usize);
