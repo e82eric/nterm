@@ -1,9 +1,12 @@
+use crate::frame_trace::{FrameSample, FrameTrace};
+use crate::presentation::{Presentation, UiChanges};
 use crate::terminal::TerminalView;
 use egui_winit::winit;
 use glow::HasContext as _;
 use std::ffi::{CString, c_char, c_void};
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub(crate) fn run(args: Vec<CString>) {
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
@@ -23,10 +26,15 @@ struct ShellApp {
 }
 
 impl ShellApp {
-    fn new(egui_ctx: &egui::Context, gl: &glow::Context, args: Vec<CString>) -> Self {
+    fn new(
+        egui_ctx: &egui::Context,
+        gl: &glow::Context,
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+        args: Vec<CString>,
+    ) -> Self {
         let mut argv: Vec<*mut c_char> = args.iter().map(|arg| arg.as_ptr().cast_mut()).collect();
         Self {
-            terminal: TerminalView::new(egui_ctx, gl, argv.len(), argv.as_mut_ptr()),
+            terminal: TerminalView::new(egui_ctx, gl, proxy, argv.len(), argv.as_mut_ptr()),
             _args: args,
             _argv: argv,
         }
@@ -42,8 +50,10 @@ impl ShellApp {
 }
 
 #[derive(Debug)]
-enum UserEvent {
-    Repaint(std::time::Duration),
+pub(crate) enum UserEvent {
+    Repaint(Instant),
+    GhosttyWake,
+    FrameReady(Instant),
 }
 
 struct NativeApp {
@@ -53,6 +63,8 @@ struct NativeApp {
     gl: Option<Arc<glow::Context>>,
     egui: Option<egui_glow::EguiGlow>,
     shell: Option<ShellApp>,
+    trace: FrameTrace,
+    presentation: Presentation,
 }
 
 impl NativeApp {
@@ -64,27 +76,77 @@ impl NativeApp {
             gl: None,
             egui: None,
             shell: None,
+            trace: FrameTrace::new(),
+            presentation: Presentation::default(),
         }
     }
 
     fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let started = Instant::now();
         let gl_window = self.gl_window.as_ref().expect("OpenGL window");
         let gl = self.gl.as_ref().expect("OpenGL context");
         let egui = self.egui.as_mut().expect("egui renderer");
         let shell = self.shell.as_mut().expect("terminal shell");
 
         egui.run(gl_window.window(), |ctx| shell.ui(ctx));
+        let ran_ui = Instant::now();
+        let retired_before_paint = shell.terminal.retired_pending();
         if shell.terminal.should_close() {
             event_loop.exit();
             return;
         }
 
-        unsafe {
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
+        self.presentation.ui_dirty |= egui
+            .egui_ctx
+            .with_plugin(|changes: &mut UiChanges| std::mem::take(&mut changes.changed))
+            .expect("UI change tracking registered");
+        let now = Instant::now();
+        let paced = self
+            .presentation
+            .present_deadline(now)
+            .is_some_and(|due| due > now);
+        let mut new_frame = false;
+        if self.presentation.ready(now) {
+            new_frame = shell.terminal.acquire_frame();
+            // A queued notification may refer to a frame already acquired.
+            self.presentation.frame_pending = new_frame;
         }
-        egui.paint(gl_window.window());
-        gl_window.swap_buffers().expect("swap egui buffers");
+        let generation = shell.terminal.frame_generation();
+        let presented = !paced && self.presentation.ready(now);
+        if presented {
+            unsafe {
+                gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            egui.paint(gl_window.window());
+        } else {
+            shell.terminal.poll_retired(gl);
+        }
+        let painted = Instant::now();
+        let paint_trace = shell.terminal.paint_trace();
+        self.presentation
+            .cleanup_pending(shell.terminal.retired_pending(), Instant::now());
+        if presented {
+            let present_started = Instant::now();
+            gl_window.swap_buffers().expect("swap egui buffers");
+            self.presentation.presented(present_started);
+        }
+        let swapped = Instant::now();
+        self.trace.record(
+            &egui.egui_ctx,
+            FrameSample {
+                started,
+                ran_ui,
+                painted,
+                swapped,
+                generation,
+                new_frame,
+                presented,
+                paced,
+                retired_before_paint,
+                paint_trace,
+            },
+        );
     }
 }
 
@@ -95,6 +157,16 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         }
 
         let gl_window = unsafe { GlutinWindowContext::new(event_loop) };
+        if let Some(refresh_millihertz) = gl_window
+            .window()
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+            .filter(|rate| *rate > 0)
+        {
+            self.presentation.interval = std::time::Duration::from_nanos(
+                1_000_000_000_000_u64 / u64::from(refresh_millihertz),
+            );
+        }
         let gl = Arc::new(unsafe {
             glow::Context::from_loader_function(|name| {
                 let name = CString::new(name).expect("OpenGL symbol contains NUL");
@@ -102,14 +174,18 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             })
         });
         let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
+        egui.egui_ctx.add_plugin(UiChanges::default());
         let proxy = self.proxy.clone();
         egui.egui_ctx.set_request_repaint_callback(move |info| {
-            let _ = proxy.send_event(UserEvent::Repaint(info.delay));
+            if let Some(deadline) = Instant::now().checked_add(info.delay) {
+                let _ = proxy.send_event(UserEvent::Repaint(deadline));
+            }
         });
 
         let shell = ShellApp::new(
             &egui.egui_ctx,
             &gl,
+            self.proxy.clone(),
             self.args.take().expect("application resumed twice"),
         );
         gl_window.window().set_visible(true);
@@ -137,6 +213,20 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         }
         if let WindowEvent::Resized(size) = event {
             self.gl_window.as_ref().expect("OpenGL window").resize(size);
+            self.presentation.force = true;
+        }
+        if matches!(
+            event,
+            WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Occluded(false)
+        ) {
+            self.presentation.force = true;
+        }
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+        ) {
+            self.trace.input_events += 1;
+            self.trace.pending_input.get_or_insert_with(Instant::now);
         }
 
         let response = self.egui.as_mut().expect("egui renderer").on_window_event(
@@ -144,6 +234,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             &event,
         );
         if response.repaint {
+            self.trace.window_repaints += 1;
             self.gl_window
                 .as_ref()
                 .expect("OpenGL window")
@@ -152,29 +243,62 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         }
     }
 
-    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
-        let UserEvent::Repaint(delay) = event;
-        if delay.is_zero() {
-            if let Some(window) = self.gl_window.as_ref() {
-                window.window().request_redraw();
+    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::GhosttyWake => {
+                if let Some(shell) = self.shell.as_mut() {
+                    let started = Instant::now();
+                    shell.terminal.tick();
+                    self.trace.tick_events += 1;
+                    self.trace.tick_time += started.elapsed();
+                }
             }
-        } else if let Some(deadline) = std::time::Instant::now().checked_add(delay) {
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
-        } else {
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            UserEvent::FrameReady(ready) => {
+                self.trace.pending_frame_ready = Some(ready);
+                self.trace.ready_events += 1;
+                self.presentation.frame_pending = true;
+                self.trace.frame_event_deferred |= !self.presentation.ready(Instant::now());
+            }
+            UserEvent::Repaint(deadline) => {
+                self.trace.repaint_events += 1;
+                self.presentation.repaint_at(deadline);
+            }
         }
     }
 
-    fn new_events(
-        &mut self,
-        _event_loop: &winit::event_loop::ActiveEventLoop,
-        cause: winit::event::StartCause,
-    ) {
-        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. })
-            && let Some(window) = self.gl_window.as_ref()
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let now = Instant::now();
+        if self
+            .presentation
+            .cleanup_deadline
+            .is_some_and(|due| due <= now)
+        {
+            self.presentation.cleanup_deadline = None;
+            if let (Some(shell), Some(gl)) = (&self.shell, &self.gl) {
+                // The UI context remains current on this thread. Cleanup does
+                // not run egui, paint, or swap buffers.
+                shell.terminal.poll_retired(gl);
+                self.presentation
+                    .cleanup_pending(shell.terminal.retired_pending(), now);
+            }
+        }
+        let repaint_due = self
+            .presentation
+            .repaint_deadline
+            .is_some_and(|due| due <= now);
+        if repaint_due {
+            self.presentation.repaint_deadline = None;
+            self.trace.timer_events += 1;
+        }
+        if (repaint_due || self.presentation.ready(now))
+            && let Some(window) = &self.gl_window
         {
             window.window().request_redraw();
         }
+        event_loop.set_control_flow(match self.presentation.next_deadline(now) {
+            Some(deadline) => winit::event_loop::ControlFlow::WaitUntil(deadline),
+            None => winit::event_loop::ControlFlow::Wait,
+        });
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -204,6 +328,7 @@ impl GlutinWindowContext {
         let window_attributes = winit::window::WindowAttributes::default()
             .with_title("Ghostty — egui OpenGL sample")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 700.0))
+            .with_decorations(false)
             .with_visible(false);
         let template = glutin::config::ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(None)
@@ -252,7 +377,11 @@ impl GlutinWindowContext {
         let context = not_current
             .make_current(&surface)
             .expect("make OpenGL current");
-        let _ = surface.set_swap_interval(&context, glutin::surface::SwapInterval::DontWait);
+        if let Err(err) =
+            surface.set_swap_interval(&context, glutin::surface::SwapInterval::DontWait)
+        {
+            eprintln!("egui OpenGL swap interval could not be disabled: {err}");
+        }
 
         Self {
             window,

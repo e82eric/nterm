@@ -9,10 +9,11 @@ pub(crate) fn forward(
     ui: &egui::Ui,
     rect: egui::Rect,
     scale: f32,
-) {
+) -> bool {
     let events = ui.input(|input| input.events.clone());
     let pointer_owned = ui.ctx().egui_wants_pointer_input();
     let keyboard_owned = ui.ctx().egui_wants_keyboard_input();
+    let mut scrolled = false;
 
     for event in events {
         match event {
@@ -97,10 +98,12 @@ pub(crate) fn forward(
                         scroll_mods,
                     );
                 }
+                scrolled = true;
             }
             _ => {}
         }
     }
+    scrolled
 }
 
 fn mods(value: egui::Modifiers) -> i32 {

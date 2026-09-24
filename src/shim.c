@@ -10,34 +10,10 @@ typedef struct {
 } GhosttyEguiHost;
 
 extern void ghostty_egui_wakeup(void *userdata);
+extern void ghostty_egui_frame_ready(void *userdata);
 extern void ghostty_egui_close(void *userdata);
 extern void ghostty_egui_search_open(void *userdata, const char *needle, size_t len);
 extern void ghostty_egui_search_close(void *userdata);
-
-typedef struct {
-    uint32_t start_x;
-    uint32_t start_y;
-    uint32_t end_x;
-    uint32_t end_y;
-} GhosttyEguiRange;
-
-static ghostty_selection_s snapshot_selection(GhosttyEguiRange range) {
-    return (ghostty_selection_s) {
-        .top_left = {
-            .tag = GHOSTTY_POINT_SCREEN,
-            .coord = GHOSTTY_POINT_COORD_EXACT,
-            .x = range.start_x,
-            .y = range.start_y,
-        },
-        .bottom_right = {
-            .tag = GHOSTTY_POINT_SCREEN,
-            .coord = GHOSTTY_POINT_COORD_EXACT,
-            .x = range.end_x,
-            .y = range.end_y,
-        },
-        .rectangle = false,
-    };
-}
 
 static void wake(void *userdata) { ghostty_egui_wakeup(userdata); }
 static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action_value) {
@@ -45,6 +21,9 @@ static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s 
 
     void *userdata = ghostty_app_userdata(app);
     switch (action_value.tag) {
+    case GHOSTTY_ACTION_RENDER:
+        ghostty_egui_frame_ready(userdata);
+        return true;
     case GHOSTTY_ACTION_START_SEARCH: {
         const char *needle = action_value.action.start_search.needle;
         ghostty_egui_search_open(userdata, needle, needle ? strlen(needle) : 0);
@@ -190,81 +169,57 @@ bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *snapshot_
 bool ghostty_egui_host_snapshot_end(GhosttyEguiHost *host, uint64_t snapshot_generation) {
     return ghostty_surface_snapshot_end(host->surface, snapshot_generation);
 }
-bool ghostty_egui_host_snapshot_size(
+bool ghostty_egui_host_snapshot_read_all_text(
     GhosttyEguiHost *host,
     uint64_t snapshot_generation,
-    uint32_t *columns,
-    uint32_t *screen_rows,
-    uint64_t *total_rows
-) {
-    return ghostty_surface_snapshot_size(
-        host->surface,
-        snapshot_generation,
-        columns,
-        screen_rows,
-        total_rows
-    );
-}
-bool ghostty_egui_host_snapshot_read_row(
-    GhosttyEguiHost *host,
-    uint64_t snapshot_generation,
-    uint32_t columns,
-    uint32_t row,
-    char **result,
+    const char **result,
     size_t *result_len
 ) {
-    if (!result || !result_len || columns == 0) return false;
+    if (!result || !result_len) return false;
     ghostty_text_s text = {0};
-    const GhosttyEguiRange range = {0, row, columns - 1, row};
-    if (!ghostty_surface_snapshot_read_text(
-            host->surface,
-            snapshot_generation,
-            snapshot_selection(range),
-            &text))
+    if (!ghostty_surface_snapshot_read_all_text(
+            host->surface, snapshot_generation, &text))
         return false;
-
-    char *copy = malloc(text.text_len + 1);
-    if (!copy) {
-        ghostty_surface_free_text(host->surface, &text);
-        return false;
-    }
-    memcpy(copy, text.text, text.text_len);
-    copy[text.text_len] = 0;
-    *result = copy;
+    *result = text.text;
     *result_len = text.text_len;
-    ghostty_surface_free_text(host->surface, &text);
     return true;
 }
-void ghostty_egui_host_snapshot_free_text(char *text) { free(text); }
+void ghostty_egui_host_snapshot_free_text(
+    GhosttyEguiHost *host,
+    const char *text,
+    size_t len
+) {
+    ghostty_text_s value = { .text = text, .text_len = len };
+    ghostty_surface_free_text(host->surface, &value);
+}
 bool ghostty_egui_host_snapshot_set_highlights(
     GhosttyEguiHost *host,
     uint64_t snapshot_generation,
-    const GhosttyEguiRange *ranges,
+    const ghostty_snapshot_text_range_s *ranges,
     size_t count,
-    const GhosttyEguiRange *selected
+    const ghostty_snapshot_text_range_s *selected,
+    bool reveal_selected
 ) {
-    ghostty_selection_s *selections = NULL;
-    ghostty_selection_s selected_selection;
-    if (count > 0) {
-        if (!ranges || count > SIZE_MAX / sizeof(*selections)) return false;
-        selections = malloc(count * sizeof(*selections));
-        if (!selections) return false;
-        for (size_t i = 0; i < count; i++) selections[i] = snapshot_selection(ranges[i]);
-    }
-    const ghostty_selection_s *selected_ptr = NULL;
-    if (selected) {
-        selected_selection = snapshot_selection(*selected);
-        selected_ptr = &selected_selection;
-    }
-    const bool result = ghostty_surface_snapshot_set_highlights(
-        host->surface,
-        snapshot_generation,
-        selections,
-        count,
-        selected_ptr
+    return ghostty_surface_snapshot_set_ordered_text_highlights(
+        host->surface, snapshot_generation, ranges, count, selected, reveal_selected
     );
-    free(selections);
-    return result;
+}
+bool ghostty_egui_host_snapshot_select_highlight(
+    GhosttyEguiHost *host,
+    uint64_t snapshot_generation,
+    ghostty_snapshot_text_range_s selected
+) {
+    return ghostty_surface_snapshot_select_text_highlight(
+        host->surface, snapshot_generation, selected
+    );
+}
+bool ghostty_egui_host_snapshot_highlights_need_refresh(
+    GhosttyEguiHost *host,
+    uint64_t snapshot_generation
+) {
+    return ghostty_surface_snapshot_text_highlights_need_refresh(
+        host->surface, snapshot_generation
+    );
 }
 void ghostty_egui_host_text(GhosttyEguiHost *host, const char *text, size_t len) {
     ghostty_surface_text(host->surface, text, len);

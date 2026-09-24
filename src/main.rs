@@ -1,7 +1,9 @@
 mod app;
 mod ffi;
+mod frame_trace;
 mod input;
 mod painter;
+mod presentation;
 mod search;
 mod terminal;
 

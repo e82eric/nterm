@@ -1,8 +1,8 @@
+use crate::app::UserEvent;
 use crate::ffi::{self, GlFrame, Host};
 use crate::input;
 use crate::painter::TerminalPainter;
 use crate::search::{SearchEvents, SearchUi, SearchWorker};
-use glow::HasContext as _;
 use std::ffi::{c_char, c_void};
 use std::sync::{
     Arc, Mutex,
@@ -11,6 +11,9 @@ use std::sync::{
 
 struct WakeState {
     context: egui::Context,
+    proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
+    wake_pending: AtomicBool,
+    frame_ready_pending: AtomicBool,
     close: AtomicBool,
     search: Mutex<SearchEvents>,
 }
@@ -18,7 +21,24 @@ struct WakeState {
 #[unsafe(no_mangle)]
 extern "C" fn ghostty_egui_wakeup(userdata: *mut c_void) {
     let state = unsafe { &*(userdata.cast::<WakeState>()) };
-    state.context.request_repaint();
+    if !state.wake_pending.swap(true, Ordering::AcqRel)
+        && state.proxy.send_event(UserEvent::GhosttyWake).is_err()
+    {
+        state.wake_pending.store(false, Ordering::Release);
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ghostty_egui_frame_ready(userdata: *mut c_void) {
+    let state = unsafe { &*(userdata.cast::<WakeState>()) };
+    if !state.frame_ready_pending.swap(true, Ordering::AcqRel)
+        && state
+            .proxy
+            .send_event(UserEvent::FrameReady(std::time::Instant::now()))
+            .is_err()
+    {
+        state.frame_ready_pending.store(false, Ordering::Release);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -58,12 +78,14 @@ extern "C" fn ghostty_egui_search_close(userdata: *mut c_void) {
 pub(crate) struct TerminalView {
     host: *mut Host,
     wake: Box<WakeState>,
-    frame: Option<GlFrame>,
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
+    paint_callback: Arc<egui_glow::CallbackFn>,
     size: [u32; 2],
     scale: f32,
     focused: bool,
     search: SearchUi,
+    pending_search_snapshot: Option<u64>,
+    next_search_open: u64,
     search_worker: SearchWorker,
 }
 
@@ -71,11 +93,15 @@ impl TerminalView {
     pub(crate) fn new(
         egui_ctx: &egui::Context,
         gl: &glow::Context,
+        proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
         argc: usize,
         argv: *mut *mut c_char,
     ) -> Self {
         let mut wake = Box::new(WakeState {
             context: egui_ctx.clone(),
+            proxy,
+            wake_pending: AtomicBool::new(false),
+            frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             search: Mutex::new(SearchEvents::default()),
         });
@@ -96,29 +122,61 @@ impl TerminalView {
             "failed to initialize the embedded Ghostty surface"
         );
 
+        let painter = Arc::new(egui::mutex::Mutex::new(TerminalPainter::new(gl)));
+        let callback_painter = Arc::clone(&painter);
+        let paint_callback = Arc::new(egui_glow::CallbackFn::new(move |_info, glow_painter| {
+            callback_painter.lock().paint(glow_painter.gl());
+        }));
         Self {
             host,
             wake,
-            frame: None,
-            painter: Arc::new(egui::mutex::Mutex::new(TerminalPainter::new(gl))),
+            painter,
+            paint_callback,
             size: [0, 0],
             scale: 0.0,
             focused: false,
             search: SearchUi::default(),
+            pending_search_snapshot: None,
+            next_search_open: 0,
             search_worker: SearchWorker::new(egui_ctx.clone()),
         }
     }
 
-    pub(crate) fn update(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn tick(&mut self) {
+        self.wake.wake_pending.store(false, Ordering::Release);
         unsafe { ffi::ghostty_egui_host_tick(self.host) };
+    }
+
+    pub(crate) fn acquire_frame(&mut self) -> bool {
+        // Clear before taking the mailbox so a concurrent publication cannot
+        // lose its notification. The callback always draws the current frame.
+        self.wake
+            .frame_ready_pending
+            .store(false, Ordering::Release);
+        let mut next = GlFrame::default();
+        if !unsafe { ffi::ghostty_egui_host_take_frame(self.host, &mut next) } {
+            return false;
+        }
+        self.painter.lock().replace_frame(next);
+        true
+    }
+
+    pub(crate) fn update(&mut self, ui: &mut egui::Ui) {
+        let pending_at_frame_start = self.pending_search_snapshot;
         self.apply_search_events();
+        if pending_at_frame_start.is_some()
+            && self.pending_search_snapshot == pending_at_frame_start
+        {
+            self.prepare_search_snapshot();
+        }
         self.apply_search_result();
 
         let rect = ui.max_rect();
         let scale = ui.ctx().pixels_per_point();
         let width = (rect.width() * scale).round().max(1.0) as u32;
         let height = (rect.height() * scale).round().max(1.0) as u32;
-        if self.size != [width, height] || self.scale != scale {
+        let resized = self.size != [width, height] || self.scale != scale;
+        if resized {
             self.size = [width, height];
             self.scale = scale;
             unsafe { ffi::ghostty_egui_host_resize(self.host, width, height, scale as f64) };
@@ -130,33 +188,31 @@ impl TerminalView {
             unsafe { ffi::ghostty_egui_host_focus(self.host, focused) };
         }
 
-        let mut next = GlFrame::default();
-        if unsafe { ffi::ghostty_egui_host_take_frame(self.host, &mut next) }
-            && let Some(old) = self.frame.replace(next)
-        {
-            self.painter.lock().retire(old.handle);
-        }
-
-        if let Some(frame) = self.frame.as_ref() {
-            let painter = Arc::clone(&self.painter);
-            let texture = frame.texture;
-            let handle = frame.handle as usize;
-            ui.painter().add(egui::PaintCallback {
-                rect,
-                callback: Arc::new(egui_glow::CallbackFn::new(move |_info, glow_painter| {
-                    painter.lock().paint(glow_painter.gl(), texture, handle);
-                })),
-            });
-        } else {
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-        }
+        ui.painter().add(egui::PaintCallback {
+            rect,
+            callback: self.paint_callback.clone(),
+        });
 
         self.show_search_overlay(ui.ctx());
-        input::forward(self.host, self.size, ui, rect, scale);
+        let scrolled = input::forward(self.host, self.size, ui, rect, scale);
+        if (scrolled || resized)
+            && let Some(snapshot_generation) = self.search.snapshot_generation
+            && unsafe {
+                ffi::ghostty_egui_host_snapshot_highlights_need_refresh(
+                    self.host,
+                    snapshot_generation,
+                )
+            }
+        {
+            self.publish_search_matches(false);
+        }
 
         if !self.search.active {
             egui::Area::new("sample-overlay".into())
                 .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
+                .fade_in(false)
+                .movable(false)
+                .interactable(false)
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.small("egui shell · Ghostty OpenGL texture");
@@ -167,22 +223,31 @@ impl TerminalView {
         if self.should_close() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if self.painter.lock().has_retired_frames() {
-            ui.ctx().request_repaint();
-        }
     }
 
     pub(crate) fn should_close(&self) -> bool {
         self.wake.close.load(Ordering::Acquire)
     }
 
+    pub(crate) fn frame_generation(&self) -> Option<u64> {
+        self.painter.lock().frame_generation()
+    }
+
+    pub(crate) fn poll_retired(&self, gl: &glow::Context) {
+        self.painter.lock().poll_retired(gl);
+    }
+
+    pub(crate) fn retired_pending(&self) -> bool {
+        self.painter.lock().has_retired_frames()
+    }
+
+    pub(crate) fn paint_trace(&self) -> crate::painter::PaintTrace {
+        self.painter.lock().paint_trace()
+    }
+
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
         self.close_search();
-        unsafe { gl.finish() };
         self.painter.lock().destroy(gl);
-        if let Some(frame) = self.frame.take() {
-            unsafe { ffi::ghostty_egui_host_release_frame(frame.handle) };
-        }
         unsafe { ffi::ghostty_egui_host_destroy(self.host) };
         self.host = std::ptr::null_mut();
     }
@@ -208,70 +273,56 @@ impl TerminalView {
     fn open_search(&mut self, needle: String) {
         self.close_search();
 
-        let mut snapshot_generation = 0;
-        if !unsafe { ffi::ghostty_egui_host_snapshot_begin(self.host, &mut snapshot_generation) } {
-            return;
-        }
-
-        let mut columns = 0;
-        let mut screen_rows = 0;
-        let mut total_rows = 0;
-        if !unsafe {
-            ffi::ghostty_egui_host_snapshot_size(
-                self.host,
-                snapshot_generation,
-                &mut columns,
-                &mut screen_rows,
-                &mut total_rows,
-            )
-        } || columns == 0
-            || total_rows > u32::MAX as u64
-        {
-            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
-            return;
-        }
-
-        let mut rows = Vec::with_capacity(total_rows as usize);
-        for row in 0..total_rows as u32 {
-            let mut text = std::ptr::null_mut();
-            let mut len = 0;
-            if !unsafe {
-                ffi::ghostty_egui_host_snapshot_read_row(
-                    self.host,
-                    snapshot_generation,
-                    columns,
-                    row,
-                    &mut text,
-                    &mut len,
-                )
-            } {
-                unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
-                return;
-            }
-            let value = String::from_utf8_lossy(unsafe {
-                std::slice::from_raw_parts(text.cast::<u8>(), len)
-            })
-            .trim_end_matches(['\r', '\n'])
-            .to_owned();
-            unsafe { ffi::ghostty_egui_host_snapshot_free_text(text) };
-            rows.push(value);
-        }
-
         self.search = SearchUi {
             active: true,
             query: needle,
-            snapshot_generation: Some(snapshot_generation),
-            columns,
-            rows: rows.into(),
-            matches: Vec::new(),
-            selected: None,
             focus_requested: true,
-            query_revision: 0,
+            ..SearchUi::default()
         };
+        self.next_search_open = self.next_search_open.wrapping_add(1);
+        self.pending_search_snapshot = Some(self.next_search_open);
+        self.wake.context.request_repaint();
+    }
+
+    fn prepare_search_snapshot(&mut self) {
+        self.pending_search_snapshot = None;
+        let mut snapshot_generation = 0;
+        if !unsafe { ffi::ghostty_egui_host_snapshot_begin(self.host, &mut snapshot_generation) } {
+            self.close_search();
+            return;
+        }
+
+        let mut text: *const c_char = std::ptr::null();
+        let mut len = 0;
+        if !unsafe {
+            ffi::ghostty_egui_host_snapshot_read_all_text(
+                self.host,
+                snapshot_generation,
+                &mut text,
+                &mut len,
+            )
+        } {
+            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
+            self.close_search();
+            return;
+        }
+        let value =
+            std::str::from_utf8(unsafe { std::slice::from_raw_parts(text.cast::<u8>(), len) })
+                .map(str::to_owned);
+        unsafe { ffi::ghostty_egui_host_snapshot_free_text(self.host, text, len) };
+        let Ok(value) = value else {
+            unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
+            self.close_search();
+            return;
+        };
+
+        self.search.snapshot_generation = Some(snapshot_generation);
+        self.search.text = value.into();
         self.queue_search();
     }
 
     fn close_search(&mut self) {
+        self.pending_search_snapshot = None;
         self.search_worker.cancel();
         if let Some(snapshot_generation) = self.search.snapshot_generation.take() {
             unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, snapshot_generation) };
@@ -286,8 +337,7 @@ impl TerminalView {
         self.search.query_revision = self.search_worker.submit(
             snapshot_generation,
             self.search.query.clone(),
-            self.search.columns,
-            Arc::clone(&self.search.rows),
+            Arc::clone(&self.search.text),
         );
     }
 
@@ -302,15 +352,29 @@ impl TerminalView {
             return;
         }
         self.search.apply_result(result.matches);
-        self.publish_search_matches();
+        self.publish_search_matches(true);
     }
 
     fn navigate_search(&mut self, previous: bool) {
         self.search.navigate(previous);
-        self.publish_search_matches();
+        let Some(snapshot_generation) = self.search.snapshot_generation else {
+            return;
+        };
+        let Some(selected) = self.search.selected_range() else {
+            return;
+        };
+        if !unsafe {
+            ffi::ghostty_egui_host_snapshot_select_highlight(
+                self.host,
+                snapshot_generation,
+                *selected,
+            )
+        } {
+            self.publish_search_matches(true);
+        }
     }
 
-    fn publish_search_matches(&self) {
+    fn publish_search_matches(&self, reveal_selected: bool) {
         let Some(snapshot_generation) = self.search.snapshot_generation else {
             return;
         };
@@ -327,6 +391,7 @@ impl TerminalView {
                 ranges,
                 self.search.matches.len(),
                 selected.map_or(std::ptr::null(), std::ptr::from_ref),
+                reveal_selected,
             );
         }
     }
@@ -340,30 +405,63 @@ impl TerminalView {
         let mut navigate = None;
         let mut close = false;
         let available_width = ctx.content_rect().width();
-        let search_width = (available_width * 0.86).clamp(320.0, 1650.0);
-        let fill = egui::Color32::from_rgb(39, 39, 39);
-        let border = egui::Color32::from_rgb(143, 136, 129);
-        let accent = egui::Color32::from_rgb(197, 211, 22);
+        let search_width = (available_width - 24.0).max(1.0);
+        // Gruvbox dark: lift the search box one shade above the terminal background.
+        let fill = egui::Color32::from_rgb(0x3c, 0x38, 0x36); // dark1
+        let border = egui::Color32::from_rgb(0x66, 0x5c, 0x54); // dark3
+        let accent = egui::Color32::from_rgb(0xfa, 0xbd, 0x2f); // bright yellow
+        let text_color = egui::Color32::from_rgb(0xeb, 0xdb, 0xb2); // light1
+        let muted_text = egui::Color32::from_rgb(0xd5, 0xc4, 0xa1); // light2
+        let selection = egui::Color32::from_rgb(0x66, 0x5c, 0x54); // dark3
 
         egui::Area::new("terminal-search".into())
-            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -12.0])
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, 0.0])
             .order(egui::Order::Foreground)
+            .fade_in(false)
+            .movable(false)
             .show(ctx, |ui| {
-                ui.set_width(search_width);
                 let frame = egui::Frame::new()
                     .fill(fill)
-                    .stroke(egui::Stroke::new(2.0, border))
-                    .corner_radius(6.0)
-                    .inner_margin(egui::Margin::symmetric(10, 7));
+                    .inner_margin(egui::Margin::symmetric(12, 3));
                 let frame_response = frame.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let match_label = self.search.match_label();
-                        let match_width = 64.0;
-                        let response = ui.add(
+                    ui.set_width(search_width);
+                    ui.visuals_mut().text_cursor.stroke = egui::Stroke::new(2.0, text_color);
+                    ui.visuals_mut().selection.bg_fill = selection;
+                    ui.visuals_mut().selection.stroke.color = text_color;
+                    ui.horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.add_sized(
+                            [16.0, 24.0],
+                            egui::Label::new(
+                                egui::RichText::new("/")
+                                    .font(egui::FontId::monospace(16.0))
+                                    .color(accent),
+                            ),
+                        );
+
+                        let match_label = if self.pending_search_snapshot.is_some() {
+                            "…".to_owned()
+                        } else {
+                            self.search.match_label()
+                        };
+                        let match_label = if available_width >= 600.0 {
+                            format!("{match_label}   ·   SNAPSHOT")
+                        } else {
+                            match_label
+                        };
+                        let match_width = if available_width >= 600.0 {
+                            210.0
+                        } else {
+                            74.0
+                        };
+                        let input_width = (ui.available_width() - match_width - 10.0).max(1.0);
+                        let response = ui.add_sized(
+                            [input_width, 24.0],
                             egui::TextEdit::singleline(&mut self.search.query)
-                                .hint_text("Search")
                                 .frame(egui::Frame::NONE)
-                                .desired_width((search_width - match_width).max(1.0)),
+                                .font(egui::FontId::monospace(15.0))
+                                .vertical_align(egui::Align::Center)
+                                .text_color(text_color),
                         );
                         if self.search.focus_requested {
                             response.request_focus();
@@ -371,11 +469,16 @@ impl TerminalView {
                         }
                         query_changed = response.changed();
 
-                        ui.add_sized(
-                            [match_width, response.rect.height()],
-                            egui::Label::new(
-                                egui::RichText::new(match_label).small().color(border),
-                            ),
+                        let (count_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(match_width, response.rect.height()),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().text(
+                            count_rect.right_center(),
+                            egui::Align2::RIGHT_CENTER,
+                            match_label,
+                            egui::FontId::monospace(14.0),
+                            muted_text,
                         );
 
                         if response.has_focus() {
@@ -399,16 +502,12 @@ impl TerminalView {
                         }
                     });
                 });
-
-                let title_center = frame_response.response.rect.center_top();
-                let title_rect = egui::Rect::from_center_size(title_center, egui::vec2(76.0, 20.0));
-                ui.painter().rect_filled(title_rect, 0.0, fill);
-                ui.painter().text(
-                    title_center,
-                    egui::Align2::CENTER_CENTER,
-                    "?Search",
-                    egui::FontId::proportional(14.0),
-                    accent,
+                ui.painter().line_segment(
+                    [
+                        frame_response.response.rect.left_top(),
+                        frame_response.response.rect.right_top(),
+                    ],
+                    egui::Stroke::new(1.0, border),
                 );
             });
 

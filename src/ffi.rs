@@ -15,11 +15,9 @@ pub(crate) struct GlFrame {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotRange {
-    pub(crate) start_x: u32,
-    pub(crate) start_y: u32,
-    pub(crate) end_x: u32,
-    pub(crate) end_y: u32,
+pub(crate) struct SnapshotTextRange {
+    pub(crate) start_byte: u64,
+    pub(crate) end_byte: u64,
 }
 
 unsafe extern "C" {
@@ -51,28 +49,33 @@ unsafe extern "C" {
     ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_end(host: *mut Host, snapshot_generation: u64)
     -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_size(
+    pub(crate) fn ghostty_egui_host_snapshot_read_all_text(
         host: *mut Host,
         snapshot_generation: u64,
-        columns: *mut u32,
-        screen_rows: *mut u32,
-        total_rows: *mut u64,
-    ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_read_row(
-        host: *mut Host,
-        snapshot_generation: u64,
-        columns: u32,
-        row: u32,
-        text: *mut *mut c_char,
+        text: *mut *const c_char,
         len: *mut usize,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_free_text(text: *mut c_char);
+    pub(crate) fn ghostty_egui_host_snapshot_free_text(
+        host: *mut Host,
+        text: *const c_char,
+        len: usize,
+    );
     pub(crate) fn ghostty_egui_host_snapshot_set_highlights(
         host: *mut Host,
         snapshot_generation: u64,
-        ranges: *const SnapshotRange,
+        ranges: *const SnapshotTextRange,
         count: usize,
-        selected: *const SnapshotRange,
+        selected: *const SnapshotTextRange,
+        reveal_selected: bool,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_select_highlight(
+        host: *mut Host,
+        snapshot_generation: u64,
+        selected: SnapshotTextRange,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_highlights_need_refresh(
+        host: *mut Host,
+        snapshot_generation: u64,
     ) -> bool;
     pub(crate) fn ghostty_egui_host_text(host: *mut Host, text: *const c_char, len: usize);
     pub(crate) fn ghostty_egui_host_preedit(host: *mut Host, text: *const c_char, len: usize);

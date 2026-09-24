@@ -1,16 +1,47 @@
-use crate::ffi::ghostty_egui_host_release_frame;
+use crate::ffi::{GlFrame, ghostty_egui_host_release_frame};
 use glow::HasContext as _;
 use std::ffi::c_void;
 use std::num::NonZeroU32;
+use std::time::Instant;
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct PaintTrace {
+    pub(crate) retired_us: u128,
+    pub(crate) setup_us: u128,
+    pub(crate) draw_us: u128,
+    pub(crate) fence_us: u128,
+    pub(crate) retired_count: usize,
+    pub(crate) fence_wait_failed: usize,
+}
+
+// Handles are stored as integers because egui callbacks must be Send. All GL
+// access and frame releases happen on the UI thread with its context current.
+struct OwnedFrame {
+    handle: usize,
+    texture: u32,
+    generation: u64,
+    fence: Option<usize>,
+}
+
+impl OwnedFrame {
+    unsafe fn release(self, gl: &glow::Context) {
+        unsafe {
+            if let Some(fence) = self.fence {
+                gl.delete_sync(glow::NativeFence(fence as _));
+            }
+            ghostty_egui_host_release_frame(self.handle as *mut c_void);
+        }
+    }
+}
 
 pub(crate) struct TerminalPainter {
     program: glow::Program,
+    texture_uniform: Option<glow::UniformLocation>,
     vertex_array: glow::VertexArray,
-    // Store native GLsync values as integers because egui requires paint
-    // callbacks to be Send even though native OpenGL callbacks run on the UI
-    // thread. The fences are only reconstructed and used on that thread.
-    last_fence: Option<(usize, usize)>,
-    retired: Vec<(usize, usize)>,
+    current: Option<OwnedFrame>,
+    retired: Vec<OwnedFrame>,
+    trace_enabled: bool,
+    paint_trace: PaintTrace,
 }
 
 impl TerminalPainter {
@@ -53,89 +84,135 @@ impl TerminalPainter {
             );
             gl.delete_shader(vertex);
             gl.delete_shader(fragment);
+            let texture_uniform = gl.get_uniform_location(program, "terminal_texture");
             Self {
                 program,
+                texture_uniform,
                 vertex_array: gl
                     .create_vertex_array()
                     .expect("create terminal vertex array"),
-                last_fence: None,
+                current: None,
                 retired: Vec::new(),
+                trace_enabled: std::env::var_os("GHOSTTY_EGUI_TRACE").is_some(),
+                paint_trace: PaintTrace::default(),
             }
         }
     }
 
-    pub(crate) fn retire(&mut self, handle: *mut c_void) {
-        let handle = handle as usize;
-        match self.last_fence.take() {
-            Some((fenced_handle, fence)) if fenced_handle == handle => {
-                self.retired.push((handle, fence));
+    pub(crate) fn replace_frame(&mut self, frame: GlFrame) {
+        let next = OwnedFrame {
+            handle: frame.handle as usize,
+            texture: frame.texture,
+            generation: frame.frame_generation,
+            fence: None,
+        };
+        if let Some(old) = self.current.replace(next) {
+            if old.fence.is_some() {
+                self.retired.push(old);
+            } else {
+                // This frame was never sampled, or a fallback glFinish completed it.
+                unsafe { ghostty_egui_host_release_frame(old.handle as *mut c_void) };
             }
-            Some(other) => {
-                self.last_fence = Some(other);
-                unsafe { ghostty_egui_host_release_frame(handle as *mut c_void) };
-            }
-            None => unsafe { ghostty_egui_host_release_frame(handle as *mut c_void) },
         }
+    }
+
+    pub(crate) fn frame_generation(&self) -> Option<u64> {
+        self.current.as_ref().map(|frame| frame.generation)
     }
 
     pub(crate) fn has_retired_frames(&self) -> bool {
         !self.retired.is_empty()
     }
 
-    pub(crate) fn paint(&mut self, gl: &glow::Context, texture: u32, handle: usize) {
-        let Some(texture) = NonZeroU32::new(texture) else {
-            return;
-        };
+    pub(crate) fn paint_trace(&self) -> PaintTrace {
+        self.paint_trace
+    }
+
+    pub(crate) fn poll_retired(&mut self, gl: &glow::Context) {
+        let started = Instant::now();
+        let mut fence_wait_failed = 0;
         unsafe {
             let mut i = 0;
             while i < self.retired.len() {
-                let (handle, fence) = self.retired[i];
-                let fence = glow::NativeFence(fence as _);
+                let fence = glow::NativeFence(self.retired[i].fence.expect("retired fence") as _);
                 let status = gl.client_wait_sync(fence, 0, 0);
                 if status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED {
-                    gl.delete_sync(fence);
-                    ghostty_egui_host_release_frame(handle as *mut c_void);
-                    self.retired.swap_remove(i);
+                    self.retired.swap_remove(i).release(gl);
                 } else {
+                    if status == glow::WAIT_FAILED {
+                        fence_wait_failed += 1;
+                    }
                     i += 1;
                 }
             }
+        }
+        if self.trace_enabled {
+            self.paint_trace = PaintTrace {
+                retired_us: started.elapsed().as_micros(),
+                retired_count: self.retired.len(),
+                fence_wait_failed,
+                ..PaintTrace::default()
+            };
+        }
+    }
 
+    pub(crate) fn paint(&mut self, gl: &glow::Context) {
+        let Some(texture) = self
+            .current
+            .as_ref()
+            .and_then(|frame| NonZeroU32::new(frame.texture))
+        else {
+            return;
+        };
+        self.poll_retired(gl);
+        let poll_trace = self.paint_trace;
+        let retired = Instant::now();
+        unsafe {
             gl.disable(glow::BLEND);
             gl.use_program(Some(self.program));
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(glow::NativeTexture(texture)));
-            gl.uniform_1_i32(
-                gl.get_uniform_location(self.program, "terminal_texture")
-                    .as_ref(),
-                0,
-            );
+            gl.uniform_1_i32(self.texture_uniform.as_ref(), 0);
             gl.bind_vertex_array(Some(self.vertex_array));
+            let prepared = Instant::now();
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            let drawn = Instant::now();
 
-            if let Some((_, fence)) = self.last_fence.take() {
+            let frame = self.current.as_mut().expect("current frame");
+            if let Some(fence) = frame.fence.take() {
                 gl.delete_sync(glow::NativeFence(fence as _));
             }
             if let Ok(fence) = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) {
                 gl.flush();
-                self.last_fence = Some((handle, fence.0 as usize));
+                frame.fence = Some(fence.0 as usize);
             } else {
                 // Fence creation is required for asynchronous retirement. If
                 // the driver rejects it, complete this read before allowing
                 // the texture to be returned to Ghostty's pool.
                 gl.finish();
             }
+            if self.trace_enabled {
+                self.paint_trace = PaintTrace {
+                    retired_us: poll_trace.retired_us,
+                    setup_us: prepared.duration_since(retired).as_micros(),
+                    draw_us: drawn.duration_since(prepared).as_micros(),
+                    fence_us: drawn.elapsed().as_micros(),
+                    retired_count: self.retired.len(),
+                    fence_wait_failed: poll_trace.fence_wait_failed,
+                };
+            }
         }
     }
 
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
         unsafe {
-            if let Some((_, fence)) = self.last_fence.take() {
-                gl.delete_sync(glow::NativeFence(fence as _));
+            // Shutdown is the only normal blocking wait for the UI's GPU work.
+            gl.finish();
+            if let Some(frame) = self.current.take() {
+                frame.release(gl);
             }
-            for (handle, fence) in self.retired.drain(..) {
-                gl.delete_sync(glow::NativeFence(fence as _));
-                ghostty_egui_host_release_frame(handle as *mut c_void);
+            for frame in self.retired.drain(..) {
+                frame.release(gl);
             }
             gl.delete_program(self.program);
             gl.delete_vertex_array(self.vertex_array);
