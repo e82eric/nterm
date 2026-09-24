@@ -59,7 +59,8 @@ in the search field to toggle regex mode. Regexes are case-sensitive by default;
 use `(?i)` for case-insensitive regex matching. Search is scoped to logical
 lines, so patterns do not span newlines. Invalid regexes appear in the search
 bar. Canonically equivalent Unicode spellings are not normalized.
-Ghostty only renders that presentation state. PTY output
+Ghostty renders the selected match and other matches as ordered decoration
+layers on the frozen snapshot. PTY output
 continues updating the live terminal behind the snapshot. Press Enter or use
 <kbd>Ctrl</kbd>+<kbd>N</kbd> for the next older result, Shift+Enter or
 <kbd>Ctrl</kbd>+<kbd>P</kbd> for the previous newer result, and Escape to close
@@ -74,7 +75,7 @@ When the search field is focused, paste remains within the search query.
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter the initial copy
 mode. Ghostty freezes the visible terminal and scrollback while the live PTY
-keeps running. A steady block cursor starts at the terminal's insertion point;
+keeps running. A steady, styled cell marks the terminal's insertion point;
 move it with <kbd>h</kbd>/<kbd>j</kbd>/<kbd>k</kbd>/<kbd>l</kbd> or the arrow
 keys. <kbd>H</kbd>/<kbd>M</kbd>/<kbd>L</kbd> move to the top, middle, or bottom
 visible row. Page Up/Down move a full screen, and <kbd>Ctrl</kbd>+<kbd>U</kbd>/

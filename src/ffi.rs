@@ -22,15 +22,8 @@ pub(crate) struct SnapshotCell {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SnapshotCopyState {
-    pub(crate) cell: SnapshotCell,
-    pub(crate) columns: u32,
-    pub(crate) rows: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SnapshotCopyView {
+pub(crate) struct SnapshotView {
+    pub(crate) cursor: SnapshotCell,
     pub(crate) viewport_top: u64,
     pub(crate) total_rows: u64,
     pub(crate) viewport_rows: u32,
@@ -42,6 +35,21 @@ pub(crate) struct SnapshotCopyView {
 pub(crate) struct SnapshotCellRange {
     pub(crate) start: SnapshotCell,
     pub(crate) end: SnapshotCell,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotDecorationStyle {
+    pub(crate) foreground_rgb: u32,
+    pub(crate) background_rgb: u32,
+    pub(crate) flags: u32,
+}
+
+#[repr(C)]
+pub(crate) struct SnapshotDecorationLayer {
+    pub(crate) ranges: *const SnapshotCellRange,
+    pub(crate) range_count: usize,
+    pub(crate) style: SnapshotDecorationStyle,
 }
 
 #[repr(C)]
@@ -90,17 +98,12 @@ unsafe extern "C" {
     ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_end(host: *mut Host, snapshot_generation: u64)
     -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_copy_cursor_origin(
+    pub(crate) fn ghostty_egui_host_snapshot_view(
         host: *mut Host,
         generation: u64,
-        state: *mut SnapshotCopyState,
+        view: *mut SnapshotView,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_copy_view(
-        host: *mut Host,
-        generation: u64,
-        view: *mut SnapshotCopyView,
-    ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_copy_cursor_set(
+    pub(crate) fn ghostty_egui_host_snapshot_resolve_cell(
         host: *mut Host,
         generation: u64,
         requested: SnapshotCell,
@@ -117,20 +120,14 @@ unsafe extern "C" {
         cursor: *mut c_void,
         chunk: *mut SnapshotTextChunk,
     ) -> i32;
-    pub(crate) fn ghostty_egui_host_snapshot_set_cell_highlights(
+    pub(crate) fn ghostty_egui_host_snapshot_apply_decorations(
         host: *mut Host,
         generation: u64,
-        ranges: *const SnapshotCellRange,
+        layers: *const SnapshotDecorationLayer,
         count: usize,
-        selected: *const SnapshotCellRange,
-        reveal_selected: bool,
+        reveal: *const SnapshotCell,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_select_cell_highlight(
-        host: *mut Host,
-        generation: u64,
-        selected: SnapshotCellRange,
-    ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_cell_highlights_need_refresh(
+    pub(crate) fn ghostty_egui_host_snapshot_decorations_need_refresh(
         host: *mut Host,
         generation: u64,
     ) -> bool;

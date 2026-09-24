@@ -1,4 +1,4 @@
-use crate::ffi::{SnapshotCell, SnapshotCopyState, SnapshotCopyView};
+use crate::ffi::{SnapshotCell, SnapshotView};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Motion {
@@ -31,18 +31,18 @@ pub(crate) struct CopyMode {
 }
 
 impl CopyMode {
-    pub(crate) fn start(&mut self, generation: u64, state: SnapshotCopyState) {
+    pub(crate) fn start(&mut self, generation: u64, state: SnapshotView) {
         self.generation = Some(generation);
-        self.cursor = state.cell;
-        self.preferred_x = state.cell.x;
+        self.cursor = state.cursor;
+        self.preferred_x = state.cursor.x;
         self.columns = state.columns;
-        self.rows = state.rows;
+        self.rows = state.total_rows;
     }
 
     pub(crate) fn move_to(
         &self,
         motion: Motion,
-        view: Option<SnapshotCopyView>,
+        view: Option<SnapshotView>,
     ) -> Option<(SnapshotCell, bool)> {
         if self.columns == 0 || self.rows == 0 {
             return None;
@@ -123,10 +123,11 @@ mod tests {
         let mut mode = CopyMode::default();
         mode.start(
             1,
-            SnapshotCopyState {
-                cell: SnapshotCell { x: 0, y: 0 },
+            SnapshotView {
+                cursor: SnapshotCell { x: 0, y: 0 },
                 columns: 4,
-                rows: 3,
+                total_rows: 3,
+                ..Default::default()
             },
         );
         assert_eq!(mode.move_to(Motion::Left, None).unwrap().0, mode.cursor);
@@ -141,17 +142,19 @@ mod tests {
         let mut mode = CopyMode::default();
         mode.start(
             7,
-            SnapshotCopyState {
-                cell: SnapshotCell { x: 4, y: 41 },
+            SnapshotView {
+                cursor: SnapshotCell { x: 4, y: 41 },
                 columns: 10,
-                rows: 100,
+                total_rows: 100,
+                ..Default::default()
             },
         );
-        let view = SnapshotCopyView {
+        let view = SnapshotView {
             viewport_top: 30,
             viewport_rows: 20,
             total_rows: 100,
             columns: 10,
+            ..Default::default()
         };
         let target = |motion| mode.move_to(motion, Some(view)).unwrap().0;
         assert_eq!(target(Motion::ViewportTop), SnapshotCell { x: 4, y: 30 });
@@ -169,17 +172,19 @@ mod tests {
         let mut mode = CopyMode::default();
         mode.start(
             1,
-            SnapshotCopyState {
-                cell: SnapshotCell { x: 2, y: 97 },
+            SnapshotView {
+                cursor: SnapshotCell { x: 2, y: 97 },
                 columns: 5,
-                rows: 100,
+                total_rows: 100,
+                ..Default::default()
             },
         );
-        let view = SnapshotCopyView {
+        let view = SnapshotView {
             viewport_top: 80,
             viewport_rows: 20,
             total_rows: 100,
             columns: 5,
+            ..Default::default()
         };
         assert_eq!(mode.move_to(Motion::PageDown, Some(view)).unwrap().0.y, 99);
         mode.cursor.y = 2;

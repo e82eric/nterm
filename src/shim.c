@@ -169,16 +169,13 @@ bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *snapshot_
 bool ghostty_egui_host_snapshot_end(GhosttyEguiHost *host, uint64_t snapshot_generation) {
     return ghostty_surface_snapshot_end(host->surface, snapshot_generation);
 }
-bool ghostty_egui_host_snapshot_copy_cursor_origin(
-    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_copy_state_s *state
-) { return ghostty_surface_snapshot_copy_cursor_origin(host->surface, generation, state); }
-bool ghostty_egui_host_snapshot_copy_view(
-    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_copy_view_s *view
-) { return ghostty_surface_snapshot_copy_view(host->surface, generation, view); }
-bool ghostty_egui_host_snapshot_copy_cursor_set(
+bool ghostty_egui_host_snapshot_view(
+    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_view_s *view
+) { return ghostty_surface_snapshot_view(host->surface, generation, view); }
+bool ghostty_egui_host_snapshot_resolve_cell(
     GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_cell_s requested,
     bool snap_right, ghostty_snapshot_cell_s *actual
-) { return ghostty_surface_snapshot_copy_cursor_set(
+) { return ghostty_surface_snapshot_resolve_cell(
     host->surface, generation, requested, snap_right, actual
 ); }
 ghostty_snapshot_text_cursor_t ghostty_egui_host_snapshot_cursor_new(
@@ -193,19 +190,16 @@ bool ghostty_egui_host_snapshot_cursor_reset(ghostty_snapshot_text_cursor_t curs
 int ghostty_egui_host_snapshot_cursor_next(
     ghostty_snapshot_text_cursor_t cursor, ghostty_snapshot_text_chunk_s *chunk
 ) { return ghostty_surface_snapshot_text_cursor_next(cursor, chunk); }
-bool ghostty_egui_host_snapshot_set_cell_highlights(
+bool ghostty_egui_host_snapshot_apply_decorations(
     GhosttyEguiHost *host, uint64_t generation,
-    const ghostty_snapshot_cell_range_s *ranges, size_t count,
-    const ghostty_snapshot_cell_range_s *selected, bool reveal_selected
-) { return ghostty_surface_snapshot_set_ordered_cell_highlights(
-    host->surface, generation, ranges, count, selected, reveal_selected
+    const ghostty_snapshot_decoration_layer_s *layers, size_t count,
+    const ghostty_snapshot_cell_s *reveal
+) { return ghostty_surface_snapshot_apply_decorations(
+    host->surface, generation, layers, count, reveal
 ); }
-bool ghostty_egui_host_snapshot_select_cell_highlight(
-    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_cell_range_s selected
-) { return ghostty_surface_snapshot_select_cell_highlight(host->surface, generation, selected); }
-bool ghostty_egui_host_snapshot_cell_highlights_need_refresh(
+bool ghostty_egui_host_snapshot_decorations_need_refresh(
     GhosttyEguiHost *host, uint64_t generation
-) { return ghostty_surface_snapshot_cell_highlights_need_refresh(host->surface, generation); }
+) { return ghostty_surface_snapshot_decorations_need_refresh(host->surface, generation); }
 void ghostty_egui_host_text(GhosttyEguiHost *host, const char *text, size_t len) {
     ghostty_surface_text(host->surface, text, len);
 }

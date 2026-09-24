@@ -1,6 +1,9 @@
 use crate::app::UserEvent;
 use crate::copy_mode::{CopyMode, Motion};
-use crate::ffi::{self, GlFrame, Host, SnapshotCell, SnapshotCopyState, SnapshotCopyView};
+use crate::ffi::{
+    self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
+    SnapshotDecorationStyle, SnapshotView,
+};
 use crate::input;
 use crate::painter::TerminalPainter;
 use crate::search::{SearchEvents, SearchUi, SearchWorker};
@@ -208,7 +211,7 @@ impl TerminalView {
         if (scrolled || resized)
             && let Some(snapshot_generation) = self.search.snapshot_generation
             && unsafe {
-                ffi::ghostty_egui_host_snapshot_cell_highlights_need_refresh(
+                ffi::ghostty_egui_host_snapshot_decorations_need_refresh(
                     self.host,
                     snapshot_generation,
                 )
@@ -342,24 +345,24 @@ impl TerminalView {
             eprintln!("copy mode: failed to create terminal snapshot");
             return;
         }
-        let mut state = SnapshotCopyState::default();
+        let mut state = SnapshotView::default();
         let mut actual = SnapshotCell::default();
         let ready = unsafe {
-            ffi::ghostty_egui_host_snapshot_copy_cursor_origin(self.host, generation, &mut state)
-                && ffi::ghostty_egui_host_snapshot_copy_cursor_set(
+            ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut state)
+                && ffi::ghostty_egui_host_snapshot_resolve_cell(
                     self.host,
                     generation,
-                    state.cell,
+                    state.cursor,
                     false,
                     &mut actual,
                 )
         };
-        if !ready {
+        if !ready || !self.publish_copy_decoration(generation, actual) {
             unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
             eprintln!("copy mode: failed to initialize snapshot cursor");
             return;
         }
-        state.cell = actual;
+        state.cursor = actual;
         self.copy_mode.start(generation, state);
         self.wake.context.request_repaint();
     }
@@ -403,9 +406,9 @@ impl TerminalView {
             };
             let generation = self.copy_mode.generation.expect("copy mode is active");
             let view = if motion.needs_view() {
-                let mut view = SnapshotCopyView::default();
+                let mut view = SnapshotView::default();
                 if !unsafe {
-                    ffi::ghostty_egui_host_snapshot_copy_view(self.host, generation, &mut view)
+                    ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
                 } {
                     self.close_copy_mode();
                     break;
@@ -419,14 +422,15 @@ impl TerminalView {
             };
             let mut actual = SnapshotCell::default();
             if unsafe {
-                ffi::ghostty_egui_host_snapshot_copy_cursor_set(
+                ffi::ghostty_egui_host_snapshot_resolve_cell(
                     self.host,
                     generation,
                     requested,
                     snap_right,
                     &mut actual,
                 )
-            } {
+            } && self.publish_copy_decoration(generation, actual)
+            {
                 self.copy_mode.moved(motion, actual);
             } else {
                 self.close_copy_mode();
@@ -464,20 +468,27 @@ impl TerminalView {
 
     fn navigate_search(&mut self, previous: bool) {
         self.search.navigate(previous);
-        let Some(snapshot_generation) = self.search.snapshot_generation else {
-            return;
+        self.publish_search_matches(true);
+    }
+
+    fn publish_copy_decoration(&self, generation: u64, cell: SnapshotCell) -> bool {
+        let range = SnapshotCellRange {
+            start: cell,
+            end: cell,
         };
-        let Some(selected) = self.search.selected_range() else {
-            return;
+        let layer = SnapshotDecorationLayer {
+            ranges: &range,
+            range_count: 1,
+            style: SnapshotDecorationStyle {
+                foreground_rgb: 0x282828,
+                background_rgb: 0xebdbb2,
+                flags: 3,
+            },
         };
-        if !unsafe {
-            ffi::ghostty_egui_host_snapshot_select_cell_highlight(
-                self.host,
-                snapshot_generation,
-                *selected,
+        unsafe {
+            ffi::ghostty_egui_host_snapshot_apply_decorations(
+                self.host, generation, &layer, 1, &cell,
             )
-        } {
-            self.publish_search_matches(true);
         }
     }
 
@@ -486,19 +497,39 @@ impl TerminalView {
             return;
         };
         let selected = self.search.selected_range();
-        let ranges = if self.search.matches.is_empty() {
-            std::ptr::null()
-        } else {
-            self.search.matches.as_ptr()
+        let selected_layers = selected.map(|range| SnapshotDecorationLayer {
+            ranges: std::ptr::from_ref(range),
+            range_count: 1,
+            style: SnapshotDecorationStyle {
+                foreground_rgb: 0x282828,
+                background_rgb: 0xfabd2f,
+                flags: 3,
+            },
+        });
+        let matches_layer = SnapshotDecorationLayer {
+            ranges: self.search.matches.as_ptr(),
+            range_count: self.search.matches.len(),
+            style: SnapshotDecorationStyle {
+                foreground_rgb: 0xebdbb2,
+                background_rgb: 0x665c54,
+                flags: 3,
+            },
         };
+        let mut layers = Vec::with_capacity(2);
+        if let Some(layer) = selected_layers {
+            layers.push(layer);
+        }
+        layers.push(matches_layer);
+        let reveal = selected
+            .filter(|_| reveal_selected)
+            .map(|range| &range.start);
         unsafe {
-            ffi::ghostty_egui_host_snapshot_set_cell_highlights(
+            ffi::ghostty_egui_host_snapshot_apply_decorations(
                 self.host,
                 snapshot_generation,
-                ranges,
-                self.search.matches.len(),
-                selected.map_or(std::ptr::null(), std::ptr::from_ref),
-                reveal_selected,
+                layers.as_ptr(),
+                layers.len(),
+                reveal.map_or(std::ptr::null(), std::ptr::from_ref),
             );
         }
     }
