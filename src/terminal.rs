@@ -1,5 +1,5 @@
 use crate::app::UserEvent;
-use crate::copy_mode::{CopyMode, Motion, TextRow};
+use crate::copy_mode::{CopyMode, Jump, Motion, TextRow};
 use crate::ffi::{
     self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
     SnapshotDecorationStyle, SnapshotTextRow, SnapshotView,
@@ -12,6 +12,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 struct WakeState {
     context: egui::Context,
@@ -229,7 +230,7 @@ impl TerminalView {
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         if self.copy_mode.generation.is_some() {
-                            ui.small("COPY · hjkl / arrows · H M L · PgUp/PgDn · Ctrl+U/D · Esc");
+                            ui.small("COPY · hjkl · w/b/e W/B/E · f/F/t/T · Esc");
                         } else {
                             ui.small("egui shell · Ghostty OpenGL texture");
                         }
@@ -379,11 +380,46 @@ impl TerminalView {
         let was_active = self.copy_mode.generation.is_some();
         let events = ui.input(|input| input.events.clone());
         let mut handled = false;
+        let mut skip_trigger_text = false;
         for event in events {
             if self.copy_mode.generation.is_none() {
                 if !self.search.active && is_copy_mode_shortcut(&event) {
                     self.open_copy_mode();
                     handled = true;
+                }
+                continue;
+            }
+            if let egui::Event::Text(text) = &event {
+                if let Some((forward, till)) = self.copy_mode.pending_jump {
+                    if skip_trigger_text {
+                        skip_trigger_text = false;
+                        continue;
+                    }
+                    let mut graphemes = text.graphemes(true);
+                    if let Some(target) = graphemes.next()
+                        && graphemes.next().is_none()
+                    {
+                        self.copy_mode.pending_jump = None;
+                        let jump = Jump {
+                            target: target.to_owned(),
+                            forward,
+                            till,
+                        };
+                        self.copy_mode.last_jump = Some(jump.clone());
+                        let generation = self.copy_mode.generation.expect("copy mode is active");
+                        if let Some(cell) = self.copy_mode.jump_target(&jump, false, |row| {
+                            self.read_snapshot_row(generation, row)
+                        }) {
+                            if !self.apply_copy_target(
+                                generation,
+                                Motion::CharacterJump,
+                                cell,
+                                false,
+                            ) {
+                                break;
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -401,7 +437,38 @@ impl TerminalView {
                 self.close_copy_mode();
                 break;
             }
-            let Some(motion) = copy_motion(key, modifiers) else {
+            if self.copy_mode.pending_jump.is_some() {
+                skip_trigger_text = false;
+                continue;
+            }
+            if let Some((forward, till)) = copy_jump_prefix(key, modifiers) {
+                self.copy_mode.pending_g = false;
+                self.copy_mode.pending_jump = Some((forward, till));
+                skip_trigger_text = true;
+                continue;
+            }
+            if modifiers == egui::Modifiers::NONE
+                && matches!(key, egui::Key::Semicolon | egui::Key::Comma)
+            {
+                self.copy_mode.pending_g = false;
+                if let Some(mut jump) = self.copy_mode.last_jump.clone() {
+                    if key == egui::Key::Comma {
+                        jump.forward = !jump.forward;
+                    }
+                    let generation = self.copy_mode.generation.expect("copy mode is active");
+                    if let Some(cell) = self
+                        .copy_mode
+                        .jump_target(&jump, true, |row| self.read_snapshot_row(generation, row))
+                    {
+                        if !self.apply_copy_target(generation, Motion::CharacterJump, cell, false) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            let motion = copy_motion_with_prefix(&mut self.copy_mode, key, modifiers);
+            let Some(motion) = motion else {
                 continue;
             };
             let generation = self.copy_mode.generation.expect("copy mode is active");
@@ -427,24 +494,37 @@ impl TerminalView {
             let Some((requested, snap_right)) = target else {
                 continue;
             };
-            let mut actual = SnapshotCell::default();
-            if unsafe {
-                ffi::ghostty_egui_host_snapshot_resolve_cell(
-                    self.host,
-                    generation,
-                    requested,
-                    snap_right,
-                    &mut actual,
-                )
-            } && self.publish_copy_decoration(generation, actual)
-            {
-                self.copy_mode.moved(motion, actual);
-            } else {
-                self.close_copy_mode();
+            if !self.apply_copy_target(generation, motion, requested, snap_right) {
                 break;
             }
         }
         was_active || self.copy_mode.generation.is_some() || handled
+    }
+
+    fn apply_copy_target(
+        &mut self,
+        generation: u64,
+        motion: Motion,
+        requested: SnapshotCell,
+        snap_right: bool,
+    ) -> bool {
+        let mut actual = SnapshotCell::default();
+        if unsafe {
+            ffi::ghostty_egui_host_snapshot_resolve_cell(
+                self.host,
+                generation,
+                requested,
+                snap_right,
+                &mut actual,
+            )
+        } && self.publish_copy_decoration(generation, actual)
+        {
+            self.copy_mode.moved(motion, actual);
+            true
+        } else {
+            self.close_copy_mode();
+            false
+        }
     }
 
     fn read_snapshot_row(&self, generation: u64, row: u64) -> Option<TextRow> {
@@ -750,6 +830,11 @@ fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
             Key::L => Some(Motion::ViewportBottom),
             Key::Num6 => Some(Motion::FirstNonblank),
             Key::Num4 => Some(Motion::LastNonblank),
+            Key::W => Some(Motion::ForwardBigWord),
+            Key::B => Some(Motion::BackwardBigWord),
+            Key::E => Some(Motion::ForwardBigWordEnd),
+            Key::G => Some(Motion::ScrollbackBottom),
+            Key::Num5 => Some(Motion::MatchingBracket),
             _ => None,
         };
     }
@@ -761,15 +846,52 @@ fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
         Key::W => Some(Motion::ForwardWord),
         Key::B => Some(Motion::BackwardWord),
         Key::E => Some(Motion::ForwardWordEnd),
+        Key::Num0 => Some(Motion::RowStart),
         Key::PageUp => Some(Motion::PageUp),
         Key::PageDown => Some(Motion::PageDown),
         _ => None,
     }
 }
 
+fn copy_motion_with_prefix(
+    mode: &mut CopyMode,
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+) -> Option<Motion> {
+    if mode.pending_g {
+        mode.pending_g = false;
+        if key == egui::Key::G && modifiers == egui::Modifiers::NONE {
+            return Some(Motion::ScrollbackTop);
+        }
+    } else if key == egui::Key::G && modifiers == egui::Modifiers::NONE {
+        mode.pending_g = true;
+        return None;
+    }
+    copy_motion(key, modifiers)
+}
+
+fn copy_jump_prefix(key: egui::Key, modifiers: egui::Modifiers) -> Option<(bool, bool)> {
+    if modifiers != egui::Modifiers::NONE
+        && modifiers
+            != (egui::Modifiers {
+                shift: true,
+                ..Default::default()
+            })
+    {
+        return None;
+    }
+    match (key, modifiers.shift) {
+        (egui::Key::F, false) => Some((true, false)),
+        (egui::Key::F, true) => Some((false, false)),
+        (egui::Key::T, false) => Some((true, true)),
+        (egui::Key::T, true) => Some((false, true)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod copy_shortcut_tests {
-    use super::{copy_motion, is_copy_mode_shortcut};
+    use super::{copy_jump_prefix, copy_motion, copy_motion_with_prefix, is_copy_mode_shortcut};
 
     #[test]
     fn copy_mode_shortcut_requires_ctrl_shift_m() {
@@ -866,6 +988,65 @@ mod copy_shortcut_tests {
             copy_motion(egui::Key::E, egui::Modifiers::NONE),
             Some(Motion::ForwardWordEnd)
         );
+        assert_eq!(
+            copy_motion(egui::Key::Num0, egui::Modifiers::NONE),
+            Some(Motion::RowStart)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::W, shift),
+            Some(Motion::ForwardBigWord)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::B, shift),
+            Some(Motion::BackwardBigWord)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::E, shift),
+            Some(Motion::ForwardBigWordEnd)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::G, shift),
+            Some(Motion::ScrollbackBottom)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::Num5, shift),
+            Some(Motion::MatchingBracket)
+        );
+        assert_eq!(
+            copy_jump_prefix(egui::Key::F, egui::Modifiers::NONE),
+            Some((true, false))
+        );
+        assert_eq!(copy_jump_prefix(egui::Key::F, shift), Some((false, false)));
+        assert_eq!(
+            copy_jump_prefix(egui::Key::T, egui::Modifiers::NONE),
+            Some((true, true))
+        );
+        assert_eq!(copy_jump_prefix(egui::Key::T, shift), Some((false, true)));
+    }
+
+    #[test]
+    fn gg_prefix_moves_to_scrollback_top_and_other_keys_cancel_it() {
+        use crate::copy_mode::{CopyMode, Motion};
+        let mut mode = CopyMode::default();
+        assert_eq!(
+            copy_motion_with_prefix(&mut mode, egui::Key::G, egui::Modifiers::NONE),
+            None
+        );
+        assert!(mode.pending_g);
+        assert_eq!(
+            copy_motion_with_prefix(&mut mode, egui::Key::G, egui::Modifiers::NONE),
+            Some(Motion::ScrollbackTop)
+        );
+        assert!(!mode.pending_g);
+        assert_eq!(
+            copy_motion_with_prefix(&mut mode, egui::Key::G, egui::Modifiers::NONE),
+            None
+        );
+        assert_eq!(
+            copy_motion_with_prefix(&mut mode, egui::Key::H, egui::Modifiers::NONE),
+            Some(Motion::Left)
+        );
+        assert!(!mode.pending_g);
     }
 }
 

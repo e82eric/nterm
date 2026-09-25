@@ -7,6 +7,9 @@ pub(crate) enum Motion {
     Down,
     Up,
     Right,
+    RowStart,
+    ScrollbackTop,
+    ScrollbackBottom,
     ViewportTop,
     ViewportMiddle,
     ViewportBottom,
@@ -19,6 +22,11 @@ pub(crate) enum Motion {
     ForwardWord,
     BackwardWord,
     ForwardWordEnd,
+    ForwardBigWord,
+    BackwardBigWord,
+    ForwardBigWordEnd,
+    CharacterJump,
+    MatchingBracket,
 }
 
 impl Motion {
@@ -43,6 +51,11 @@ impl Motion {
                 | Self::ForwardWord
                 | Self::BackwardWord
                 | Self::ForwardWordEnd
+                | Self::ForwardBigWord
+                | Self::BackwardBigWord
+                | Self::ForwardBigWordEnd
+                | Self::CharacterJump
+                | Self::MatchingBracket
         )
     }
 }
@@ -69,17 +82,25 @@ struct Glyph {
 }
 
 impl TextRow {
-    fn glyphs(&self) -> Vec<Glyph> {
+    fn grapheme_cells(&self) -> Vec<(u32, &str)> {
+        self.text
+            .grapheme_indices(true)
+            .filter_map(|(byte, grapheme)| Some((*self.columns.get(byte)?, grapheme)))
+            .collect()
+    }
+
+    fn glyphs(&self, big_word: bool) -> Vec<Glyph> {
         self.text
             .grapheme_indices(true)
             .filter_map(|(byte, grapheme)| {
                 let x = *self.columns.get(byte)?;
                 let class = if grapheme.chars().all(char::is_whitespace) {
                     WordClass::Whitespace
-                } else if grapheme
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch == '_' || ch.is_alphanumeric())
+                } else if big_word
+                    || grapheme
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch == '_' || ch.is_alphanumeric())
                 {
                     WordClass::Keyword
                 } else {
@@ -95,6 +116,13 @@ impl TextRow {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Jump {
+    pub(crate) target: String,
+    pub(crate) forward: bool,
+    pub(crate) till: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct CopyMode {
     pub(crate) generation: Option<u64>,
@@ -102,6 +130,9 @@ pub(crate) struct CopyMode {
     preferred_x: u32,
     columns: u32,
     rows: u64,
+    pub(crate) pending_g: bool,
+    pub(crate) pending_jump: Option<(bool, bool)>,
+    pub(crate) last_jump: Option<Jump>,
 }
 
 impl CopyMode {
@@ -111,6 +142,9 @@ impl CopyMode {
         self.preferred_x = state.cursor.x;
         self.columns = state.columns;
         self.rows = state.total_rows;
+        self.pending_g = false;
+        self.pending_jump = None;
+        self.last_jump = None;
     }
 
     pub(crate) fn move_to(
@@ -127,6 +161,9 @@ impl CopyMode {
         match motion {
             Motion::Left => cell.x = cell.x.saturating_sub(1),
             Motion::Right => cell.x = cell.x.saturating_add(1).min(self.columns - 1),
+            Motion::RowStart => cell.x = 0,
+            Motion::ScrollbackTop => cell.y = 0,
+            Motion::ScrollbackBottom => cell.y = last_row,
             Motion::Up => {
                 cell.y = cell.y.saturating_sub(1);
                 cell.x = self.preferred_x.min(self.columns - 1);
@@ -181,13 +218,19 @@ impl CopyMode {
             | Motion::ForwardWord
             | Motion::BackwardWord
             | Motion::ForwardWordEnd => return None,
+            Motion::ForwardBigWord
+            | Motion::BackwardBigWord
+            | Motion::ForwardBigWordEnd
+            | Motion::CharacterJump
+            | Motion::MatchingBracket => return None,
         }
         Some((cell, snap_right))
     }
 
     pub(crate) fn moved(&mut self, motion: Motion, cell: SnapshotCell) {
         self.cursor = cell;
-        if matches!(motion, Motion::Left | Motion::Right) || motion.needs_text() {
+        if matches!(motion, Motion::Left | Motion::Right | Motion::RowStart) || motion.needs_text()
+        {
             self.preferred_x = cell.x;
         }
     }
@@ -201,7 +244,7 @@ impl CopyMode {
         match motion {
             Motion::FirstNonblank | Motion::LastNonblank => {
                 let row = read(current.y)?;
-                let glyphs = row.glyphs();
+                let glyphs = row.glyphs(false);
                 let x = if motion == Motion::FirstNonblank {
                     glyphs.iter().find(|g| g.nonblank).map_or(0, |g| g.x)
                 } else {
@@ -209,18 +252,118 @@ impl CopyMode {
                 };
                 Some(SnapshotCell { x, y: current.y })
             }
-            Motion::ForwardWord => self.forward_word(&mut read),
-            Motion::BackwardWord => self.backward_word(&mut read),
-            Motion::ForwardWordEnd => self.forward_word_end(&mut read),
+            Motion::ForwardWord => self.forward_word(&mut read, false),
+            Motion::BackwardWord => self.backward_word(&mut read, false),
+            Motion::ForwardWordEnd => self.forward_word_end(&mut read, false),
+            Motion::ForwardBigWord => self.forward_word(&mut read, true),
+            Motion::BackwardBigWord => self.backward_word(&mut read, true),
+            Motion::ForwardBigWordEnd => self.forward_word_end(&mut read, true),
+            Motion::MatchingBracket => self.matching_bracket(&mut read),
             _ => None,
         }
     }
 
-    fn forward_word(&self, read: &mut impl FnMut(u64) -> Option<TextRow>) -> Option<SnapshotCell> {
+    pub(crate) fn jump_target(
+        &self,
+        jump: &Jump,
+        repeat: bool,
+        read: impl FnOnce(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCell> {
+        let row = read(self.cursor.y)?;
+        let cells = row.grapheme_cells();
+        let cursor = self.cursor.x;
+        let cutoff = if repeat && jump.till {
+            if jump.forward {
+                cursor.saturating_add(1)
+            } else {
+                cursor.saturating_sub(1)
+            }
+        } else {
+            cursor
+        };
+        let index = if jump.forward {
+            cells
+                .iter()
+                .position(|(x, text)| *x > cutoff && *text == jump.target)
+        } else {
+            cells
+                .iter()
+                .rposition(|(x, text)| *x < cutoff && *text == jump.target)
+        }?;
+        let x = if jump.till {
+            if jump.forward {
+                cells.get(index.checked_sub(1)?)?.0
+            } else {
+                cells.get(index + 1)?.0
+            }
+        } else {
+            cells[index].0
+        };
+        Some(SnapshotCell {
+            x,
+            y: self.cursor.y,
+        })
+    }
+
+    fn matching_bracket(
+        &self,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCell> {
+        let row = read(self.cursor.y)?;
+        let (source_x, source, target, forward) = row
+            .grapheme_cells()
+            .into_iter()
+            .filter(|(x, _)| *x >= self.cursor.x)
+            .find_map(|(x, text)| match text {
+                "(" => Some((x, "(", ")", true)),
+                "[" => Some((x, "[", "]", true)),
+                "{" => Some((x, "{", "}", true)),
+                ")" => Some((x, ")", "(", false)),
+                "]" => Some((x, "]", "[", false)),
+                "}" => Some((x, "}", "{", false)),
+                _ => None,
+            })?;
+        let mut depth = 0usize;
+        let mut y = self.cursor.y;
+        loop {
+            let row = read(y)?;
+            let mut cells = row.grapheme_cells();
+            if !forward {
+                cells.reverse();
+            }
+            for (x, text) in cells {
+                if y == self.cursor.y && (if forward { x < source_x } else { x > source_x }) {
+                    continue;
+                }
+                if text == source {
+                    depth += 1;
+                } else if text == target {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(SnapshotCell { x, y });
+                    }
+                }
+            }
+            if forward {
+                y = y.checked_add(1)?;
+                if y >= self.rows {
+                    return None;
+                }
+            } else {
+                y = y.checked_sub(1)?;
+            }
+        }
+    }
+
+    fn forward_word(
+        &self,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+        big: bool,
+    ) -> Option<SnapshotCell> {
         let mut previous = WordClass::Whitespace;
         for y in self.cursor.y..self.rows {
             let row = read(y)?;
-            let glyphs = row.glyphs();
+            let glyphs = row.glyphs(big);
             for glyph in glyphs {
                 if y == self.cursor.y && glyph.x <= self.cursor.x {
                     previous = glyph.class;
@@ -238,14 +381,18 @@ impl CopyMode {
         None
     }
 
-    fn backward_word(&self, read: &mut impl FnMut(u64) -> Option<TextRow>) -> Option<SnapshotCell> {
+    fn backward_word(
+        &self,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+        big: bool,
+    ) -> Option<SnapshotCell> {
         for y in (0..=self.cursor.y).rev() {
             let row = read(y)?;
             let previous_class = if y > 0 {
                 let prior = read(y - 1)?;
                 if prior.wraps_to_next {
                     prior
-                        .glyphs()
+                        .glyphs(big)
                         .last()
                         .map_or(WordClass::Whitespace, |glyph| glyph.class)
                 } else {
@@ -256,7 +403,7 @@ impl CopyMode {
             };
             let mut previous = previous_class;
             let mut candidate = None;
-            for glyph in row.glyphs() {
+            for glyph in row.glyphs(big) {
                 if glyph.class != WordClass::Whitespace
                     && glyph.class != previous
                     && (y < self.cursor.y || glyph.x < self.cursor.x)
@@ -275,12 +422,13 @@ impl CopyMode {
     fn forward_word_end(
         &self,
         read: &mut impl FnMut(u64) -> Option<TextRow>,
+        big: bool,
     ) -> Option<SnapshotCell> {
         let mut active_class = WordClass::Whitespace;
         let mut last: Option<SnapshotCell> = None;
         for y in self.cursor.y..self.rows {
             let row = read(y)?;
-            for glyph in row.glyphs() {
+            for glyph in row.glyphs(big) {
                 if y == self.cursor.y && glyph.x < self.cursor.x {
                     continue;
                 }
@@ -429,6 +577,112 @@ mod tests {
         assert_eq!(
             mode.text_target(Motion::ForwardWordEnd, |_| Some(row("a b", false))),
             Some(SnapshotCell { x: 2, y: 0 })
+        );
+    }
+
+    #[test]
+    fn big_words_join_punctuation_and_words() {
+        let read = |_| Some(row("foo.bar baz", false));
+        let mode = copy_at(1, 0, 1);
+        assert_eq!(mode.text_target(Motion::ForwardBigWord, read).unwrap().x, 8);
+        assert_eq!(
+            mode.text_target(Motion::ForwardBigWordEnd, read).unwrap().x,
+            6
+        );
+        let mode = copy_at(8, 0, 1);
+        assert_eq!(
+            mode.text_target(Motion::BackwardBigWord, read).unwrap().x,
+            0
+        );
+    }
+
+    #[test]
+    fn row_and_scrollback_edges_are_clamped() {
+        let mode = copy_at(5, 3, 10);
+        assert_eq!(
+            mode.move_to(Motion::RowStart, None).unwrap().0,
+            SnapshotCell { x: 0, y: 3 }
+        );
+        assert_eq!(mode.move_to(Motion::ScrollbackTop, None).unwrap().0.y, 0);
+        assert_eq!(mode.move_to(Motion::ScrollbackBottom, None).unwrap().0.y, 9);
+    }
+
+    #[test]
+    fn character_jumps_find_graphemes_and_till_stops_before_target() {
+        let row = TextRow {
+            text: "a界b界c".into(),
+            columns: vec![0, 1, 1, 1, 3, 4, 4, 4, 6],
+            wraps_to_next: false,
+        };
+        let mode = copy_at(0, 0, 1);
+        let jump = Jump {
+            target: "界".into(),
+            forward: true,
+            till: false,
+        };
+        assert_eq!(
+            mode.jump_target(&jump, false, |_| Some(row.clone()))
+                .unwrap()
+                .x,
+            1
+        );
+        let till = Jump {
+            till: true,
+            ..jump.clone()
+        };
+        assert_eq!(
+            mode.jump_target(&till, false, |_| Some(row.clone()))
+                .unwrap()
+                .x,
+            0
+        );
+        let mode = copy_at(0, 0, 1);
+        assert_eq!(
+            mode.jump_target(&till, true, |_| Some(row.clone()))
+                .unwrap()
+                .x,
+            3
+        );
+        let reverse = Jump {
+            target: "界".into(),
+            forward: false,
+            till: false,
+        };
+        let mode = copy_at(6, 0, 1);
+        assert_eq!(
+            mode.jump_target(&reverse, true, |_| Some(row.clone()))
+                .unwrap()
+                .x,
+            4
+        );
+    }
+
+    #[test]
+    fn matching_bracket_handles_nesting_across_rows() {
+        let rows = [row("(a(", false), row("b)", false), row(")", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        let mode = copy_at(0, 0, 3);
+        assert_eq!(
+            mode.text_target(Motion::MatchingBracket, read),
+            Some(SnapshotCell { x: 0, y: 2 })
+        );
+        let mode = copy_at(0, 2, 3);
+        assert_eq!(
+            mode.text_target(Motion::MatchingBracket, read),
+            Some(SnapshotCell { x: 0, y: 0 })
+        );
+    }
+
+    #[test]
+    fn matching_bracket_starts_at_next_bracket_on_row() {
+        let mode = copy_at(0, 0, 1);
+        assert_eq!(
+            mode.text_target(Motion::MatchingBracket, |_| Some(row("hi [x]", false))),
+            Some(SnapshotCell { x: 5, y: 0 })
+        );
+        assert_eq!(
+            mode.text_target(Motion::MatchingBracket, |_| Some(row("plain", false))),
+            None
         );
     }
 

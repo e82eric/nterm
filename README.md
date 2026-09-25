@@ -82,9 +82,15 @@ visible row. Page Up/Down move a full screen, and <kbd>Ctrl</kbd>+<kbd>U</kbd>/
 <kbd>Ctrl</kbd>+<kbd>D</kbd> move half a screen. Movement scrolls the frozen
 viewport when necessary. <kbd>^</kbd> and <kbd>$</kbd> move to the first and
 last nonblank cell on the current row. <kbd>w</kbd>, <kbd>b</kbd>, and
-<kbd>e</kbd> move through words across the frozen scrollback. Press Escape to
-return to the live terminal. Selection and copying are not part of this first
-version.
+<kbd>e</kbd> move through words across the frozen scrollback.
+<kbd>0</kbd> moves to the start of the row; <kbd>W</kbd>, <kbd>B</kbd>, and
+<kbd>E</kbd> move through whitespace-delimited words. <kbd>gg</kbd> and
+<kbd>G</kbd> move to the top and bottom of scrollback. <kbd>f</kbd>/<kbd>F</kbd>
+and <kbd>t</kbd>/<kbd>T</kbd> jump to or before/after a character on the
+current row; <kbd>;</kbd> repeats the jump and <kbd>,</kbd> reverses it.
+<kbd>%</kbd> matches nested parentheses, brackets, or braces across rows.
+Press Escape to return to the live terminal. Selection and copying are not part
+of this first version.
 
 The native C Win32 sample remains available through
 `zig build win32-sample -Doptimize=ReleaseFast`.
