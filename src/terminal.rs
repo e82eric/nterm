@@ -452,11 +452,37 @@ impl TerminalView {
             };
             handled = true;
             if key == egui::Key::Escape {
+                if self.copy_mode.visual_anchor.take().is_some() {
+                    self.copy_mode.pending_count = None;
+                    self.copy_mode.pending_g = false;
+                    self.copy_mode.pending_jump = None;
+                    let generation = self.copy_mode.generation.unwrap();
+                    self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                    continue;
+                }
                 self.close_copy_mode();
                 break;
             }
             if self.copy_mode.pending_jump.is_some() {
                 skip_trigger_text = false;
+                continue;
+            }
+            if modifiers == egui::Modifiers::NONE && key == egui::Key::V {
+                self.copy_mode.pending_count = None;
+                self.copy_mode.pending_g = false;
+                self.copy_mode.toggle_visual();
+                let generation = self.copy_mode.generation.unwrap();
+                self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                continue;
+            }
+            if modifiers == egui::Modifiers::NONE && key == egui::Key::Y {
+                self.copy_mode.pending_count = None;
+                self.copy_mode.pending_g = false;
+                if self.yank_visual(ui.ctx()) {
+                    self.copy_mode.visual_anchor = None;
+                    let generation = self.copy_mode.generation.unwrap();
+                    self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                }
                 continue;
             }
             if modifiers == egui::Modifiers::NONE
@@ -778,6 +804,16 @@ impl TerminalView {
                 flags: 3,
             },
         };
+        let selection = self.copy_mode.visual_range_to(cell);
+        let selection_layer = selection.as_ref().map(|range| SnapshotDecorationLayer {
+            ranges: std::ptr::from_ref(range),
+            range_count: 1,
+            style: SnapshotDecorationStyle {
+                foreground_rgb: 0xebdbb2,
+                background_rgb: 0x504945,
+                flags: 3,
+            },
+        });
         let matches_layer = SnapshotDecorationLayer {
             ranges: self.copy_search.matches.as_ptr(),
             range_count: self.copy_search.matches.len(),
@@ -787,7 +823,12 @@ impl TerminalView {
                 flags: 3,
             },
         };
-        let layers = [caret_layer, matches_layer];
+        let mut layers = Vec::with_capacity(3);
+        layers.push(caret_layer);
+        if let Some(layer) = selection_layer {
+            layers.push(layer);
+        }
+        layers.push(matches_layer);
         unsafe {
             ffi::ghostty_egui_host_snapshot_apply_decorations(
                 self.host,
@@ -796,6 +837,38 @@ impl TerminalView {
                 layers.len(),
                 if reveal { &cell } else { std::ptr::null() },
             )
+        }
+    }
+
+    fn yank_visual(&self, ctx: &egui::Context) -> bool {
+        let (Some(generation), Some(range)) =
+            (self.copy_mode.generation, self.copy_mode.visual_range())
+        else {
+            return false;
+        };
+        let mut result = ffi::SnapshotSelectionText::default();
+        if !unsafe {
+            ffi::ghostty_egui_host_snapshot_selection_text(
+                self.host,
+                generation,
+                range,
+                &mut result,
+            )
+        } {
+            return false;
+        }
+        let text = if result.text.is_null() {
+            None
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(result.text, result.len) };
+            std::str::from_utf8(bytes).ok().map(str::to_owned)
+        };
+        unsafe { ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result) };
+        if let Some(text) = text {
+            ctx.copy_text(text);
+            true
+        } else {
+            false
         }
     }
 

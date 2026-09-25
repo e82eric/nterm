@@ -38,6 +38,13 @@ pub(crate) struct SnapshotCellRange {
 }
 
 #[repr(C)]
+#[derive(Default)]
+pub(crate) struct SnapshotSelectionText {
+    pub(crate) text: *const u8,
+    pub(crate) len: usize,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct SnapshotDecorationStyle {
     pub(crate) foreground_rgb: u32,
@@ -120,6 +127,15 @@ unsafe extern "C" {
         snap_right: bool,
         actual: *mut SnapshotCell,
     ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_selection_text(
+        host: *mut Host,
+        generation: u64,
+        range: SnapshotCellRange,
+        result: *mut SnapshotSelectionText,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_selection_text_free(
+        result: *mut SnapshotSelectionText,
+    );
     pub(crate) fn ghostty_egui_host_snapshot_cursor_new(
         host: *mut Host,
         generation: u64,

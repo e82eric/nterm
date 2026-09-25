@@ -137,6 +137,7 @@ pub(crate) struct Jump {
 pub(crate) struct CopyMode {
     pub(crate) generation: Option<u64>,
     pub(crate) cursor: SnapshotCell,
+    pub(crate) visual_anchor: Option<SnapshotCell>,
     preferred_x: u32,
     columns: u32,
     rows: u64,
@@ -150,6 +151,7 @@ impl CopyMode {
     pub(crate) fn start(&mut self, generation: u64, state: SnapshotView) {
         self.generation = Some(generation);
         self.cursor = state.cursor;
+        self.visual_anchor = None;
         self.preferred_x = state.cursor.x;
         self.columns = state.columns;
         self.rows = state.total_rows;
@@ -250,6 +252,24 @@ impl CopyMode {
         {
             self.preferred_x = cell.x;
         }
+    }
+
+    pub(crate) fn toggle_visual(&mut self) {
+        self.visual_anchor = self.visual_anchor.is_none().then_some(self.cursor);
+    }
+
+    pub(crate) fn visual_range(&self) -> Option<SnapshotCellRange> {
+        self.visual_range_to(self.cursor)
+    }
+
+    pub(crate) fn visual_range_to(&self, cursor: SnapshotCell) -> Option<SnapshotCellRange> {
+        let anchor = self.visual_anchor?;
+        let (start, end) = if (anchor.y, anchor.x) <= (cursor.y, cursor.x) {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        Some(SnapshotCellRange { start, end })
     }
 
     pub(crate) fn add_count_digit(&mut self, digit: u32) -> bool {
@@ -720,6 +740,25 @@ pub(crate) fn word_search_pattern(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visual_range_includes_anchor_and_orders_reverse_motion() {
+        let mut mode = CopyMode {
+            cursor: SnapshotCell { x: 4, y: 8 },
+            ..Default::default()
+        };
+        mode.toggle_visual();
+        assert_eq!(mode.visual_range().unwrap().start, mode.cursor);
+        assert_eq!(mode.visual_range().unwrap().end, mode.cursor);
+        mode.moved(Motion::Up, SnapshotCell { x: 2, y: 5 });
+        assert_eq!(mode.visual_range().unwrap().start, mode.cursor);
+        assert_eq!(
+            mode.visual_range().unwrap().end,
+            SnapshotCell { x: 4, y: 8 }
+        );
+        mode.toggle_visual();
+        assert!(mode.visual_range().is_none());
+    }
 
     fn row(text: &str, wraps_to_next: bool) -> TextRow {
         TextRow {

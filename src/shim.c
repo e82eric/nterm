@@ -179,6 +179,13 @@ bool ghostty_egui_host_snapshot_resolve_cell(
 ) { return ghostty_surface_snapshot_resolve_cell(
     host->surface, generation, requested, snap_right, actual
 ); }
+bool ghostty_egui_host_snapshot_selection_text(
+    GhosttyEguiHost *host, uint64_t generation,
+    ghostty_snapshot_cell_range_s range, ghostty_snapshot_selection_text_s *result
+) { return ghostty_surface_snapshot_selection_text(host->surface, generation, range, result); }
+void ghostty_egui_host_snapshot_selection_text_free(
+    ghostty_snapshot_selection_text_s *result
+) { ghostty_surface_snapshot_selection_text_free(result); }
 ghostty_snapshot_text_cursor_t ghostty_egui_host_snapshot_cursor_new(
     GhosttyEguiHost *host, uint64_t generation
 ) { return ghostty_surface_snapshot_text_cursor_new(host->surface, generation); }

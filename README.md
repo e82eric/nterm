@@ -98,8 +98,12 @@ previous row; <kbd>_</kbd> does so on the current row (or the counted row).
 <kbd>*</kbd>/<kbd>#</kbd> search for the word under the copy cursor toward
 newer/older output. <kbd>n</kbd> repeats that direction and <kbd>N</kbd>
 reverses it; matches wrap around the frozen scrollback.
-Press Escape to return to the live terminal. Selection and copying are not part
-of this first version.
+Press <kbd>v</kbd> to start characterwise visual selection, then use any copy
+motion to extend it. Press <kbd>v</kbd> again or Escape to cancel the selection.
+Press <kbd>y</kbd> to copy the selected text to the system clipboard; copy mode
+stays open so you can navigate or select again. With no selection, <kbd>y</kbd>
+does nothing. Press Escape outside visual selection to return to the live
+terminal.
 
 The native C Win32 sample remains available through
 `zig build win32-sample -Doptimize=ReleaseFast`.
