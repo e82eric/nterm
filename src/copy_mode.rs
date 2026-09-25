@@ -133,11 +133,19 @@ pub(crate) struct Jump {
     pub(crate) till: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub(crate) enum VisualMode {
+    #[default]
+    Characterwise,
+    Linewise,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct CopyMode {
     pub(crate) generation: Option<u64>,
     pub(crate) cursor: SnapshotCell,
     pub(crate) visual_anchor: Option<SnapshotCell>,
+    pub(crate) visual_mode: VisualMode,
     preferred_x: u32,
     columns: u32,
     rows: u64,
@@ -152,6 +160,7 @@ impl CopyMode {
         self.generation = Some(generation);
         self.cursor = state.cursor;
         self.visual_anchor = None;
+        self.visual_mode = VisualMode::Characterwise;
         self.preferred_x = state.cursor.x;
         self.columns = state.columns;
         self.rows = state.total_rows;
@@ -254,12 +263,15 @@ impl CopyMode {
         }
     }
 
-    pub(crate) fn toggle_visual(&mut self) {
-        self.visual_anchor = self.visual_anchor.is_none().then_some(self.cursor);
-    }
-
-    pub(crate) fn visual_range(&self) -> Option<SnapshotCellRange> {
-        self.visual_range_to(self.cursor)
+    pub(crate) fn toggle_visual(&mut self, mode: VisualMode) {
+        if self.visual_anchor.is_some() && self.visual_mode == mode {
+            self.visual_anchor = None;
+        } else {
+            if self.visual_anchor.is_none() {
+                self.visual_anchor = Some(self.cursor);
+            }
+            self.visual_mode = mode;
+        }
     }
 
     pub(crate) fn visual_range_to(&self, cursor: SnapshotCell) -> Option<SnapshotCellRange> {
@@ -270,6 +282,46 @@ impl CopyMode {
             (cursor, anchor)
         };
         Some(SnapshotCellRange { start, end })
+    }
+
+    pub(crate) fn linewise_visual_range_to(
+        &self,
+        cursor: SnapshotCell,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCellRange> {
+        let anchor = self.visual_anchor?;
+        let last_col = self.columns.checked_sub(1)?;
+        let (anchor_start, anchor_end) = self.logical_line_bounds(anchor.y, &mut read)?;
+        let (cursor_start, cursor_end) = self.logical_line_bounds(cursor.y, &mut read)?;
+        Some(SnapshotCellRange {
+            start: SnapshotCell {
+                x: 0,
+                y: anchor_start.min(cursor_start),
+            },
+            end: SnapshotCell {
+                x: last_col,
+                y: anchor_end.max(cursor_end),
+            },
+        })
+    }
+
+    fn logical_line_bounds(
+        &self,
+        row: u64,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<(u64, u64)> {
+        if row >= self.rows {
+            return None;
+        }
+        let mut start = row;
+        while start > 0 && read(start - 1)?.wraps_to_next {
+            start -= 1;
+        }
+        let mut end = row;
+        while end < self.rows - 1 && read(end)?.wraps_to_next {
+            end += 1;
+        }
+        Some((start, end))
     }
 
     pub(crate) fn add_count_digit(&mut self, digit: u32) -> bool {
@@ -747,17 +799,57 @@ mod tests {
             cursor: SnapshotCell { x: 4, y: 8 },
             ..Default::default()
         };
-        mode.toggle_visual();
-        assert_eq!(mode.visual_range().unwrap().start, mode.cursor);
-        assert_eq!(mode.visual_range().unwrap().end, mode.cursor);
-        mode.moved(Motion::Up, SnapshotCell { x: 2, y: 5 });
-        assert_eq!(mode.visual_range().unwrap().start, mode.cursor);
+        mode.toggle_visual(VisualMode::Characterwise);
         assert_eq!(
-            mode.visual_range().unwrap().end,
+            mode.visual_range_to(mode.cursor).unwrap().start,
+            mode.cursor
+        );
+        assert_eq!(mode.visual_range_to(mode.cursor).unwrap().end, mode.cursor);
+        mode.moved(Motion::Up, SnapshotCell { x: 2, y: 5 });
+        assert_eq!(
+            mode.visual_range_to(mode.cursor).unwrap().start,
+            mode.cursor
+        );
+        assert_eq!(
+            mode.visual_range_to(mode.cursor).unwrap().end,
             SnapshotCell { x: 4, y: 8 }
         );
-        mode.toggle_visual();
-        assert!(mode.visual_range().is_none());
+        mode.toggle_visual(VisualMode::Characterwise);
+        assert!(mode.visual_range_to(mode.cursor).is_none());
+    }
+
+    #[test]
+    fn linewise_visual_range_expands_wrapped_lines_in_both_directions() {
+        let rows = [
+            row("before", false),
+            row("first", true),
+            row("last", false),
+            row("middle", false),
+            row("next", true),
+            row("end", false),
+        ];
+        let mut mode = copy_at(3, 2, rows.len() as u64);
+        mode.toggle_visual(VisualMode::Linewise);
+        let range = mode
+            .linewise_visual_range_to(SnapshotCell { x: 2, y: 4 }, |y| {
+                rows.get(y as usize).cloned()
+            })
+            .unwrap();
+        assert_eq!(range.start, SnapshotCell { x: 0, y: 1 });
+        assert_eq!(range.end, SnapshotCell { x: 19, y: 5 });
+
+        let range = mode
+            .linewise_visual_range_to(SnapshotCell { x: 2, y: 0 }, |y| {
+                rows.get(y as usize).cloned()
+            })
+            .unwrap();
+        assert_eq!(range.start, SnapshotCell { x: 0, y: 0 });
+        assert_eq!(range.end, SnapshotCell { x: 19, y: 2 });
+
+        mode.toggle_visual(VisualMode::Characterwise);
+        assert_eq!(mode.visual_anchor, Some(SnapshotCell { x: 3, y: 2 }));
+        mode.toggle_visual(VisualMode::Characterwise);
+        assert!(mode.visual_anchor.is_none());
     }
 
     fn row(text: &str, wraps_to_next: bool) -> TextRow {

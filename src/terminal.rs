@@ -1,5 +1,7 @@
 use crate::app::UserEvent;
-use crate::copy_mode::{CopyMode, Jump, Motion, TextRow, next_match_cell, word_search_pattern};
+use crate::copy_mode::{
+    CopyMode, Jump, Motion, TextRow, VisualMode, next_match_cell, word_search_pattern,
+};
 use crate::ffi::{
     self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
     SnapshotDecorationStyle, SnapshotTextRow, SnapshotView,
@@ -467,10 +469,17 @@ impl TerminalView {
                 skip_trigger_text = false;
                 continue;
             }
-            if modifiers == egui::Modifiers::NONE && key == egui::Key::V {
+            if key == egui::Key::V
+                && (modifiers == egui::Modifiers::NONE || modifiers == egui::Modifiers::SHIFT)
+            {
                 self.copy_mode.pending_count = None;
                 self.copy_mode.pending_g = false;
-                self.copy_mode.toggle_visual();
+                let mode = if modifiers.shift {
+                    VisualMode::Linewise
+                } else {
+                    VisualMode::Characterwise
+                };
+                self.copy_mode.toggle_visual(mode);
                 let generation = self.copy_mode.generation.unwrap();
                 self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
                 continue;
@@ -804,7 +813,7 @@ impl TerminalView {
                 flags: 3,
             },
         };
-        let selection = self.copy_mode.visual_range_to(cell);
+        let selection = self.copy_visual_range(generation, cell);
         let selection_layer = selection.as_ref().map(|range| SnapshotDecorationLayer {
             ranges: std::ptr::from_ref(range),
             range_count: 1,
@@ -840,10 +849,20 @@ impl TerminalView {
         }
     }
 
+    fn copy_visual_range(&self, generation: u64, cell: SnapshotCell) -> Option<SnapshotCellRange> {
+        match self.copy_mode.visual_mode {
+            VisualMode::Characterwise => self.copy_mode.visual_range_to(cell),
+            VisualMode::Linewise => self
+                .copy_mode
+                .linewise_visual_range_to(cell, |row| self.read_snapshot_row(generation, row)),
+        }
+    }
+
     fn yank_visual(&self, ctx: &egui::Context) -> bool {
-        let (Some(generation), Some(range)) =
-            (self.copy_mode.generation, self.copy_mode.visual_range())
-        else {
+        let Some(generation) = self.copy_mode.generation else {
+            return false;
+        };
+        let Some(range) = self.copy_visual_range(generation, self.copy_mode.cursor) else {
             return false;
         };
         let mut result = ffi::SnapshotSelectionText::default();
@@ -864,7 +883,10 @@ impl TerminalView {
             std::str::from_utf8(bytes).ok().map(str::to_owned)
         };
         unsafe { ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result) };
-        if let Some(text) = text {
+        if let Some(mut text) = text {
+            if self.copy_mode.visual_mode == VisualMode::Linewise {
+                text.push('\n');
+            }
             ctx.copy_text(text);
             true
         } else {

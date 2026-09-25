@@ -99,8 +99,11 @@ previous row; <kbd>_</kbd> does so on the current row (or the counted row).
 newer/older output. <kbd>n</kbd> repeats that direction and <kbd>N</kbd>
 reverses it; matches wrap around the frozen scrollback.
 Press <kbd>v</kbd> to start characterwise visual selection, then use any copy
-motion to extend it. Press <kbd>v</kbd> again or Escape to cancel the selection.
-Press <kbd>y</kbd> to copy the selected text to the system clipboard; copy mode
+motion to extend it. Press <kbd>V</kbd> to select complete logical lines,
+including all rows of a wrapped line. Press the active visual key again or
+Escape to cancel the selection; pressing the other visual key switches modes.
+Press <kbd>y</kbd> to copy the selected text to the system clipboard. Linewise
+copies end with a newline. Copy mode
 stays open so you can navigate or select again. With no selection, <kbd>y</kbd>
 does nothing. Press Escape outside visual selection to return to the live
 terminal.
