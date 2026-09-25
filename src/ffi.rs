@@ -69,6 +69,15 @@ pub(crate) struct SnapshotTextChunk {
     pub(crate) start_y: u16,
 }
 
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct SnapshotTextRow {
+    pub(crate) text: *const u8,
+    pub(crate) columns: *const u32,
+    pub(crate) len: usize,
+    pub(crate) wraps_to_next: bool,
+}
+
 unsafe extern "C" {
     pub(crate) fn ghostty_egui_host_create(
         argc: usize,
@@ -120,6 +129,13 @@ unsafe extern "C" {
         cursor: *mut c_void,
         chunk: *mut SnapshotTextChunk,
     ) -> i32;
+    pub(crate) fn ghostty_egui_host_snapshot_text_row(
+        host: *mut Host,
+        generation: u64,
+        row: u64,
+        result: *mut SnapshotTextRow,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_text_row_free(result: *mut SnapshotTextRow);
     pub(crate) fn ghostty_egui_host_snapshot_apply_decorations(
         host: *mut Host,
         generation: u64,

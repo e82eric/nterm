@@ -80,7 +80,9 @@ move it with <kbd>h</kbd>/<kbd>j</kbd>/<kbd>k</kbd>/<kbd>l</kbd> or the arrow
 keys. <kbd>H</kbd>/<kbd>M</kbd>/<kbd>L</kbd> move to the top, middle, or bottom
 visible row. Page Up/Down move a full screen, and <kbd>Ctrl</kbd>+<kbd>U</kbd>/
 <kbd>Ctrl</kbd>+<kbd>D</kbd> move half a screen. Movement scrolls the frozen
-viewport when necessary. Press Escape to
+viewport when necessary. <kbd>^</kbd> and <kbd>$</kbd> move to the first and
+last nonblank cell on the current row. <kbd>w</kbd>, <kbd>b</kbd>, and
+<kbd>e</kbd> move through words across the frozen scrollback. Press Escape to
 return to the live terminal. Selection and copying are not part of this first
 version.
 

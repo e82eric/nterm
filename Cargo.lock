@@ -683,6 +683,7 @@ dependencies = [
  "glutin",
  "glutin-winit",
  "regex",
+ "unicode-segmentation",
 ]
 
 [[package]]

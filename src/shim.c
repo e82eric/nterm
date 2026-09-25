@@ -190,6 +190,13 @@ bool ghostty_egui_host_snapshot_cursor_reset(ghostty_snapshot_text_cursor_t curs
 int ghostty_egui_host_snapshot_cursor_next(
     ghostty_snapshot_text_cursor_t cursor, ghostty_snapshot_text_chunk_s *chunk
 ) { return ghostty_surface_snapshot_text_cursor_next(cursor, chunk); }
+bool ghostty_egui_host_snapshot_text_row(
+    GhosttyEguiHost *host, uint64_t generation, uint64_t row,
+    ghostty_snapshot_text_row_s *result
+) { return ghostty_surface_snapshot_text_row(host->surface, generation, row, result); }
+void ghostty_egui_host_snapshot_text_row_free(ghostty_snapshot_text_row_s *result) {
+    ghostty_surface_snapshot_text_row_free(result);
+}
 bool ghostty_egui_host_snapshot_apply_decorations(
     GhosttyEguiHost *host, uint64_t generation,
     const ghostty_snapshot_decoration_layer_s *layers, size_t count,

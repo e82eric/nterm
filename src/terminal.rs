@@ -1,8 +1,8 @@
 use crate::app::UserEvent;
-use crate::copy_mode::{CopyMode, Motion};
+use crate::copy_mode::{CopyMode, Motion, TextRow};
 use crate::ffi::{
     self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
-    SnapshotDecorationStyle, SnapshotView,
+    SnapshotDecorationStyle, SnapshotTextRow, SnapshotView,
 };
 use crate::input;
 use crate::painter::TerminalPainter;
@@ -417,7 +417,14 @@ impl TerminalView {
             } else {
                 None
             };
-            let Some((requested, snap_right)) = self.copy_mode.move_to(motion, view) else {
+            let target = if motion.needs_text() {
+                self.copy_mode
+                    .text_target(motion, |row| self.read_snapshot_row(generation, row))
+                    .map(|cell| (cell, false))
+            } else {
+                self.copy_mode.move_to(motion, view)
+            };
+            let Some((requested, snap_right)) = target else {
                 continue;
             };
             let mut actual = SnapshotCell::default();
@@ -438,6 +445,30 @@ impl TerminalView {
             }
         }
         was_active || self.copy_mode.generation.is_some() || handled
+    }
+
+    fn read_snapshot_row(&self, generation: u64, row: u64) -> Option<TextRow> {
+        let mut result = SnapshotTextRow::default();
+        if !unsafe {
+            ffi::ghostty_egui_host_snapshot_text_row(self.host, generation, row, &mut result)
+        } {
+            return None;
+        }
+        let (text, columns) = if result.len == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                unsafe { std::slice::from_raw_parts(result.text, result.len) }.to_vec(),
+                unsafe { std::slice::from_raw_parts(result.columns, result.len) }.to_vec(),
+            )
+        };
+        let wraps_to_next = result.wraps_to_next;
+        unsafe { ffi::ghostty_egui_host_snapshot_text_row_free(&mut result) };
+        Some(TextRow {
+            text: String::from_utf8(text).ok()?,
+            columns,
+            wraps_to_next,
+        })
     }
 
     fn queue_search(&mut self) {
@@ -717,6 +748,8 @@ fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
             Key::H => Some(Motion::ViewportTop),
             Key::M => Some(Motion::ViewportMiddle),
             Key::L => Some(Motion::ViewportBottom),
+            Key::Num6 => Some(Motion::FirstNonblank),
+            Key::Num4 => Some(Motion::LastNonblank),
             _ => None,
         };
     }
@@ -725,6 +758,9 @@ fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
         Key::J | Key::ArrowDown => Some(Motion::Down),
         Key::K | Key::ArrowUp => Some(Motion::Up),
         Key::L | Key::ArrowRight => Some(Motion::Right),
+        Key::W => Some(Motion::ForwardWord),
+        Key::B => Some(Motion::BackwardWord),
+        Key::E => Some(Motion::ForwardWordEnd),
         Key::PageUp => Some(Motion::PageUp),
         Key::PageDown => Some(Motion::PageDown),
         _ => None,
@@ -801,6 +837,35 @@ mod copy_shortcut_tests {
             Some(crate::copy_mode::Motion::HalfPageDown)
         ));
         assert!(copy_motion(egui::Key::H, ctrl).is_none());
+    }
+
+    #[test]
+    fn text_motion_keys_are_copy_mode_only() {
+        use crate::copy_mode::Motion;
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            copy_motion(egui::Key::Num6, shift),
+            Some(Motion::FirstNonblank)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::Num4, shift),
+            Some(Motion::LastNonblank)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::W, egui::Modifiers::NONE),
+            Some(Motion::ForwardWord)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::B, egui::Modifiers::NONE),
+            Some(Motion::BackwardWord)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::E, egui::Modifiers::NONE),
+            Some(Motion::ForwardWordEnd)
+        );
     }
 }
 
