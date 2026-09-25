@@ -1,5 +1,5 @@
 use crate::app::UserEvent;
-use crate::copy_mode::{CopyMode, Jump, Motion, TextRow};
+use crate::copy_mode::{CopyMode, Jump, Motion, TextRow, next_match_cell, word_search_pattern};
 use crate::ffi::{
     self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
     SnapshotDecorationStyle, SnapshotTextRow, SnapshotView,
@@ -93,6 +93,17 @@ pub(crate) struct TerminalView {
     next_search_open: u64,
     search_worker: SearchWorker,
     copy_mode: CopyMode,
+    copy_search: CopySearch,
+}
+
+#[derive(Default)]
+struct CopySearch {
+    cursor: usize,
+    query_revision: u64,
+    matches: Vec<SnapshotCellRange>,
+    forward: bool,
+    waiting: bool,
+    pending_moves: Vec<(bool, u32)>,
 }
 
 impl TerminalView {
@@ -146,6 +157,7 @@ impl TerminalView {
             next_search_open: 0,
             search_worker: SearchWorker::new(egui_ctx.clone()),
             copy_mode: CopyMode::default(),
+            copy_search: CopySearch::default(),
         }
     }
 
@@ -219,6 +231,14 @@ impl TerminalView {
             }
         {
             self.publish_search_matches(false);
+        }
+        if scrolled
+            && let Some(generation) = self.copy_mode.generation
+            && unsafe {
+                ffi::ghostty_egui_host_snapshot_decorations_need_refresh(self.host, generation)
+            }
+        {
+            self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
         }
 
         if !self.search.active {
@@ -358,7 +378,7 @@ impl TerminalView {
                     &mut actual,
                 )
         };
-        if !ready || !self.publish_copy_decoration(generation, actual) {
+        if !ready || !self.publish_copy_decoration(generation, actual, true) {
             unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
             eprintln!("copy mode: failed to initialize snapshot cursor");
             return;
@@ -370,8 +390,15 @@ impl TerminalView {
 
     fn close_copy_mode(&mut self) {
         if let Some(generation) = self.copy_mode.generation {
+            if self.copy_search.cursor != 0 {
+                self.search_worker.cancel_and_wait();
+                unsafe {
+                    ffi::ghostty_egui_host_snapshot_cursor_free(self.copy_search.cursor as *mut _)
+                };
+            }
             unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
             self.copy_mode = CopyMode::default();
+            self.copy_search = CopySearch::default();
             self.wake.context.request_repaint();
         }
     }
@@ -406,18 +433,9 @@ impl TerminalView {
                             till,
                         };
                         self.copy_mode.last_jump = Some(jump.clone());
-                        let generation = self.copy_mode.generation.expect("copy mode is active");
-                        if let Some(cell) = self.copy_mode.jump_target(&jump, false, |row| {
-                            self.read_snapshot_row(generation, row)
-                        }) {
-                            if !self.apply_copy_target(
-                                generation,
-                                Motion::CharacterJump,
-                                cell,
-                                false,
-                            ) {
-                                break;
-                            }
+                        let count = self.copy_mode.take_count();
+                        if !self.perform_copy_jump(&jump, false, count) {
+                            break;
                         }
                     }
                 }
@@ -441,6 +459,12 @@ impl TerminalView {
                 skip_trigger_text = false;
                 continue;
             }
+            if modifiers == egui::Modifiers::NONE
+                && let Some(digit) = copy_digit(key)
+                && self.copy_mode.add_count_digit(digit)
+            {
+                continue;
+            }
             if let Some((forward, till)) = copy_jump_prefix(key, modifiers) {
                 self.copy_mode.pending_g = false;
                 self.copy_mode.pending_jump = Some((forward, till));
@@ -451,50 +475,44 @@ impl TerminalView {
                 && matches!(key, egui::Key::Semicolon | egui::Key::Comma)
             {
                 self.copy_mode.pending_g = false;
+                let count = self.copy_mode.take_count();
                 if let Some(mut jump) = self.copy_mode.last_jump.clone() {
                     if key == egui::Key::Comma {
                         jump.forward = !jump.forward;
                     }
-                    let generation = self.copy_mode.generation.expect("copy mode is active");
-                    if let Some(cell) = self
-                        .copy_mode
-                        .jump_target(&jump, true, |row| self.read_snapshot_row(generation, row))
-                    {
-                        if !self.apply_copy_target(generation, Motion::CharacterJump, cell, false) {
-                            break;
-                        }
+                    if !self.perform_copy_jump(&jump, true, count) {
+                        break;
                     }
                 }
                 continue;
             }
+            if modifiers.shift
+                && !modifiers.ctrl
+                && !modifiers.alt
+                && !modifiers.mac_cmd
+                && matches!(key, egui::Key::Num8 | egui::Key::Num3)
+            {
+                self.copy_mode.pending_g = false;
+                let count = self.copy_mode.take_count();
+                self.search_copy_word(key == egui::Key::Num8, count);
+                continue;
+            }
+            if !modifiers.ctrl && !modifiers.alt && !modifiers.mac_cmd && key == egui::Key::N {
+                self.copy_mode.pending_g = false;
+                let count = self.copy_mode.take_count();
+                self.navigate_copy_search(modifiers.shift, count);
+                continue;
+            }
+            let explicit_count = self.copy_mode.pending_count.is_some();
             let motion = copy_motion_with_prefix(&mut self.copy_mode, key, modifiers);
             let Some(motion) = motion else {
-                continue;
-            };
-            let generation = self.copy_mode.generation.expect("copy mode is active");
-            let view = if motion.needs_view() {
-                let mut view = SnapshotView::default();
-                if !unsafe {
-                    ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
-                } {
-                    self.close_copy_mode();
-                    break;
+                if !self.copy_mode.pending_g {
+                    self.copy_mode.pending_count = None;
                 }
-                Some(view)
-            } else {
-                None
-            };
-            let target = if motion.needs_text() {
-                self.copy_mode
-                    .text_target(motion, |row| self.read_snapshot_row(generation, row))
-                    .map(|cell| (cell, false))
-            } else {
-                self.copy_mode.move_to(motion, view)
-            };
-            let Some((requested, snap_right)) = target else {
                 continue;
             };
-            if !self.apply_copy_target(generation, motion, requested, snap_right) {
+            let count = self.copy_mode.take_count();
+            if !self.perform_copy_motion(motion, count, explicit_count) {
                 break;
             }
         }
@@ -508,16 +526,8 @@ impl TerminalView {
         requested: SnapshotCell,
         snap_right: bool,
     ) -> bool {
-        let mut actual = SnapshotCell::default();
-        if unsafe {
-            ffi::ghostty_egui_host_snapshot_resolve_cell(
-                self.host,
-                generation,
-                requested,
-                snap_right,
-                &mut actual,
-            )
-        } && self.publish_copy_decoration(generation, actual)
+        if let Some(actual) = self.resolve_copy_cell(generation, requested, snap_right)
+            && self.publish_copy_decoration(generation, actual, true)
         {
             self.copy_mode.moved(motion, actual);
             true
@@ -525,6 +535,105 @@ impl TerminalView {
             self.close_copy_mode();
             false
         }
+    }
+
+    fn resolve_copy_cell(
+        &self,
+        generation: u64,
+        requested: SnapshotCell,
+        snap_right: bool,
+    ) -> Option<SnapshotCell> {
+        let mut actual = SnapshotCell::default();
+        unsafe {
+            ffi::ghostty_egui_host_snapshot_resolve_cell(
+                self.host,
+                generation,
+                requested,
+                snap_right,
+                &mut actual,
+            )
+        }
+        .then_some(actual)
+    }
+
+    fn perform_copy_motion(&mut self, motion: Motion, count: u32, explicit_count: bool) -> bool {
+        let generation = self.copy_mode.generation.expect("copy mode is active");
+        if explicit_count && matches!(motion, Motion::ScrollbackTop | Motion::ScrollbackBottom) {
+            return self
+                .copy_mode
+                .numbered_row_target(count)
+                .is_none_or(|target| self.apply_copy_target(generation, motion, target, false));
+        }
+        if explicit_count && motion == Motion::MatchingBracket {
+            return self
+                .copy_mode
+                .percent_row_target(count)
+                .is_none_or(|target| self.apply_copy_target(generation, motion, target, false));
+        }
+        if matches!(
+            motion,
+            Motion::NextLineNonblank | Motion::PreviousLineNonblank | Motion::LineNonblank
+        ) {
+            let target = self
+                .copy_mode
+                .nonblank_line_target(motion, count, |row| self.read_snapshot_row(generation, row));
+            return target
+                .is_none_or(|target| self.apply_copy_target(generation, motion, target, false));
+        }
+        let view = if motion.needs_view() {
+            let mut view = SnapshotView::default();
+            if !unsafe { ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) } {
+                self.close_copy_mode();
+                return false;
+            }
+            Some(view)
+        } else {
+            None
+        };
+        if let Some((target, snap_right)) =
+            self.copy_mode.counted_simple_target(motion, count, view)
+        {
+            return self.apply_copy_target(generation, motion, target, snap_right);
+        }
+        let mut working = self.copy_mode.clone();
+        let mut final_cell = None;
+        for _ in 0..count {
+            let target = if motion.needs_text() {
+                working
+                    .text_target(motion, |row| self.read_snapshot_row(generation, row))
+                    .map(|cell| (cell, false))
+            } else {
+                working.move_to(motion, view)
+            };
+            let Some((requested, snap_right)) = target else {
+                break;
+            };
+            let Some(actual) = self.resolve_copy_cell(generation, requested, snap_right) else {
+                self.close_copy_mode();
+                return false;
+            };
+            let unchanged = actual == working.cursor;
+            working.moved(motion, actual);
+            final_cell = Some(actual);
+            if unchanged {
+                break;
+            }
+        }
+        final_cell.is_none_or(|cell| self.apply_copy_target(generation, motion, cell, false))
+    }
+
+    fn perform_copy_jump(&mut self, jump: &Jump, repeat: bool, count: u32) -> bool {
+        let generation = self.copy_mode.generation.expect("copy mode is active");
+        let mut working = self.copy_mode.clone();
+        for index in 0..count {
+            let Some(cell) = working.jump_target(jump, repeat || index > 0, |row| {
+                self.read_snapshot_row(generation, row)
+            }) else {
+                return true;
+            };
+            working.moved(Motion::CharacterJump, cell);
+        }
+        self.apply_copy_target(generation, Motion::CharacterJump, working.cursor, false)
     }
 
     fn read_snapshot_row(&self, generation: u64, row: u64) -> Option<TextRow> {
@@ -567,6 +676,29 @@ impl TerminalView {
         let Some(result) = self.search_worker.take_latest_result() else {
             return;
         };
+        if self.copy_mode.generation == Some(result.snapshot_generation)
+            && self.copy_search.waiting
+            && self.copy_search.query_revision == result.query_revision
+        {
+            self.copy_search.waiting = false;
+            self.copy_search.matches = result.matches;
+            self.copy_search.matches.reverse();
+            let mut target = self.copy_mode.cursor;
+            for (forward, count) in std::mem::take(&mut self.copy_search.pending_moves) {
+                if let Some(next) =
+                    next_match_cell(&self.copy_search.matches, target, forward, count)
+                {
+                    target = next;
+                }
+            }
+            self.apply_copy_target(
+                result.snapshot_generation,
+                Motion::CharacterJump,
+                target,
+                false,
+            );
+            return;
+        }
         if !self.search.active
             || self.search.snapshot_generation != Some(result.snapshot_generation)
             || self.search.query_revision != result.query_revision
@@ -582,12 +714,62 @@ impl TerminalView {
         self.publish_search_matches(true);
     }
 
-    fn publish_copy_decoration(&self, generation: u64, cell: SnapshotCell) -> bool {
+    fn search_copy_word(&mut self, forward: bool, count: u32) {
+        let Some(generation) = self.copy_mode.generation else {
+            return;
+        };
+        let Some(word) = self
+            .copy_mode
+            .word_under_cursor(|row| self.read_snapshot_row(generation, row))
+        else {
+            return;
+        };
+        if self.copy_search.cursor == 0 {
+            let cursor =
+                unsafe { ffi::ghostty_egui_host_snapshot_cursor_new(self.host, generation) };
+            if cursor.is_null() {
+                return;
+            }
+            self.copy_search.cursor = cursor as usize;
+        }
+        self.copy_search.forward = forward;
+        self.copy_search.matches.clear();
+        self.copy_search.pending_moves.clear();
+        self.copy_search.pending_moves.push((forward, count));
+        self.copy_search.waiting = true;
+        let pattern = word_search_pattern(&word);
+        self.copy_search.query_revision =
+            self.search_worker
+                .submit(generation, pattern, true, self.copy_search.cursor);
+        self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+    }
+
+    fn navigate_copy_search(&mut self, reverse: bool, count: u32) {
+        let Some(generation) = self.copy_mode.generation else {
+            return;
+        };
+        if self.copy_search.query_revision == 0 {
+            return;
+        }
+        let forward = self.copy_search.forward != reverse;
+        if self.copy_search.waiting {
+            self.copy_search.pending_moves.push((forward, count));
+        } else if let Some(target) = next_match_cell(
+            &self.copy_search.matches,
+            self.copy_mode.cursor,
+            forward,
+            count,
+        ) {
+            self.apply_copy_target(generation, Motion::CharacterJump, target, false);
+        }
+    }
+
+    fn publish_copy_decoration(&self, generation: u64, cell: SnapshotCell, reveal: bool) -> bool {
         let range = SnapshotCellRange {
             start: cell,
             end: cell,
         };
-        let layer = SnapshotDecorationLayer {
+        let caret_layer = SnapshotDecorationLayer {
             ranges: &range,
             range_count: 1,
             style: SnapshotDecorationStyle {
@@ -596,9 +778,23 @@ impl TerminalView {
                 flags: 3,
             },
         };
+        let matches_layer = SnapshotDecorationLayer {
+            ranges: self.copy_search.matches.as_ptr(),
+            range_count: self.copy_search.matches.len(),
+            style: SnapshotDecorationStyle {
+                foreground_rgb: 0xebdbb2,
+                background_rgb: 0x665c54,
+                flags: 3,
+            },
+        };
+        let layers = [caret_layer, matches_layer];
         unsafe {
             ffi::ghostty_egui_host_snapshot_apply_decorations(
-                self.host, generation, &layer, 1, &cell,
+                self.host,
+                generation,
+                layers.as_ptr(),
+                layers.len(),
+                if reveal { &cell } else { std::ptr::null() },
             )
         }
     }
@@ -835,6 +1031,8 @@ fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
             Key::E => Some(Motion::ForwardBigWordEnd),
             Key::G => Some(Motion::ScrollbackBottom),
             Key::Num5 => Some(Motion::MatchingBracket),
+            Key::Minus => Some(Motion::LineNonblank),
+            Key::Equals | Key::Plus => Some(Motion::NextLineNonblank),
             _ => None,
         };
     }
@@ -847,10 +1045,29 @@ fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
         Key::B => Some(Motion::BackwardWord),
         Key::E => Some(Motion::ForwardWordEnd),
         Key::Num0 => Some(Motion::RowStart),
+        Key::Minus => Some(Motion::PreviousLineNonblank),
+        Key::Plus => Some(Motion::NextLineNonblank),
         Key::PageUp => Some(Motion::PageUp),
         Key::PageDown => Some(Motion::PageDown),
         _ => None,
     }
+}
+
+fn copy_digit(key: egui::Key) -> Option<u32> {
+    use egui::Key;
+    Some(match key {
+        Key::Num0 => 0,
+        Key::Num1 => 1,
+        Key::Num2 => 2,
+        Key::Num3 => 3,
+        Key::Num4 => 4,
+        Key::Num5 => 5,
+        Key::Num6 => 6,
+        Key::Num7 => 7,
+        Key::Num8 => 8,
+        Key::Num9 => 9,
+        _ => return None,
+    })
 }
 
 fn copy_motion_with_prefix(
@@ -862,6 +1079,17 @@ fn copy_motion_with_prefix(
         mode.pending_g = false;
         if key == egui::Key::G && modifiers == egui::Modifiers::NONE {
             return Some(Motion::ScrollbackTop);
+        }
+        if key == egui::Key::E && modifiers == egui::Modifiers::NONE {
+            return Some(Motion::PreviousWordEnd);
+        }
+        if key == egui::Key::E
+            && modifiers.shift
+            && !modifiers.ctrl
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+        {
+            return Some(Motion::PreviousBigWordEnd);
         }
     } else if key == egui::Key::G && modifiers == egui::Modifiers::NONE {
         mode.pending_g = true;
@@ -891,7 +1119,9 @@ fn copy_jump_prefix(key: egui::Key, modifiers: egui::Modifiers) -> Option<(bool,
 
 #[cfg(test)]
 mod copy_shortcut_tests {
-    use super::{copy_jump_prefix, copy_motion, copy_motion_with_prefix, is_copy_mode_shortcut};
+    use super::{
+        copy_digit, copy_jump_prefix, copy_motion, copy_motion_with_prefix, is_copy_mode_shortcut,
+    };
 
     #[test]
     fn copy_mode_shortcut_requires_ctrl_shift_m() {
@@ -1047,6 +1277,46 @@ mod copy_shortcut_tests {
             Some(Motion::Left)
         );
         assert!(!mode.pending_g);
+    }
+
+    #[test]
+    fn next_copy_motions_and_digits_have_distinct_bindings() {
+        use crate::copy_mode::{CopyMode, Motion};
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(copy_digit(egui::Key::Num0), Some(0));
+        assert_eq!(copy_digit(egui::Key::Num9), Some(9));
+        assert_eq!(
+            copy_motion(egui::Key::Plus, egui::Modifiers::NONE),
+            Some(Motion::NextLineNonblank)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::Minus, egui::Modifiers::NONE),
+            Some(Motion::PreviousLineNonblank)
+        );
+        assert_eq!(
+            copy_motion(egui::Key::Minus, shift),
+            Some(Motion::LineNonblank)
+        );
+        let mut mode = CopyMode::default();
+        assert_eq!(
+            copy_motion_with_prefix(&mut mode, egui::Key::G, egui::Modifiers::NONE),
+            None
+        );
+        assert_eq!(
+            copy_motion_with_prefix(&mut mode, egui::Key::E, egui::Modifiers::NONE),
+            Some(Motion::PreviousWordEnd)
+        );
+        assert_eq!(
+            copy_motion_with_prefix(&mut mode, egui::Key::G, egui::Modifiers::NONE),
+            None
+        );
+        assert_eq!(
+            copy_motion_with_prefix(&mut mode, egui::Key::E, shift),
+            Some(Motion::PreviousBigWordEnd)
+        );
     }
 }
 

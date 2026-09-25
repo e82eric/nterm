@@ -89,6 +89,15 @@ last nonblank cell on the current row. <kbd>w</kbd>, <kbd>b</kbd>, and
 and <kbd>t</kbd>/<kbd>T</kbd> jump to or before/after a character on the
 current row; <kbd>;</kbd> repeats the jump and <kbd>,</kbd> reverses it.
 <kbd>%</kbd> matches nested parentheses, brackets, or braces across rows.
+Prefix a motion with a count, such as <kbd>10j</kbd>, <kbd>3w</kbd>, or
+<kbd>2f:</kbd>. <kbd>3gg</kbd>/<kbd>3G</kbd> go to the third snapshot row;
+<kbd>50%</kbd> goes halfway through the snapshot. <kbd>ge</kbd>/<kbd>gE</kbd>
+move to the end of the previous word or whitespace-delimited word.
+<kbd>+</kbd> and <kbd>-</kbd> move to the first nonblank cell on the next or
+previous row; <kbd>_</kbd> does so on the current row (or the counted row).
+<kbd>*</kbd>/<kbd>#</kbd> search for the word under the copy cursor toward
+newer/older output. <kbd>n</kbd> repeats that direction and <kbd>N</kbd>
+reverses it; matches wrap around the frozen scrollback.
 Press Escape to return to the live terminal. Selection and copying are not part
 of this first version.
 

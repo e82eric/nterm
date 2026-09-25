@@ -1,4 +1,4 @@
-use crate::ffi::{SnapshotCell, SnapshotView};
+use crate::ffi::{SnapshotCell, SnapshotCellRange, SnapshotView};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +25,11 @@ pub(crate) enum Motion {
     ForwardBigWord,
     BackwardBigWord,
     ForwardBigWordEnd,
+    PreviousWordEnd,
+    PreviousBigWordEnd,
+    NextLineNonblank,
+    PreviousLineNonblank,
+    LineNonblank,
     CharacterJump,
     MatchingBracket,
 }
@@ -54,6 +59,11 @@ impl Motion {
                 | Self::ForwardBigWord
                 | Self::BackwardBigWord
                 | Self::ForwardBigWordEnd
+                | Self::PreviousWordEnd
+                | Self::PreviousBigWordEnd
+                | Self::NextLineNonblank
+                | Self::PreviousLineNonblank
+                | Self::LineNonblank
                 | Self::CharacterJump
                 | Self::MatchingBracket
         )
@@ -123,7 +133,7 @@ pub(crate) struct Jump {
     pub(crate) till: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct CopyMode {
     pub(crate) generation: Option<u64>,
     pub(crate) cursor: SnapshotCell,
@@ -131,6 +141,7 @@ pub(crate) struct CopyMode {
     columns: u32,
     rows: u64,
     pub(crate) pending_g: bool,
+    pub(crate) pending_count: Option<u32>,
     pub(crate) pending_jump: Option<(bool, bool)>,
     pub(crate) last_jump: Option<Jump>,
 }
@@ -143,6 +154,7 @@ impl CopyMode {
         self.columns = state.columns;
         self.rows = state.total_rows;
         self.pending_g = false;
+        self.pending_count = None;
         self.pending_jump = None;
         self.last_jump = None;
     }
@@ -221,6 +233,11 @@ impl CopyMode {
             Motion::ForwardBigWord
             | Motion::BackwardBigWord
             | Motion::ForwardBigWordEnd
+            | Motion::PreviousWordEnd
+            | Motion::PreviousBigWordEnd
+            | Motion::NextLineNonblank
+            | Motion::PreviousLineNonblank
+            | Motion::LineNonblank
             | Motion::CharacterJump
             | Motion::MatchingBracket => return None,
         }
@@ -233,6 +250,183 @@ impl CopyMode {
         {
             self.preferred_x = cell.x;
         }
+    }
+
+    pub(crate) fn add_count_digit(&mut self, digit: u32) -> bool {
+        if digit == 0 && self.pending_count.is_none() {
+            return false;
+        }
+        self.pending_count = Some(
+            self.pending_count
+                .unwrap_or(0)
+                .saturating_mul(10)
+                .saturating_add(digit),
+        );
+        true
+    }
+
+    pub(crate) fn take_count(&mut self) -> u32 {
+        self.pending_count.take().unwrap_or(1).max(1)
+    }
+
+    pub(crate) fn numbered_row_target(&self, count: u32) -> Option<SnapshotCell> {
+        let last = self.rows.checked_sub(1)?;
+        Some(SnapshotCell {
+            x: self.preferred_x.min(self.columns.checked_sub(1)?),
+            y: u64::from(count - 1).min(last),
+        })
+    }
+
+    pub(crate) fn percent_row_target(&self, percent: u32) -> Option<SnapshotCell> {
+        if percent == 0 || percent > 100 {
+            return None;
+        }
+        let last = self.rows.checked_sub(1)?;
+        Some(SnapshotCell {
+            x: self.preferred_x.min(self.columns.checked_sub(1)?),
+            y: u64::from(percent - 1).saturating_mul(last) / 99,
+        })
+    }
+
+    pub(crate) fn counted_simple_target(
+        &self,
+        motion: Motion,
+        count: u32,
+        view: Option<SnapshotView>,
+    ) -> Option<(SnapshotCell, bool)> {
+        let (mut cell, snap_right) = self.move_to(motion, view)?;
+        let extra = u64::from(count - 1);
+        let last = self.rows - 1;
+        match motion {
+            Motion::Up => cell.y = self.cursor.y.saturating_sub(u64::from(count)),
+            Motion::Down => cell.y = self.cursor.y.saturating_add(u64::from(count)).min(last),
+            Motion::PageUp | Motion::PageDown | Motion::HalfPageUp | Motion::HalfPageDown => {
+                let rows = u64::from(view?.viewport_rows);
+                let step = if matches!(motion, Motion::HalfPageUp | Motion::HalfPageDown) {
+                    (rows / 2).max(1)
+                } else {
+                    rows
+                };
+                let delta = step.saturating_mul(u64::from(count));
+                cell.y = if matches!(motion, Motion::PageUp | Motion::HalfPageUp) {
+                    self.cursor.y.saturating_sub(delta)
+                } else {
+                    self.cursor.y.saturating_add(delta).min(last)
+                };
+            }
+            Motion::ViewportTop => {
+                let view = view?;
+                let bottom = view
+                    .viewport_top
+                    .saturating_add(u64::from(view.viewport_rows - 1))
+                    .min(last);
+                cell.y = cell.y.saturating_add(extra).min(bottom);
+            }
+            Motion::ViewportBottom => {
+                let view = view?;
+                cell.y = cell.y.saturating_sub(extra).max(view.viewport_top);
+            }
+            // Horizontal counts must resolve each intermediate cell so wide
+            // graphemes count as one motion rather than two terminal columns.
+            _ => return None,
+        }
+        Some((cell, snap_right))
+    }
+
+    pub(crate) fn nonblank_line_target(
+        &self,
+        motion: Motion,
+        count: u32,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCell> {
+        let last = self.rows.checked_sub(1)?;
+        let y = match motion {
+            Motion::NextLineNonblank => self.cursor.y.saturating_add(u64::from(count)).min(last),
+            Motion::PreviousLineNonblank => self.cursor.y.saturating_sub(u64::from(count)),
+            Motion::LineNonblank => self.cursor.y.saturating_add(u64::from(count - 1)).min(last),
+            _ => return None,
+        };
+        let row = read(y)?;
+        let x = row
+            .glyphs(false)
+            .iter()
+            .find(|glyph| glyph.nonblank)
+            .map_or(0, |glyph| glyph.x);
+        Some(SnapshotCell { x, y })
+    }
+
+    pub(crate) fn word_under_cursor(
+        &self,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<String> {
+        let row = read(self.cursor.y)?;
+        let glyphs = row.glyphs(false);
+        let cells = row.grapheme_cells();
+        let index = glyphs
+            .iter()
+            .position(|glyph| glyph.class == WordClass::Keyword && glyph.x >= self.cursor.x)
+            .or_else(|| {
+                glyphs.iter().rposition(|glyph| {
+                    glyph.x <= self.cursor.x && glyph.class == WordClass::Keyword
+                })
+            })?;
+        let mut start = index;
+        while start > 0 && glyphs[start - 1].class == WordClass::Keyword {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while end < glyphs.len() && glyphs[end].class == WordClass::Keyword {
+            end += 1;
+        }
+        let mut word: String = cells[start..end].iter().map(|(_, text)| *text).collect();
+        if start == 0 {
+            let mut y = self.cursor.y;
+            while let Some(previous) = y.checked_sub(1) {
+                let prior = read(previous)?;
+                if !prior.wraps_to_next {
+                    break;
+                }
+                let prior_glyphs = prior.glyphs(false);
+                let prior_cells = prior.grapheme_cells();
+                let prior_start = prior_glyphs
+                    .iter()
+                    .rposition(|glyph| glyph.class != WordClass::Keyword)
+                    .map_or(0, |index| index + 1);
+                if prior_start == prior_glyphs.len() {
+                    break;
+                }
+                let prefix: String = prior_cells[prior_start..]
+                    .iter()
+                    .map(|(_, text)| *text)
+                    .collect();
+                word.insert_str(0, &prefix);
+                if prior_start != 0 {
+                    break;
+                }
+                y = previous;
+            }
+        }
+        if end == glyphs.len() && row.wraps_to_next {
+            let mut y = self.cursor.y + 1;
+            while y < self.rows {
+                let next = read(y)?;
+                let next_glyphs = next.glyphs(false);
+                let next_cells = next.grapheme_cells();
+                let next_end = next_glyphs
+                    .iter()
+                    .position(|glyph| glyph.class != WordClass::Keyword)
+                    .unwrap_or(next_glyphs.len());
+                if next_end == 0 {
+                    break;
+                }
+                word.extend(next_cells[..next_end].iter().map(|(_, text)| *text));
+                if next_end != next_glyphs.len() || !next.wraps_to_next {
+                    break;
+                }
+                y += 1;
+            }
+        }
+        Some(word)
     }
 
     pub(crate) fn text_target(
@@ -258,6 +452,11 @@ impl CopyMode {
             Motion::ForwardBigWord => self.forward_word(&mut read, true),
             Motion::BackwardBigWord => self.backward_word(&mut read, true),
             Motion::ForwardBigWordEnd => self.forward_word_end(&mut read, true),
+            Motion::PreviousWordEnd => self.previous_word_end(&mut read, false),
+            Motion::PreviousBigWordEnd => self.previous_word_end(&mut read, true),
+            Motion::NextLineNonblank | Motion::PreviousLineNonblank | Motion::LineNonblank => {
+                self.nonblank_line_target(motion, 1, read)
+            }
             Motion::MatchingBracket => self.matching_bracket(&mut read),
             _ => None,
         }
@@ -457,6 +656,65 @@ impl CopyMode {
         }
         last.filter(|end| (end.y, end.x) > (self.cursor.y, self.cursor.x))
     }
+
+    fn previous_word_end(
+        &self,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+        big: bool,
+    ) -> Option<SnapshotCell> {
+        for y in (0..=self.cursor.y).rev() {
+            let row = read(y)?;
+            let mut next_class = if row.wraps_to_next && y + 1 < self.rows {
+                read(y + 1)?
+                    .glyphs(big)
+                    .first()
+                    .map_or(WordClass::Whitespace, |glyph| glyph.class)
+            } else {
+                WordClass::Whitespace
+            };
+            for glyph in row.glyphs(big).into_iter().rev() {
+                if y == self.cursor.y && glyph.x >= self.cursor.x {
+                    next_class = glyph.class;
+                    continue;
+                }
+                if glyph.class != WordClass::Whitespace && glyph.class != next_class {
+                    return Some(SnapshotCell { x: glyph.x, y });
+                }
+                next_class = glyph.class;
+            }
+        }
+        None
+    }
+}
+
+/// Matches are sorted by their start cell, oldest to newest.
+pub(crate) fn next_match_cell(
+    matches: &[SnapshotCellRange],
+    cursor: SnapshotCell,
+    forward: bool,
+    count: u32,
+) -> Option<SnapshotCell> {
+    if matches.is_empty() {
+        return None;
+    }
+    let at = (cursor.y, cursor.x);
+    let index = if forward {
+        matches.partition_point(|range| (range.start.y, range.start.x) <= at) % matches.len()
+    } else {
+        let before = matches.partition_point(|range| (range.start.y, range.start.x) < at);
+        (before + matches.len() - 1) % matches.len()
+    };
+    let steps = ((count - 1) as usize) % matches.len();
+    let index = if forward {
+        (index + steps) % matches.len()
+    } else {
+        (index + matches.len() - steps) % matches.len()
+    };
+    Some(matches[index].start)
+}
+
+pub(crate) fn word_search_pattern(word: &str) -> String {
+    format!(r"(?i:\b{}\b)", regex::escape(word))
 }
 
 #[cfg(test)]
@@ -593,6 +851,125 @@ mod tests {
         assert_eq!(
             mode.text_target(Motion::BackwardBigWord, read).unwrap().x,
             0
+        );
+    }
+
+    #[test]
+    fn counts_keep_zero_as_a_motion_only_without_a_prefix() {
+        let mut mode = copy_at(5, 3, 10);
+        assert!(!mode.add_count_digit(0));
+        assert!(mode.add_count_digit(2));
+        assert!(mode.add_count_digit(0));
+        assert_eq!(mode.take_count(), 20);
+        assert_eq!(mode.take_count(), 1);
+        assert_eq!(mode.numbered_row_target(3).unwrap().y, 2);
+    }
+
+    #[test]
+    fn previous_word_end_distinguishes_punctuation_and_big_words() {
+        let mode = copy_at(6, 0, 1);
+        let read = |_| Some(row("foo.bar", false));
+        assert_eq!(
+            mode.text_target(Motion::PreviousWordEnd, read).unwrap().x,
+            3
+        );
+        assert_eq!(mode.text_target(Motion::PreviousBigWordEnd, read), None);
+        let rows = [row("foo", true), row("bar baz", false)];
+        let mode = copy_at(5, 1, 2);
+        assert_eq!(
+            mode.text_target(Motion::PreviousWordEnd, |y| rows.get(y as usize).cloned()),
+            Some(SnapshotCell { x: 2, y: 1 })
+        );
+    }
+
+    #[test]
+    fn nonblank_line_motions_use_count_and_clamp() {
+        let rows = [
+            row("  one", false),
+            row("    ", false),
+            row(" three", false),
+        ];
+        let mode = copy_at(3, 0, 3);
+        let read = |y: u64| rows.get(y as usize).cloned();
+        assert_eq!(
+            mode.nonblank_line_target(Motion::NextLineNonblank, 2, read),
+            Some(SnapshotCell { x: 1, y: 2 })
+        );
+        assert_eq!(
+            mode.nonblank_line_target(Motion::LineNonblank, 1, read),
+            Some(SnapshotCell { x: 2, y: 0 })
+        );
+        let mode = copy_at(3, 2, 3);
+        assert_eq!(
+            mode.nonblank_line_target(Motion::PreviousLineNonblank, 1, read),
+            Some(SnapshotCell { x: 0, y: 1 })
+        );
+    }
+
+    #[test]
+    fn word_under_cursor_joins_soft_wrapped_keyword() {
+        let rows = [row("foo", true), row("bar baz", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        assert_eq!(
+            copy_at(1, 0, 2).word_under_cursor(read).as_deref(),
+            Some("foobar")
+        );
+        assert_eq!(
+            copy_at(1, 1, 2).word_under_cursor(read).as_deref(),
+            Some("foobar")
+        );
+        let unicode = TextRow {
+            text: "猫語 test".into(),
+            columns: vec![0, 0, 0, 1, 1, 1, 2, 3, 4, 5, 6],
+            wraps_to_next: false,
+        };
+        assert_eq!(
+            copy_at(1, 0, 1)
+                .word_under_cursor(|_| Some(unicode.clone()))
+                .as_deref(),
+            Some("猫語")
+        );
+    }
+
+    #[test]
+    fn word_search_matches_whole_unicode_words() {
+        let matcher = regex::Regex::new(&word_search_pattern("猫")).unwrap();
+        assert!(matcher.is_match("a 猫 b"));
+        assert!(!matcher.is_match("a 猫語 b"));
+        let matcher = regex::Regex::new(&word_search_pattern("foo")).unwrap();
+        assert!(matcher.is_match("FOO"));
+        assert!(!matcher.is_match("foobar"));
+    }
+
+    #[test]
+    fn match_navigation_skips_current_and_wraps_in_both_directions() {
+        let matches = [0, 4, 9].map(|x| SnapshotCellRange {
+            start: SnapshotCell { x, y: 0 },
+            end: SnapshotCell { x, y: 0 },
+        });
+        assert_eq!(
+            next_match_cell(&matches, SnapshotCell { x: 4, y: 0 }, true, 1)
+                .unwrap()
+                .x,
+            9
+        );
+        assert_eq!(
+            next_match_cell(&matches, SnapshotCell { x: 4, y: 0 }, false, 1)
+                .unwrap()
+                .x,
+            0
+        );
+        assert_eq!(
+            next_match_cell(&matches, SnapshotCell { x: 9, y: 0 }, true, 2)
+                .unwrap()
+                .x,
+            4
+        );
+        assert_eq!(
+            next_match_cell(&matches, SnapshotCell { x: 0, y: 0 }, false, 2)
+                .unwrap()
+                .x,
+            4
         );
     }
 
