@@ -2,6 +2,7 @@ use crate::ffi::{
     Host, ghostty_egui_host_key, ghostty_egui_host_mouse_button, ghostty_egui_host_mouse_pos,
     ghostty_egui_host_mouse_scroll, ghostty_egui_host_preedit, ghostty_egui_host_text,
 };
+use std::ffi::CString;
 
 pub(crate) fn forward(
     host: *mut Host,
@@ -16,7 +17,7 @@ pub(crate) fn forward(
     let keyboard_owned = modal_input_blocked || ui.ctx().egui_wants_keyboard_input();
     let mut scrolled = false;
 
-    for event in events {
+    for (index, event) in events.iter().cloned().enumerate() {
         match event {
             egui::Event::Key {
                 key,
@@ -26,7 +27,17 @@ pub(crate) fn forward(
                 modifiers,
                 ..
             } if !keyboard_owned => {
-                let Some((usb, unshifted)) = key_to_usb(physical_key.unwrap_or(key)) else {
+                // egui-winit emits translated Text immediately after its Key.
+                // Keep them in one Ghostty key event; sending Text through the
+                // paste API makes each typed character a bracketed paste.
+                let text = if pressed {
+                    paired_key_text(&events, index).and_then(|text| CString::new(text).ok())
+                } else {
+                    None
+                };
+                let Some((usb, unshifted)) = key_to_usb(physical_key.unwrap_or(key))
+                    .or_else(|| text.as_ref().map(|_| (0, 0)))
+                else {
                     continue;
                 };
                 let action = if !pressed {
@@ -37,19 +48,42 @@ pub(crate) fn forward(
                     1
                 };
                 unsafe {
-                    ghostty_egui_host_key(host, action, mods(modifiers), usb, unshifted);
+                    ghostty_egui_host_key(
+                        host,
+                        action,
+                        mods(modifiers),
+                        usb,
+                        unshifted,
+                        text.as_ref().map_or(std::ptr::null(), |text| text.as_ptr()),
+                    );
                 }
             }
-            egui::Event::Text(text) | egui::Event::Paste(text) if !keyboard_owned => unsafe {
+            egui::Event::Text(text) if !keyboard_owned && !text_follows_key(&events, index) => {
+                if let Ok(text) = CString::new(text.as_str()) {
+                    unsafe {
+                        ghostty_egui_host_key(
+                            host,
+                            1,
+                            mods(ui.input(|input| input.modifiers)),
+                            0,
+                            0,
+                            text.as_ptr(),
+                        );
+                    }
+                }
+            }
+            egui::Event::Paste(text) if !keyboard_owned => unsafe {
                 ghostty_egui_host_text(host, text.as_ptr().cast(), text.len());
             },
             egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !keyboard_owned => unsafe {
                 ghostty_egui_host_preedit(host, text.as_ptr().cast(), text.len());
             },
-            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !keyboard_owned => unsafe {
-                ghostty_egui_host_preedit(host, "".as_ptr().cast(), 0);
-                ghostty_egui_host_text(host, text.as_ptr().cast(), text.len());
-            },
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !keyboard_owned => {
+                unsafe { ghostty_egui_host_preedit(host, "".as_ptr().cast(), 0) };
+                if let Ok(text) = CString::new(text.as_str()) {
+                    unsafe { ghostty_egui_host_key(host, 1, 0, 0, 0, text.as_ptr()) };
+                }
+            }
             egui::Event::PointerMoved(pos)
                 if !pointer_owned && !modal_input_blocked && rect.contains(pos) =>
             unsafe {
@@ -114,6 +148,22 @@ fn mods(value: egui::Modifiers) -> i32 {
         | (if value.ctrl { 2 } else { 0 })
         | (if value.alt { 4 } else { 0 })
         | (if value.mac_cmd { 8 } else { 0 })
+}
+
+fn paired_key_text(events: &[egui::Event], index: usize) -> Option<&str> {
+    match events.get(index + 1) {
+        Some(egui::Event::Text(text)) => Some(text),
+        _ => None,
+    }
+}
+
+fn text_follows_key(events: &[egui::Event], index: usize) -> bool {
+    matches!(
+        index
+            .checked_sub(1)
+            .and_then(|previous| events.get(previous)),
+        Some(egui::Event::Key { pressed: true, .. })
+    )
 }
 
 fn key_to_usb(key: egui::Key) -> Option<(u32, u32)> {
@@ -201,7 +251,7 @@ fn key_to_usb(key: egui::Key) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::key_to_usb;
+    use super::{key_to_usb, paired_key_text, text_follows_key};
 
     #[test]
     fn keys_include_the_usb_keyboard_usage_page() {
@@ -210,5 +260,24 @@ mod tests {
             Some((0x0007_0028, '\r' as u32))
         );
         assert_eq!(key_to_usb(egui::Key::A), Some((0x0007_0004, 'a' as u32)));
+    }
+
+    #[test]
+    fn translated_text_is_attached_to_its_key_once() {
+        let events = [
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("a".into()),
+            egui::Event::Paste("pasted".into()),
+        ];
+        assert_eq!(paired_key_text(&events, 0), Some("a"));
+        assert!(text_follows_key(&events, 1));
+        assert_eq!(paired_key_text(&events, 1), None);
+        assert!(!text_follows_key(&events, 2));
     }
 }

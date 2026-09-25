@@ -100,6 +100,7 @@ unsafe extern "C" {
         mods: i32,
         usb: u32,
         unshifted: u32,
+        text: *const c_char,
     ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_begin(
         host: *mut Host,

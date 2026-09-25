@@ -159,9 +159,10 @@ bool ghostty_egui_host_key(
     int action_value,
     int mods,
     uint32_t usb,
-    uint32_t unshifted
+    uint32_t unshifted,
+    const char *text
 ) {
-    return ghostty_surface_key_usb(host->surface, action_value, mods, usb, unshifted);
+    return ghostty_surface_key_usb(host->surface, action_value, mods, usb, unshifted, text);
 }
 bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *snapshot_generation) {
     return ghostty_surface_snapshot_begin(host->surface, snapshot_generation);
