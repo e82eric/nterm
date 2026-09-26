@@ -72,6 +72,8 @@ pub(crate) struct TerminalView {
     search_worker: SearchWorker,
     copy_mode: CopyMode,
     quick_select: Option<QuickSelect>,
+    picker: Option<crate::picker::Picker>,
+    picker_font: crate::picker_font::PickerFont,
     copy_search: CopySearch,
     prompt_boundaries: Option<(u64, Vec<u64>)>,
 }
@@ -119,6 +121,7 @@ impl TerminalView {
         );
 
         let painter = Arc::new(egui::mutex::Mutex::new(TerminalPainter::new(gl)));
+        let picker_font = crate::picker_font::PickerFont::new(egui_ctx, host);
         let callback_painter = Arc::clone(&painter);
         let paint_callback = Arc::new(egui_glow::CallbackFn::new(move |_info, glow_painter| {
             callback_painter.lock().paint(glow_painter.gl());
@@ -137,6 +140,8 @@ impl TerminalView {
             search_worker: SearchWorker::new(egui_ctx.clone()),
             copy_mode: CopyMode::default(),
             quick_select: None,
+            picker: None,
+            picker_font,
             copy_search: CopySearch::default(),
             prompt_boundaries: None,
         }
@@ -200,6 +205,7 @@ impl TerminalView {
 
         if let Some(generation) = self.copy_mode.generation
             && self.quick_select.is_none()
+            && self.picker.is_none()
         {
             let now = Instant::now();
             if self.copy_mode.clear_expired_yank_highlight(now) {
@@ -217,15 +223,19 @@ impl TerminalView {
         // Search may surrender text-field focus when Enter transfers its
         // snapshot to copy mode. Consume that frame's input even after the
         // overlay closes, so Enter is never also sent to the PTY.
-        let quick_select_consumed = self.handle_quick_select_keys(ui);
-        let search_shortcut_consumed = !quick_select_consumed && self.handle_search_shortcut(ui);
-        let copy_input_consumed = !quick_select_consumed && self.handle_copy_keys(ui);
-        let keyboard_blocked = quick_select_consumed
+        let picker_consumed = self.handle_picker(ui, status_height);
+        let quick_select_consumed = !picker_consumed && self.handle_quick_select_keys(ui);
+        let search_shortcut_consumed =
+            !picker_consumed && !quick_select_consumed && self.handle_search_shortcut(ui);
+        let copy_input_consumed =
+            !picker_consumed && !quick_select_consumed && self.handle_copy_keys(ui);
+        let keyboard_blocked = picker_consumed
+            || quick_select_consumed
             || copy_input_consumed
             || self.search.active
             || search_shortcut_consumed;
         self.show_search_overlay(ui.ctx(), status_height);
-        let scrolled = if quick_select_consumed {
+        let scrolled = if picker_consumed || quick_select_consumed {
             false // Hint labels are stable until this mode is completed or canceled.
         } else {
             input::forward(self.host, self.size, ui, rect, scale, keyboard_blocked)
@@ -265,7 +275,9 @@ impl TerminalView {
         let copying = self.copy_mode.generation.is_some();
         let visual =
             copying && self.quick_select.is_none() && self.copy_mode.visual_anchor.is_some();
-        let label = if self.quick_select.is_some() {
+        let label = if self.picker.is_some() {
+            "SCROLLBACK PICKER"
+        } else if self.quick_select.is_some() {
             "QUICK SELECT"
         } else if self.search.active {
             "SEARCH"
@@ -444,6 +456,85 @@ impl TerminalView {
         true
     }
 
+    fn handle_picker(&mut self, ui: &egui::Ui, status_height: f32) -> bool {
+        let was_active = self.picker.is_some();
+        let (shortcut, consumed) = ui.input_mut(|i| crate::picker::consume_shortcut(&mut i.events));
+        if shortcut && !was_active && !self.search.active && self.quick_select.is_none() {
+            let from_copy = self.copy_mode.generation.is_some();
+            let generation = if let Some(generation) = self.copy_mode.generation {
+                generation
+            } else {
+                let mut generation = 0;
+                if !unsafe { ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) } {
+                    return true;
+                }
+                generation
+            };
+            let mut view = SnapshotView::default();
+            if !unsafe { ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) } {
+                if !from_copy {
+                    unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+                }
+                return true;
+            }
+            if !from_copy {
+                self.copy_mode.start(generation, view);
+            }
+            self.picker = Some(crate::picker::Picker::start(
+                self.host,
+                generation,
+                from_copy,
+                view.total_rows,
+                ui.ctx().clone(),
+            ));
+        }
+        let active = self.picker.is_some();
+        if let Some(picker) = &mut self.picker {
+            picker.typography = self.picker_font.typography(ui.ctx(), self.host);
+        }
+        let action = self
+            .picker
+            .as_mut()
+            .and_then(|picker| picker.show(ui.ctx(), status_height));
+        if let Some(action) = action {
+            let picker = self
+                .picker
+                .take()
+                .expect("picker action requires active picker");
+            let (generation, from_copy) = (picker.generation, picker.from_copy);
+            drop(picker);
+            // Surrender query focus before returning terminal/copy input.
+            ui.ctx().memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+            match action {
+                crate::picker::Action::Cancel if from_copy => {
+                    self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                }
+                crate::picker::Action::Cancel => self.close_copy_mode(),
+                crate::picker::Action::Accept(target) => {
+                    // A pending copy-mode word search must not move the cursor
+                    // again after accepting this picker result.
+                    self.search_worker.cancel();
+                    self.copy_search.waiting = false;
+                    self.copy_search.pending_moves.clear();
+                    self.copy_mode.visual_anchor = None;
+                    self.copy_mode.pending_yank = None;
+                    self.copy_mode.pending_visual_object = None;
+                    self.copy_mode.pending_jump = None;
+                    self.copy_mode.pending_count = None;
+                    self.copy_mode.pending_g = false;
+                    self.copy_mode.pending_z = false;
+                    self.apply_copy_target(generation, Motion::CharacterJump, target, false);
+                }
+            }
+            ui.ctx().request_repaint();
+        }
+        was_active || active || consumed
+    }
+
     fn open_quick_select(&mut self) {
         let from_copy = self.copy_mode.generation.is_some();
         let generation = if let Some(generation) = self.copy_mode.generation {
@@ -522,7 +613,7 @@ impl TerminalView {
             style: SnapshotDecorationStyle {
                 foreground_rgb: 0xebdbb2,
                 background_rgb: 0x3c3836,
-                flags: 2, // Preserve the underlying terminal's foreground colors.
+                flags: 3, // Matches use consistent colors regardless of terminal styling.
             },
         };
         unsafe {
@@ -742,6 +833,7 @@ impl TerminalView {
     }
 
     fn close_copy_mode(&mut self) {
+        self.picker = None;
         self.quick_select = None;
         if let Some(generation) = self.copy_mode.generation {
             if self.copy_search.cursor != 0 {
@@ -1427,7 +1519,7 @@ impl TerminalView {
     }
 
     fn apply_search_result(&mut self) {
-        if self.quick_select.is_some() {
+        if self.quick_select.is_some() || self.picker.is_some() {
             return;
         }
         let Some(result) = self.search_worker.take_latest_result() else {
@@ -2015,15 +2107,19 @@ fn consume_search_shortcut(events: &mut Vec<egui::Event>) -> (bool, bool) {
     let mut consumed = false;
     while let Some(event) = incoming.next() {
         if let egui::Event::Key {
-            key: egui::Key::F,
+            key,
             pressed,
             repeat,
             modifiers,
             ..
         } = &event
             && !modifiers.alt
-            && ((modifiers.ctrl && modifiers.shift && !modifiers.mac_cmd)
+            && ((matches!(key, egui::Key::Slash | egui::Key::Questionmark)
+                && modifiers.ctrl
+                && modifiers.shift
+                && !modifiers.mac_cmd)
                 || (cfg!(target_os = "macos")
+                    && *key == egui::Key::F
                     && modifiers.mac_cmd
                     && !modifiers.ctrl
                     && !modifiers.shift))
@@ -2326,8 +2422,8 @@ mod copy_shortcut_tests {
     #[test]
     fn search_shortcut_consumes_key_and_paired_text_only() {
         let key = |modifiers, pressed, repeat| egui::Event::Key {
-            key: egui::Key::F,
-            physical_key: Some(egui::Key::F),
+            key: egui::Key::Questionmark,
+            physical_key: Some(egui::Key::Slash),
             pressed,
             repeat,
             modifiers,
@@ -2339,7 +2435,7 @@ mod copy_shortcut_tests {
         };
         let mut events = vec![
             key(modifiers, true, false),
-            egui::Event::Text("F".into()),
+            egui::Event::Text("?".into()),
             egui::Event::Paste("query".into()),
         ];
         assert_eq!(consume_search_shortcut(&mut events), (true, true));

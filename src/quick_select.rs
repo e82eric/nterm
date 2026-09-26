@@ -138,8 +138,8 @@ impl QuickSelect {
                     codepoint: u32::from(ch.to_ascii_uppercase()),
                     style: SnapshotDecorationStyle {
                         foreground_rgb: 0xd79921,
-                        background_rgb: 0,
-                        flags: 1, // Override foreground only.
+                        background_rgb: 0x282828,
+                        flags: 3, // Hints use plain background, even on styled cells.
                     },
                     bold: true,
                 });

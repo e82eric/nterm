@@ -169,6 +169,13 @@ void ghostty_egui_host_destroy(GhosttyEguiHost *host) {
     if (host->app) ghostty_app_free(host->app);
     free(host);
 }
+
+bool ghostty_egui_host_read_font(GhosttyEguiHost *host, bool bold, ghostty_font_data_s *result) {
+    return ghostty_surface_read_font(host->surface, bold, result);
+}
+ghostty_surface_size_s ghostty_egui_host_surface_size(GhosttyEguiHost *host) {
+    return ghostty_surface_size(host->surface);
+}
 void ghostty_egui_host_tick(GhosttyEguiHost *host) { ghostty_app_tick(host->app); }
 void ghostty_egui_host_resize(GhosttyEguiHost *host, uint32_t width, uint32_t height, double scale) {
     ghostty_surface_set_content_scale(host->surface, scale, scale);

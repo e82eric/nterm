@@ -25,13 +25,36 @@ frame and frames awaiting GPU completion. That
 boundary leaves room for fixed-position overlay terminals without moving
 terminal drawing into egui.
 
+Lua settings are loaded at startup from the first available location:
+
+1. An explicit `--lua-config=PATH` argument.
+2. `config.lua` in the home directory (`%USERPROFILE%` on Windows, `$HOME` on Linux).
+3. `config.lua` beside the executable, regardless of the current working directory.
+
+Only one file is loaded. Missing default files preserve the existing configuration.
+An explicit missing file, unreadable file, or invalid configuration reports the
+filename and exits before opening a window, without falling back to another file.
+See `config.lua` in this example for a starting configuration:
+
+```powershell
+.\zig-out\bin\ghostty_egui.exe --lua-config=example/rust-egui-terminal/config.lua --command=pwsh.exe
+```
+
+The file returns a table with optional `font.family`, `font.size` (points),
+`terminal.scrollback_limit` (bytes), and `colors.theme` settings. Unknown fields
+are rejected. Rust evaluates Lua once, validates the settings, and translates them
+into Ghostty configuration arguments. Ghostty's normal configuration files remain
+the base; Lua overrides them, and explicit command-line options override Lua.
+The picker still imports Ghostty's resolved font and tracks its cell dimensions.
+Changes to Lua require restarting the app; callbacks and live reload are not yet supported.
+
 The Rust source is divided by responsibility: `app.rs` owns the native window
 and event loop, `terminal.rs` coordinates the embedded surface, `ffi.rs`
 contains the C boundary, `painter.rs` presents Ghostty's OpenGL textures,
 `input.rs` translates egui input, and `search.rs` owns search state and
 matching. `presentation.rs` owns presentation pacing and detects changes to
 egui's drawing commands; `frame_trace.rs` owns timing diagnostics. `main.rs`
-only collects process arguments and starts the app.
+loads Lua settings through `config.rs`, collects process arguments, and starts the app.
 
 Input updates run promptly, independently of presentation pacing. Completed
 terminal frame notifications are coalesced, and the host acquires the newest
@@ -49,7 +72,7 @@ Snapshot generations and per-query revisions prevent completed work for an
 older snapshot or query from replacing current results. Closing search waits
 for the worker to stop reading before releasing the snapshot.
 
-Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> on Windows and Linux to
+Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>/</kbd> on Windows and Linux to
 open the search overlay. Rust consumes this shortcut before forwarding input
 to Ghostty; Ghostty search keybindings do not control the sample's search UI.
 Search queries, result highlighting, match selection,
@@ -96,6 +119,22 @@ and clears the typed prefix. Other scrolling is blocked while labels are display
 Labels are rendered by
 Ghostty using generic printable-ASCII cell text overrides; the frozen terminal
 text stays unchanged.
+
+Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> to open the scrollback fuzzy
+picker from terminal or copy mode. Nonblank logical lines stream newest first
+from a frozen snapshot into `nfm-search-core`. Type to filter; Ctrl+N/P, arrows,
+and Page Up/Down move through results. Enter enters copy mode at the first
+nonblank cell of the selected line. Escape returns to the originating mode.
+Results fill upward from the query, with the first result at the bottom.
+Arrow and page keys follow that visual direction; Ctrl+N/P move to the next
+or previous result in ranking order.
+There is no preview. The sample currently uses the local `nfm_search_core` crate
+at `G:/src/RustWin32Host/nfm-search-core`; adjust its Cargo path on other machines.
+
+The picker imports Ghostty's resolved primary regular and bold fonts and uses the current
+terminal cell dimensions to size its text and rows, including zoom and DPI changes.
+Matched positions use bold orange text; selection uses a background highlight.
+Unsupported non-SFNT font formats use egui's monospace fallback.
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter the initial copy
 mode. Ghostty freezes the visible terminal and scrollback while the live PTY

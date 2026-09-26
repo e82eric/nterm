@@ -17,6 +17,10 @@ glutin = "=0.32.3"
 glutin-winit = "=0.5.0"
 regex = "1.13"
 unicode-segmentation = "1.13"
+crossbeam-channel = "0.5"
+mlua = { version = "0.9.9", features = ["lua54", "vendored", "serialize"] }
+serde = { version = "1", features = ["derive"] }
+nfm_search_core = { path = "G:/src/RustWin32Host/nfm-search-core" }
 
 [build-dependencies]
 cc = "1.2"

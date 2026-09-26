@@ -5,6 +5,24 @@ pub(crate) struct Host(c_void);
 
 #[repr(C)]
 #[derive(Default)]
+pub(crate) struct FontData {
+    pub(crate) data: *mut u8,
+    pub(crate) len: usize,
+    pub(crate) face_index: u32,
+}
+
+#[repr(C)]
+pub(crate) struct SurfaceSize {
+    pub(crate) columns: u16,
+    pub(crate) rows: u16,
+    pub(crate) width_px: u32,
+    pub(crate) height_px: u32,
+    pub(crate) cell_width_px: u32,
+    pub(crate) cell_height_px: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
 pub(crate) struct GlFrame {
     pub(crate) handle: *mut c_void,
     pub(crate) texture: u32,
@@ -102,6 +120,13 @@ pub(crate) struct SnapshotTextRow {
 }
 
 unsafe extern "C" {
+    pub(crate) fn ghostty_egui_host_read_font(
+        host: *mut Host,
+        bold: bool,
+        result: *mut FontData,
+    ) -> bool;
+    pub(crate) fn ghostty_font_data_free(result: *mut FontData);
+    pub(crate) fn ghostty_egui_host_surface_size(host: *mut Host) -> SurfaceSize;
     pub(crate) fn ghostty_egui_host_create(
         argc: usize,
         argv: *mut *mut c_char,

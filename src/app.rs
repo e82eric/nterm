@@ -176,6 +176,8 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
         egui.egui_ctx.add_plugin(UiChanges::default());
         let proxy = self.proxy.clone();
+        egui.egui_ctx
+            .global_style_mut(|style| style.animation_time = 0.0);
         egui.egui_ctx.set_request_repaint_callback(move |info| {
             if let Some(deadline) = Instant::now().checked_add(info.delay) {
                 let _ = proxy.send_event(UserEvent::Repaint(deadline));
