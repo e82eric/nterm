@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) const YANK_HIGHLIGHT_DURATION: Duration = Duration::from_millis(250);
+pub(crate) const SCROLL_PADDING_ROWS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Motion {
@@ -465,16 +466,26 @@ pub(crate) enum VisualMode {
     Linewise,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ViewportPosition {
+    Top,
+    Center,
+    Bottom,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct CopyMode {
     pub(crate) generation: Option<u64>,
     pub(crate) cursor: SnapshotCell,
     pub(crate) visual_anchor: Option<SnapshotCell>,
     pub(crate) visual_mode: VisualMode,
+    pub(crate) visual_trim: bool,
+    pub(crate) pending_visual_object: Option<(WordObject, u32)>,
     preferred_x: u32,
     columns: u32,
     rows: u64,
     pub(crate) pending_g: bool,
+    pub(crate) pending_z: bool,
     pub(crate) pending_count: Option<u32>,
     pub(crate) pending_jump: Option<(bool, bool)>,
     pub(crate) pending_yank: Option<YankPending>,
@@ -488,10 +499,13 @@ impl CopyMode {
         self.cursor = state.cursor;
         self.visual_anchor = None;
         self.visual_mode = VisualMode::Characterwise;
+        self.visual_trim = true;
+        self.pending_visual_object = None;
         self.preferred_x = state.cursor.x;
         self.columns = state.columns;
         self.rows = state.total_rows;
         self.pending_g = false;
+        self.pending_z = false;
         self.pending_count = None;
         self.pending_jump = None;
         self.pending_yank = None;
@@ -630,6 +644,8 @@ impl CopyMode {
     }
 
     pub(crate) fn toggle_visual(&mut self, mode: VisualMode) {
+        self.pending_visual_object = None;
+        self.visual_trim = true;
         if self.visual_anchor.is_some() && self.visual_mode == mode {
             self.visual_anchor = None;
         } else {
@@ -638,6 +654,27 @@ impl CopyMode {
             }
             self.visual_mode = mode;
         }
+    }
+
+    pub(crate) fn begin_visual_object(&mut self, object: WordObject) -> bool {
+        if self.visual_anchor.is_none() {
+            return false;
+        }
+        self.pending_visual_object = Some((object, self.take_count()));
+        self.pending_g = false;
+        self.pending_jump = None;
+        true
+    }
+
+    /// Replace the selection with an object; repeated objects do not yet
+    /// expand an existing selection as Vim does.
+    pub(crate) fn select_visual_object(&mut self, range: SnapshotCellRange, trim: bool) {
+        self.visual_anchor = Some(range.start);
+        self.visual_mode = VisualMode::Characterwise;
+        self.visual_trim = trim;
+        self.moved(Motion::CharacterJump, range.end);
+        self.pending_visual_object = None;
+        self.pending_count = None;
     }
 
     pub(crate) fn visual_range_to(&self, cursor: SnapshotCell) -> Option<SnapshotCellRange> {
@@ -947,6 +984,29 @@ impl CopyMode {
 
     pub(crate) fn total_rows(&self) -> u64 {
         self.rows
+    }
+
+    pub(crate) fn positioned_viewport_top(
+        &self,
+        position: ViewportPosition,
+        view: SnapshotView,
+    ) -> Option<u64> {
+        if view.viewport_rows == 0 || view.total_rows != self.rows || view.columns != self.columns {
+            return None;
+        }
+        let height = u64::from(view.viewport_rows);
+        let padding = u64::from(SCROLL_PADDING_ROWS).min((height - 1) / 2);
+        let offset = match position {
+            ViewportPosition::Top => padding,
+            ViewportPosition::Center => height / 2,
+            ViewportPosition::Bottom => height - 1 - padding,
+        };
+        Some(
+            self.cursor
+                .y
+                .saturating_sub(offset)
+                .min(self.rows.saturating_sub(height)),
+        )
     }
 
     /// Evaluate without changing the displayed cursor. Operators can reject a
@@ -1480,6 +1540,130 @@ pub(crate) fn word_search_pattern(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_positioning_preserves_cursor_and_selection_and_clamps() {
+        let mut mode = copy_at(3, 50, 100);
+        mode.toggle_visual(VisualMode::Characterwise);
+        mode.moved(Motion::Down, SnapshotCell { x: 3, y: 52 });
+        let cursor = mode.cursor;
+        let anchor = mode.visual_anchor;
+        let view = SnapshotView {
+            columns: mode.columns,
+            total_rows: 100,
+            viewport_rows: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Top, view),
+            Some(49)
+        );
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Center, view),
+            Some(42)
+        );
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Bottom, view),
+            Some(36)
+        );
+        assert_eq!(mode.cursor, cursor);
+        assert_eq!(mode.visual_anchor, anchor);
+        mode.cursor.y = 2;
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Center, view),
+            Some(0)
+        );
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Bottom, view),
+            Some(0)
+        );
+        mode.cursor.y = 99;
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Top, view),
+            Some(80)
+        );
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Center, view),
+            Some(80)
+        );
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Bottom, view),
+            Some(80)
+        );
+        let empty_view = SnapshotView {
+            viewport_rows: 0,
+            ..view
+        };
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Top, empty_view),
+            None
+        );
+        let mismatched = SnapshotView {
+            total_rows: 99,
+            ..view
+        };
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Top, mismatched),
+            None
+        );
+        let short_view = SnapshotView {
+            total_rows: 5,
+            viewport_rows: 20,
+            ..view
+        };
+        let mode = copy_at(0, 2, 5);
+        assert_eq!(
+            mode.positioned_viewport_top(ViewportPosition::Top, short_view),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn visual_word_objects_replace_selection_and_keep_motions_available() {
+        for (object, end, trim) in [(WordObject::Inner, 2, true), (WordObject::Around, 3, false)] {
+            let mut mode = copy_at(1, 0, 1);
+            mode.toggle_visual(VisualMode::Linewise);
+            assert!(mode.begin_visual_object(object));
+            let (object, count) = mode.pending_visual_object.unwrap();
+            let range = mode
+                .word_object_range(count, object, false, |_| Some(row("foo bar", false)))
+                .unwrap();
+            mode.select_visual_object(range, trim);
+            assert_eq!(mode.visual_mode, VisualMode::Characterwise);
+            assert_eq!(mode.visual_anchor, Some(SnapshotCell { x: 0, y: 0 }));
+            assert_eq!(mode.cursor, SnapshotCell { x: end, y: 0 });
+            assert_eq!(mode.visual_range_to(mode.cursor), Some(range));
+            assert_eq!(mode.visual_trim, trim);
+            assert!(mode.pending_visual_object.is_none());
+            // Subsequent motion extends the selection without losing its anchor.
+            mode.moved(Motion::Right, SnapshotCell { x: end + 1, y: 0 });
+            assert_eq!(mode.visual_range_to(mode.cursor).unwrap().end.x, end + 1);
+        }
+    }
+
+    #[test]
+    fn counted_visual_objects_cross_soft_wraps_and_reset_pending_state() {
+        let mut mode = copy_at(1, 0, 2);
+        assert!(!mode.begin_visual_object(WordObject::Inner));
+        mode.toggle_visual(VisualMode::Characterwise);
+        mode.add_count_digit(2);
+        assert!(mode.begin_visual_object(WordObject::Inner));
+        let (object, count) = mode.pending_visual_object.unwrap();
+        assert_eq!(count, 2);
+        assert!(mode.pending_count.is_none());
+        let rows = [row("foo", true), row("bar baz qux", false)];
+        let range = mode
+            .word_object_range(count, object, false, |y| rows.get(y as usize).cloned())
+            .unwrap();
+        mode.select_visual_object(range, true);
+        assert_eq!(range.start, SnapshotCell { x: 0, y: 0 });
+        assert_eq!(range.end, SnapshotCell { x: 6, y: 1 });
+        assert_eq!(mode.cursor, range.end);
+        assert_eq!(mode.visual_range_to(mode.cursor), Some(range));
+        mode.begin_visual_object(WordObject::Around);
+        mode.toggle_visual(VisualMode::Linewise);
+        assert!(mode.pending_visual_object.is_none());
+    }
 
     #[test]
     fn evaluation_distinguishes_partial_motion_and_invalid_snapshot() {

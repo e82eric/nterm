@@ -60,6 +60,14 @@ pub(crate) struct SnapshotDecorationLayer {
 }
 
 #[repr(C)]
+#[derive(Default)]
+pub(crate) struct SnapshotViewportOptions {
+    pub(crate) reveal: *const SnapshotCell,
+    pub(crate) padding_rows: u32,
+    pub(crate) top_row: *const u64,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SnapshotTextPoint {
     pub(crate) x: u16,
@@ -159,7 +167,7 @@ unsafe extern "C" {
         generation: u64,
         layers: *const SnapshotDecorationLayer,
         count: usize,
-        reveal: *const SnapshotCell,
+        viewport: *const SnapshotViewportOptions,
     ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_decorations_need_refresh(
         host: *mut Host,

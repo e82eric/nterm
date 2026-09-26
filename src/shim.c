@@ -198,9 +198,9 @@ void ghostty_egui_host_snapshot_text_row_free(ghostty_snapshot_text_row_s *resul
 bool ghostty_egui_host_snapshot_apply_decorations(
     GhosttyEguiHost *host, uint64_t generation,
     const ghostty_snapshot_decoration_layer_s *layers, size_t count,
-    const ghostty_snapshot_cell_s *reveal
+    const ghostty_snapshot_viewport_options_s *viewport
 ) { return ghostty_surface_snapshot_apply_decorations(
-    host->surface, generation, layers, count, reveal
+    host->surface, generation, layers, count, viewport
 ); }
 bool ghostty_egui_host_snapshot_decorations_need_refresh(
     GhosttyEguiHost *host, uint64_t generation

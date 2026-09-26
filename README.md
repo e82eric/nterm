@@ -100,6 +100,12 @@ last nonblank cell on the current row. <kbd>w</kbd>, <kbd>b</kbd>, and
 and <kbd>t</kbd>/<kbd>T</kbd> jump to or before/after a character on the
 current row; <kbd>;</kbd> repeats the jump and <kbd>,</kbd> reverses it.
 <kbd>%</kbd> matches nested parentheses, brackets, or braces across rows.
+Use <kbd>zt</kbd>, <kbd>zz</kbd>, or <kbd>zb</kbd> to place the copy cursor's
+row at the top, center, or bottom of the viewport without moving the cursor
+or changing the selection. Placement clamps at the scrollback boundaries.
+Copy motions, search-match navigation, and <kbd>zt</kbd>/<kbd>zb</kbd> keep
+three rows of padding above and below the cursor when possible. Short viewports
+reduce the padding; <kbd>zz</kbd> keeps the cursor centered.
 Prefix a motion with a count, such as <kbd>10j</kbd>, <kbd>3w</kbd>, or
 <kbd>2f:</kbd>. <kbd>3gg</kbd>/<kbd>3G</kbd> go to the third snapshot row;
 <kbd>50%</kbd> goes halfway through the snapshot. <kbd>ge</kbd>/<kbd>gE</kbd>
@@ -127,6 +133,13 @@ backticks, and either side of <kbd>()</kbd>, <kbd>[]</kbd>, <kbd>{}</kbd>, or
 motions, including <kbd>yw</kbd>, <kbd>yb</kbd>, <kbd>yj</kbd>, <kbd>ygg</kbd>,
 <kbd>yf:</kbd>, and <kbd>y;</kbd>. Counts such as <kbd>2yy</kbd>,
 <kbd>2yiw</kbd>, and <kbd>y3w</kbd> are supported.
+While visual mode is active, <kbd>i</kbd>/<kbd>a</kbd> select the same text
+objects: <kbd>viw</kbd>/<kbd>vaw</kbd>, <kbd>viW</kbd>/<kbd>vaW</kbd>, quotes,
+brackets, and <kbd>vic</kbd>/<kbd>vac</kbd> for command blocks. Counts such as
+<kbd>v2iw</kbd> are supported. Selecting an object replaces the current
+selection and switches to characterwise visual mode; use motions to extend it
+or <kbd>y</kbd> to copy it and stay in copy mode. Repeated text objects do not
+yet expand existing selections as Vim does.
 <kbd>yic</kbd>/<kbd>yac</kbd> copy a command's output or the prompt and output
 using prompt regexes over the frozen scrollback. The four patterns copied
 from the reference WezTerm configuration are hardcoded in
