@@ -400,6 +400,17 @@ impl TerminalView {
                     break;
                 }
                 egui::Event::Key {
+                    key: key @ (egui::Key::PageUp | egui::Key::PageDown),
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers == egui::Modifiers::NONE => {
+                    if !self.page_quick_select(key == egui::Key::PageDown) {
+                        self.cancel_quick_select();
+                        break;
+                    }
+                }
+                egui::Event::Key {
                     key: egui::Key::Backspace,
                     pressed: true,
                     ..
@@ -466,6 +477,36 @@ impl TerminalView {
     }
 
     fn publish_quick_select(&self) -> bool {
+        self.publish_quick_select_with_viewport(std::ptr::null())
+    }
+
+    fn page_quick_select(&mut self, down: bool) -> bool {
+        let Some(quick) = &self.quick_select else {
+            return false;
+        };
+        let (generation, from_copy) = (quick.generation, quick.from_copy);
+        let mut view = SnapshotView::default();
+        if !unsafe { ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) } {
+            return false;
+        }
+        let view = QuickSelect::paged_view(view, down);
+        let Some(quick) = QuickSelect::new(generation, from_copy, view, |row| {
+            self.read_snapshot_row(generation, row)
+        }) else {
+            return false;
+        };
+        self.quick_select = Some(quick);
+        // Move the viewport and replace labels in the same Ghostty operation.
+        let viewport = SnapshotViewportOptions {
+            top_row: &view.viewport_top,
+            ..Default::default()
+        };
+        let published = self.publish_quick_select_with_viewport(&viewport);
+        self.wake.context.request_repaint();
+        published
+    }
+
+    fn publish_quick_select_with_viewport(&self, viewport: *const SnapshotViewportOptions) -> bool {
         let Some(quick) = &self.quick_select else {
             return false;
         };
@@ -488,6 +529,7 @@ impl TerminalView {
                 1,
                 text.as_ptr(),
                 text.len(),
+                viewport,
             )
         }
     }

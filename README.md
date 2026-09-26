@@ -89,7 +89,9 @@ remaining letters stay yellow. Backspace removes
 a prefix character.
 Escape (or Alt+Space again) returns to the previous mode. Quick select reuses
 the existing copy snapshot and preserves its cursor and selection on cancel.
-The viewport stays fixed while labels are displayed. Labels are rendered by
+Page Up/Down moves through the frozen scrollback, regenerates visible labels,
+and clears the typed prefix. Other scrolling is blocked while labels are displayed.
+Labels are rendered by
 Ghostty using generic printable-ASCII cell text overrides; the frozen terminal
 text stays unchanged.
 

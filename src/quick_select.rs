@@ -21,6 +21,17 @@ pub(crate) struct QuickSelect {
 }
 
 impl QuickSelect {
+    pub(crate) fn paged_view(mut view: SnapshotView, down: bool) -> SnapshotView {
+        let height = u64::from(view.viewport_rows);
+        let max_top = view.total_rows.saturating_sub(height);
+        view.viewport_top = if down {
+            view.viewport_top.saturating_add(height).min(max_top)
+        } else {
+            view.viewport_top.saturating_sub(height).min(max_top)
+        };
+        view
+    }
+
     pub(crate) fn new(
         generation: u64,
         from_copy: bool,
@@ -190,6 +201,42 @@ pub(crate) fn consume_shortcut(events: &mut Vec<egui::Event>) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paging_clamps_to_scrollback_and_rebuilds_labels_without_prefix() {
+        let view = SnapshotView {
+            viewport_top: 4,
+            viewport_rows: 3,
+            total_rows: 8,
+            columns: 20,
+            ..Default::default()
+        };
+        assert_eq!(QuickSelect::paged_view(view, true).viewport_top, 5);
+        let up = QuickSelect::paged_view(view, false);
+        assert_eq!(up.viewport_top, 1);
+        assert_eq!(QuickSelect::paged_view(up, false).viewport_top, 0);
+        let short = SnapshotView {
+            total_rows: 2,
+            ..view
+        };
+        assert_eq!(QuickSelect::paged_view(short, true).viewport_top, 0);
+        let read = |row| {
+            Some(TextRow {
+                text: format!("row{row}"),
+                columns: vec![0, 1, 2, 3],
+                wraps_to_next: false,
+            })
+        };
+        let mut initial = QuickSelect::new(42, true, view, read).unwrap();
+        initial.prefix = "a".into();
+        let paged = QuickSelect::new(42, initial.from_copy, up, read).unwrap();
+        assert!(paged.prefix.is_empty());
+        assert_eq!(paged.generation, 42);
+        assert!(paged.from_copy);
+        assert_eq!(paged.hints.len(), 3);
+        assert_eq!(paged.hints[0].range.start.y, 3);
+        assert_eq!(paged.hints[2].range.start.y, 1);
+    }
 
     #[test]
     fn alt_space_is_consumed_once_with_its_paired_text() {

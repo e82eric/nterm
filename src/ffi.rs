@@ -189,6 +189,7 @@ unsafe extern "C" {
         count: usize,
         text: *const SnapshotCellText,
         text_count: usize,
+        viewport: *const SnapshotViewportOptions,
     ) -> bool;
     pub(crate) fn ghostty_egui_host_text(host: *mut Host, text: *const c_char, len: usize);
     pub(crate) fn ghostty_egui_host_preedit(host: *mut Host, text: *const c_char, len: usize);

@@ -244,9 +244,10 @@ bool ghostty_egui_host_snapshot_apply_decorations(
 bool ghostty_egui_host_snapshot_apply_cell_text(
     GhosttyEguiHost *host, uint64_t generation,
     const ghostty_snapshot_decoration_layer_s *layers, size_t count,
-    const ghostty_snapshot_cell_text_s *text, size_t text_count
+    const ghostty_snapshot_cell_text_s *text, size_t text_count,
+    const ghostty_snapshot_viewport_options_s *viewport
 ) { return ghostty_surface_snapshot_apply_decorations(
-    host->surface, generation, layers, count, text, text_count, NULL
+    host->surface, generation, layers, count, text, text_count, viewport
 ); }
 bool ghostty_egui_host_snapshot_decorations_need_refresh(
     GhosttyEguiHost *host, uint64_t generation
