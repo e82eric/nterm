@@ -100,6 +100,11 @@ last nonblank cell on the current row. <kbd>w</kbd>, <kbd>b</kbd>, and
 and <kbd>t</kbd>/<kbd>T</kbd> jump to or before/after a character on the
 current row; <kbd>;</kbd> repeats the jump and <kbd>,</kbd> reverses it.
 <kbd>%</kbd> matches nested parentheses, brackets, or braces across rows.
+Use <kbd>Ctrl</kbd>+<kbd>E</kbd>/<kbd>Y</kbd> to scroll down/up one physical
+row, or prefix a count to scroll multiple rows. The cursor stays on its cell
+until scrolling would move it outside the padded viewport. Visual selections
+keep their anchor fixed while scrolling.
+
 Use <kbd>zt</kbd>, <kbd>zz</kbd>, or <kbd>zb</kbd> to place the copy cursor's
 row at the top, center, or bottom of the viewport without moving the cursor
 or changing the selection. Placement clamps at the scrollback boundaries.
@@ -115,6 +120,10 @@ previous row; <kbd>_</kbd> does so on the current row (or the counted row).
 <kbd>*</kbd>/<kbd>#</kbd> search for the word under the copy cursor toward
 newer/older output. <kbd>n</kbd> repeats that direction and <kbd>N</kbd>
 reverses it; matches wrap around the frozen scrollback.
+In visual mode, <kbd>o</kbd> or <kbd>O</kbd> swaps the cursor and selection
+anchor so you can extend the other end. Both keys behave the same for the
+supported characterwise and linewise selections.
+
 Press <kbd>v</kbd> to start characterwise visual selection, then use any copy
 motion to extend it. Press <kbd>V</kbd> to select complete logical lines,
 including all rows of a wrapped line. Press the active visual key again or

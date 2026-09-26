@@ -656,6 +656,16 @@ impl CopyMode {
         }
     }
 
+    pub(crate) fn swap_visual_endpoint(&mut self) -> bool {
+        let Some(anchor) = self.visual_anchor else {
+            return false;
+        };
+        self.visual_anchor = Some(self.cursor);
+        self.cursor = anchor;
+        self.preferred_x = anchor.x;
+        true
+    }
+
     pub(crate) fn begin_visual_object(&mut self, object: WordObject) -> bool {
         if self.visual_anchor.is_none() {
             return false;
@@ -1007,6 +1017,47 @@ impl CopyMode {
                 .saturating_sub(offset)
                 .min(self.rows.saturating_sub(height)),
         )
+    }
+
+    /// Scroll physical rows, moving the cursor only to keep it within the
+    /// padded viewport. The caller resolves wide cells before publishing.
+    pub(crate) fn scrolled_viewport_target(
+        &self,
+        down: bool,
+        count: u32,
+        view: SnapshotView,
+    ) -> Option<(u64, SnapshotCell)> {
+        if self.rows == 0
+            || self.columns == 0
+            || view.viewport_rows == 0
+            || view.total_rows != self.rows
+            || view.columns != self.columns
+        {
+            return None;
+        }
+        let height = u64::from(view.viewport_rows).min(self.rows);
+        let max_top = self.rows - height;
+        let current = view.viewport_top.min(max_top);
+        let top = if down {
+            current.saturating_add(u64::from(count)).min(max_top)
+        } else {
+            current.saturating_sub(u64::from(count))
+        };
+        // A clamped scroll at either boundary must not move the cursor.
+        if top == current {
+            return Some((top, self.cursor));
+        }
+        let padding = u64::from(SCROLL_PADDING_ROWS).min((height - 1) / 2);
+        let y = self
+            .cursor
+            .y
+            .clamp(top + padding, top + height - 1 - padding);
+        let x = if y == self.cursor.y {
+            self.cursor.x
+        } else {
+            self.preferred_x.min(self.columns - 1)
+        };
+        Some((top, SnapshotCell { x, y }))
     }
 
     /// Evaluate without changing the displayed cursor. Operators can reject a
@@ -1540,6 +1591,108 @@ pub(crate) fn word_search_pattern(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visual_endpoint_swap_preserves_range_and_updates_preferred_column() {
+        for visual in [VisualMode::Characterwise, VisualMode::Linewise] {
+            let mut mode = copy_at(3, 50, 100);
+            assert!(!mode.swap_visual_endpoint());
+            mode.toggle_visual(visual);
+            mode.moved(Motion::Right, SnapshotCell { x: 7, y: 55 });
+            let range = mode.visual_range_to(mode.cursor);
+            assert!(mode.swap_visual_endpoint());
+            assert_eq!(mode.cursor, SnapshotCell { x: 3, y: 50 });
+            assert_eq!(mode.visual_anchor, Some(SnapshotCell { x: 7, y: 55 }));
+            assert_eq!(mode.visual_range_to(mode.cursor), range);
+            assert_eq!(mode.visual_mode, visual);
+            assert_eq!(mode.move_to(Motion::Down, None).unwrap().0.x, 3);
+            assert!(mode.swap_visual_endpoint());
+            assert_eq!(mode.cursor, SnapshotCell { x: 7, y: 55 });
+        }
+    }
+
+    #[test]
+    fn viewport_scrolling_counts_padding_boundaries_and_selection() {
+        let mut mode = copy_at(3, 50, 100);
+        mode.toggle_visual(VisualMode::Characterwise);
+        let view = SnapshotView {
+            columns: mode.columns,
+            total_rows: 100,
+            viewport_top: 40,
+            viewport_rows: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            mode.scrolled_viewport_target(true, 1, view),
+            Some((41, mode.cursor))
+        );
+        assert_eq!(
+            mode.scrolled_viewport_target(false, 1, view),
+            Some((39, mode.cursor))
+        );
+        assert_eq!(
+            mode.scrolled_viewport_target(true, 10, view),
+            Some((50, SnapshotCell { x: 3, y: 53 }))
+        );
+        assert_eq!(
+            mode.scrolled_viewport_target(false, 10, view),
+            Some((30, SnapshotCell { x: 3, y: 46 }))
+        );
+        assert_eq!(
+            mode.scrolled_viewport_target(true, u32::MAX, view),
+            Some((80, SnapshotCell { x: 3, y: 83 }))
+        );
+        assert_eq!(
+            mode.scrolled_viewport_target(false, u32::MAX, view),
+            Some((0, SnapshotCell { x: 3, y: 16 }))
+        );
+        assert_eq!(mode.visual_anchor, Some(mode.cursor));
+        assert_eq!(
+            mode.scrolled_viewport_target(
+                false,
+                1,
+                SnapshotView {
+                    viewport_top: 0,
+                    ..view
+                }
+            ),
+            Some((0, mode.cursor))
+        );
+        assert_eq!(
+            mode.scrolled_viewport_target(
+                true,
+                1,
+                SnapshotView {
+                    viewport_top: 80,
+                    ..view
+                }
+            ),
+            Some((80, mode.cursor))
+        );
+        assert_eq!(
+            mode.scrolled_viewport_target(
+                true,
+                1,
+                SnapshotView {
+                    viewport_rows: 1,
+                    viewport_top: 49,
+                    ..view
+                }
+            ),
+            Some((50, mode.cursor))
+        );
+        assert!(
+            mode.scrolled_viewport_target(
+                true,
+                1,
+                SnapshotView {
+                    viewport_rows: 0,
+                    ..view
+                }
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn viewport_positioning_preserves_cursor_and_selection_and_clamps() {

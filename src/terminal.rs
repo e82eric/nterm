@@ -710,6 +710,29 @@ impl TerminalView {
                 }
                 continue;
             }
+            if !self.copy_mode.pending_g
+                && key == egui::Key::O
+                && (modifiers == egui::Modifiers::NONE || modifiers == egui::Modifiers::SHIFT)
+            {
+                self.copy_mode.pending_count = None;
+                if self.copy_mode.swap_visual_endpoint() {
+                    let generation = self.copy_mode.generation.unwrap();
+                    if !self.publish_copy_decoration(generation, self.copy_mode.cursor, true) {
+                        self.close_copy_mode();
+                        break;
+                    }
+                }
+                continue;
+            }
+            if !self.copy_mode.pending_g
+                && let Some(down) = copy_scroll_direction(key, modifiers)
+            {
+                let count = self.copy_mode.take_count();
+                if !self.scroll_copy_viewport(down, count) {
+                    break;
+                }
+                continue;
+            }
             if modifiers == egui::Modifiers::NONE && key == egui::Key::Z {
                 self.copy_mode.pending_z = true;
                 self.copy_mode.pending_g = false;
@@ -817,6 +840,36 @@ impl TerminalView {
             }
         }
         was_active || self.copy_mode.generation.is_some() || handled
+    }
+
+    fn scroll_copy_viewport(&mut self, down: bool, count: u32) -> bool {
+        let generation = self.copy_mode.generation.expect("copy mode is active");
+        let mut view = SnapshotView::default();
+        if !unsafe { ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) } {
+            self.close_copy_mode();
+            return false;
+        }
+        let Some((top, requested)) = self.copy_mode.scrolled_viewport_target(down, count, view)
+        else {
+            self.close_copy_mode();
+            return false;
+        };
+        let Some(actual) = self.resolve_copy_cell(generation, requested, false) else {
+            self.close_copy_mode();
+            return false;
+        };
+        let viewport = SnapshotViewportOptions {
+            top_row: &top,
+            ..Default::default()
+        };
+        if !self.publish_copy_decoration_with_viewport(generation, actual, &viewport) {
+            self.close_copy_mode();
+            return false;
+        }
+        self.copy_mode
+            .moved(if down { Motion::Down } else { Motion::Up }, actual);
+        self.wake.context.request_repaint();
+        true
     }
 
     fn position_copy_viewport(&mut self, position: ViewportPosition) -> bool {
@@ -1652,6 +1705,18 @@ fn copy_text_object_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<Co
     }
 }
 
+fn copy_scroll_direction(key: egui::Key, modifiers: egui::Modifiers) -> Option<bool> {
+    // egui-winit also sets `command` for Ctrl on Windows and Linux.
+    if !modifiers.ctrl || modifiers.shift || modifiers.alt || modifiers.mac_cmd {
+        return None;
+    }
+    match key {
+        egui::Key::E => Some(true),
+        egui::Key::Y => Some(false),
+        _ => None,
+    }
+}
+
 fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
     use egui::Key;
     if modifiers.alt || modifiers.mac_cmd {
@@ -1771,6 +1836,42 @@ fn copy_jump_prefix(key: egui::Key, modifiers: egui::Modifiers) -> Option<(bool,
 
 #[cfg(test)]
 mod copy_shortcut_tests {
+    #[test]
+    fn scroll_shortcuts_accept_platform_command_alias_for_control() {
+        use super::copy_scroll_direction;
+        for command in [false, true] {
+            let modifiers = egui::Modifiers {
+                ctrl: true,
+                command,
+                ..Default::default()
+            };
+            assert_eq!(copy_scroll_direction(egui::Key::E, modifiers), Some(true));
+            assert_eq!(copy_scroll_direction(egui::Key::Y, modifiers), Some(false));
+            assert_eq!(copy_scroll_direction(egui::Key::U, modifiers), None);
+            for invalid in [
+                egui::Modifiers {
+                    shift: true,
+                    ..modifiers
+                },
+                egui::Modifiers {
+                    alt: true,
+                    ..modifiers
+                },
+                egui::Modifiers {
+                    mac_cmd: true,
+                    ..modifiers
+                },
+                egui::Modifiers {
+                    ctrl: false,
+                    ..modifiers
+                },
+            ] {
+                assert_eq!(copy_scroll_direction(egui::Key::E, invalid), None);
+                assert_eq!(copy_scroll_direction(egui::Key::Y, invalid), None);
+            }
+        }
+    }
+
     #[test]
     fn viewport_position_keys_require_unmodified_z_suffixes() {
         use super::{ViewportPosition, copy_viewport_position_key};
