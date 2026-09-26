@@ -1,6 +1,8 @@
 use crate::app::UserEvent;
 use crate::copy_mode::{
-    CopyMode, Jump, Motion, TextRow, VisualMode, next_match_cell, word_search_pattern,
+    CopyMode, Jump, Motion, MotionEvaluation, MotionResult, TextRow, VisualMode, WordObject,
+    YANK_HIGHLIGHT_DURATION, YankPending, find_prompt_boundaries, next_match_cell,
+    word_search_pattern,
 };
 use crate::ffi::{
     self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
@@ -14,6 +16,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
 struct WakeState {
@@ -96,6 +99,7 @@ pub(crate) struct TerminalView {
     search_worker: SearchWorker,
     copy_mode: CopyMode,
     copy_search: CopySearch,
+    prompt_boundaries: Option<(u64, Vec<u64>)>,
 }
 
 #[derive(Default)]
@@ -160,6 +164,7 @@ impl TerminalView {
             search_worker: SearchWorker::new(egui_ctx.clone()),
             copy_mode: CopyMode::default(),
             copy_search: CopySearch::default(),
+            prompt_boundaries: None,
         }
     }
 
@@ -215,12 +220,24 @@ impl TerminalView {
             unsafe { ffi::ghostty_egui_host_focus(self.host, focused) };
         }
 
+        if let Some(generation) = self.copy_mode.generation {
+            let now = Instant::now();
+            if self.copy_mode.clear_expired_yank_highlight(now) {
+                self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+            } else if let Some(remaining) = self.copy_mode.yank_highlight_remaining(now) {
+                ui.ctx().request_repaint_after(remaining);
+            }
+        }
+
         ui.painter().add(egui::PaintCallback {
             rect,
             callback: self.paint_callback.clone(),
         });
 
-        let keyboard_blocked = self.handle_copy_keys(ui);
+        // Search may surrender text-field focus when Enter transfers its
+        // snapshot to copy mode. Consume that frame's input even after the
+        // overlay closes, so Enter is never also sent to the PTY.
+        let keyboard_blocked = self.handle_copy_keys(ui) || self.search.active;
         self.show_search_overlay(ui.ctx());
         let scrolled = input::forward(self.host, self.size, ui, rect, scale, keyboard_blocked);
         if (scrolled || resized)
@@ -387,6 +404,57 @@ impl TerminalView {
         }
         state.cursor = actual;
         self.copy_mode.start(generation, state);
+        self.prompt_boundaries = None;
+        self.wake.context.request_repaint();
+    }
+
+    fn accept_search(&mut self) {
+        // A single-line TextEdit can surrender focus on Enter. Keep search
+        // usable if no match is ready yet or the query has no valid result.
+        self.search.focus_requested = true;
+        self.wake.context.request_repaint();
+        if self.search.waiting || self.pending_search_snapshot.is_some() {
+            self.search.accept_requested = true;
+            return;
+        }
+        self.search.accept_requested = false;
+        let Some(target) = self.search.copy_target() else {
+            return;
+        };
+        let Some(generation) = self.search.snapshot_generation else {
+            return;
+        };
+        let mut view = SnapshotView::default();
+        if !unsafe { ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) } {
+            return;
+        }
+        let Some(actual) = self.resolve_copy_cell(generation, target, false) else {
+            return;
+        };
+        self.search_worker.cancel_and_wait();
+        // Transfer ownership instead of closing search: ending this snapshot
+        // would invalidate the match coordinates and briefly show live output.
+        let mut search = std::mem::take(&mut self.search);
+        search.matches.reverse();
+        view.cursor = actual;
+        self.copy_mode.start(generation, view);
+        self.copy_search = CopySearch {
+            cursor: search.cursor,
+            query_revision: search.query_revision,
+            matches: search.matches,
+            forward: false,
+            ..Default::default()
+        };
+        self.pending_search_snapshot = None;
+        self.prompt_boundaries = None;
+        self.wake.context.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+        if !self.publish_copy_decoration(generation, actual, true) {
+            self.close_copy_mode();
+        }
         self.wake.context.request_repaint();
     }
 
@@ -401,6 +469,7 @@ impl TerminalView {
             unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
             self.copy_mode = CopyMode::default();
             self.copy_search = CopySearch::default();
+            self.prompt_boundaries = None;
             self.wake.context.request_repaint();
         }
     }
@@ -412,13 +481,63 @@ impl TerminalView {
         let mut skip_trigger_text = false;
         for event in events {
             if self.copy_mode.generation.is_none() {
-                if !self.search.active && is_copy_mode_shortcut(&event) {
+                let command_direction = copy_command_shortcut(&event);
+                if !self.search.active
+                    && (is_copy_mode_shortcut(&event) || command_direction.is_some())
+                {
                     self.open_copy_mode();
                     handled = true;
+                    if let Some(forward) = command_direction {
+                        self.navigate_copy_command(forward, 1);
+                    }
+                }
+                continue;
+            }
+            if let Some(forward) = copy_command_shortcut(&event) {
+                handled = true;
+                let count = self.copy_mode.take_count();
+                self.copy_mode.pending_g = false;
+                self.copy_mode.pending_jump = None;
+                self.copy_mode.pending_yank = None;
+                if !self.navigate_copy_command(forward, count) {
+                    break;
                 }
                 continue;
             }
             if let egui::Event::Text(text) = &event {
+                if let Some(pending) = self.copy_mode.pending_yank
+                    && let Some((forward, till)) = pending.jump
+                {
+                    if skip_trigger_text {
+                        skip_trigger_text = false;
+                        continue;
+                    }
+                    let mut graphemes = text.graphemes(true);
+                    if let Some(target) = graphemes.next()
+                        && graphemes.next().is_none()
+                    {
+                        self.copy_mode.pending_yank = None;
+                        let jump = Jump {
+                            target: target.to_owned(),
+                            forward,
+                            till,
+                        };
+                        self.copy_mode.last_jump = Some(jump.clone());
+                        let generation = self.copy_mode.generation.unwrap();
+                        let count = pending.count.saturating_mul(self.copy_mode.take_count());
+                        if let Some(cell) = self.copy_jump_target(generation, &jump, count)
+                            && let Some((range, linewise)) = self
+                                .copy_mode
+                                .yank_motion_range(Motion::CharacterJump.result(cell), |row| {
+                                    self.read_snapshot_row(generation, row)
+                                })
+                            && self.yank_range(ui.ctx(), generation, range, linewise, true)
+                        {
+                            self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                        }
+                    }
+                    continue;
+                }
                 if let Some((forward, till)) = self.copy_mode.pending_jump {
                     if skip_trigger_text {
                         skip_trigger_text = false;
@@ -453,7 +572,17 @@ impl TerminalView {
                 continue;
             };
             handled = true;
+            // egui 0.36 emits a separate Key event when Shift, Ctrl, Alt, or
+            // Super is pressed. It changes the modifiers on the next key but
+            // is never itself a copy-mode command or an operator target.
+            if is_copy_modifier_key(key) {
+                continue;
+            }
             if key == egui::Key::Escape {
+                if self.copy_mode.pending_yank.take().is_some() {
+                    self.copy_mode.pending_count = None;
+                    continue;
+                }
                 if self.copy_mode.visual_anchor.take().is_some() {
                     self.copy_mode.pending_count = None;
                     self.copy_mode.pending_g = false;
@@ -467,6 +596,148 @@ impl TerminalView {
             }
             if self.copy_mode.pending_jump.is_some() {
                 skip_trigger_text = false;
+                continue;
+            }
+            if let Some(mut pending) = self.copy_mode.pending_yank {
+                if pending.jump.is_some() {
+                    continue;
+                }
+                if modifiers == egui::Modifiers::NONE
+                    && let Some(digit) = copy_digit(key)
+                    && self.copy_mode.add_count_digit(digit)
+                {
+                    continue;
+                }
+                if pending.object.is_none() && modifiers == egui::Modifiers::NONE {
+                    if key == egui::Key::I || key == egui::Key::A {
+                        pending.object = Some(if key == egui::Key::I {
+                            WordObject::Inner
+                        } else {
+                            WordObject::Around
+                        });
+                        self.copy_mode.pending_yank = Some(pending);
+                        continue;
+                    }
+                }
+                if pending.object.is_none()
+                    && let Some(jump) = copy_jump_prefix(key, modifiers)
+                {
+                    pending.jump = Some(jump);
+                    self.copy_mode.pending_yank = Some(pending);
+                    skip_trigger_text = true;
+                    continue;
+                }
+                let pending_motion = if pending.object.is_none() {
+                    copy_motion_with_prefix(&mut self.copy_mode, key, modifiers)
+                } else {
+                    None
+                };
+                if self.copy_mode.pending_g {
+                    self.copy_mode.pending_yank = Some(pending);
+                    continue;
+                }
+                self.copy_mode.pending_yank = None;
+                let count = pending.count.saturating_mul(self.copy_mode.take_count());
+                let generation = self.copy_mode.generation.unwrap();
+                if pending.object.is_none()
+                    && modifiers == egui::Modifiers::NONE
+                    && matches!(key, egui::Key::Semicolon | egui::Key::Comma)
+                {
+                    if let Some(mut jump) = self.copy_mode.last_jump.clone() {
+                        if key == egui::Key::Comma {
+                            jump.forward = !jump.forward;
+                        }
+                        if let Some(cell) = self.copy_jump_target(generation, &jump, count)
+                            && let Some((range, linewise)) = self
+                                .copy_mode
+                                .yank_motion_range(Motion::CharacterJump.result(cell), |row| {
+                                    self.read_snapshot_row(generation, row)
+                                })
+                            && self.yank_range(ui.ctx(), generation, range, linewise, true)
+                        {
+                            self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                        }
+                    }
+                    continue;
+                }
+                let (range, linewise, trim) = match (pending.object, key, modifiers) {
+                    (None, egui::Key::Y, egui::Modifiers::NONE) => (
+                        self.copy_mode
+                            .yank_lines_range(count, |row| self.read_snapshot_row(generation, row)),
+                        true,
+                        true,
+                    ),
+                    (None, egui::Key::Num4, egui::Modifiers::SHIFT) => (
+                        self.copy_mode.yank_to_row_end_range(count, |row| {
+                            self.read_snapshot_row(generation, row)
+                        }),
+                        false,
+                        true,
+                    ),
+                    (Some(object), key, modifiers) => {
+                        let kind = copy_text_object_key(key, modifiers);
+                        let range = match kind {
+                            Some(YankTextObject::Word(big)) => {
+                                self.copy_mode.word_object_range(count, object, big, |row| {
+                                    self.read_snapshot_row(generation, row)
+                                })
+                            }
+                            Some(YankTextObject::Quote(quote)) => {
+                                self.copy_mode.quote_object_range(object, quote, |row| {
+                                    self.read_snapshot_row(generation, row)
+                                })
+                            }
+                            Some(YankTextObject::Delimiter(open, close)) => self
+                                .copy_mode
+                                .delimiter_object_range(object, open, close, |row| {
+                                    self.read_snapshot_row(generation, row)
+                                }),
+                            Some(YankTextObject::Command) => {
+                                if self.ensure_prompt_boundaries(generation) {
+                                    self.copy_mode.command_object_range(
+                                        object,
+                                        count,
+                                        &self.prompt_boundaries.as_ref().unwrap().1,
+                                    )
+                                } else {
+                                    None
+                                }
+                            }
+                            None => None,
+                        };
+                        (
+                            range,
+                            matches!(kind, Some(YankTextObject::Command)),
+                            matches!(kind, Some(YankTextObject::Command))
+                                || (matches!(kind, Some(YankTextObject::Word(_)))
+                                    && object == WordObject::Inner),
+                        )
+                    }
+                    _ => {
+                        let target = pending_motion.and_then(|motion| {
+                            self.copy_motion_target(
+                                generation,
+                                motion,
+                                count,
+                                pending.count > 1 || count > 1,
+                            )
+                            .and_then(|target| {
+                                self.copy_mode.yank_motion_range(target, |row| {
+                                    self.read_snapshot_row(generation, row)
+                                })
+                            })
+                        });
+                        match target {
+                            Some((range, linewise)) => (Some(range), linewise, true),
+                            None => (None, false, true),
+                        }
+                    }
+                };
+                if let Some(range) = range {
+                    if self.yank_range(ui.ctx(), generation, range, linewise, trim) {
+                        self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                    }
+                }
                 continue;
             }
             if key == egui::Key::V
@@ -485,12 +756,20 @@ impl TerminalView {
                 continue;
             }
             if modifiers == egui::Modifiers::NONE && key == egui::Key::Y {
-                self.copy_mode.pending_count = None;
                 self.copy_mode.pending_g = false;
-                if self.yank_visual(ui.ctx()) {
-                    self.copy_mode.visual_anchor = None;
-                    let generation = self.copy_mode.generation.unwrap();
-                    self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                if self.copy_mode.visual_anchor.is_some() {
+                    self.copy_mode.pending_count = None;
+                    if self.yank_visual(ui.ctx()) {
+                        self.copy_mode.visual_anchor = None;
+                        let generation = self.copy_mode.generation.unwrap();
+                        self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                    }
+                } else {
+                    self.copy_mode.pending_yank = Some(YankPending {
+                        count: self.copy_mode.take_count(),
+                        object: None,
+                        jump: None,
+                    });
                 }
                 continue;
             }
@@ -591,70 +870,58 @@ impl TerminalView {
         .then_some(actual)
     }
 
-    fn perform_copy_motion(&mut self, motion: Motion, count: u32, explicit_count: bool) -> bool {
-        let generation = self.copy_mode.generation.expect("copy mode is active");
-        if explicit_count && matches!(motion, Motion::ScrollbackTop | Motion::ScrollbackBottom) {
-            return self
-                .copy_mode
-                .numbered_row_target(count)
-                .is_none_or(|target| self.apply_copy_target(generation, motion, target, false));
-        }
-        if explicit_count && motion == Motion::MatchingBracket {
-            return self
-                .copy_mode
-                .percent_row_target(count)
-                .is_none_or(|target| self.apply_copy_target(generation, motion, target, false));
-        }
-        if matches!(
-            motion,
-            Motion::NextLineNonblank | Motion::PreviousLineNonblank | Motion::LineNonblank
-        ) {
-            let target = self
-                .copy_mode
-                .nonblank_line_target(motion, count, |row| self.read_snapshot_row(generation, row));
-            return target
-                .is_none_or(|target| self.apply_copy_target(generation, motion, target, false));
-        }
+    fn evaluate_copy_motion(
+        &self,
+        generation: u64,
+        motion: Motion,
+        count: u32,
+        explicit_count: bool,
+    ) -> MotionEvaluation {
         let view = if motion.needs_view() {
             let mut view = SnapshotView::default();
             if !unsafe { ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) } {
-                self.close_copy_mode();
-                return false;
+                return MotionEvaluation::InvalidSnapshot;
             }
             Some(view)
         } else {
             None
         };
-        if let Some((target, snap_right)) =
-            self.copy_mode.counted_simple_target(motion, count, view)
-        {
-            return self.apply_copy_target(generation, motion, target, snap_right);
-        }
-        let mut working = self.copy_mode.clone();
-        let mut final_cell = None;
-        for _ in 0..count {
-            let target = if motion.needs_text() {
-                working
-                    .text_target(motion, |row| self.read_snapshot_row(generation, row))
-                    .map(|cell| (cell, false))
-            } else {
-                working.move_to(motion, view)
-            };
-            let Some((requested, snap_right)) = target else {
-                break;
-            };
-            let Some(actual) = self.resolve_copy_cell(generation, requested, snap_right) else {
+        self.copy_mode.evaluate_motion(
+            motion,
+            count,
+            explicit_count,
+            view,
+            |row| self.read_snapshot_row(generation, row),
+            |cell, right| self.resolve_copy_cell(generation, cell, right),
+        )
+    }
+
+    fn perform_copy_motion(&mut self, motion: Motion, count: u32, explicit_count: bool) -> bool {
+        let generation = self.copy_mode.generation.expect("copy mode is active");
+        match self.evaluate_copy_motion(generation, motion, count, explicit_count) {
+            MotionEvaluation::NoMovement => true,
+            MotionEvaluation::Complete(result) | MotionEvaluation::Partial(result) => {
+                self.apply_copy_target(generation, motion, result.target, false)
+            }
+            MotionEvaluation::InvalidSnapshot => {
                 self.close_copy_mode();
-                return false;
-            };
-            let unchanged = actual == working.cursor;
-            working.moved(motion, actual);
-            final_cell = Some(actual);
-            if unchanged {
-                break;
+                false
             }
         }
-        final_cell.is_none_or(|cell| self.apply_copy_target(generation, motion, cell, false))
+    }
+
+    fn copy_motion_target(
+        &self,
+        generation: u64,
+        motion: Motion,
+        count: u32,
+        explicit_count: bool,
+    ) -> Option<MotionResult> {
+        match self.evaluate_copy_motion(generation, motion, count, explicit_count) {
+            MotionEvaluation::Complete(result) => Some(result),
+            // A failed counted operator must not yank an incomplete range.
+            _ => None,
+        }
     }
 
     fn perform_copy_jump(&mut self, jump: &Jump, repeat: bool, count: u32) -> bool {
@@ -669,6 +936,17 @@ impl TerminalView {
             working.moved(Motion::CharacterJump, cell);
         }
         self.apply_copy_target(generation, Motion::CharacterJump, working.cursor, false)
+    }
+
+    fn copy_jump_target(&self, generation: u64, jump: &Jump, count: u32) -> Option<SnapshotCell> {
+        let mut working = self.copy_mode.clone();
+        for index in 0..count {
+            let cell = working.jump_target(jump, index > 0, |row| {
+                self.read_snapshot_row(generation, row)
+            })?;
+            working.moved(Motion::CharacterJump, cell);
+        }
+        Some(working.cursor)
     }
 
     fn read_snapshot_row(&self, generation: u64, row: u64) -> Option<TextRow> {
@@ -695,6 +973,40 @@ impl TerminalView {
         })
     }
 
+    fn ensure_prompt_boundaries(&mut self, generation: u64) -> bool {
+        if self
+            .prompt_boundaries
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == generation)
+        {
+            return true;
+        }
+        let Some(rows) = find_prompt_boundaries(self.copy_mode.total_rows(), |row| {
+            self.read_snapshot_row(generation, row)
+        }) else {
+            return false;
+        };
+        self.prompt_boundaries = Some((generation, rows));
+        true
+    }
+
+    fn navigate_copy_command(&mut self, forward: bool, count: u32) -> bool {
+        let Some(generation) = self.copy_mode.generation else {
+            return false;
+        };
+        if !self.ensure_prompt_boundaries(generation) {
+            return false;
+        }
+        let target = self.copy_mode.command_target(
+            forward,
+            count,
+            &self.prompt_boundaries.as_ref().unwrap().1,
+        );
+        // All configured prompt patterns are anchored at column zero. Reset
+        // the preferred column just as a row-start motion does.
+        target.is_none_or(|cell| self.apply_copy_target(generation, Motion::RowStart, cell, false))
+    }
+
     fn queue_search(&mut self) {
         let Some(snapshot_generation) = self.search.snapshot_generation else {
             return;
@@ -705,6 +1017,7 @@ impl TerminalView {
             self.search.regex,
             self.search.cursor,
         );
+        self.search.waiting = true;
     }
 
     fn apply_search_result(&mut self) {
@@ -742,6 +1055,9 @@ impl TerminalView {
         }
         self.search.apply_result(result.matches, result.error);
         self.publish_search_matches(true);
+        if self.search.accept_requested {
+            self.accept_search();
+        }
     }
 
     fn navigate_search(&mut self, previous: bool) {
@@ -832,9 +1148,22 @@ impl TerminalView {
                 flags: 3,
             },
         };
-        let mut layers = Vec::with_capacity(3);
+        let yank = self.copy_mode.yank_highlight_range();
+        let yank_layer = yank.as_ref().map(|range| SnapshotDecorationLayer {
+            ranges: std::ptr::from_ref(range),
+            range_count: 1,
+            style: SnapshotDecorationStyle {
+                foreground_rgb: 0x282828,
+                background_rgb: 0xd79921,
+                flags: 3,
+            },
+        });
+        let mut layers = Vec::with_capacity(4);
         layers.push(caret_layer);
         if let Some(layer) = selection_layer {
+            layers.push(layer);
+        }
+        if let Some(layer) = yank_layer {
             layers.push(layer);
         }
         layers.push(matches_layer);
@@ -858,19 +1187,37 @@ impl TerminalView {
         }
     }
 
-    fn yank_visual(&self, ctx: &egui::Context) -> bool {
+    fn yank_visual(&mut self, ctx: &egui::Context) -> bool {
         let Some(generation) = self.copy_mode.generation else {
             return false;
         };
         let Some(range) = self.copy_visual_range(generation, self.copy_mode.cursor) else {
             return false;
         };
+        self.yank_range(
+            ctx,
+            generation,
+            range,
+            self.copy_mode.visual_mode == VisualMode::Linewise,
+            true,
+        )
+    }
+
+    fn yank_range(
+        &mut self,
+        ctx: &egui::Context,
+        generation: u64,
+        range: SnapshotCellRange,
+        linewise: bool,
+        trim: bool,
+    ) -> bool {
         let mut result = ffi::SnapshotSelectionText::default();
         if !unsafe {
             ffi::ghostty_egui_host_snapshot_selection_text(
                 self.host,
                 generation,
                 range,
+                trim,
                 &mut result,
             )
         } {
@@ -884,10 +1231,12 @@ impl TerminalView {
         };
         unsafe { ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result) };
         if let Some(mut text) = text {
-            if self.copy_mode.visual_mode == VisualMode::Linewise {
+            if linewise {
                 text.push('\n');
             }
             ctx.copy_text(text);
+            self.copy_mode.highlight_yank(range, Instant::now());
+            ctx.request_repaint_after(YANK_HIGHLIGHT_DURATION);
             true
         } else {
             false
@@ -945,6 +1294,7 @@ impl TerminalView {
         let mut mode_changed = false;
         let mut navigate = None;
         let mut close = false;
+        let mut accept = false;
         let available_width = ctx.content_rect().width();
         let search_width = (available_width - 24.0).max(1.0);
         // Gruvbox dark: lift the search box one shade above the terminal background.
@@ -1037,7 +1387,7 @@ impl TerminalView {
                             match_color,
                         );
 
-                        if response.has_focus() {
+                        if response.has_focus() || response.lost_focus() {
                             if ui.input(|input| {
                                 input.modifiers.ctrl && input.key_pressed(egui::Key::R)
                             }) {
@@ -1050,14 +1400,15 @@ impl TerminalView {
                                     Some(false)
                                 } else if input.modifiers.ctrl && input.key_pressed(egui::Key::P) {
                                     Some(true)
-                                } else if input.key_pressed(egui::Key::Enter) {
-                                    Some(input.modifiers.shift)
                                 } else {
                                     None
                                 }
                             });
                             if search_key.is_some() {
                                 navigate = search_key;
+                            }
+                            if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                                accept = true;
                             }
                             if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                                 close = true;
@@ -1075,6 +1426,7 @@ impl TerminalView {
             });
 
         if query_changed || mode_changed {
+            self.search.accept_requested = false;
             self.queue_search();
         }
         if let Some(previous) = navigate {
@@ -1082,7 +1434,40 @@ impl TerminalView {
         }
         if close {
             self.close_search();
+        } else if accept {
+            self.accept_search();
         }
+    }
+}
+
+fn is_copy_modifier_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ShiftLeft
+            | egui::Key::ShiftRight
+            | egui::Key::ControlLeft
+            | egui::Key::ControlRight
+            | egui::Key::AltLeft
+            | egui::Key::AltRight
+            | egui::Key::SuperLeft
+            | egui::Key::SuperRight
+    )
+}
+
+fn copy_command_shortcut(event: &egui::Event) -> Option<bool> {
+    match event {
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.mac_cmd => match key
+        {
+            egui::Key::ArrowUp => Some(false),
+            egui::Key::ArrowDown => Some(true),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1093,6 +1478,37 @@ fn is_copy_mode_shortcut(event: &egui::Event) -> bool {
         modifiers,
         ..
     } if modifiers.ctrl && modifiers.shift)
+}
+
+#[derive(Clone, Copy)]
+enum YankTextObject {
+    Word(bool),
+    Quote(char),
+    Delimiter(char, char),
+    Command,
+}
+
+fn copy_text_object_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<YankTextObject> {
+    use egui::Key;
+    if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd {
+        return None;
+    }
+    match key {
+        Key::W => Some(YankTextObject::Word(modifiers.shift)),
+        Key::C if !modifiers.shift => Some(YankTextObject::Command),
+        Key::Quote => Some(YankTextObject::Quote(if modifiers.shift {
+            '"'
+        } else {
+            '\''
+        })),
+        Key::Backtick => Some(YankTextObject::Quote('`')),
+        Key::Num9 if modifiers.shift => Some(YankTextObject::Delimiter('(', ')')),
+        Key::Num0 if modifiers.shift => Some(YankTextObject::Delimiter('(', ')')),
+        Key::OpenBracket | Key::CloseBracket => Some(YankTextObject::Delimiter('[', ']')),
+        Key::OpenCurlyBracket | Key::CloseCurlyBracket => Some(YankTextObject::Delimiter('{', '}')),
+        Key::Comma | Key::Period if modifiers.shift => Some(YankTextObject::Delimiter('<', '>')),
+        _ => None,
+    }
 }
 
 fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
@@ -1215,8 +1631,99 @@ fn copy_jump_prefix(key: egui::Key, modifiers: egui::Modifiers) -> Option<(bool,
 #[cfg(test)]
 mod copy_shortcut_tests {
     use super::{
-        copy_digit, copy_jump_prefix, copy_motion, copy_motion_with_prefix, is_copy_mode_shortcut,
+        YankTextObject, copy_command_shortcut, copy_digit, copy_jump_prefix, copy_motion,
+        copy_motion_with_prefix, copy_text_object_key, is_copy_mode_shortcut, is_copy_modifier_key,
     };
+
+    #[test]
+    fn command_shortcuts_require_ctrl_shift_arrows_and_a_key_press() {
+        let event = |key, modifiers, pressed| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            copy_command_shortcut(&event(egui::Key::ArrowUp, modifiers, true)),
+            Some(false)
+        );
+        assert_eq!(
+            copy_command_shortcut(&event(egui::Key::ArrowDown, modifiers, true)),
+            Some(true)
+        );
+        assert_eq!(
+            copy_command_shortcut(&event(egui::Key::ArrowUp, modifiers, false)),
+            None
+        );
+        assert_eq!(
+            copy_command_shortcut(&event(egui::Key::ArrowUp, egui::Modifiers::CTRL, true)),
+            None
+        );
+        assert_eq!(
+            copy_command_shortcut(&event(egui::Key::ArrowUp, egui::Modifiers::SHIFT, true)),
+            None
+        );
+        assert_eq!(
+            copy_command_shortcut(&event(
+                egui::Key::ArrowUp,
+                egui::Modifiers {
+                    alt: true,
+                    ..modifiers
+                },
+                true
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn standalone_modifier_events_do_not_consume_yank_targets() {
+        for key in [
+            egui::Key::ShiftLeft,
+            egui::Key::ShiftRight,
+            egui::Key::ControlLeft,
+            egui::Key::ControlRight,
+            egui::Key::AltLeft,
+            egui::Key::AltRight,
+            egui::Key::SuperLeft,
+            egui::Key::SuperRight,
+        ] {
+            assert!(is_copy_modifier_key(key));
+        }
+        assert!(!is_copy_modifier_key(egui::Key::W));
+        assert!(!is_copy_modifier_key(egui::Key::Escape));
+    }
+
+    #[test]
+    fn yank_text_object_keys_include_shifted_big_words_and_delimiters() {
+        let shift = egui::Modifiers::SHIFT;
+        assert!(matches!(
+            copy_text_object_key(egui::Key::W, shift),
+            Some(YankTextObject::Word(true))
+        ));
+        assert!(matches!(
+            copy_text_object_key(egui::Key::W, egui::Modifiers::NONE),
+            Some(YankTextObject::Word(false))
+        ));
+        assert!(matches!(
+            copy_text_object_key(egui::Key::Quote, shift),
+            Some(YankTextObject::Quote('"'))
+        ));
+        assert!(matches!(
+            copy_text_object_key(egui::Key::OpenCurlyBracket, shift),
+            Some(YankTextObject::Delimiter('{', '}'))
+        ));
+        assert!(matches!(
+            copy_text_object_key(egui::Key::C, egui::Modifiers::NONE),
+            Some(YankTextObject::Command)
+        ));
+    }
 
     #[test]
     fn copy_mode_shortcut_requires_ctrl_shift_m() {

@@ -61,10 +61,14 @@ lines, so patterns do not span newlines. Invalid regexes appear in the search
 bar. Canonically equivalent Unicode spellings are not normalized.
 Ghostty renders the selected match and other matches as ordered decoration
 layers on the frozen snapshot. PTY output
-continues updating the live terminal behind the snapshot. Press Enter or use
-<kbd>Ctrl</kbd>+<kbd>N</kbd> for the next older result, Shift+Enter or
+continues updating the live terminal behind the snapshot. Press
+<kbd>Ctrl</kbd>+<kbd>N</kbd> for the next older result,
 <kbd>Ctrl</kbd>+<kbd>P</kbd> for the previous newer result, and Escape to close
-the overlay and reveal the newest live state.
+the overlay and reveal the newest live state. Enter closes the search field
+and enters copy mode at the selected match's first cell, preserving the frozen
+snapshot. If a query is still running, Enter waits for its result; no matches
+or an invalid regex leave search open. In copy mode, <kbd>n</kbd>/<kbd>N</kbd>
+can continue navigating the transferred matches.
 
 While the search field is focused, <kbd>Ctrl</kbd>+<kbd>N</kbd> selects the
 next older match and <kbd>Ctrl</kbd>+<kbd>P</kbd> selects the previous newer
@@ -75,8 +79,13 @@ When the search field is focused, paste remains within the search query.
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter the initial copy
 mode. Ghostty freezes the visible terminal and scrollback while the live PTY
-keeps running. A steady, styled cell marks the terminal's insertion point;
-move it with <kbd>h</kbd>/<kbd>j</kbd>/<kbd>k</kbd>/<kbd>l</kbd> or the arrow
+keeps running. A steady, styled cell marks the terminal's insertion point.
+<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Up</kbd>/<kbd>Down</kbd> also enter copy
+mode and move to the previous/next regex-matched command prompt. In copy mode,
+the same shortcuts navigate commands; a count such as <kbd>3</kbd> followed
+by <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Up</kbd> skips three prompts. Navigation
+stops at the first or last command without wrapping.
+Move the cursor with <kbd>h</kbd>/<kbd>j</kbd>/<kbd>k</kbd>/<kbd>l</kbd> or the arrow
 keys. <kbd>H</kbd>/<kbd>M</kbd>/<kbd>L</kbd> move to the top, middle, or bottom
 visible row. Page Up/Down move a full screen, and <kbd>Ctrl</kbd>+<kbd>U</kbd>/
 <kbd>Ctrl</kbd>+<kbd>D</kbd> move half a screen. Movement scrolls the frozen
@@ -105,7 +114,26 @@ Escape to cancel the selection; pressing the other visual key switches modes.
 Press <kbd>y</kbd> to copy the selected text to the system clipboard. Linewise
 copies end with a newline. Copy mode
 stays open so you can navigate or select again. With no selection, <kbd>y</kbd>
-does nothing. Press Escape outside visual selection to return to the live
+waits for a yank target: <kbd>yy</kbd> copies the current logical line,
+<kbd>y$</kbd> copies through the last nonblank cell of the current physical
+row. <kbd>yiw</kbd>/<kbd>yaw</kbd> copy a word without or with adjacent
+whitespace; <kbd>yiW</kbd>/<kbd>yaW</kbd> treat punctuation as part of the word.
+The <kbd>i</kbd>/<kbd>a</kbd> text objects also accept single or double quotes,
+backticks, and either side of <kbd>()</kbd>, <kbd>[]</kbd>, <kbd>{}</kbd>, or
+<kbd>&lt;&gt;</kbd>. For example, <kbd>yi(</kbd> excludes the parentheses and
+<kbd>ya"</kbd> includes the quotes. <kbd>y</kbd> also accepts the copy-mode
+motions, including <kbd>yw</kbd>, <kbd>yb</kbd>, <kbd>yj</kbd>, <kbd>ygg</kbd>,
+<kbd>yf:</kbd>, and <kbd>y;</kbd>. Counts such as <kbd>2yy</kbd>,
+<kbd>2yiw</kbd>, and <kbd>y3w</kbd> are supported.
+<kbd>yic</kbd>/<kbd>yac</kbd> copy a command's output or the prompt and output
+using prompt regexes over the frozen scrollback. The four patterns copied
+from the reference WezTerm configuration are hardcoded in
+`src/copy_mode.rs` for now, with Lua configuration planned for later.
+Like WezTerm, a command block ends immediately before the next matching
+prompt line. Text that resembles a prompt can create a false boundary.
+Every successful yank briefly highlights the copied cells for 250 ms; a new
+yank replaces and restarts the highlight.
+Escape cancels a pending yank. Press Escape outside visual selection to return to the live
 terminal.
 
 The native C Win32 sample remains available through

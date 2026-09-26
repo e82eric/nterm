@@ -25,6 +25,8 @@ pub(crate) struct SearchUi {
     pub(crate) selected: Option<usize>,
     pub(crate) focus_requested: bool,
     pub(crate) query_revision: u64,
+    pub(crate) waiting: bool,
+    pub(crate) accept_requested: bool,
 }
 
 impl SearchUi {
@@ -32,6 +34,7 @@ impl SearchUi {
         self.matches = matches;
         self.selected = (!self.matches.is_empty()).then_some(0);
         self.error = error;
+        self.waiting = false;
     }
 
     pub(crate) fn navigate(&mut self, previous: bool) {
@@ -49,6 +52,13 @@ impl SearchUi {
 
     pub(crate) fn selected_range(&self) -> Option<&SnapshotCellRange> {
         self.selected.and_then(|index| self.matches.get(index))
+    }
+
+    pub(crate) fn copy_target(&self) -> Option<SnapshotCell> {
+        if !self.active || self.waiting || self.error.is_some() {
+            return None;
+        }
+        self.selected_range().map(|range| range.start)
     }
 
     pub(crate) fn match_label(&self) -> String {
@@ -353,9 +363,37 @@ impl LineScan {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineScan, find_search_matches_cancellable};
+    use super::{LineScan, SearchUi, find_search_matches_cancellable};
     use crate::ffi::{SnapshotCell, SnapshotCellRange, SnapshotTextPoint};
     use regex::{Regex, RegexBuilder};
+
+    #[test]
+    fn copy_target_uses_selected_start_and_rejects_pending_or_invalid_results() {
+        let mut search = SearchUi {
+            active: true,
+            ..Default::default()
+        };
+        let matches = vec![
+            SnapshotCellRange {
+                start: SnapshotCell { x: 4, y: 20 },
+                end: SnapshotCell { x: 7, y: 20 },
+            },
+            SnapshotCellRange {
+                start: SnapshotCell { x: 2, y: 10 },
+                end: SnapshotCell { x: 1, y: 11 },
+            },
+        ];
+        search.apply_result(matches, None);
+        search.navigate(false);
+        assert_eq!(search.copy_target(), Some(SnapshotCell { x: 2, y: 10 }));
+        search.waiting = true;
+        assert_eq!(search.copy_target(), None);
+        search.waiting = false;
+        search.error = Some("invalid regex".into());
+        assert_eq!(search.copy_target(), None);
+        search.apply_result(Vec::new(), None);
+        assert_eq!(search.copy_target(), None);
+    }
 
     fn feed(scan: &mut LineScan, text: &str, row_base: u64) {
         let points: Vec<_> = (0..text.len())

@@ -1,5 +1,11 @@
 use crate::ffi::{SnapshotCell, SnapshotCellRange, SnapshotView};
+use regex::RegexSet;
+use std::collections::VecDeque;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
+
+pub(crate) const YANK_HIGHLIGHT_DURATION: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Motion {
@@ -35,6 +41,42 @@ pub(crate) enum Motion {
 }
 
 impl Motion {
+    pub(crate) fn result(self, target: SnapshotCell) -> MotionResult {
+        let kind = if matches!(
+            self,
+            Self::Up
+                | Self::Down
+                | Self::ScrollbackTop
+                | Self::ScrollbackBottom
+                | Self::ViewportTop
+                | Self::ViewportMiddle
+                | Self::ViewportBottom
+                | Self::PageUp
+                | Self::PageDown
+                | Self::HalfPageUp
+                | Self::HalfPageDown
+                | Self::NextLineNonblank
+                | Self::PreviousLineNonblank
+                | Self::LineNonblank
+        ) {
+            RangeKind::Linewise
+        } else {
+            RangeKind::Characterwise
+        };
+        let endpoint = if matches!(
+            self,
+            Self::ForwardWord | Self::ForwardBigWord | Self::BackwardWord | Self::BackwardBigWord
+        ) {
+            Endpoint::Exclusive
+        } else {
+            Endpoint::Inclusive
+        };
+        MotionResult {
+            target,
+            kind,
+            endpoint,
+        }
+    }
     pub(crate) fn needs_view(self) -> bool {
         matches!(
             self,
@@ -70,11 +112,79 @@ impl Motion {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RangeKind {
+    Characterwise,
+    Linewise,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Endpoint {
+    Inclusive,
+    Exclusive,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MotionResult {
+    pub(crate) target: SnapshotCell,
+    pub(crate) kind: RangeKind,
+    pub(crate) endpoint: Endpoint,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MotionEvaluation {
+    NoMovement,
+    Complete(MotionResult),
+    Partial(MotionResult),
+    InvalidSnapshot,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TextRow {
     pub(crate) text: String,
     pub(crate) columns: Vec<u32>,
     pub(crate) wraps_to_next: bool,
+}
+
+fn prompt_patterns() -> &'static RegexSet {
+    static PATTERNS: OnceLock<RegexSet> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        // Copied from the reference WezTerm config.prompt_patterns.
+        // Keep these here until the sample has Lua configuration.
+        RegexSet::new([
+            r"^PS [^>]*>\s*",
+            r"^\d+:\d+>\s*",
+            r"^›\s*",
+            r"^────────────────────*",
+        ])
+        .expect("valid hardcoded prompt patterns")
+    })
+}
+
+/// Prompt regexes operate on logical lines, so a soft-wrapped prompt is
+/// matched once at its first physical row. The snapshot never changes.
+pub(crate) fn find_prompt_boundaries(
+    rows: u64,
+    mut read: impl FnMut(u64) -> Option<TextRow>,
+) -> Option<Vec<u64>> {
+    let mut boundaries = Vec::new();
+    let mut line = String::new();
+    let mut line_start = 0;
+    for y in 0..rows {
+        let row = read(y)?;
+        if y == 0 {
+            line_start = y;
+        }
+        line.push_str(&row.text);
+        if !row.wraps_to_next || y + 1 == rows {
+            if prompt_patterns().is_match(&line) {
+                boundaries.push(line_start);
+            }
+            line.clear();
+            line_start = y + 1;
+        }
+    }
+    Some(boundaries)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +199,219 @@ struct Glyph {
     x: u32,
     class: WordClass,
     nonblank: bool,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
+#[derive(Clone, Copy)]
+struct ScannedGlyph {
+    cell: SnapshotCell,
+    class: WordClass,
+    first: char,
+    single: bool,
+}
+
+enum TextStep {
+    Glyph(ScannedGlyph),
+    LineBreak,
+    EmptyRow,
+}
+
+/// Row-at-a-time traversal shared by motions and delimiter scans. Soft wraps
+/// preserve word continuity; hard breaks are explicit events. Only the current
+/// row's graphemes are retained, even when scanning a large scrollback.
+struct TextScanner<'a, F> {
+    read: &'a mut F,
+    rows: u64,
+    y: u64,
+    direction: Direction,
+    big: bool,
+    glyphs: std::vec::IntoIter<ScannedGlyph>,
+    wraps: bool,
+    loaded: bool,
+    finished: bool,
+}
+
+impl<'a, F: FnMut(u64) -> Option<TextRow>> TextScanner<'a, F> {
+    fn new(read: &'a mut F, rows: u64, y: u64, direction: Direction, big: bool) -> Self {
+        Self {
+            read,
+            rows,
+            y,
+            direction,
+            big,
+            glyphs: Vec::new().into_iter(),
+            wraps: false,
+            loaded: false,
+            finished: false,
+        }
+    }
+
+    fn load(&mut self) -> Option<()> {
+        let row = (self.read)(self.y)?;
+        self.wraps = row.wraps_to_next;
+        let mut glyphs: Vec<_> = row
+            .glyphs(self.big)
+            .into_iter()
+            .map(|glyph| {
+                let mut chars = row.text[glyph.byte_start..glyph.byte_end].chars();
+                ScannedGlyph {
+                    cell: SnapshotCell {
+                        x: glyph.x,
+                        y: self.y,
+                    },
+                    class: glyph.class,
+                    first: chars.next().unwrap(),
+                    single: chars.next().is_none(),
+                }
+            })
+            .collect();
+        if matches!(self.direction, Direction::Backward) {
+            glyphs.reverse();
+        }
+        self.glyphs = glyphs.into_iter();
+        self.loaded = true;
+        Some(())
+    }
+}
+
+impl<F: FnMut(u64) -> Option<TextRow>> Iterator for TextScanner<'_, F> {
+    type Item = TextStep;
+
+    fn next(&mut self) -> Option<TextStep> {
+        if self.finished {
+            return None;
+        }
+        loop {
+            if !self.loaded && (self.y >= self.rows || self.load().is_none()) {
+                self.finished = true;
+                return None;
+            }
+            if let Some(glyph) = self.glyphs.next() {
+                return Some(TextStep::Glyph(glyph));
+            }
+            let previous_wraps = self.wraps;
+            let next = match self.direction {
+                Direction::Forward => self.y.checked_add(1).filter(|&y| y < self.rows),
+                Direction::Backward => self.y.checked_sub(1),
+            };
+            let Some(y) = next else {
+                self.finished = true;
+                return None;
+            };
+            self.y = y;
+            if self.load().is_none() {
+                self.finished = true;
+                return None;
+            }
+            let hard_break = match self.direction {
+                Direction::Forward => !previous_wraps,
+                Direction::Backward => !self.wraps,
+            };
+            if hard_break {
+                return Some(TextStep::LineBreak);
+            }
+            if self.glyphs.len() == 0 {
+                return Some(TextStep::EmptyRow);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WordObject {
+    Inner,
+    Around,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct YankPending {
+    pub(crate) count: u32,
+    pub(crate) object: Option<WordObject>,
+    pub(crate) jump: Option<(bool, bool)>,
+}
+
+#[derive(Clone, Copy)]
+struct LocatedGlyph {
+    cell: SnapshotCell,
+    class: WordClass,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+struct LogicalWordLine {
+    text: String,
+    glyphs: Vec<LocatedGlyph>,
+}
+
+struct WordSpan {
+    start: usize,
+    end: usize,
+}
+
+fn word_span_at(
+    glyphs: &[LocatedGlyph],
+    cursor: SnapshotCell,
+    keywords_only: bool,
+) -> Option<WordSpan> {
+    let cursor_at = (cursor.y, cursor.x);
+    let index = if keywords_only {
+        // Search chooses a keyword on the cursor's physical row, then expands
+        // through soft wraps. It must not choose a word on another row.
+        glyphs
+            .iter()
+            .position(|glyph| {
+                glyph.cell.y == cursor.y
+                    && glyph.cell.x >= cursor.x
+                    && glyph.class == WordClass::Keyword
+            })
+            .or_else(|| {
+                glyphs.iter().rposition(|glyph| {
+                    glyph.cell.y == cursor.y
+                        && glyph.cell.x <= cursor.x
+                        && glyph.class == WordClass::Keyword
+                })
+            })?
+    } else {
+        let cursor_index = glyphs
+            .iter()
+            .position(|glyph| (glyph.cell.y, glyph.cell.x) >= cursor_at)
+            .or_else(|| glyphs.len().checked_sub(1))?;
+        if glyphs[cursor_index].class == WordClass::Whitespace {
+            glyphs[cursor_index..]
+                .iter()
+                .position(|glyph| glyph.class != WordClass::Whitespace)
+                .map(|offset| cursor_index + offset)
+                .or_else(|| {
+                    glyphs[..cursor_index]
+                        .iter()
+                        .rposition(|glyph| glyph.class != WordClass::Whitespace)
+                })?
+        } else {
+            cursor_index
+        }
+    };
+    let mut start = index;
+    while start > 0 && glyphs[start - 1].class == glyphs[index].class {
+        start -= 1;
+    }
+    let mut end = index + 1;
+    while end < glyphs.len() && glyphs[end].class == glyphs[index].class {
+        end += 1;
+    }
+    Some(WordSpan { start, end })
+}
+
+#[derive(Clone, Copy)]
+struct YankHighlight {
+    range: SnapshotCellRange,
+    expires_at: Instant,
 }
 
 impl TextRow {
@@ -120,6 +443,8 @@ impl TextRow {
                     x,
                     class,
                     nonblank: grapheme != " ",
+                    byte_start: byte,
+                    byte_end: byte + grapheme.len(),
                 })
             })
             .collect()
@@ -152,6 +477,8 @@ pub(crate) struct CopyMode {
     pub(crate) pending_g: bool,
     pub(crate) pending_count: Option<u32>,
     pub(crate) pending_jump: Option<(bool, bool)>,
+    pub(crate) pending_yank: Option<YankPending>,
+    yank_highlight: Option<YankHighlight>,
     pub(crate) last_jump: Option<Jump>,
 }
 
@@ -167,12 +494,22 @@ impl CopyMode {
         self.pending_g = false;
         self.pending_count = None;
         self.pending_jump = None;
+        self.pending_yank = None;
+        self.yank_highlight = None;
         self.last_jump = None;
     }
 
     pub(crate) fn move_to(
         &self,
         motion: Motion,
+        view: Option<SnapshotView>,
+    ) -> Option<(SnapshotCell, bool)> {
+        self.simple_target(motion, 1, view)
+    }
+    fn simple_target(
+        &self,
+        motion: Motion,
+        count: u32,
         view: Option<SnapshotView>,
     ) -> Option<(SnapshotCell, bool)> {
         if self.columns == 0 || self.rows == 0 {
@@ -188,11 +525,11 @@ impl CopyMode {
             Motion::ScrollbackTop => cell.y = 0,
             Motion::ScrollbackBottom => cell.y = last_row,
             Motion::Up => {
-                cell.y = cell.y.saturating_sub(1);
+                cell.y = cell.y.saturating_sub(u64::from(count));
                 cell.x = self.preferred_x.min(self.columns - 1);
             }
             Motion::Down => {
-                cell.y = cell.y.saturating_add(1).min(last_row);
+                cell.y = cell.y.saturating_add(u64::from(count)).min(last_row);
                 cell.x = self.preferred_x.min(self.columns - 1);
             }
             Motion::ViewportTop | Motion::ViewportMiddle | Motion::ViewportBottom => {
@@ -208,9 +545,9 @@ impl CopyMode {
                     .saturating_add(u64::from(view.viewport_rows - 1))
                     .min(last_row);
                 cell.y = match motion {
-                    Motion::ViewportTop => top,
+                    Motion::ViewportTop => top.saturating_add(u64::from(count - 1)).min(bottom),
                     Motion::ViewportMiddle => top + (bottom - top + 1) / 2,
-                    Motion::ViewportBottom => bottom,
+                    Motion::ViewportBottom => bottom.saturating_sub(u64::from(count - 1)).max(top),
                     _ => unreachable!(),
                 };
                 cell.x = self.preferred_x.min(self.columns - 1);
@@ -230,9 +567,11 @@ impl CopyMode {
                     rows
                 };
                 cell.y = if matches!(motion, Motion::PageUp | Motion::HalfPageUp) {
-                    cell.y.saturating_sub(step)
+                    cell.y.saturating_sub(step.saturating_mul(u64::from(count)))
                 } else {
-                    cell.y.saturating_add(step).min(last_row)
+                    cell.y
+                        .saturating_add(step.saturating_mul(u64::from(count)))
+                        .min(last_row)
                 };
                 cell.x = self.preferred_x.min(self.columns - 1);
             }
@@ -263,6 +602,33 @@ impl CopyMode {
         }
     }
 
+    pub(crate) fn highlight_yank(&mut self, range: SnapshotCellRange, now: Instant) {
+        self.yank_highlight = Some(YankHighlight {
+            range,
+            expires_at: now + YANK_HIGHLIGHT_DURATION,
+        });
+    }
+
+    pub(crate) fn yank_highlight_range(&self) -> Option<SnapshotCellRange> {
+        self.yank_highlight.map(|highlight| highlight.range)
+    }
+
+    pub(crate) fn yank_highlight_remaining(&self, now: Instant) -> Option<Duration> {
+        self.yank_highlight
+            .map(|highlight| highlight.expires_at.saturating_duration_since(now))
+    }
+
+    pub(crate) fn clear_expired_yank_highlight(&mut self, now: Instant) -> bool {
+        if self
+            .yank_highlight
+            .is_some_and(|highlight| now >= highlight.expires_at)
+        {
+            self.yank_highlight = None;
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn toggle_visual(&mut self, mode: VisualMode) {
         if self.visual_anchor.is_some() && self.visual_mode == mode {
             self.visual_anchor = None;
@@ -289,22 +655,8 @@ impl CopyMode {
         cursor: SnapshotCell,
         mut read: impl FnMut(u64) -> Option<TextRow>,
     ) -> Option<SnapshotCellRange> {
-        let anchor = self.visual_anchor?;
-        let last_col = self.columns.checked_sub(1)?;
-        let (anchor_start, anchor_end) = self.logical_line_bounds(anchor.y, &mut read)?;
-        let (cursor_start, cursor_end) = self.logical_line_bounds(cursor.y, &mut read)?;
-        Some(SnapshotCellRange {
-            start: SnapshotCell {
-                x: 0,
-                y: anchor_start.min(cursor_start),
-            },
-            end: SnapshotCell {
-                x: last_col,
-                y: anchor_end.max(cursor_end),
-            },
-        })
+        self.logical_line_range_between(self.visual_anchor?.y, cursor.y, &mut read)
     }
-
     fn logical_line_bounds(
         &self,
         row: u64,
@@ -322,6 +674,410 @@ impl CopyMode {
             end += 1;
         }
         Some((start, end))
+    }
+
+    pub(crate) fn yank_lines_range(
+        &self,
+        count: u32,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCellRange> {
+        let (start, mut end) = self.logical_line_bounds(self.cursor.y, &mut read)?;
+        for _ in 1..count {
+            if end >= self.rows - 1 {
+                break;
+            }
+            (_, end) = self.logical_line_bounds(end + 1, &mut read)?;
+        }
+        Some(SnapshotCellRange {
+            start: SnapshotCell { x: 0, y: start },
+            end: SnapshotCell {
+                x: self.columns.checked_sub(1)?,
+                y: end,
+            },
+        })
+    }
+
+    pub(crate) fn yank_to_row_end_range(
+        &self,
+        count: u32,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCellRange> {
+        let y = self
+            .cursor
+            .y
+            .saturating_add(u64::from(count.checked_sub(1)?));
+        let y = y.min(self.rows.checked_sub(1)?);
+        let end_x = read(y)?
+            .glyphs(false)
+            .iter()
+            .rev()
+            .find(|glyph| glyph.nonblank)
+            .map_or(0, |glyph| glyph.x);
+        let end = SnapshotCell { x: end_x, y };
+        ((end.y, end.x) >= (self.cursor.y, self.cursor.x)).then_some(SnapshotCellRange {
+            start: self.cursor,
+            end,
+        })
+    }
+
+    pub(crate) fn yank_motion_range(
+        &self,
+        result: MotionResult,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<(SnapshotCellRange, bool)> {
+        if result.kind == RangeKind::Linewise {
+            return Some((
+                self.logical_line_range_between(self.cursor.y, result.target.y, &mut read)?,
+                true,
+            ));
+        }
+        let a = self.cursor;
+        let b = result.target;
+        let (start, mut end) = if (a.y, a.x) <= (b.y, b.x) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        if result.endpoint == Endpoint::Exclusive {
+            end = self.previous_text_cell(end, &mut read)?;
+        }
+        ((start.y, start.x) <= (end.y, end.x)).then_some((SnapshotCellRange { start, end }, false))
+    }
+
+    fn logical_line_range_between(
+        &self,
+        a: u64,
+        b: u64,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCellRange> {
+        let (a_start, a_end) = self.logical_line_bounds(a, read)?;
+        let (b_start, b_end) = if a == b {
+            (a_start, a_end)
+        } else {
+            self.logical_line_bounds(b, read)?
+        };
+        Some(SnapshotCellRange {
+            start: SnapshotCell {
+                x: 0,
+                y: a_start.min(b_start),
+            },
+            end: SnapshotCell {
+                x: self.columns.checked_sub(1)?,
+                y: a_end.max(b_end),
+            },
+        })
+    }
+    fn previous_text_cell(
+        &self,
+        cell: SnapshotCell,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCell> {
+        for y in (0..=cell.y).rev() {
+            let row = read(y)?;
+            if let Some((x, _)) = row
+                .grapheme_cells()
+                .into_iter()
+                .rev()
+                .find(|(x, _)| y < cell.y || *x < cell.x)
+            {
+                return Some(SnapshotCell { x, y });
+            }
+        }
+        None
+    }
+
+    pub(crate) fn word_object_range(
+        &self,
+        count: u32,
+        object: WordObject,
+        big: bool,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCellRange> {
+        let line = self.logical_word_line(big, &mut read)?;
+        let glyphs = &line.glyphs;
+        let WordSpan { mut start, mut end } = word_span_at(glyphs, self.cursor, false)?;
+        for _ in 1..count {
+            let Some(next) = glyphs[end..]
+                .iter()
+                .position(|glyph| glyph.class != WordClass::Whitespace)
+                .map(|offset| end + offset)
+            else {
+                break;
+            };
+            end = next + 1;
+            while end < glyphs.len() && glyphs[end].class == glyphs[next].class {
+                end += 1;
+            }
+        }
+        if object == WordObject::Around {
+            if end < glyphs.len() && glyphs[end].class == WordClass::Whitespace {
+                while end < glyphs.len() && glyphs[end].class == WordClass::Whitespace {
+                    end += 1;
+                }
+            } else {
+                while start > 0 && glyphs[start - 1].class == WordClass::Whitespace {
+                    start -= 1;
+                }
+            }
+        }
+        Some(SnapshotCellRange {
+            start: glyphs[start].cell,
+            end: glyphs[end - 1].cell,
+        })
+    }
+
+    pub(crate) fn quote_object_range(
+        &self,
+        object: WordObject,
+        quote: char,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCellRange> {
+        let (first, last) = self.logical_line_bounds(self.cursor.y, &mut read)?;
+        let mut quotes = Vec::new();
+        for y in first..=last {
+            let row = read(y)?;
+            let mut escaped = false;
+            for (x, grapheme) in row.grapheme_cells() {
+                if grapheme == "\\" {
+                    escaped = !escaped;
+                } else {
+                    if grapheme.starts_with(quote) && !escaped {
+                        quotes.push(SnapshotCell { x, y });
+                    }
+                    escaped = false;
+                }
+            }
+        }
+        let cursor = (self.cursor.y, self.cursor.x);
+        for pair in quotes.chunks_exact(2) {
+            if (pair[0].y, pair[0].x) <= cursor && cursor <= (pair[1].y, pair[1].x) {
+                return self.bounded_object_range(pair[0], pair[1], object, &mut read);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn delimiter_object_range(
+        &self,
+        object: WordObject,
+        open: char,
+        close: char,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCellRange> {
+        let cursor = (self.cursor.y, self.cursor.x);
+        let mut depth = 0usize;
+        let mut opener = None;
+        for step in TextScanner::new(
+            &mut read,
+            self.rows,
+            self.cursor.y,
+            Direction::Backward,
+            false,
+        ) {
+            let TextStep::Glyph(glyph) = step else {
+                continue;
+            };
+            if (glyph.cell.y, glyph.cell.x) > cursor {
+                continue;
+            }
+            if glyph.first == close {
+                depth += 1;
+            }
+            if glyph.first == open {
+                if depth == 0 {
+                    opener = Some(glyph.cell);
+                    break;
+                }
+                depth -= 1;
+            }
+        }
+        let opener = opener?;
+        depth = 0;
+        let mut closer = None;
+        for step in TextScanner::new(&mut read, self.rows, opener.y, Direction::Forward, false) {
+            let TextStep::Glyph(glyph) = step else {
+                continue;
+            };
+            if (glyph.cell.y, glyph.cell.x) < (opener.y, opener.x) {
+                continue;
+            }
+            if glyph.first == open {
+                depth += 1;
+            }
+            if glyph.first == close {
+                depth -= 1;
+                if depth == 0 {
+                    closer = Some(glyph.cell);
+                    break;
+                }
+            }
+        }
+        self.bounded_object_range(opener, closer?, object, &mut read)
+    }
+    pub(crate) fn command_object_range(
+        &self,
+        object: WordObject,
+        count: u32,
+        boundaries: &[u64],
+    ) -> Option<SnapshotCellRange> {
+        let index = boundaries
+            .partition_point(|&y| y <= self.cursor.y)
+            .checked_sub(1)?;
+        let prompt = boundaries[index];
+        let mut end = self.rows.checked_sub(1)?;
+        if let Some(&next) = boundaries.get(index.saturating_add(count as usize)) {
+            end = next.checked_sub(1)?;
+        }
+        let start = if object == WordObject::Around {
+            prompt
+        } else {
+            prompt + 1
+        };
+        if start > end {
+            return None;
+        }
+        Some(SnapshotCellRange {
+            start: SnapshotCell { x: 0, y: start },
+            end: SnapshotCell {
+                x: self.columns.checked_sub(1)?,
+                y: end,
+            },
+        })
+    }
+
+    pub(crate) fn total_rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Evaluate without changing the displayed cursor. Operators can reject a
+    /// partial result, while ordinary movement can keep the progress made.
+    pub(crate) fn evaluate_motion(
+        &self,
+        motion: Motion,
+        count: u32,
+        explicit_count: bool,
+        view: Option<SnapshotView>,
+        read: impl FnMut(u64) -> Option<TextRow>,
+        mut resolve: impl FnMut(SnapshotCell, bool) -> Option<SnapshotCell>,
+    ) -> MotionEvaluation {
+        let count = count.max(1);
+        // A counted motion often revisits the same rows. Keep a small cache
+        // for this evaluation only; scanning never retains the whole history.
+        let mut source = read;
+        let mut rows: VecDeque<(u64, TextRow)> = VecDeque::new();
+        let mut read = |y| {
+            if let Some((_, row)) = rows.iter().find(|(cached, _)| *cached == y) {
+                return Some(row.clone());
+            }
+            let row = source(y)?;
+            if rows.len() == 4 {
+                rows.pop_front();
+            }
+            rows.push_back((y, row.clone()));
+            Some(row)
+        };
+        let direct = if explicit_count
+            && matches!(motion, Motion::ScrollbackTop | Motion::ScrollbackBottom)
+        {
+            Some(self.numbered_row_target(count).map(|cell| (cell, false)))
+        } else if explicit_count && motion == Motion::MatchingBracket {
+            Some(self.percent_row_target(count).map(|cell| (cell, false)))
+        } else if matches!(
+            motion,
+            Motion::NextLineNonblank | Motion::PreviousLineNonblank | Motion::LineNonblank
+        ) {
+            Some(
+                self.nonblank_line_target(motion, count, &mut read)
+                    .map(|cell| (cell, false)),
+            )
+        } else {
+            self.counted_simple_target(motion, count, view).map(Some)
+        };
+        if let Some(target) = direct {
+            return match target {
+                None => MotionEvaluation::NoMovement,
+                Some((cell, right)) => match resolve(cell, right) {
+                    Some(actual) => MotionEvaluation::Complete(motion.result(actual)),
+                    None => MotionEvaluation::InvalidSnapshot,
+                },
+            };
+        }
+        let mut working = self.clone();
+        let mut result = None;
+        for _ in 0..count {
+            let target = if motion.needs_text() {
+                working
+                    .text_target(motion, &mut read)
+                    .map(|cell| (cell, false))
+            } else {
+                working.move_to(motion, view)
+            };
+            let Some((cell, right)) = target else {
+                return result.map_or(MotionEvaluation::NoMovement, MotionEvaluation::Partial);
+            };
+            let Some(actual) = resolve(cell, right) else {
+                return MotionEvaluation::InvalidSnapshot;
+            };
+            if actual == working.cursor {
+                break;
+            }
+            working.moved(motion, actual);
+            result = Some(motion.result(actual));
+        }
+        result.map_or(MotionEvaluation::NoMovement, MotionEvaluation::Complete)
+    }
+
+    pub(crate) fn command_target(
+        &self,
+        forward: bool,
+        count: u32,
+        boundaries: &[u64],
+    ) -> Option<SnapshotCell> {
+        let steps = usize::try_from(count.max(1)).ok()?;
+        let index = if forward {
+            boundaries
+                .partition_point(|&row| row <= self.cursor.y)
+                .checked_add(steps - 1)?
+        } else {
+            boundaries
+                .partition_point(|&row| row < self.cursor.y)
+                .checked_sub(steps)?
+        };
+        Some(SnapshotCell {
+            x: 0,
+            y: *boundaries.get(index)?,
+        })
+    }
+
+    fn bounded_object_range(
+        &self,
+        start: SnapshotCell,
+        end: SnapshotCell,
+        object: WordObject,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCellRange> {
+        if object == WordObject::Around {
+            return Some(SnapshotCellRange { start, end });
+        }
+        let first = (start.y..=end.y).find_map(|y| {
+            read(y)?
+                .grapheme_cells()
+                .into_iter()
+                .find(|(x, _)| (y, *x) > (start.y, start.x))
+                .map(|(x, _)| SnapshotCell { x, y })
+        })?;
+        let last = (start.y..=end.y).rev().find_map(|y| {
+            read(y)?
+                .grapheme_cells()
+                .into_iter()
+                .rev()
+                .find(|(x, _)| (y, *x) < (end.y, end.x))
+                .map(|(x, _)| SnapshotCell { x, y })
+        })?;
+        ((first.y, first.x) <= (last.y, last.x)).then_some(SnapshotCellRange {
+            start: first,
+            end: last,
+        })
     }
 
     pub(crate) fn add_count_digit(&mut self, digit: u32) -> bool {
@@ -366,45 +1122,24 @@ impl CopyMode {
         count: u32,
         view: Option<SnapshotView>,
     ) -> Option<(SnapshotCell, bool)> {
-        let (mut cell, snap_right) = self.move_to(motion, view)?;
-        let extra = u64::from(count - 1);
-        let last = self.rows - 1;
-        match motion {
-            Motion::Up => cell.y = self.cursor.y.saturating_sub(u64::from(count)),
-            Motion::Down => cell.y = self.cursor.y.saturating_add(u64::from(count)).min(last),
-            Motion::PageUp | Motion::PageDown | Motion::HalfPageUp | Motion::HalfPageDown => {
-                let rows = u64::from(view?.viewport_rows);
-                let step = if matches!(motion, Motion::HalfPageUp | Motion::HalfPageDown) {
-                    (rows / 2).max(1)
-                } else {
-                    rows
-                };
-                let delta = step.saturating_mul(u64::from(count));
-                cell.y = if matches!(motion, Motion::PageUp | Motion::HalfPageUp) {
-                    self.cursor.y.saturating_sub(delta)
-                } else {
-                    self.cursor.y.saturating_add(delta).min(last)
-                };
-            }
-            Motion::ViewportTop => {
-                let view = view?;
-                let bottom = view
-                    .viewport_top
-                    .saturating_add(u64::from(view.viewport_rows - 1))
-                    .min(last);
-                cell.y = cell.y.saturating_add(extra).min(bottom);
-            }
-            Motion::ViewportBottom => {
-                let view = view?;
-                cell.y = cell.y.saturating_sub(extra).max(view.viewport_top);
-            }
-            // Horizontal counts must resolve each intermediate cell so wide
-            // graphemes count as one motion rather than two terminal columns.
-            _ => return None,
+        // Horizontal counts resolve intermediate cells so a wide grapheme
+        // counts as one motion rather than two terminal columns.
+        if matches!(
+            motion,
+            Motion::Up
+                | Motion::Down
+                | Motion::PageUp
+                | Motion::PageDown
+                | Motion::HalfPageUp
+                | Motion::HalfPageDown
+                | Motion::ViewportTop
+                | Motion::ViewportBottom
+        ) {
+            self.simple_target(motion, count.max(1), view)
+        } else {
+            None
         }
-        Some((cell, snap_right))
     }
-
     pub(crate) fn nonblank_line_target(
         &self,
         motion: Motion,
@@ -427,80 +1162,43 @@ impl CopyMode {
         Some(SnapshotCell { x, y })
     }
 
+    fn logical_word_line(
+        &self,
+        big: bool,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<LogicalWordLine> {
+        let (start, end) = self.logical_line_bounds(self.cursor.y, read)?;
+        let mut line = LogicalWordLine {
+            text: String::new(),
+            glyphs: Vec::new(),
+        };
+        for y in start..=end {
+            let row = read(y)?;
+            let byte_base = line.text.len();
+            for glyph in row.glyphs(big) {
+                line.glyphs.push(LocatedGlyph {
+                    cell: SnapshotCell { x: glyph.x, y },
+                    class: glyph.class,
+                    byte_start: byte_base + glyph.byte_start,
+                    byte_end: byte_base + glyph.byte_end,
+                });
+            }
+            line.text.push_str(&row.text);
+        }
+        Some(line)
+    }
+
     pub(crate) fn word_under_cursor(
         &self,
         mut read: impl FnMut(u64) -> Option<TextRow>,
     ) -> Option<String> {
-        let row = read(self.cursor.y)?;
-        let glyphs = row.glyphs(false);
-        let cells = row.grapheme_cells();
-        let index = glyphs
-            .iter()
-            .position(|glyph| glyph.class == WordClass::Keyword && glyph.x >= self.cursor.x)
-            .or_else(|| {
-                glyphs.iter().rposition(|glyph| {
-                    glyph.x <= self.cursor.x && glyph.class == WordClass::Keyword
-                })
-            })?;
-        let mut start = index;
-        while start > 0 && glyphs[start - 1].class == WordClass::Keyword {
-            start -= 1;
-        }
-        let mut end = index + 1;
-        while end < glyphs.len() && glyphs[end].class == WordClass::Keyword {
-            end += 1;
-        }
-        let mut word: String = cells[start..end].iter().map(|(_, text)| *text).collect();
-        if start == 0 {
-            let mut y = self.cursor.y;
-            while let Some(previous) = y.checked_sub(1) {
-                let prior = read(previous)?;
-                if !prior.wraps_to_next {
-                    break;
-                }
-                let prior_glyphs = prior.glyphs(false);
-                let prior_cells = prior.grapheme_cells();
-                let prior_start = prior_glyphs
-                    .iter()
-                    .rposition(|glyph| glyph.class != WordClass::Keyword)
-                    .map_or(0, |index| index + 1);
-                if prior_start == prior_glyphs.len() {
-                    break;
-                }
-                let prefix: String = prior_cells[prior_start..]
-                    .iter()
-                    .map(|(_, text)| *text)
-                    .collect();
-                word.insert_str(0, &prefix);
-                if prior_start != 0 {
-                    break;
-                }
-                y = previous;
-            }
-        }
-        if end == glyphs.len() && row.wraps_to_next {
-            let mut y = self.cursor.y + 1;
-            while y < self.rows {
-                let next = read(y)?;
-                let next_glyphs = next.glyphs(false);
-                let next_cells = next.grapheme_cells();
-                let next_end = next_glyphs
-                    .iter()
-                    .position(|glyph| glyph.class != WordClass::Keyword)
-                    .unwrap_or(next_glyphs.len());
-                if next_end == 0 {
-                    break;
-                }
-                word.extend(next_cells[..next_end].iter().map(|(_, text)| *text));
-                if next_end != next_glyphs.len() || !next.wraps_to_next {
-                    break;
-                }
-                y += 1;
-            }
-        }
-        Some(word)
+        let line = self.logical_word_line(false, &mut read)?;
+        let span = word_span_at(&line.glyphs, self.cursor, true)?;
+        Some(
+            line.text[line.glyphs[span.start].byte_start..line.glyphs[span.end - 1].byte_end]
+                .to_owned(),
+        )
     }
-
     pub(crate) fn text_target(
         &self,
         motion: Motion,
@@ -586,44 +1284,46 @@ impl CopyMode {
             .into_iter()
             .filter(|(x, _)| *x >= self.cursor.x)
             .find_map(|(x, text)| match text {
-                "(" => Some((x, "(", ")", true)),
-                "[" => Some((x, "[", "]", true)),
-                "{" => Some((x, "{", "}", true)),
-                ")" => Some((x, ")", "(", false)),
-                "]" => Some((x, "]", "[", false)),
-                "}" => Some((x, "}", "{", false)),
+                "(" => Some((x, '(', ')', true)),
+                "[" => Some((x, '[', ']', true)),
+                "{" => Some((x, '{', '}', true)),
+                ")" => Some((x, ')', '(', false)),
+                "]" => Some((x, ']', '[', false)),
+                "}" => Some((x, '}', '{', false)),
                 _ => None,
             })?;
+        let direction = if forward {
+            Direction::Forward
+        } else {
+            Direction::Backward
+        };
         let mut depth = 0usize;
-        let mut y = self.cursor.y;
-        loop {
-            let row = read(y)?;
-            let mut cells = row.grapheme_cells();
-            if !forward {
-                cells.reverse();
+        for step in TextScanner::new(read, self.rows, self.cursor.y, direction, false) {
+            let TextStep::Glyph(glyph) = step else {
+                continue;
+            };
+            if glyph.cell.y == self.cursor.y
+                && (if forward {
+                    glyph.cell.x < source_x
+                } else {
+                    glyph.cell.x > source_x
+                })
+            {
+                continue;
             }
-            for (x, text) in cells {
-                if y == self.cursor.y && (if forward { x < source_x } else { x > source_x }) {
-                    continue;
-                }
-                if text == source {
-                    depth += 1;
-                } else if text == target {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(SnapshotCell { x, y });
-                    }
-                }
+            if !glyph.single {
+                continue;
             }
-            if forward {
-                y = y.checked_add(1)?;
-                if y >= self.rows {
-                    return None;
+            if glyph.first == source {
+                depth += 1;
+            } else if glyph.first == target {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(glyph.cell);
                 }
-            } else {
-                y = y.checked_sub(1)?;
             }
         }
+        None
     }
 
     fn forward_word(
@@ -632,22 +1332,22 @@ impl CopyMode {
         big: bool,
     ) -> Option<SnapshotCell> {
         let mut previous = WordClass::Whitespace;
-        for y in self.cursor.y..self.rows {
-            let row = read(y)?;
-            let glyphs = row.glyphs(big);
-            for glyph in glyphs {
-                if y == self.cursor.y && glyph.x <= self.cursor.x {
-                    previous = glyph.class;
-                    continue;
-                }
-                if glyph.class != WordClass::Whitespace && glyph.class != previous {
-                    return Some(SnapshotCell { x: glyph.x, y });
-                }
-                previous = glyph.class;
+        for step in TextScanner::new(read, self.rows, self.cursor.y, Direction::Forward, big) {
+            if matches!(step, TextStep::EmptyRow) {
+                continue;
             }
-            if !row.wraps_to_next {
+            let TextStep::Glyph(glyph) = step else {
                 previous = WordClass::Whitespace;
+                continue;
+            };
+            if (glyph.cell.y, glyph.cell.x) <= (self.cursor.y, self.cursor.x) {
+                previous = glyph.class;
+                continue;
             }
+            if glyph.class != WordClass::Whitespace && glyph.class != previous {
+                return Some(glyph.cell);
+            }
+            previous = glyph.class;
         }
         None
     }
@@ -657,34 +1357,23 @@ impl CopyMode {
         read: &mut impl FnMut(u64) -> Option<TextRow>,
         big: bool,
     ) -> Option<SnapshotCell> {
-        for y in (0..=self.cursor.y).rev() {
-            let row = read(y)?;
-            let previous_class = if y > 0 {
-                let prior = read(y - 1)?;
-                if prior.wraps_to_next {
-                    prior
-                        .glyphs(big)
-                        .last()
-                        .map_or(WordClass::Whitespace, |glyph| glyph.class)
-                } else {
-                    WordClass::Whitespace
-                }
-            } else {
-                WordClass::Whitespace
+        let mut scan =
+            TextScanner::new(read, self.rows, self.cursor.y, Direction::Backward, big).peekable();
+        while let Some(step) = scan.next() {
+            let TextStep::Glyph(glyph) = step else {
+                continue;
             };
-            let mut previous = previous_class;
-            let mut candidate = None;
-            for glyph in row.glyphs(big) {
-                if glyph.class != WordClass::Whitespace
-                    && glyph.class != previous
-                    && (y < self.cursor.y || glyph.x < self.cursor.x)
-                {
-                    candidate = Some(SnapshotCell { x: glyph.x, y });
-                }
-                previous = glyph.class;
+            if (glyph.cell.y, glyph.cell.x) >= (self.cursor.y, self.cursor.x)
+                || glyph.class == WordClass::Whitespace
+            {
+                continue;
             }
-            if candidate.is_some() {
-                return candidate;
+            let previous_class = match scan.peek() {
+                Some(TextStep::Glyph(previous)) => previous.class,
+                _ => WordClass::Whitespace,
+            };
+            if glyph.class != previous_class {
+                return Some(glyph.cell);
             }
         }
         None
@@ -697,33 +1386,28 @@ impl CopyMode {
     ) -> Option<SnapshotCell> {
         let mut active_class = WordClass::Whitespace;
         let mut last: Option<SnapshotCell> = None;
-        for y in self.cursor.y..self.rows {
-            let row = read(y)?;
-            for glyph in row.glyphs(big) {
-                if y == self.cursor.y && glyph.x < self.cursor.x {
-                    continue;
-                }
-                if glyph.class != active_class {
-                    if let Some(end) = last
-                        && (end.y, end.x) > (self.cursor.y, self.cursor.x)
-                    {
-                        return Some(end);
+        for step in TextScanner::new(read, self.rows, self.cursor.y, Direction::Forward, big) {
+            let (class, cell) = match step {
+                TextStep::Glyph(glyph) => {
+                    if (glyph.cell.y, glyph.cell.x) < (self.cursor.y, self.cursor.x) {
+                        continue;
                     }
-                    last = None;
+                    (glyph.class, Some(glyph.cell))
                 }
-                active_class = glyph.class;
-                if glyph.class != WordClass::Whitespace {
-                    last = Some(SnapshotCell { x: glyph.x, y });
-                }
-            }
-            if !row.wraps_to_next {
+                TextStep::LineBreak => (WordClass::Whitespace, None),
+                TextStep::EmptyRow => continue,
+            };
+            if class != active_class {
                 if let Some(end) = last
                     && (end.y, end.x) > (self.cursor.y, self.cursor.x)
                 {
                     return Some(end);
                 }
-                active_class = WordClass::Whitespace;
                 last = None;
+            }
+            active_class = class;
+            if class != WordClass::Whitespace {
+                last = cell;
             }
         }
         last.filter(|end| (end.y, end.x) > (self.cursor.y, self.cursor.x))
@@ -734,26 +1418,30 @@ impl CopyMode {
         read: &mut impl FnMut(u64) -> Option<TextRow>,
         big: bool,
     ) -> Option<SnapshotCell> {
-        for y in (0..=self.cursor.y).rev() {
-            let row = read(y)?;
-            let mut next_class = if row.wraps_to_next && y + 1 < self.rows {
-                read(y + 1)?
-                    .glyphs(big)
-                    .first()
-                    .map_or(WordClass::Whitespace, |glyph| glyph.class)
-            } else {
-                WordClass::Whitespace
+        // Include text to the right of the cursor to establish the class on
+        // the other side of the first candidate, even across a soft wrap.
+        let row = read(self.cursor.y)?;
+        let mut next_class = if row.wraps_to_next && self.cursor.y + 1 < self.rows {
+            read(self.cursor.y + 1)?
+                .glyphs(big)
+                .first()
+                .map_or(WordClass::Whitespace, |glyph| glyph.class)
+        } else {
+            WordClass::Whitespace
+        };
+        for step in TextScanner::new(read, self.rows, self.cursor.y, Direction::Backward, big) {
+            let TextStep::Glyph(glyph) = step else {
+                next_class = WordClass::Whitespace;
+                continue;
             };
-            for glyph in row.glyphs(big).into_iter().rev() {
-                if y == self.cursor.y && glyph.x >= self.cursor.x {
-                    next_class = glyph.class;
-                    continue;
-                }
-                if glyph.class != WordClass::Whitespace && glyph.class != next_class {
-                    return Some(SnapshotCell { x: glyph.x, y });
-                }
+            if (glyph.cell.y, glyph.cell.x) >= (self.cursor.y, self.cursor.x) {
                 next_class = glyph.class;
+                continue;
             }
+            if glyph.class != WordClass::Whitespace && glyph.class != next_class {
+                return Some(glyph.cell);
+            }
+            next_class = glyph.class;
         }
         None
     }
@@ -792,6 +1480,138 @@ pub(crate) fn word_search_pattern(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evaluation_distinguishes_partial_motion_and_invalid_snapshot() {
+        let mode = copy_at(0, 0, 1);
+        let rows = [row("foo bar", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        let resolve = |cell, _| Some(cell);
+        let MotionEvaluation::Partial(result) =
+            mode.evaluate_motion(Motion::ForwardWord, 3, true, None, read, resolve)
+        else {
+            panic!("count exhaustion should preserve partial movement");
+        };
+        assert_eq!(result.target, SnapshotCell { x: 4, y: 0 });
+        assert_eq!(result.endpoint, Endpoint::Exclusive);
+        assert_eq!(mode.cursor, SnapshotCell { x: 0, y: 0 });
+        assert!(matches!(
+            mode.evaluate_motion(Motion::BackwardWord, 1, false, None, read, resolve,),
+            MotionEvaluation::NoMovement
+        ));
+        assert!(matches!(
+            mode.evaluate_motion(Motion::ForwardWord, 1, false, None, read, |_, _| None,),
+            MotionEvaluation::InvalidSnapshot
+        ));
+    }
+
+    #[test]
+    fn counted_horizontal_motion_resolves_each_wide_cell() {
+        let mut mode = copy_at(0, 0, 1);
+        mode.columns = 6;
+        let mut requested = Vec::new();
+        let result = mode.evaluate_motion(
+            Motion::Right,
+            2,
+            true,
+            None,
+            |_| None,
+            |mut cell, right| {
+                requested.push((cell.x, right));
+                if cell.x == 1 {
+                    cell.x = 2;
+                }
+                Some(cell)
+            },
+        );
+        let MotionEvaluation::Complete(result) = result else {
+            panic!("expected a complete motion");
+        };
+        assert_eq!(result.target, SnapshotCell { x: 3, y: 0 });
+        assert_eq!(requested, vec![(1, true), (3, true)]);
+        assert_eq!(mode.cursor.x, 0);
+    }
+
+    #[test]
+    fn counted_word_motion_reuses_rows_and_produces_yank_metadata() {
+        let mode = copy_at(0, 0, 1);
+        let mut reads = 0;
+        let result = mode.evaluate_motion(
+            Motion::ForwardWordEnd,
+            2,
+            true,
+            None,
+            |_| {
+                reads += 1;
+                Some(row("foo bar baz", false))
+            },
+            |cell, _| Some(cell),
+        );
+        let MotionEvaluation::Complete(result) = result else {
+            panic!("expected a complete motion");
+        };
+        assert_eq!(result.target.x, 6);
+        assert_eq!(result.kind, RangeKind::Characterwise);
+        assert_eq!(result.endpoint, Endpoint::Inclusive);
+        assert_eq!(reads, 1);
+        let (range, linewise) = mode
+            .yank_motion_range(result, |_| Some(row("foo bar baz", false)))
+            .unwrap();
+        assert_eq!(range.end.x, 6);
+        assert!(!linewise);
+    }
+
+    #[test]
+    fn word_scanning_distinguishes_soft_wraps_and_hard_breaks() {
+        let rows = [row("foo", true), row("bar", false), row("baz", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        assert_eq!(
+            copy_at(0, 0, 3).text_target(Motion::ForwardWord, read),
+            Some(SnapshotCell { x: 0, y: 2 })
+        );
+        assert_eq!(
+            copy_at(1, 1, 3).text_target(Motion::BackwardWord, read),
+            Some(SnapshotCell { x: 0, y: 0 })
+        );
+        assert_eq!(
+            copy_at(0, 2, 3).text_target(Motion::PreviousWordEnd, read),
+            Some(SnapshotCell { x: 2, y: 1 })
+        );
+        let rows = [row("foo", false), row("", false), row("bar", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        assert_eq!(
+            copy_at(0, 0, 3).text_target(Motion::ForwardWord, read),
+            Some(SnapshotCell { x: 0, y: 2 })
+        );
+        assert_eq!(
+            copy_at(0, 2, 3).text_target(Motion::BackwardWord, read),
+            Some(SnapshotCell { x: 0, y: 0 })
+        );
+    }
+
+    #[test]
+    fn newer_yank_replaces_highlight_and_outlives_old_expiry() {
+        let mut mode = CopyMode::default();
+        let first = SnapshotCellRange {
+            start: SnapshotCell { x: 1, y: 2 },
+            end: SnapshotCell { x: 3, y: 2 },
+        };
+        let second = SnapshotCellRange {
+            start: SnapshotCell { x: 5, y: 6 },
+            end: SnapshotCell { x: 7, y: 6 },
+        };
+        let started = Instant::now();
+        mode.highlight_yank(first, started);
+        mode.highlight_yank(second, started + Duration::from_millis(100));
+        assert!(!mode.clear_expired_yank_highlight(started + YANK_HIGHLIGHT_DURATION));
+        assert_eq!(mode.yank_highlight_range(), Some(second));
+        assert_eq!(
+            mode.yank_highlight_remaining(started + YANK_HIGHLIGHT_DURATION),
+            Some(Duration::from_millis(100))
+        );
+        assert!(mode.clear_expired_yank_highlight(started + Duration::from_millis(350)));
+        assert!(mode.yank_highlight_range().is_none());
+    }
 
     #[test]
     fn visual_range_includes_anchor_and_orders_reverse_motion() {
@@ -872,6 +1692,247 @@ mod tests {
             },
         );
         result
+    }
+
+    #[test]
+    fn yank_word_objects_distinguish_inner_around_and_punctuation() {
+        let row = row("foo.bar  baz", false);
+        let mode = copy_at(5, 0, 1);
+        let read = |_| Some(row.clone());
+        assert_eq!(
+            mode.word_object_range(1, WordObject::Inner, false, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 4, y: 0 },
+                end: SnapshotCell { x: 6, y: 0 },
+            })
+        );
+        assert_eq!(
+            mode.word_object_range(1, WordObject::Around, false, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 4, y: 0 },
+                end: SnapshotCell { x: 8, y: 0 },
+            })
+        );
+        let mode = copy_at(3, 0, 1);
+        assert_eq!(
+            mode.word_object_range(1, WordObject::Inner, false, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 3, y: 0 },
+                end: SnapshotCell { x: 3, y: 0 },
+            })
+        );
+        let mode = copy_at(7, 0, 1);
+        assert_eq!(
+            mode.word_object_range(1, WordObject::Around, false, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 7, y: 0 },
+                end: SnapshotCell { x: 11, y: 0 },
+            })
+        );
+    }
+
+    #[test]
+    fn yank_word_object_spans_soft_wrap_and_counted_words() {
+        let rows = [row("foo", true), row("bar baz", false)];
+        let mode = copy_at(1, 1, 2);
+        let read = |y: u64| rows.get(y as usize).cloned();
+        assert_eq!(
+            mode.word_object_range(1, WordObject::Inner, false, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 0, y: 0 },
+                end: SnapshotCell { x: 2, y: 1 },
+            })
+        );
+        assert_eq!(
+            mode.word_object_range(2, WordObject::Inner, false, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 0, y: 0 },
+                end: SnapshotCell { x: 6, y: 1 },
+            })
+        );
+    }
+
+    #[test]
+    fn yank_word_object_uses_cell_columns_for_multibyte_text() {
+        let row = TextRow {
+            text: "a.界 b".into(),
+            columns: vec![0, 1, 2, 2, 2, 4, 5],
+            wraps_to_next: false,
+        };
+        let mode = copy_at(2, 0, 1);
+        let range = mode
+            .word_object_range(1, WordObject::Around, false, |_| Some(row.clone()))
+            .unwrap();
+        assert_eq!(range.start, SnapshotCell { x: 2, y: 0 });
+        assert_eq!(range.end, SnapshotCell { x: 4, y: 0 });
+    }
+
+    #[test]
+    fn yank_big_word_includes_punctuation() {
+        let row = row("foo.bar baz", false);
+        let mode = copy_at(4, 0, 1);
+        let read = |_| Some(row.clone());
+        assert_eq!(
+            mode.word_object_range(1, WordObject::Inner, true, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 0, y: 0 },
+                end: SnapshotCell { x: 6, y: 0 },
+            })
+        );
+        assert_eq!(
+            mode.word_object_range(1, WordObject::Around, true, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 0, y: 0 },
+                end: SnapshotCell { x: 7, y: 0 },
+            })
+        );
+    }
+
+    #[test]
+    fn yank_quotes_and_nested_brackets_map_to_cells() {
+        let rows = [row("prefix (a [界]", true), row(" b) 'one \\' two'", false)];
+        let mode = copy_at(10, 0, 2);
+        let read = |y: u64| rows.get(y as usize).cloned();
+        assert_eq!(
+            mode.delimiter_object_range(WordObject::Around, '(', ')', read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 7, y: 0 },
+                end: SnapshotCell { x: 2, y: 1 },
+            })
+        );
+        let mode = copy_at(9, 1, 2);
+        assert_eq!(
+            mode.quote_object_range(WordObject::Around, '\'', read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 4, y: 1 },
+                end: SnapshotCell { x: 15, y: 1 },
+            })
+        );
+    }
+
+    #[test]
+    fn yank_word_motions_are_exclusive_and_line_motions_use_logical_lines() {
+        let rows = [row("foo bar", false), row("wrap", true), row("end", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        let mode = copy_at(1, 0, 3);
+        assert_eq!(
+            mode.yank_motion_range(
+                Motion::ForwardWord.result(SnapshotCell { x: 4, y: 0 }),
+                read
+            ),
+            Some((
+                SnapshotCellRange {
+                    start: SnapshotCell { x: 1, y: 0 },
+                    end: SnapshotCell { x: 3, y: 0 },
+                },
+                false
+            ))
+        );
+        assert_eq!(
+            mode.yank_motion_range(Motion::Down.result(SnapshotCell { x: 1, y: 2 }), read),
+            Some((
+                SnapshotCellRange {
+                    start: SnapshotCell { x: 0, y: 0 },
+                    end: SnapshotCell { x: 19, y: 2 },
+                },
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn yank_command_objects_use_regex_prompt_boundaries() {
+        let rows = [
+            row("PS C:\\> first", false),
+            row("output", false),
+            row("12:34> second", false),
+            row("more", false),
+        ];
+        let mode = copy_at(2, 1, 4);
+        let boundaries =
+            super::find_prompt_boundaries(rows.len() as u64, |y| rows.get(y as usize).cloned())
+                .unwrap();
+        assert_eq!(boundaries, [0, 2]);
+        assert_eq!(
+            mode.command_object_range(WordObject::Inner, 1, &boundaries),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 0, y: 1 },
+                end: SnapshotCell { x: 19, y: 1 },
+            })
+        );
+        assert_eq!(
+            mode.command_object_range(WordObject::Around, 2, &boundaries),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 0, y: 0 },
+                end: SnapshotCell { x: 19, y: 3 },
+            })
+        );
+    }
+
+    #[test]
+    fn command_navigation_skips_current_prompt_counts_and_stops_at_edges() {
+        let mode = copy_at(7, 10, 40);
+        let boundaries = [0, 10, 20, 30];
+        assert_eq!(
+            mode.command_target(false, 1, &boundaries),
+            Some(SnapshotCell { x: 0, y: 0 })
+        );
+        assert_eq!(
+            mode.command_target(true, 1, &boundaries),
+            Some(SnapshotCell { x: 0, y: 20 })
+        );
+        assert_eq!(
+            mode.command_target(true, 2, &boundaries),
+            Some(SnapshotCell { x: 0, y: 30 })
+        );
+        assert_eq!(mode.command_target(false, 2, &boundaries), None);
+        assert_eq!(mode.command_target(true, 3, &boundaries), None);
+        assert_eq!(mode.command_target(true, 1, &[]), None);
+        let mode = copy_at(7, 15, 40);
+        assert_eq!(
+            mode.command_target(false, 1, &boundaries),
+            Some(SnapshotCell { x: 0, y: 10 })
+        );
+    }
+
+    #[test]
+    fn prompt_patterns_match_logical_lines_without_osc_markers() {
+        let rows = [
+            row("ordinary output", false),
+            row("› command", true),
+            row(" continued input", false),
+            row("────────────────────", false),
+        ];
+        assert_eq!(
+            super::find_prompt_boundaries(rows.len() as u64, |y| { rows.get(y as usize).cloned() }),
+            Some(vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn yank_line_ranges_count_logical_lines_and_dollar_uses_current_row() {
+        let rows = [
+            row("before", false),
+            row("wrapped", true),
+            row("end", false),
+            row("next", false),
+        ];
+        let mode = copy_at(1, 1, rows.len() as u64);
+        let read = |y: u64| rows.get(y as usize).cloned();
+        assert_eq!(
+            mode.yank_lines_range(2, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 0, y: 1 },
+                end: SnapshotCell { x: 19, y: 3 },
+            })
+        );
+        assert_eq!(
+            mode.yank_to_row_end_range(1, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 1, y: 1 },
+                end: SnapshotCell { x: 6, y: 1 },
+            })
+        );
     }
 
     #[test]
@@ -1035,6 +2096,34 @@ mod tests {
             mode.nonblank_line_target(Motion::PreviousLineNonblank, 1, read),
             Some(SnapshotCell { x: 0, y: 1 })
         );
+    }
+
+    #[test]
+    fn word_lookup_preserves_search_and_object_punctuation_rules() {
+        let rows = [row("foo ... bar", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        let mode = copy_at(5, 0, 1);
+        assert_eq!(mode.word_under_cursor(read).as_deref(), Some("bar"));
+        assert_eq!(
+            mode.word_object_range(1, WordObject::Inner, false, read),
+            Some(SnapshotCellRange {
+                start: SnapshotCell { x: 4, y: 0 },
+                end: SnapshotCell { x: 6, y: 0 },
+            })
+        );
+        assert_eq!(
+            copy_at(3, 0, 1).word_under_cursor(read).as_deref(),
+            Some("bar")
+        );
+        assert_eq!(
+            copy_at(10, 0, 1).word_under_cursor(read).as_deref(),
+            Some("bar")
+        );
+
+        let rows = [row("foo", true), row("...", true), row("bar", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        // A keyword on another physical row is not a search fallback.
+        assert_eq!(copy_at(1, 1, 3).word_under_cursor(read), None);
     }
 
     #[test]
