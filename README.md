@@ -82,6 +82,12 @@ When the search field is focused, paste remains within the search query.
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter the initial copy
 mode. Ghostty freezes the visible terminal and scrollback while the live PTY
 keeps running. A steady, styled cell marks the terminal's insertion point.
+A permanent 24-point status row below the terminal shows `TERMINAL` in live
+mode and a yellow `NORMAL` label in copy mode. Visual selection changes the
+label and top separator to orange and shows `VISUAL`, `V-LINE`, or `V-BLOCK`.
+The right side shows the copy cursor's one-based scrollback row and column.
+The status row never covers terminal content or changes size when switching modes.
+
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Up</kbd>/<kbd>Down</kbd> also enter copy
 mode and move to the previous/next regex-matched command prompt. In copy mode,
 the same shortcuts navigate commands; a count such as <kbd>3</kbd> followed

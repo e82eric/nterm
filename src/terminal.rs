@@ -164,7 +164,15 @@ impl TerminalView {
         }
         self.apply_search_result();
 
-        let rect = ui.max_rect();
+        // Reserve the same status height in every mode. Toggling copy mode
+        // must not resize the terminal and invalidate its frozen snapshot.
+        let available = ui.max_rect();
+        let status_height = 24.0_f32.min((available.height() - 1.0).max(0.0));
+        let rect = egui::Rect::from_min_max(
+            available.min,
+            egui::pos2(available.right(), available.bottom() - status_height),
+        );
+        let status_rect = egui::Rect::from_min_max(rect.left_bottom(), available.max);
         let scale = ui.ctx().pixels_per_point();
         let width = (rect.width() * scale).round().max(1.0) as u32;
         let height = (rect.height() * scale).round().max(1.0) as u32;
@@ -207,7 +215,7 @@ impl TerminalView {
         let search_shortcut_consumed = self.handle_search_shortcut(ui);
         let keyboard_blocked =
             self.handle_copy_keys(ui) || self.search.active || search_shortcut_consumed;
-        self.show_search_overlay(ui.ctx());
+        self.show_search_overlay(ui.ctx(), status_height);
         let scrolled = input::forward(self.host, self.size, ui, rect, scale, keyboard_blocked);
         if (scrolled || resized)
             && let Some(snapshot_generation) = self.search.snapshot_generation
@@ -229,22 +237,7 @@ impl TerminalView {
             self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
         }
 
-        if !self.search.active {
-            egui::Area::new("sample-overlay".into())
-                .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
-                .fade_in(false)
-                .movable(false)
-                .interactable(false)
-                .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        if self.copy_mode.generation.is_some() {
-                            ui.small("COPY · hjkl · w/b/e W/B/E · f/F/t/T · Esc");
-                        } else {
-                            ui.small("egui shell · Ghostty OpenGL texture");
-                        }
-                    });
-                });
-        }
+        self.show_mode_status(ui, status_rect);
 
         if self.should_close() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -255,6 +248,75 @@ impl TerminalView {
         self.wake.close.load(Ordering::Acquire)
     }
 
+    fn show_mode_status(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let copying = self.copy_mode.generation.is_some();
+        let visual = copying && self.copy_mode.visual_anchor.is_some();
+        let label = if self.search.active {
+            "SEARCH"
+        } else if visual {
+            match self.copy_mode.visual_mode {
+                VisualMode::Characterwise => "VISUAL",
+                VisualMode::Linewise => "V-LINE",
+                VisualMode::Blockwise => "V-BLOCK",
+            }
+        } else if copying {
+            "NORMAL"
+        } else {
+            "TERMINAL"
+        };
+        let accent = if visual {
+            egui::Color32::from_rgb(0xd6, 0x5d, 0x0e)
+        } else if copying || self.search.active {
+            egui::Color32::from_rgb(0xd7, 0x99, 0x21)
+        } else {
+            egui::Color32::from_rgb(0x92, 0x83, 0x74)
+        };
+        let background = egui::Color32::from_rgb(0x1d, 0x20, 0x21);
+        let foreground = egui::Color32::from_rgb(0xeb, 0xdb, 0xb2);
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, background);
+        let separator = if copying || self.search.active {
+            accent
+        } else {
+            egui::Color32::from_rgb(0x3c, 0x38, 0x36)
+        };
+        painter.line_segment(
+            [
+                rect.left_top() + egui::vec2(0.0, 0.75),
+                rect.right_top() + egui::vec2(0.0, 0.75),
+            ],
+            egui::Stroke::new(1.5, separator),
+        );
+        let font = egui::FontId::monospace(15.0);
+        let label_rect = painter.text(
+            egui::pos2(rect.left() + 10.0, rect.center().y + 1.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font.clone(),
+            accent,
+        );
+        if copying {
+            // One-based physical scrollback row and terminal column.
+            let cursor = self.copy_mode.cursor;
+            let position = painter.layout_no_wrap(
+                format!(
+                    "{}:{}",
+                    cursor.y.saturating_add(1),
+                    cursor.x.saturating_add(1)
+                ),
+                font,
+                foreground,
+            );
+            let left = rect.right() - 10.0 - position.size().x;
+            if left > label_rect.right() + 8.0 {
+                painter.galley(
+                    egui::pos2(left, rect.center().y + 1.0 - position.size().y / 2.0),
+                    position,
+                    foreground,
+                );
+            }
+        }
+    }
     pub(crate) fn frame_generation(&self) -> Option<u64> {
         self.painter.lock().frame_generation()
     }
@@ -1224,7 +1286,11 @@ impl TerminalView {
             range_count: 1,
             style: SnapshotDecorationStyle {
                 foreground_rgb: 0x282828,
-                background_rgb: 0xebdbb2,
+                background_rgb: if self.copy_mode.visual_anchor.is_some() {
+                    0xd65d0e // Gruvbox neutral orange, matching the visual statusline.
+                } else {
+                    0xd79921 // Gruvbox neutral yellow, matching the normal statusline.
+                },
                 flags: 3,
             },
         };
@@ -1524,7 +1590,7 @@ impl TerminalView {
         }
     }
 
-    fn show_search_overlay(&mut self, ctx: &egui::Context) {
+    fn show_search_overlay(&mut self, ctx: &egui::Context, status_height: f32) {
         if !self.search.active {
             return;
         }
@@ -1545,7 +1611,7 @@ impl TerminalView {
         let selection = egui::Color32::from_rgb(0x66, 0x5c, 0x54); // dark3
 
         egui::Area::new("terminal-search".into())
-            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, 0.0])
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -status_height])
             .order(egui::Order::Foreground)
             .fade_in(false)
             .movable(false)
