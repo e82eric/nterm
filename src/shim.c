@@ -170,9 +170,9 @@ bool ghostty_egui_host_snapshot_resolve_cell(
 ); }
 bool ghostty_egui_host_snapshot_selection_text(
     GhosttyEguiHost *host, uint64_t generation,
-    ghostty_snapshot_cell_range_s range, bool trim,
+    ghostty_snapshot_cell_range_s range, bool trim, bool rectangle,
     ghostty_snapshot_selection_text_s *result
-) { return ghostty_surface_snapshot_selection_text(host->surface, generation, range, trim, result); }
+) { return ghostty_surface_snapshot_selection_text(host->surface, generation, range, trim, rectangle, result); }
 void ghostty_egui_host_snapshot_selection_text_free(
     ghostty_snapshot_selection_text_s *result
 ) { ghostty_surface_snapshot_selection_text_free(result); }

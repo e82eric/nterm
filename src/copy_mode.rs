@@ -412,6 +412,7 @@ fn word_span_at(
 #[derive(Clone, Copy)]
 struct YankHighlight {
     range: SnapshotCellRange,
+    rectangle: bool,
     expires_at: Instant,
 }
 
@@ -464,6 +465,7 @@ pub(crate) enum VisualMode {
     #[default]
     Characterwise,
     Linewise,
+    Blockwise,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -619,12 +621,23 @@ impl CopyMode {
     pub(crate) fn highlight_yank(&mut self, range: SnapshotCellRange, now: Instant) {
         self.yank_highlight = Some(YankHighlight {
             range,
+            rectangle: false,
             expires_at: now + YANK_HIGHLIGHT_DURATION,
         });
     }
 
     pub(crate) fn yank_highlight_range(&self) -> Option<SnapshotCellRange> {
         self.yank_highlight.map(|highlight| highlight.range)
+    }
+
+    pub(crate) fn highlight_rectangle_yank(&mut self, range: SnapshotCellRange, now: Instant) {
+        self.highlight_yank(range, now);
+        self.yank_highlight.as_mut().unwrap().rectangle = true;
+    }
+
+    pub(crate) fn yank_highlight_is_rectangle(&self) -> bool {
+        self.yank_highlight
+            .is_some_and(|highlight| highlight.rectangle)
     }
 
     pub(crate) fn yank_highlight_remaining(&self, now: Instant) -> Option<Duration> {
@@ -664,6 +677,32 @@ impl CopyMode {
         self.cursor = anchor;
         self.preferred_x = anchor.x;
         true
+    }
+
+    pub(crate) fn swap_visual_horizontal_endpoint(&mut self) -> bool {
+        if self.visual_mode != VisualMode::Blockwise {
+            return self.swap_visual_endpoint();
+        }
+        let Some(anchor) = self.visual_anchor.as_mut() else {
+            return false;
+        };
+        std::mem::swap(&mut anchor.x, &mut self.cursor.x);
+        self.preferred_x = self.cursor.x;
+        true
+    }
+
+    pub(crate) fn visual_rectangle_to(&self, cursor: SnapshotCell) -> Option<SnapshotCellRange> {
+        let anchor = self.visual_anchor?;
+        Some(SnapshotCellRange {
+            start: SnapshotCell {
+                x: anchor.x.min(cursor.x),
+                y: anchor.y.min(cursor.y),
+            },
+            end: SnapshotCell {
+                x: anchor.x.max(cursor.x),
+                y: anchor.y.max(cursor.y),
+            },
+        })
     }
 
     pub(crate) fn begin_visual_object(&mut self, object: WordObject) -> bool {
@@ -1584,6 +1623,33 @@ pub(crate) fn next_match_cell(
     Some(matches[index].start)
 }
 
+/// Decoration ranges are ordered newest row first. Only materialize visible
+/// physical rows, even when a block extends across the entire scrollback.
+pub(crate) fn rectangle_row_ranges(
+    range: SnapshotCellRange,
+    top: u64,
+    height: u64,
+) -> Vec<SnapshotCellRange> {
+    let start = range.start.y.max(top);
+    let end = range
+        .end
+        .y
+        .min(top.saturating_add(height).saturating_sub(1));
+    if height == 0 || start > end {
+        return Vec::new();
+    }
+    (start..=end)
+        .rev()
+        .map(|y| SnapshotCellRange {
+            start: SnapshotCell {
+                x: range.start.x,
+                y,
+            },
+            end: SnapshotCell { x: range.end.x, y },
+        })
+        .collect()
+}
+
 pub(crate) fn word_search_pattern(word: &str) -> String {
     format!(r"(?i:\b{}\b)", regex::escape(word))
 }
@@ -1591,6 +1657,69 @@ pub(crate) fn word_search_pattern(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_selection_normalizes_corners_and_swaps_endpoints() {
+        let mut mode = copy_at(7, 50, 100);
+        mode.toggle_visual(VisualMode::Blockwise);
+        mode.moved(Motion::CharacterJump, SnapshotCell { x: 3, y: 55 });
+        let rectangle = SnapshotCellRange {
+            start: SnapshotCell { x: 3, y: 50 },
+            end: SnapshotCell { x: 7, y: 55 },
+        };
+        assert_eq!(mode.visual_rectangle_to(mode.cursor), Some(rectangle));
+        assert!(mode.swap_visual_horizontal_endpoint());
+        assert_eq!(mode.cursor, SnapshotCell { x: 7, y: 55 });
+        assert_eq!(mode.visual_anchor, Some(SnapshotCell { x: 3, y: 50 }));
+        assert_eq!(mode.visual_rectangle_to(mode.cursor), Some(rectangle));
+        assert!(mode.swap_visual_endpoint());
+        assert_eq!(mode.cursor, SnapshotCell { x: 3, y: 50 });
+        assert_eq!(mode.visual_rectangle_to(mode.cursor), Some(rectangle));
+        mode.toggle_visual(VisualMode::Linewise);
+        assert_eq!(mode.visual_anchor, Some(SnapshotCell { x: 7, y: 55 }));
+        mode.toggle_visual(VisualMode::Blockwise);
+        mode.toggle_visual(VisualMode::Blockwise);
+        assert!(mode.visual_rectangle_to(mode.cursor).is_none());
+    }
+
+    #[test]
+    fn rectangle_decorations_are_clipped_and_ordered_newest_first() {
+        let rectangle = SnapshotCellRange {
+            start: SnapshotCell { x: 2, y: 0 },
+            end: SnapshotCell { x: 5, y: 1_000_000 },
+        };
+        let ranges = rectangle_row_ranges(rectangle, 50, 3);
+        assert_eq!(ranges.len(), 3);
+        for (range, y) in ranges.iter().zip([52, 51, 50]) {
+            assert_eq!(
+                *range,
+                SnapshotCellRange {
+                    start: SnapshotCell { x: 2, y },
+                    end: SnapshotCell { x: 5, y },
+                }
+            );
+        }
+        assert!(rectangle_row_ranges(rectangle, 50, 0).is_empty());
+        assert!(rectangle_row_ranges(rectangle, 1_000_001, 3).is_empty());
+    }
+
+    #[test]
+    fn rectangle_yank_flash_retains_shape_until_replaced_or_expired() {
+        let mut mode = copy_at(2, 1, 10);
+        let range = SnapshotCellRange {
+            start: SnapshotCell { x: 1, y: 1 },
+            end: SnapshotCell { x: 5, y: 3 },
+        };
+        let now = Instant::now();
+        mode.highlight_rectangle_yank(range, now);
+        assert!(mode.yank_highlight_is_rectangle());
+        assert_eq!(mode.yank_highlight_range(), Some(range));
+        mode.highlight_yank(range, now);
+        assert!(!mode.yank_highlight_is_rectangle());
+        mode.highlight_rectangle_yank(range, now);
+        assert!(mode.clear_expired_yank_highlight(now + YANK_HIGHLIGHT_DURATION));
+        assert!(!mode.yank_highlight_is_rectangle());
+    }
 
     #[test]
     fn visual_endpoint_swap_preserves_range_and_updates_preferred_column() {

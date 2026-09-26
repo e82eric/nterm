@@ -488,7 +488,7 @@ impl TerminalView {
                             till,
                         };
                         self.copy_mode.last_jump = Some(jump.clone());
-                        let generation = self.copy_mode.generation.unwrap();
+                        let generation = self.copy_mode.generation.expect("copy mode is active");
                         let count = pending.count.saturating_mul(self.copy_mode.take_count());
                         if let Some(cell) = self.copy_jump_target(generation, &jump, count)
                             && let Some((range, linewise)) = self
@@ -561,7 +561,7 @@ impl TerminalView {
                     self.copy_mode.pending_count = None;
                     self.copy_mode.pending_g = false;
                     self.copy_mode.pending_jump = None;
-                    let generation = self.copy_mode.generation.unwrap();
+                    let generation = self.copy_mode.generation.expect("copy mode is active");
                     self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
                     continue;
                 }
@@ -586,7 +586,7 @@ impl TerminalView {
                 }
                 self.copy_mode.pending_visual_object = None;
                 let count = prefix_count.saturating_mul(self.copy_mode.take_count());
-                let generation = self.copy_mode.generation.unwrap();
+                let generation = self.copy_mode.generation.expect("copy mode is active");
                 if let Some(kind) = copy_text_object_key(key, modifiers)
                     && let Some((range, _, trim)) =
                         self.copy_text_object_range(generation, count, object, kind)
@@ -640,7 +640,7 @@ impl TerminalView {
                 }
                 self.copy_mode.pending_yank = None;
                 let count = pending.count.saturating_mul(self.copy_mode.take_count());
-                let generation = self.copy_mode.generation.unwrap();
+                let generation = self.copy_mode.generation.expect("copy mode is active");
                 if pending.object.is_none()
                     && modifiers == egui::Modifiers::NONE
                     && matches!(key, egui::Key::Semicolon | egui::Key::Comma)
@@ -715,10 +715,19 @@ impl TerminalView {
                 && (modifiers == egui::Modifiers::NONE || modifiers == egui::Modifiers::SHIFT)
             {
                 self.copy_mode.pending_count = None;
-                if self.copy_mode.swap_visual_endpoint() {
-                    let generation = self.copy_mode.generation.unwrap();
-                    if !self.publish_copy_decoration(generation, self.copy_mode.cursor, true) {
-                        self.close_copy_mode();
+                let swapped = if modifiers.shift {
+                    self.copy_mode.swap_visual_horizontal_endpoint()
+                } else {
+                    self.copy_mode.swap_visual_endpoint()
+                };
+                if swapped {
+                    let generation = self.copy_mode.generation.expect("copy mode is active");
+                    if !self.apply_copy_target(
+                        generation,
+                        Motion::CharacterJump,
+                        self.copy_mode.cursor,
+                        false,
+                    ) {
                         break;
                     }
                 }
@@ -749,6 +758,19 @@ impl TerminalView {
             {
                 continue;
             }
+            if key == egui::Key::Q
+                && modifiers.ctrl
+                && !modifiers.shift
+                && !modifiers.alt
+                && !modifiers.mac_cmd
+            {
+                self.copy_mode.pending_count = None;
+                self.copy_mode.pending_g = false;
+                self.copy_mode.toggle_visual(VisualMode::Blockwise);
+                let generation = self.copy_mode.generation.expect("copy mode is active");
+                self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                continue;
+            }
             if key == egui::Key::V
                 && (modifiers == egui::Modifiers::NONE || modifiers == egui::Modifiers::SHIFT)
             {
@@ -760,7 +782,7 @@ impl TerminalView {
                     VisualMode::Characterwise
                 };
                 self.copy_mode.toggle_visual(mode);
-                let generation = self.copy_mode.generation.unwrap();
+                let generation = self.copy_mode.generation.expect("copy mode is active");
                 self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
                 continue;
             }
@@ -770,7 +792,7 @@ impl TerminalView {
                     self.copy_mode.pending_count = None;
                     if self.yank_visual(ui.ctx()) {
                         self.copy_mode.visual_anchor = None;
-                        let generation = self.copy_mode.generation.unwrap();
+                        let generation = self.copy_mode.generation.expect("copy mode is active");
                         self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
                     }
                 } else {
@@ -1207,9 +1229,15 @@ impl TerminalView {
             },
         };
         let selection = self.copy_visual_range(generation, cell);
-        let selection_layer = selection.as_ref().map(|range| SnapshotDecorationLayer {
-            ranges: std::ptr::from_ref(range),
-            range_count: 1,
+        let selection_ranges = self.copy_decoration_ranges(
+            generation,
+            selection,
+            self.copy_mode.visual_mode == VisualMode::Blockwise,
+            viewport,
+        );
+        let selection_layer = selection.map(|_| SnapshotDecorationLayer {
+            ranges: selection_ranges.as_ptr(),
+            range_count: selection_ranges.len(),
             style: SnapshotDecorationStyle {
                 foreground_rgb: 0xebdbb2,
                 background_rgb: 0x504945,
@@ -1226,9 +1254,15 @@ impl TerminalView {
             },
         };
         let yank = self.copy_mode.yank_highlight_range();
-        let yank_layer = yank.as_ref().map(|range| SnapshotDecorationLayer {
-            ranges: std::ptr::from_ref(range),
-            range_count: 1,
+        let yank_ranges = self.copy_decoration_ranges(
+            generation,
+            yank,
+            self.copy_mode.yank_highlight_is_rectangle(),
+            viewport,
+        );
+        let yank_layer = yank.map(|_| SnapshotDecorationLayer {
+            ranges: yank_ranges.as_ptr(),
+            range_count: yank_ranges.len(),
             style: SnapshotDecorationStyle {
                 foreground_rgb: 0x282828,
                 background_rgb: 0xd79921,
@@ -1255,9 +1289,49 @@ impl TerminalView {
         }
     }
 
+    fn copy_decoration_ranges(
+        &self,
+        generation: u64,
+        range: Option<SnapshotCellRange>,
+        rectangle: bool,
+        viewport: *const SnapshotViewportOptions,
+    ) -> Vec<SnapshotCellRange> {
+        let Some(range) = range else {
+            return Vec::new();
+        };
+        if !rectangle {
+            return vec![range];
+        }
+        let mut view = SnapshotView::default();
+        if !unsafe { ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) }
+            || view.viewport_rows == 0
+        {
+            return Vec::new();
+        }
+        let height = u64::from(view.viewport_rows);
+        let max_top = view.total_rows.saturating_sub(height);
+        let mut top = view.viewport_top.min(max_top);
+        // These pointers borrow local values for this decoration call only.
+        if let Some(options) = unsafe { viewport.as_ref() } {
+            if let Some(requested) = unsafe { options.top_row.as_ref() } {
+                top = (*requested).min(max_top);
+            } else if let Some(cell) = unsafe { options.reveal.as_ref() } {
+                let padding = u64::from(options.padding_rows).min((height - 1) / 2);
+                if cell.y < top + padding {
+                    top = cell.y.saturating_sub(padding);
+                } else if cell.y > top + height - 1 - padding {
+                    top = cell.y.saturating_sub(height - 1 - padding);
+                }
+                top = top.min(max_top);
+            }
+        }
+        crate::copy_mode::rectangle_row_ranges(range, top, height)
+    }
+
     fn copy_visual_range(&self, generation: u64, cell: SnapshotCell) -> Option<SnapshotCellRange> {
         match self.copy_mode.visual_mode {
             VisualMode::Characterwise => self.copy_mode.visual_range_to(cell),
+            VisualMode::Blockwise => self.copy_mode.visual_rectangle_to(cell),
             VisualMode::Linewise => self
                 .copy_mode
                 .linewise_visual_range_to(cell, |row| self.read_snapshot_row(generation, row)),
@@ -1336,12 +1410,13 @@ impl TerminalView {
         let Some(range) = self.copy_visual_range(generation, self.copy_mode.cursor) else {
             return false;
         };
-        self.yank_range(
+        self.yank_selection(
             ctx,
             generation,
             range,
             self.copy_mode.visual_mode == VisualMode::Linewise,
-            self.copy_mode.visual_trim,
+            self.copy_mode.visual_trim && self.copy_mode.visual_mode != VisualMode::Blockwise,
+            self.copy_mode.visual_mode == VisualMode::Blockwise,
         )
     }
 
@@ -1353,6 +1428,18 @@ impl TerminalView {
         linewise: bool,
         trim: bool,
     ) -> bool {
+        self.yank_selection(ctx, generation, range, linewise, trim, false)
+    }
+
+    fn yank_selection(
+        &mut self,
+        ctx: &egui::Context,
+        generation: u64,
+        range: SnapshotCellRange,
+        linewise: bool,
+        trim: bool,
+        rectangle: bool,
+    ) -> bool {
         let mut result = ffi::SnapshotSelectionText::default();
         if !unsafe {
             ffi::ghostty_egui_host_snapshot_selection_text(
@@ -1360,6 +1447,7 @@ impl TerminalView {
                 generation,
                 range,
                 trim,
+                rectangle,
                 &mut result,
             )
         } {
@@ -1377,7 +1465,12 @@ impl TerminalView {
                 text.push('\n');
             }
             ctx.copy_text(text);
-            self.copy_mode.highlight_yank(range, Instant::now());
+            if rectangle {
+                self.copy_mode
+                    .highlight_rectangle_yank(range, Instant::now());
+            } else {
+                self.copy_mode.highlight_yank(range, Instant::now());
+            }
             ctx.request_repaint_after(YANK_HIGHLIGHT_DURATION);
             true
         } else {

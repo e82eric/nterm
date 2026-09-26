@@ -120,9 +120,15 @@ previous row; <kbd>_</kbd> does so on the current row (or the counted row).
 <kbd>*</kbd>/<kbd>#</kbd> search for the word under the copy cursor toward
 newer/older output. <kbd>n</kbd> repeats that direction and <kbd>N</kbd>
 reverses it; matches wrap around the frozen scrollback.
-In visual mode, <kbd>o</kbd> or <kbd>O</kbd> swaps the cursor and selection
-anchor so you can extend the other end. Both keys behave the same for the
-supported characterwise and linewise selections.
+In visual mode, <kbd>o</kbd> swaps the cursor and selection anchor so you can
+extend the other end. <kbd>O</kbd> does the same in characterwise/linewise mode;
+in rectangular mode it switches to the other horizontal corner.
+
+Press <kbd>Ctrl</kbd>+<kbd>Q</kbd> in copy mode to toggle rectangular selection.
+The block covers the same inclusive columns on each physical row, including
+soft-wrapped rows. Use motions to adjust it, then <kbd>y</kbd> to copy one line
+per selected row and stay in copy mode. Wide characters and combining marks
+are extracted by Ghostty. The yank flash keeps the rectangular shape.
 
 Press <kbd>v</kbd> to start characterwise visual selection, then use any copy
 motion to extend it. Press <kbd>V</kbd> to select complete logical lines,

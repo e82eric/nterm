@@ -140,6 +140,7 @@ unsafe extern "C" {
         generation: u64,
         range: SnapshotCellRange,
         trim: bool,
+        rectangle: bool,
         result: *mut SnapshotSelectionText,
     ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_selection_text_free(
