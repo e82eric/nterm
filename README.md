@@ -82,7 +82,9 @@ When the search field is focused, paste remains within the search query.
 Press <kbd>Alt</kbd>+<kbd>Space</kbd> in terminal or copy mode to enter quick
 select. It labels visible big words using the hardcoded regex `\S+`, including
 words across soft wraps. Type a label to enter copy mode at the word's first
-cell. Labels are case-insensitive; as you type, only matching labels remain
+cell. Hold Shift on the final hint letter to leave the snapshot and paste the
+matched text into the live terminal without submitting it. Caps Lock alone
+does not trigger paste. Labels are case-insensitive; as you type, only matching labels remain
 with bold yellow labels on muted gray matches. Hint cells retain their original
 background. After typing a prefix, the already typed letters disappear and the
 remaining letters stay yellow. Backspace removes

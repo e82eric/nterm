@@ -198,9 +198,36 @@ pub(crate) fn consume_shortcut(events: &mut Vec<egui::Event>) -> (bool, bool) {
     (open, consumed)
 }
 
+/// Use the physical modifier from the paired key, not uppercase text (Caps Lock).
+pub(crate) fn shifted_hint(events: &[egui::Event], text_index: usize) -> bool {
+    matches!(text_index.checked_sub(1).and_then(|i| events.get(i)),
+        Some(egui::Event::Key { pressed: true, modifiers, .. }) if modifiers.shift)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shifted_completion_uses_key_modifier_instead_of_letter_case() {
+        for shift in [false, true] {
+            let events = vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: Some(egui::Key::A),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers {
+                        shift,
+                        ..Default::default()
+                    },
+                },
+                egui::Event::Text("A".into()),
+            ];
+            assert_eq!(shifted_hint(&events, 1), shift);
+        }
+        assert!(!shifted_hint(&[egui::Event::Text("A".into())], 0));
+    }
 
     #[test]
     fn paging_clamps_to_scrollback_and_rebuilds_labels_without_prefix() {

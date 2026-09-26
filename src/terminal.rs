@@ -389,7 +389,7 @@ impl TerminalView {
             return was_active || consumed;
         }
         let events = ui.input(|input| input.events.clone());
-        for event in events {
+        for (index, event) in events.iter().cloned().enumerate() {
             match event {
                 egui::Event::Key {
                     key: egui::Key::Escape,
@@ -429,7 +429,11 @@ impl TerminalView {
                         .expect("quick select is active")
                         .type_text(&text);
                     if let Some(target) = target {
-                        self.accept_quick_select(target);
+                        if quick_select::shifted_hint(&events, index) {
+                            self.paste_quick_select(target);
+                        } else {
+                            self.accept_quick_select(target);
+                        }
                         break;
                     }
                     self.publish_quick_select();
@@ -558,6 +562,40 @@ impl TerminalView {
         self.copy_mode.pending_g = false;
         self.copy_mode.pending_z = false;
         self.apply_copy_target(quick.generation, Motion::CharacterJump, target, false);
+        self.wake.context.request_repaint();
+    }
+
+    fn paste_quick_select(&mut self, target: SnapshotCell) {
+        let Some(quick) = &self.quick_select else {
+            return;
+        };
+        let Some(hint) = quick.hints.iter().find(|hint| hint.range.start == target) else {
+            return;
+        };
+        let mut result = ffi::SnapshotSelectionText::default();
+        if !unsafe {
+            ffi::ghostty_egui_host_snapshot_selection_text(
+                self.host,
+                quick.generation,
+                hint.range,
+                false,
+                false,
+                &mut result,
+            )
+        } {
+            self.cancel_quick_select();
+            return;
+        }
+        // Own the original text before releasing the snapshot. Ghostty's
+        // selection formatter handles Unicode and joins soft-wrapped rows.
+        let text = if result.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(result.text, result.len) }.to_vec()
+        };
+        unsafe { ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result) };
+        self.close_copy_mode();
+        unsafe { ffi::ghostty_egui_host_text(self.host, text.as_ptr().cast(), text.len()) };
         self.wake.context.request_repaint();
     }
 
