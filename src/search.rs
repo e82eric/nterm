@@ -8,12 +8,6 @@ use std::sync::{
 use std::thread;
 
 #[derive(Default)]
-pub(crate) struct SearchEvents {
-    pub(crate) open: Option<String>,
-    pub(crate) close: bool,
-}
-
-#[derive(Default)]
 pub(crate) struct SearchUi {
     pub(crate) active: bool,
     pub(crate) query: String,

@@ -2,7 +2,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 
 typedef struct {
     ghostty_app_t app;
@@ -12,8 +11,6 @@ typedef struct {
 extern void ghostty_egui_wakeup(void *userdata);
 extern void ghostty_egui_frame_ready(void *userdata);
 extern void ghostty_egui_close(void *userdata);
-extern void ghostty_egui_search_open(void *userdata, const char *needle, size_t len);
-extern void ghostty_egui_search_close(void *userdata);
 
 static void wake(void *userdata) { ghostty_egui_wakeup(userdata); }
 static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action_value) {
@@ -23,14 +20,6 @@ static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s 
     switch (action_value.tag) {
     case GHOSTTY_ACTION_RENDER:
         ghostty_egui_frame_ready(userdata);
-        return true;
-    case GHOSTTY_ACTION_START_SEARCH: {
-        const char *needle = action_value.action.start_search.needle;
-        ghostty_egui_search_open(userdata, needle, needle ? strlen(needle) : 0);
-        return true;
-    }
-    case GHOSTTY_ACTION_END_SEARCH:
-        ghostty_egui_search_close(userdata);
         return true;
     default:
         return false;

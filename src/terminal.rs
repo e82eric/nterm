@@ -10,10 +10,10 @@ use crate::ffi::{
 };
 use crate::input;
 use crate::painter::TerminalPainter;
-use crate::search::{SearchEvents, SearchUi, SearchWorker};
+use crate::search::{SearchUi, SearchWorker};
 use std::ffi::{c_char, c_void};
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Instant;
@@ -25,7 +25,6 @@ struct WakeState {
     wake_pending: AtomicBool,
     frame_ready_pending: AtomicBool,
     close: AtomicBool,
-    search: Mutex<SearchEvents>,
 }
 
 #[unsafe(no_mangle)]
@@ -55,33 +54,6 @@ extern "C" fn ghostty_egui_frame_ready(userdata: *mut c_void) {
 extern "C" fn ghostty_egui_close(userdata: *mut c_void) {
     let state = unsafe { &*(userdata.cast::<WakeState>()) };
     state.close.store(true, Ordering::Release);
-    state.context.request_repaint();
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_search_open(userdata: *mut c_void, needle: *const c_char, len: usize) {
-    let state = unsafe { &*(userdata.cast::<WakeState>()) };
-    let needle = if needle.is_null() {
-        String::new()
-    } else {
-        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(needle.cast(), len) })
-            .into_owned()
-    };
-    let mut events = state.search.lock().expect("search event mutex poisoned");
-    events.open = Some(needle);
-    events.close = false;
-    drop(events);
-    state.context.request_repaint();
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_search_close(userdata: *mut c_void) {
-    let state = unsafe { &*(userdata.cast::<WakeState>()) };
-    state
-        .search
-        .lock()
-        .expect("search event mutex poisoned")
-        .close = true;
     state.context.request_repaint();
 }
 
@@ -126,7 +98,6 @@ impl TerminalView {
             wake_pending: AtomicBool::new(false),
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
-            search: Mutex::new(SearchEvents::default()),
         });
         let native = current_native_context();
         let host = unsafe {
@@ -188,11 +159,7 @@ impl TerminalView {
     }
 
     pub(crate) fn update(&mut self, ui: &mut egui::Ui) {
-        let pending_at_frame_start = self.pending_search_snapshot;
-        self.apply_search_events();
-        if pending_at_frame_start.is_some()
-            && self.pending_search_snapshot == pending_at_frame_start
-        {
+        if self.pending_search_snapshot.is_some() {
             self.prepare_search_snapshot();
         }
         self.apply_search_result();
@@ -237,7 +204,9 @@ impl TerminalView {
         // Search may surrender text-field focus when Enter transfers its
         // snapshot to copy mode. Consume that frame's input even after the
         // overlay closes, so Enter is never also sent to the PTY.
-        let keyboard_blocked = self.handle_copy_keys(ui) || self.search.active;
+        let search_shortcut_consumed = self.handle_search_shortcut(ui);
+        let keyboard_blocked =
+            self.handle_copy_keys(ui) || self.search.active || search_shortcut_consumed;
         self.show_search_overlay(ui.ctx());
         let scrolled = input::forward(self.host, self.size, ui, rect, scale, keyboard_blocked);
         if (scrolled || resized)
@@ -310,24 +279,18 @@ impl TerminalView {
         self.host = std::ptr::null_mut();
     }
 
-    fn apply_search_events(&mut self) {
-        let events = {
-            let mut pending = self
-                .wake
-                .search
-                .lock()
-                .expect("search event mutex poisoned");
-            std::mem::take(&mut *pending)
-        };
-
-        if let Some(needle) = events.open {
-            self.open_search(needle);
+    fn handle_search_shortcut(&mut self, ui: &egui::Ui) -> bool {
+        let (open, consumed) = ui.input_mut(|input| consume_search_shortcut(&mut input.events));
+        if open {
+            if self.search.active {
+                self.search.focus_requested = true;
+                ui.ctx().request_repaint();
+            } else {
+                self.open_search(String::new());
+            }
         }
-        if events.close {
-            self.close_search();
-        }
+        consumed
     }
-
     fn open_search(&mut self, needle: String) {
         self.close_copy_mode();
         self.close_search();
@@ -1440,6 +1403,39 @@ impl TerminalView {
     }
 }
 
+/// Consume the app shortcut and its paired Text event before either copy
+/// mode, the search field, or Ghostty sees them. Repeats do not reopen search.
+fn consume_search_shortcut(events: &mut Vec<egui::Event>) -> (bool, bool) {
+    let mut incoming = std::mem::take(events).into_iter().peekable();
+    let mut open = false;
+    let mut consumed = false;
+    while let Some(event) = incoming.next() {
+        if let egui::Event::Key {
+            key: egui::Key::F,
+            pressed,
+            repeat,
+            modifiers,
+            ..
+        } = &event
+            && !modifiers.alt
+            && ((modifiers.ctrl && modifiers.shift && !modifiers.mac_cmd)
+                || (cfg!(target_os = "macos")
+                    && modifiers.mac_cmd
+                    && !modifiers.ctrl
+                    && !modifiers.shift))
+        {
+            consumed = true;
+            open |= *pressed && !*repeat;
+            if *pressed && matches!(incoming.peek(), Some(egui::Event::Text(_))) {
+                incoming.next();
+            }
+        } else {
+            events.push(event);
+        }
+    }
+    (open, consumed)
+}
+
 fn is_copy_modifier_key(key: egui::Key) -> bool {
     matches!(
         key,
@@ -1631,9 +1627,53 @@ fn copy_jump_prefix(key: egui::Key, modifiers: egui::Modifiers) -> Option<(bool,
 #[cfg(test)]
 mod copy_shortcut_tests {
     use super::{
-        YankTextObject, copy_command_shortcut, copy_digit, copy_jump_prefix, copy_motion,
-        copy_motion_with_prefix, copy_text_object_key, is_copy_mode_shortcut, is_copy_modifier_key,
+        YankTextObject, consume_search_shortcut, copy_command_shortcut, copy_digit,
+        copy_jump_prefix, copy_motion, copy_motion_with_prefix, copy_text_object_key,
+        is_copy_mode_shortcut, is_copy_modifier_key,
     };
+
+    #[test]
+    fn search_shortcut_consumes_key_and_paired_text_only() {
+        let key = |modifiers, pressed, repeat| egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: Some(egui::Key::F),
+            pressed,
+            repeat,
+            modifiers,
+        };
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let mut events = vec![
+            key(modifiers, true, false),
+            egui::Event::Text("F".into()),
+            egui::Event::Paste("query".into()),
+        ];
+        assert_eq!(consume_search_shortcut(&mut events), (true, true));
+        assert_eq!(events, vec![egui::Event::Paste("query".into())]);
+
+        for (pressed, repeat) in [(true, true), (false, false)] {
+            let mut events = vec![key(modifiers, pressed, repeat)];
+            assert_eq!(consume_search_shortcut(&mut events), (false, true));
+            assert!(events.is_empty());
+        }
+        for modifiers in [
+            egui::Modifiers::NONE,
+            egui::Modifiers::CTRL,
+            egui::Modifiers::SHIFT,
+            egui::Modifiers {
+                alt: true,
+                ..modifiers
+            },
+        ] {
+            let original = vec![key(modifiers, true, false), egui::Event::Text("f".into())];
+            let mut events = original.clone();
+            assert_eq!(consume_search_shortcut(&mut events), (false, false));
+            assert_eq!(events, original);
+        }
+    }
 
     #[test]
     fn command_shortcuts_require_ctrl_shift_arrows_and_a_key_press() {

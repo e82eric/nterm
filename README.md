@@ -50,7 +50,9 @@ older snapshot or query from replacing current results. Closing search waits
 for the worker to stop reading before releasing the snapshot.
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> on Windows and Linux to
-open the search overlay. Search queries, result highlighting, match selection,
+open the search overlay. Rust consumes this shortcut before forwarding input
+to Ghostty; Ghostty search keybindings do not control the sample's search UI.
+Search queries, result highlighting, match selection,
 and viewport movement are owned by the Rust egui application. It asks Ghostty
 for a frozen copy of the complete scrollback, performs Unicode-aware,
 case-insensitive literal matching over its streamed UTF-8 text, and sends
