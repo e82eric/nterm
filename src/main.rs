@@ -5,6 +5,7 @@ mod frame_trace;
 mod input;
 mod painter;
 mod presentation;
+mod quick_select;
 mod search;
 mod terminal;
 

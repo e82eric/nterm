@@ -79,6 +79,20 @@ match.
 Clipboard paste is forwarded to Ghostty when the terminal has keyboard focus.
 When the search field is focused, paste remains within the search query.
 
+Press <kbd>Alt</kbd>+<kbd>Space</kbd> in terminal or copy mode to enter quick
+select. It labels visible big words using the hardcoded regex `\S+`, including
+words across soft wraps. Type a label to enter copy mode at the word's first
+cell. Labels are case-insensitive; as you type, only matching labels remain
+with bold yellow labels on muted gray matches. Hint cells retain their original
+background. After typing a prefix, the already typed letters disappear and the
+remaining letters stay yellow. Backspace removes
+a prefix character.
+Escape (or Alt+Space again) returns to the previous mode. Quick select reuses
+the existing copy snapshot and preserves its cursor and selection on cancel.
+The viewport stays fixed while labels are displayed. Labels are rendered by
+Ghostty using generic printable-ASCII cell text overrides; the frozen terminal
+text stays unchanged.
+
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter the initial copy
 mode. Ghostty freezes the visible terminal and scrollback while the live PTY
 keeps running. A steady, styled cell marks the terminal's insertion point.

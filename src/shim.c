@@ -2,11 +2,36 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 typedef struct {
     ghostty_app_t app;
     ghostty_surface_t surface;
+#ifdef _WIN32
+    HWND window;
+    WNDPROC previous_window_proc;
+#endif
 } GhosttyEguiHost;
+
+#ifdef _WIN32
+static const wchar_t host_property[] = L"GhosttyEguiHost.QuickSelect";
+static LRESULT CALLBACK host_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    GhosttyEguiHost *host = (GhosttyEguiHost *)GetPropW(window, host_property);
+    if (!host) return DefWindowProcW(window, message, wparam, lparam);
+    // Winit still receives WM_SYSKEYDOWN. Only prevent the default system-menu
+    // action generated for Alt+Space, so the app can own this shortcut.
+    if (message == WM_SYSCOMMAND && (wparam & 0xfff0) == SC_KEYMENU && lparam == L' ') return 0;
+    WNDPROC previous = host->previous_window_proc;
+    if (message == WM_NCDESTROY) {
+        SetWindowLongPtrW(window, GWLP_WNDPROC, (LONG_PTR)previous);
+        RemovePropW(window, host_property);
+        host->window = NULL;
+    }
+    return CallWindowProcW(previous, window, message, wparam, lparam);
+}
+#endif
 
 extern void ghostty_egui_wakeup(void *userdata);
 extern void ghostty_egui_frame_ready(void *userdata);
@@ -121,11 +146,25 @@ GhosttyEguiHost *ghostty_egui_host_create(
     }
     host->app = app;
     host->surface = surface;
+#ifdef _WIN32
+    if (SetPropW((HWND)window, host_property, host)) {
+        host->previous_window_proc = (WNDPROC)SetWindowLongPtrW((HWND)window, GWLP_WNDPROC, (LONG_PTR)host_window_proc);
+        if (host->previous_window_proc) host->window = (HWND)window;
+        else RemovePropW((HWND)window, host_property);
+    }
+#endif
     return host;
 }
 
 void ghostty_egui_host_destroy(GhosttyEguiHost *host) {
     if (!host) return;
+#ifdef _WIN32
+    if (host->window) {
+        if ((WNDPROC)GetWindowLongPtrW(host->window, GWLP_WNDPROC) == host_window_proc)
+            SetWindowLongPtrW(host->window, GWLP_WNDPROC, (LONG_PTR)host->previous_window_proc);
+        RemovePropW(host->window, host_property);
+    }
+#endif
     if (host->surface) ghostty_surface_free(host->surface);
     if (host->app) ghostty_app_free(host->app);
     free(host);
@@ -200,7 +239,14 @@ bool ghostty_egui_host_snapshot_apply_decorations(
     const ghostty_snapshot_decoration_layer_s *layers, size_t count,
     const ghostty_snapshot_viewport_options_s *viewport
 ) { return ghostty_surface_snapshot_apply_decorations(
-    host->surface, generation, layers, count, viewport
+    host->surface, generation, layers, count, NULL, 0, viewport
+); }
+bool ghostty_egui_host_snapshot_apply_cell_text(
+    GhosttyEguiHost *host, uint64_t generation,
+    const ghostty_snapshot_decoration_layer_s *layers, size_t count,
+    const ghostty_snapshot_cell_text_s *text, size_t text_count
+) { return ghostty_surface_snapshot_apply_decorations(
+    host->surface, generation, layers, count, text, text_count, NULL
 ); }
 bool ghostty_egui_host_snapshot_decorations_need_refresh(
     GhosttyEguiHost *host, uint64_t generation

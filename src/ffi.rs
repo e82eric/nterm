@@ -68,6 +68,14 @@ pub(crate) struct SnapshotViewportOptions {
 }
 
 #[repr(C)]
+pub(crate) struct SnapshotCellText {
+    pub(crate) cell: SnapshotCell,
+    pub(crate) codepoint: u32,
+    pub(crate) style: SnapshotDecorationStyle,
+    pub(crate) bold: bool,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SnapshotTextPoint {
     pub(crate) x: u16,
@@ -173,6 +181,14 @@ unsafe extern "C" {
     pub(crate) fn ghostty_egui_host_snapshot_decorations_need_refresh(
         host: *mut Host,
         generation: u64,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_apply_cell_text(
+        host: *mut Host,
+        generation: u64,
+        layers: *const SnapshotDecorationLayer,
+        count: usize,
+        text: *const SnapshotCellText,
+        text_count: usize,
     ) -> bool;
     pub(crate) fn ghostty_egui_host_text(host: *mut Host, text: *const c_char, len: usize);
     pub(crate) fn ghostty_egui_host_preedit(host: *mut Host, text: *const c_char, len: usize);

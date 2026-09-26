@@ -10,6 +10,7 @@ use crate::ffi::{
 };
 use crate::input;
 use crate::painter::TerminalPainter;
+use crate::quick_select::{self, QuickSelect};
 use crate::search::{SearchUi, SearchWorker};
 use std::ffi::{c_char, c_void};
 use std::sync::{
@@ -70,6 +71,7 @@ pub(crate) struct TerminalView {
     next_search_open: u64,
     search_worker: SearchWorker,
     copy_mode: CopyMode,
+    quick_select: Option<QuickSelect>,
     copy_search: CopySearch,
     prompt_boundaries: Option<(u64, Vec<u64>)>,
 }
@@ -134,6 +136,7 @@ impl TerminalView {
             next_search_open: 0,
             search_worker: SearchWorker::new(egui_ctx.clone()),
             copy_mode: CopyMode::default(),
+            quick_select: None,
             copy_search: CopySearch::default(),
             prompt_boundaries: None,
         }
@@ -195,7 +198,9 @@ impl TerminalView {
             unsafe { ffi::ghostty_egui_host_focus(self.host, focused) };
         }
 
-        if let Some(generation) = self.copy_mode.generation {
+        if let Some(generation) = self.copy_mode.generation
+            && self.quick_select.is_none()
+        {
             let now = Instant::now();
             if self.copy_mode.clear_expired_yank_highlight(now) {
                 self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
@@ -212,11 +217,19 @@ impl TerminalView {
         // Search may surrender text-field focus when Enter transfers its
         // snapshot to copy mode. Consume that frame's input even after the
         // overlay closes, so Enter is never also sent to the PTY.
-        let search_shortcut_consumed = self.handle_search_shortcut(ui);
-        let keyboard_blocked =
-            self.handle_copy_keys(ui) || self.search.active || search_shortcut_consumed;
+        let quick_select_consumed = self.handle_quick_select_keys(ui);
+        let search_shortcut_consumed = !quick_select_consumed && self.handle_search_shortcut(ui);
+        let copy_input_consumed = !quick_select_consumed && self.handle_copy_keys(ui);
+        let keyboard_blocked = quick_select_consumed
+            || copy_input_consumed
+            || self.search.active
+            || search_shortcut_consumed;
         self.show_search_overlay(ui.ctx(), status_height);
-        let scrolled = input::forward(self.host, self.size, ui, rect, scale, keyboard_blocked);
+        let scrolled = if quick_select_consumed {
+            false // Hint labels are stable until this mode is completed or canceled.
+        } else {
+            input::forward(self.host, self.size, ui, rect, scale, keyboard_blocked)
+        };
         if (scrolled || resized)
             && let Some(snapshot_generation) = self.search.snapshot_generation
             && unsafe {
@@ -250,8 +263,11 @@ impl TerminalView {
 
     fn show_mode_status(&self, ui: &egui::Ui, rect: egui::Rect) {
         let copying = self.copy_mode.generation.is_some();
-        let visual = copying && self.copy_mode.visual_anchor.is_some();
-        let label = if self.search.active {
+        let visual =
+            copying && self.quick_select.is_none() && self.copy_mode.visual_anchor.is_some();
+        let label = if self.quick_select.is_some() {
+            "QUICK SELECT"
+        } else if self.search.active {
             "SEARCH"
         } else if visual {
             match self.copy_mode.visual_mode {
@@ -295,7 +311,24 @@ impl TerminalView {
             font.clone(),
             accent,
         );
-        if copying {
+        if let Some(quick) = &self.quick_select {
+            let text = if quick.hints.is_empty() {
+                "NO MATCHES · Esc".to_owned()
+            } else {
+                format!(
+                    "{}  ·  {} hints",
+                    quick.prefix.to_ascii_uppercase(),
+                    quick.visible_hints().count()
+                )
+            };
+            painter.text(
+                egui::pos2(rect.right() - 10.0, rect.center().y + 1.0),
+                egui::Align2::RIGHT_CENTER,
+                text,
+                font,
+                foreground,
+            );
+        } else if copying {
             // One-based physical scrollback row and terminal column.
             let cursor = self.copy_mode.cursor;
             let position = painter.layout_no_wrap(
@@ -339,6 +372,151 @@ impl TerminalView {
         self.painter.lock().destroy(gl);
         unsafe { ffi::ghostty_egui_host_destroy(self.host) };
         self.host = std::ptr::null_mut();
+    }
+
+    fn handle_quick_select_keys(&mut self, ui: &egui::Ui) -> bool {
+        let was_active = self.quick_select.is_some();
+        let (open, consumed) =
+            ui.input_mut(|input| quick_select::consume_shortcut(&mut input.events));
+        if open && !self.search.active {
+            if was_active {
+                self.cancel_quick_select();
+            } else {
+                self.open_quick_select();
+            }
+        }
+        if self.quick_select.is_none() {
+            return was_active || consumed;
+        }
+        let events = ui.input(|input| input.events.clone());
+        for event in events {
+            match event {
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                } => {
+                    self.cancel_quick_select();
+                    break;
+                }
+                egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    pressed: true,
+                    ..
+                } => {
+                    self.quick_select
+                        .as_mut()
+                        .expect("quick select is active")
+                        .prefix
+                        .pop();
+                    self.publish_quick_select();
+                }
+                egui::Event::Text(text) => {
+                    let target = self
+                        .quick_select
+                        .as_mut()
+                        .expect("quick select is active")
+                        .type_text(&text);
+                    if let Some(target) = target {
+                        self.accept_quick_select(target);
+                        break;
+                    }
+                    self.publish_quick_select();
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn open_quick_select(&mut self) {
+        let from_copy = self.copy_mode.generation.is_some();
+        let generation = if let Some(generation) = self.copy_mode.generation {
+            generation
+        } else {
+            let mut generation = 0;
+            if !unsafe { ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) } {
+                return;
+            }
+            generation
+        };
+        let mut view = SnapshotView::default();
+        if !unsafe { ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) } {
+            if !from_copy {
+                unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+            }
+            return;
+        }
+        if !from_copy {
+            self.copy_mode.start(generation, view);
+        }
+        self.quick_select = QuickSelect::new(generation, from_copy, view, |row| {
+            self.read_snapshot_row(generation, row)
+        });
+        if self.quick_select.is_none() {
+            if !from_copy {
+                self.close_copy_mode();
+            }
+            return;
+        }
+        if !self.publish_quick_select() {
+            self.cancel_quick_select();
+        }
+        self.wake.context.request_repaint();
+    }
+
+    fn publish_quick_select(&self) -> bool {
+        let Some(quick) = &self.quick_select else {
+            return false;
+        };
+        let ranges: Vec<_> = quick.visible_hints().map(|hint| hint.range).collect();
+        let text = quick.cell_text();
+        let layer = SnapshotDecorationLayer {
+            ranges: ranges.as_ptr(),
+            range_count: ranges.len(),
+            style: SnapshotDecorationStyle {
+                foreground_rgb: 0xebdbb2,
+                background_rgb: 0x3c3836,
+                flags: 2, // Preserve the underlying terminal's foreground colors.
+            },
+        };
+        unsafe {
+            ffi::ghostty_egui_host_snapshot_apply_cell_text(
+                self.host,
+                quick.generation,
+                &layer,
+                1,
+                text.as_ptr(),
+                text.len(),
+            )
+        }
+    }
+
+    fn cancel_quick_select(&mut self) {
+        let Some(quick) = self.quick_select.take() else {
+            return;
+        };
+        if quick.from_copy {
+            self.publish_copy_decoration(quick.generation, self.copy_mode.cursor, false);
+        } else {
+            self.close_copy_mode();
+        }
+        self.wake.context.request_repaint();
+    }
+
+    fn accept_quick_select(&mut self, target: SnapshotCell) {
+        let Some(quick) = self.quick_select.take() else {
+            return;
+        };
+        self.copy_mode.visual_anchor = None;
+        self.copy_mode.pending_yank = None;
+        self.copy_mode.pending_visual_object = None;
+        self.copy_mode.pending_jump = None;
+        self.copy_mode.pending_count = None;
+        self.copy_mode.pending_g = false;
+        self.copy_mode.pending_z = false;
+        self.apply_copy_target(quick.generation, Motion::CharacterJump, target, false);
+        self.wake.context.request_repaint();
     }
 
     fn handle_search_shortcut(&mut self, ui: &egui::Ui) -> bool {
@@ -484,6 +662,7 @@ impl TerminalView {
     }
 
     fn close_copy_mode(&mut self) {
+        self.quick_select = None;
         if let Some(generation) = self.copy_mode.generation {
             if self.copy_search.cursor != 0 {
                 self.search_worker.cancel_and_wait();
@@ -1168,6 +1347,9 @@ impl TerminalView {
     }
 
     fn apply_search_result(&mut self) {
+        if self.quick_select.is_some() {
+            return;
+        }
         let Some(result) = self.search_worker.take_latest_result() else {
             return;
         };
