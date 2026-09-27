@@ -8,6 +8,8 @@ struct AppConfig {
     font: FontConfig,
     terminal: TerminalConfig,
     colors: ColorConfig,
+    pickers: Option<std::collections::BTreeMap<String, crate::picker_config::Definition>>,
+    keys: Option<Vec<crate::picker_config::KeyBinding>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -113,7 +115,9 @@ fn read_config(
     Ok(None)
 }
 
-pub(crate) fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
+pub(crate) fn prepare(
+    args: Vec<String>,
+) -> Result<(Vec<String>, crate::picker_config::Bindings), String> {
     let mut incoming = args.into_iter();
     let program = incoming.next().unwrap_or_else(|| "ghostty_egui".into());
     let mut remaining = Vec::new();
@@ -139,13 +143,20 @@ pub(crate) fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
         }
     }
     let mut prepared = vec![program];
+    let mut pickers = crate::picker_config::Bindings::default();
     if let Some((path, source)) = read_config(explicit.as_deref(), &default_paths(), |path| {
         std::fs::read_to_string(path)
     })? {
-        let options = AppConfig::parse(&source, &path)
-            .and_then(|config| config.ghostty_args())
+        let (options, bindings) = AppConfig::parse(&source, &path)
+            .and_then(|config| {
+                Ok((
+                    config.ghostty_args()?,
+                    crate::picker_config::Bindings::compile(config.pickers, config.keys)?,
+                ))
+            })
             .map_err(|error| format!("{}: {error}", path.display()))?;
         prepared.extend(options);
+        pickers = bindings;
     }
     // Ghostty loads its normal files first, then these arguments. Explicit
     // command-line values come last and override the Lua configuration.
@@ -158,7 +169,12 @@ pub(crate) fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
         prepared.push("--font-family=".into());
     }
     prepared.extend(remaining);
-    Ok(prepared)
+    Ok((prepared, pickers))
+}
+
+#[cfg(test)]
+fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
+    prepare(args).map(|(args, _)| args)
 }
 
 #[cfg(test)]
@@ -167,6 +183,57 @@ mod tests {
 
     fn parse(source: &str) -> Result<AppConfig, String> {
         AppConfig::parse(source, Path::new("test-config.lua"))
+    }
+
+    #[test]
+    fn named_pickers_compile_and_reject_bad_bindings_and_regexes() {
+        let example = parse(include_str!("../config.lua")).unwrap();
+        assert!(crate::picker_config::Bindings::compile(example.pickers, example.keys).is_ok());
+        let config = parse(r#"return {pickers = {paths = {type = 'Scrollback', regex = '\\S+', enter_action = 'SendInput'}}, keys = {{key = 'p', mods = 'CTRL|SHIFT', picker = 'paths'}}}"#).unwrap();
+        let bindings =
+            crate::picker_config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let mut events = vec![egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: Some(egui::Key::P),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        }];
+        let (options, consumed) = bindings.consume(&mut events);
+        assert!(consumed && events.is_empty());
+        let options = options.unwrap();
+        assert!(matches!(
+            options.enter_action,
+            crate::picker_config::EnterAction::SendInput
+        ));
+        assert_eq!(options.regex.find("x y").unwrap().as_str(), "x");
+        for source in [
+            "return {pickers={x={regex='['}}}",
+            "return {pickers={x={regex='a*'}}}",
+            "return {keys={{key='p', picker='missing'}}}",
+            "return {keys={{key='f', mods='BAD', picker='lines'}}}",
+            "return {keys={{key='/', mods='CTRL|SHIFT', picker='lines'}}}",
+            "return {keys={{key='p', picker='lines'}, {key='p', picker='lines'}}}",
+        ] {
+            let config = parse(source).unwrap();
+            assert!(
+                crate::picker_config::Bindings::compile(config.pickers, config.keys).is_err(),
+                "{source}"
+            );
+        }
+        assert!(parse("return {pickers={x={type='Command'}}}").is_err());
+        assert!(parse("return {pickers={x={enter_action='Bad'}}}").is_err());
+        let empty = parse("return {keys={}}").unwrap();
+        let bindings = crate::picker_config::Bindings::compile(empty.pickers, empty.keys).unwrap();
+        let mut events = vec![egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: Some(egui::Key::F),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        }];
+        let (open, consumed) = bindings.consume(&mut events);
+        assert!(!consumed && open.is_none() && events.len() == 1);
     }
 
     #[test]

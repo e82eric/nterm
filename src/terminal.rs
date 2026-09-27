@@ -73,6 +73,7 @@ pub(crate) struct TerminalView {
     copy_mode: CopyMode,
     quick_select: Option<QuickSelect>,
     picker: Option<crate::picker::Picker>,
+    picker_bindings: crate::picker_config::Bindings,
     picker_font: crate::picker_font::PickerFont,
     copy_search: CopySearch,
     prompt_boundaries: Option<(u64, Vec<u64>)>,
@@ -95,6 +96,7 @@ impl TerminalView {
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
         argc: usize,
         argv: *mut *mut c_char,
+        picker_bindings: crate::picker_config::Bindings,
     ) -> Self {
         let mut wake = Box::new(WakeState {
             context: egui_ctx.clone(),
@@ -141,6 +143,7 @@ impl TerminalView {
             copy_mode: CopyMode::default(),
             quick_select: None,
             picker: None,
+            picker_bindings,
             picker_font,
             copy_search: CopySearch::default(),
             prompt_boundaries: None,
@@ -458,8 +461,15 @@ impl TerminalView {
 
     fn handle_picker(&mut self, ui: &egui::Ui, status_height: f32) -> bool {
         let was_active = self.picker.is_some();
-        let (shortcut, consumed) = ui.input_mut(|i| crate::picker::consume_shortcut(&mut i.events));
-        if shortcut && !was_active && !self.search.active && self.quick_select.is_none() {
+        let (shortcut, consumed) =
+            if was_active || self.search.active || self.quick_select.is_some() {
+                (None, false)
+            } else {
+                ui.input_mut(|i| self.picker_bindings.consume(&mut i.events))
+            };
+        if let Some(options) =
+            shortcut.filter(|_| !was_active && !self.search.active && self.quick_select.is_none())
+        {
             let from_copy = self.copy_mode.generation.is_some();
             let generation = if let Some(generation) = self.copy_mode.generation {
                 generation
@@ -486,6 +496,7 @@ impl TerminalView {
                 from_copy,
                 view.total_rows,
                 ui.ctx().clone(),
+                options,
             ));
         }
         let active = self.picker.is_some();
@@ -514,6 +525,12 @@ impl TerminalView {
                     self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
                 }
                 crate::picker::Action::Cancel => self.close_copy_mode(),
+                crate::picker::Action::SendInput(text) => {
+                    self.close_copy_mode();
+                    unsafe {
+                        ffi::ghostty_egui_host_text(self.host, text.as_ptr().cast(), text.len())
+                    };
+                }
                 crate::picker::Action::Accept(target) => {
                     // A pending copy-mode word search must not move the cursor
                     // again after accepting this picker result.

@@ -41,7 +41,7 @@ fn result_layout(
         ..Default::default()
     };
     let matched = egui::TextFormat {
-        color: egui::Color32::from_rgb(254, 128, 25),
+        color: egui::Color32::from_rgb(251, 73, 52),
         font_id: matched_font.clone(),
         ..normal.clone()
     };
@@ -78,6 +78,7 @@ pub(crate) struct Picker {
     pub(crate) generation: u64,
     pub(crate) from_copy: bool,
     pub(crate) typography: crate::picker_font::Typography,
+    enter_action: crate::picker_config::EnterAction,
     session_id: u64,
     session: FuzzySearchSession<Items, SnapshotStore<Items>>,
     store: Arc<SnapshotStore<Items>>,
@@ -100,6 +101,7 @@ pub(crate) struct Picker {
 pub(crate) enum Action {
     Cancel,
     Accept(SnapshotCell),
+    SendInput(String),
 }
 
 impl Picker {
@@ -109,6 +111,7 @@ impl Picker {
         from_copy: bool,
         rows: u64,
         ctx: egui::Context,
+        options: crate::picker_config::Options,
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let session_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -175,16 +178,19 @@ impl Picker {
                         break;
                     }
                     lines.reverse();
-                    if let Some((text, range)) = logical_item(&lines) {
+                    for (text, range) in logical_items(&lines, &options.regex).into_iter().rev() {
+                        if cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
                         publisher.add_item(text.as_bytes(), range);
                         batch += 1;
+                        if batch >= 128 {
+                            publisher.publish();
+                            batch = 0;
+                            ctx.request_repaint();
+                        }
                     }
                     bottom = start;
-                    if batch >= 128 {
-                        publisher.publish();
-                        batch = 0;
-                        ctx.request_repaint();
-                    }
                 }
                 publisher.complete();
                 ctx.request_repaint();
@@ -194,6 +200,7 @@ impl Picker {
             generation,
             from_copy,
             typography: crate::picker_font::Typography::default(),
+            enter_action: options.enter_action,
             session_id,
             session,
             store,
@@ -411,7 +418,14 @@ impl Picker {
         if action.is_none() && accept && self.results_revision == Some(self.query_revision) {
             if let Some(result) = self.results.get(self.selected) {
                 if let Some(snapshot) = self.store.snapshot() {
-                    action = Some(Action::Accept(snapshot.payload(result.node_index).start));
+                    action = Some(match self.enter_action {
+                        crate::picker_config::EnterAction::Navigate => {
+                            Action::Accept(snapshot.payload(result.node_index).start)
+                        }
+                        crate::picker_config::EnterAction::SendInput => {
+                            Action::SendInput(result.path.clone())
+                        }
+                    });
                 }
             }
         }
@@ -420,34 +434,6 @@ impl Picker {
         }
         action
     }
-}
-
-pub(crate) fn consume_shortcut(events: &mut Vec<egui::Event>) -> (bool, bool) {
-    let mut incoming = std::mem::take(events).into_iter().peekable();
-    let (mut open, mut consumed) = (false, false);
-    while let Some(event) = incoming.next() {
-        if let egui::Event::Key {
-            key: egui::Key::F,
-            pressed,
-            repeat,
-            modifiers,
-            ..
-        } = &event
-            && modifiers.ctrl
-            && modifiers.shift
-            && !modifiers.alt
-            && !modifiers.mac_cmd
-        {
-            consumed = true;
-            open |= *pressed && !*repeat;
-            if *pressed && matches!(incoming.peek(), Some(egui::Event::Text(_))) {
-                incoming.next();
-            }
-        } else {
-            events.push(event);
-        }
-    }
-    (open, consumed)
 }
 
 impl Drop for Picker {
@@ -486,29 +472,39 @@ fn read_row(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
     })
 }
 
-fn logical_item(rows: &[(u64, TextRow)]) -> Option<(String, SnapshotCellRange)> {
+fn logical_items(
+    rows: &[(u64, TextRow)],
+    regex: &regex::Regex,
+) -> Vec<(String, SnapshotCellRange)> {
     let mut text = String::new();
     let mut points = Vec::new();
     for (y, row) in rows {
         if row.text.len() != row.columns.len() {
-            return None;
+            return Vec::new();
         }
         text.push_str(&row.text);
         points.extend(row.columns.iter().map(|&x| SnapshotCell { x, y: *y }));
     }
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let start = text.len() - text.trim_start().len();
-    let end = text.trim_end().len() - 1;
-    Some((
-        trimmed.to_owned(),
-        SnapshotCellRange {
-            start: points[start],
-            end: points[end],
-        },
-    ))
+    regex
+        .find_iter(&text)
+        .filter(|matched| !matched.as_str().trim().is_empty())
+        .map(|matched| {
+            (
+                matched.as_str().to_owned(),
+                SnapshotCellRange {
+                    start: points[matched.start()],
+                    end: points[matched.end() - 1],
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn logical_item(rows: &[(u64, TextRow)]) -> Option<(String, SnapshotCellRange)> {
+    logical_items(rows, &crate::picker_config::Options::default().regex)
+        .into_iter()
+        .next()
 }
 
 #[cfg(test)]
@@ -523,14 +519,14 @@ mod tests {
             let highlighted: String = job
                 .sections
                 .iter()
-                .filter(|section| section.format.color == egui::Color32::from_rgb(254, 128, 25))
+                .filter(|section| section.format.color == egui::Color32::from_rgb(251, 73, 52))
                 .map(|section| &job.text[section.byte_range.start.0..section.byte_range.end.0])
                 .collect();
             assert_eq!(highlighted, expected);
             assert!(
                 job.sections
                     .iter()
-                    .filter(|section| section.format.color == egui::Color32::from_rgb(254, 128, 25))
+                    .filter(|section| section.format.color == egui::Color32::from_rgb(251, 73, 52))
                     .all(|section| section.format.font_id == bold)
             );
         }
@@ -569,6 +565,7 @@ mod tests {
             generation: 1,
             from_copy: false,
             typography: crate::picker_font::Typography::default(),
+            enter_action: crate::picker_config::EnterAction::Navigate,
             session_id: 123,
             session: FuzzySearchSession::new(123, store.clone(), String::new(), tx),
             store,
@@ -640,26 +637,53 @@ mod tests {
             picker.results_shown,
             "later empty updates must not hide the panel"
         );
-    }
-
-    #[test]
-    fn shortcut_consumes_paired_text_and_ignores_repeats() {
-        let key = |repeat| egui::Event::Key {
-            key: egui::Key::F,
-            physical_key: Some(egui::Key::F),
-            pressed: true,
-            repeat,
-            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        let range = SnapshotCellRange {
+            start: SnapshotCell { x: 4, y: 19 },
+            end: SnapshotCell { x: 9, y: 19 },
         };
-        let mut events = vec![
-            key(false),
-            egui::Event::Text("F".into()),
-            egui::Event::Text("x".into()),
-        ];
-        assert_eq!(consume_shortcut(&mut events), (true, true));
-        assert!(matches!(events.as_slice(), [egui::Event::Text(t)] if t == "x"));
-        let mut events = vec![key(true)];
-        assert_eq!(consume_shortcut(&mut events), (false, true));
+        let mut publisher = PublishingStreamingItemStoreWithPayload::new(picker.store.clone());
+        publisher.add_item(b"chosen", range);
+        publisher.complete();
+        picker.results = vec![SearchResult {
+            node_index: 0,
+            score: 1,
+            path: "chosen".into(),
+        }];
+        picker.selected = 0;
+        picker.visible_start = 0;
+        picker.results_revision = Some(picker.query_revision);
+        for enter_action in [
+            crate::picker_config::EnterAction::Navigate,
+            crate::picker_config::EnterAction::SendInput,
+        ] {
+            picker.enter_action = enter_action;
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let mut accepted = None;
+            let mut output = ctx.run_ui(input, |ui| {
+                if let Some(action) = picker.show(ui.ctx(), 24.0) {
+                    accepted = Some(action);
+                }
+            });
+            output.textures_delta.clear();
+            match (enter_action, accepted) {
+                (crate::picker_config::EnterAction::Navigate, Some(Action::Accept(cell))) => {
+                    assert_eq!(cell, range.start)
+                }
+                (crate::picker_config::EnterAction::SendInput, Some(Action::SendInput(text))) => {
+                    assert_eq!(text, "chosen")
+                }
+                _ => panic!("configured Enter action was not used"),
+            }
+        }
     }
 
     #[test]
@@ -723,6 +747,13 @@ mod tests {
         assert_eq!(text, "界foo");
         assert_eq!(range.start, SnapshotCell { x: 2, y: 3 });
         assert_eq!(range.end, SnapshotCell { x: 2, y: 4 });
+        let matches = logical_items(&rows, &regex::Regex::new("界f|oo").unwrap());
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].0, "界f");
+        assert_eq!(matches[0].1.start, SnapshotCell { x: 2, y: 3 });
+        assert_eq!(matches[0].1.end, SnapshotCell { x: 0, y: 4 });
+        assert_eq!(matches[1].0, "oo");
+        assert_eq!(matches[1].1.start, SnapshotCell { x: 1, y: 4 });
         assert!(
             logical_item(&[(
                 0,

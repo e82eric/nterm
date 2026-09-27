@@ -6,6 +6,7 @@ mod frame_trace;
 mod input;
 mod painter;
 mod picker;
+mod picker_config;
 mod picker_font;
 mod presentation;
 mod quick_select;
@@ -15,7 +16,7 @@ mod terminal;
 use std::ffi::CString;
 
 fn main() {
-    let args = match config::prepare_args(std::env::args().collect()) {
+    let (args, pickers) = match config::prepare(std::env::args().collect()) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("{error}");
@@ -26,5 +27,5 @@ fn main() {
         .into_iter()
         .map(|arg| CString::new(arg).expect("command-line arguments cannot contain NUL bytes"))
         .collect();
-    app::run(args);
+    app::run(args, pickers);
 }

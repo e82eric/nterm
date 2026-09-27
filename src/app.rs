@@ -8,12 +8,12 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(crate) fn run(args: Vec<CString>) {
+pub(crate) fn run(args: Vec<CString>, pickers: crate::picker_config::Bindings) {
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("create event loop");
     let proxy = event_loop.create_proxy();
-    let mut app = NativeApp::new(proxy, args);
+    let mut app = NativeApp::new(proxy, args, pickers);
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
@@ -31,10 +31,18 @@ impl ShellApp {
         gl: &glow::Context,
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
         args: Vec<CString>,
+        pickers: crate::picker_config::Bindings,
     ) -> Self {
         let mut argv: Vec<*mut c_char> = args.iter().map(|arg| arg.as_ptr().cast_mut()).collect();
         Self {
-            terminal: TerminalView::new(egui_ctx, gl, proxy, argv.len(), argv.as_mut_ptr()),
+            terminal: TerminalView::new(
+                egui_ctx,
+                gl,
+                proxy,
+                argv.len(),
+                argv.as_mut_ptr(),
+                pickers,
+            ),
             _args: args,
             _argv: argv,
         }
@@ -59,6 +67,7 @@ pub(crate) enum UserEvent {
 struct NativeApp {
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     args: Option<Vec<CString>>,
+    pickers: Option<crate::picker_config::Bindings>,
     gl_window: Option<GlutinWindowContext>,
     gl: Option<Arc<glow::Context>>,
     egui: Option<egui_glow::EguiGlow>,
@@ -68,10 +77,15 @@ struct NativeApp {
 }
 
 impl NativeApp {
-    fn new(proxy: winit::event_loop::EventLoopProxy<UserEvent>, args: Vec<CString>) -> Self {
+    fn new(
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+        args: Vec<CString>,
+        pickers: crate::picker_config::Bindings,
+    ) -> Self {
         Self {
             proxy,
             args: Some(args),
+            pickers: Some(pickers),
             gl_window: None,
             gl: None,
             egui: None,
@@ -189,6 +203,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             &gl,
             self.proxy.clone(),
             self.args.take().expect("application resumed twice"),
+            self.pickers.take().expect("application resumed twice"),
         );
         gl_window.window().set_visible(true);
         gl_window.window().request_redraw();

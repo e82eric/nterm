@@ -48,6 +48,38 @@ the base; Lua overrides them, and explicit command-line options override Lua.
 The picker still imports Ghostty's resolved font and tracks its cell dimensions.
 Changes to Lua require restarting the app; callbacks and live reload are not yet supported.
 
+Named pickers and their shortcuts can also be defined in Lua:
+
+```lua
+pickers = {
+  lines = { type = "Scrollback", enter_action = "Navigate" },
+  words = { type = "Scrollback", regex = [[\S+]], enter_action = "SendInput" },
+},
+keys = {
+  { key = "f", mods = "CTRL|SHIFT", picker = "lines" },
+  { key = "p", mods = "CTRL|SHIFT", picker = "words" },
+},
+```
+
+These fields belong inside the returned configuration table. `Scrollback` is the
+only type currently supported. Regexes extract individual candidates from logical
+lines (joining soft wraps, never separate hard lines). The default extracts whole
+nonblank lines without surrounding whitespace. Extraction uses Rust's `regex`
+syntax; lookaround and backreferences are unsupported. Empty matches are skipped.
+Each candidate retains its exact snapshot cell range, including Unicode text.
+`Navigate` enters copy mode at its first cell. `SendInput` returns to the live
+terminal and pastes the matched text without pressing Enter, including when the
+picker was opened from copy mode.
+
+Keys accept egui names such as `f`, `Space`, and `ArrowUp`; modifiers are joined
+with `|` (`CTRL`, `SHIFT`, `ALT`; `CMD`/`SUPER` are macOS-only). Definitions and regexes are compiled
+at startup; unknown picker names, invalid patterns, duplicate bindings, and
+conflicts with reserved app shortcuts report configuration errors. Bindings only
+trigger from terminal or copy mode, leaving modal query input unaffected.
+Without `pickers`, the built-in `lines` picker remains available. Without `keys`,
+Ctrl+Shift+F opens `lines` if defined. An explicit empty `keys = {}` disables picker
+shortcuts. Explicit `pickers` and `keys` replace their respective defaults.
+
 The Rust source is divided by responsibility: `app.rs` owns the native window
 and event loop, `terminal.rs` coordinates the embedded surface, `ffi.rs`
 contains the C boundary, `painter.rs` presents Ghostty's OpenGL textures,
@@ -133,7 +165,7 @@ at `G:/src/RustWin32Host/nfm-search-core`; adjust its Cargo path on other machin
 
 The picker imports Ghostty's resolved primary regular and bold fonts and uses the current
 terminal cell dimensions to size its text and rows, including zoom and DPI changes.
-Matched positions use bold orange text; selection uses a background highlight.
+Matched positions use bold red text; selection uses a background highlight.
 Unsupported non-SFNT font formats use egui's monospace fallback.
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter the initial copy
