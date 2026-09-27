@@ -24,3 +24,6 @@ nfm_search_core = { path = "G:/src/RustWin32Host/nfm-search-core" }
 
 [build-dependencies]
 cc = "1.2"
+
+[target.'cfg(windows)'.dependencies]
+nfm_file_system = { path = "G:/src/RustWin32Host/nfm-file-system" }

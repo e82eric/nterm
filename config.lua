@@ -22,9 +22,17 @@ return {
       regex = [[\S+]],
       enter_action = "SendInput",
     },
+    files = {
+      type = "FileSystem",
+      roots = { [[G:\src, C:\src]] },
+      files_only = true,
+      max_depth = 0, -- Zero means unlimited.
+      enter_action = "SendInput",
+    },
   },
   keys = {
     { key = "f", mods = "CTRL|SHIFT", picker = "lines" },
     { key = "p", mods = "CTRL|SHIFT", picker = "words" },
+    { key = "o", mods = "CTRL|SHIFT", picker = "files" },
   },
 }

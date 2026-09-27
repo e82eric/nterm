@@ -9,23 +9,72 @@ pub(crate) enum EnterAction {
     SendInput,
 }
 
-#[derive(Default, Deserialize)]
-pub(crate) enum PickerType {
-    #[default]
-    Scrollback,
-}
-
+// Repeat the shared acceptance fields so each variant can reject unknown fields.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Definition {
-    #[serde(rename = "type", default)]
-    kind: PickerType,
-    #[serde(default = "default_regex")]
-    regex: String,
-    #[serde(default)]
-    enter_action: EnterAction,
+#[serde(tag = "type", deny_unknown_fields)]
+pub(crate) enum Definition {
+    Scrollback {
+        #[serde(default)]
+        regex: Option<String>,
+        #[serde(default)]
+        enter_action: Option<EnterAction>,
+        #[serde(skip)]
+        callback: Option<std::rc::Rc<crate::picker_action::Callback>>,
+    },
+    FileSystem {
+        #[serde(default)]
+        roots: Vec<String>,
+        #[serde(default)]
+        max_depth: Option<i32>,
+        #[serde(default)]
+        files_only: bool,
+        #[serde(default)]
+        directories_only: bool,
+        #[serde(default)]
+        enter_action: Option<EnterAction>,
+        #[serde(skip)]
+        callback: Option<std::rc::Rc<crate::picker_action::Callback>>,
+    },
 }
 
+impl Definition {
+    pub(crate) fn set_callback(&mut self, value: std::rc::Rc<crate::picker_action::Callback>) {
+        match self {
+            Self::Scrollback { callback, .. } | Self::FileSystem { callback, .. } => {
+                *callback = Some(value)
+            }
+        }
+    }
+
+    fn acceptance(
+        &self,
+    ) -> (
+        Option<std::rc::Rc<crate::picker_action::Callback>>,
+        Option<EnterAction>,
+    ) {
+        match self {
+            Self::Scrollback {
+                callback,
+                enter_action,
+                ..
+            }
+            | Self::FileSystem {
+                callback,
+                enter_action,
+                ..
+            } => (callback.clone(), *enter_action),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn callback(&self) -> Option<&std::rc::Rc<crate::picker_action::Callback>> {
+        match self {
+            Self::Scrollback { callback, .. } | Self::FileSystem { callback, .. } => {
+                callback.as_ref()
+            }
+        }
+    }
+}
 fn default_regex() -> String {
     r"\S(?:[^\r\n]*\S)?".into()
 }
@@ -41,14 +90,31 @@ pub(crate) struct KeyBinding {
 
 #[derive(Clone)]
 pub(crate) struct Options {
-    pub(crate) regex: Regex,
+    pub(crate) callback: Option<std::rc::Rc<crate::picker_action::Callback>>,
+    pub(crate) source: Source,
     pub(crate) enter_action: EnterAction,
+}
+
+#[derive(Clone)]
+pub(crate) enum Source {
+    Scrollback(Regex),
+    FileSystem(FileOptions),
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(windows), allow(dead_code))] // Reserved for NFM's future Linux backend.
+pub(crate) struct FileOptions {
+    pub(crate) roots: Vec<std::path::PathBuf>,
+    pub(crate) max_depth: i32,
+    pub(crate) files_only: bool,
+    pub(crate) directories_only: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
-            regex: Regex::new(&default_regex()).unwrap(),
+            callback: None,
+            source: Source::Scrollback(Regex::new(&default_regex()).unwrap()),
             enter_action: EnterAction::Navigate,
         }
     }
@@ -70,10 +136,10 @@ impl Bindings {
         let definitions = definitions.unwrap_or_else(|| {
             BTreeMap::from([(
                 "lines".into(),
-                Definition {
-                    kind: PickerType::Scrollback,
-                    regex: default_regex(),
-                    enter_action: EnterAction::Navigate,
+                Definition::Scrollback {
+                    callback: None,
+                    regex: None,
+                    enter_action: None,
                 },
             )])
         });
@@ -82,19 +148,59 @@ impl Bindings {
             if name.trim().is_empty() {
                 return Err("picker names must not be empty".into());
             }
-            let PickerType::Scrollback = definition.kind;
-            let regex = Regex::new(&definition.regex)
-                .map_err(|error| format!("pickers.{name}.regex: {error}"))?;
-            if regex.is_match("") {
-                return Err(format!("pickers.{name}.regex must not match empty text"));
-            }
-            compiled.insert(
-                name,
-                Options {
-                    regex,
-                    enter_action: definition.enter_action,
-                },
-            );
+            let (callback, enter_action) = definition.acceptance();
+            let options = match definition {
+                Definition::Scrollback { regex, .. } => {
+                    let regex = Regex::new(&regex.unwrap_or_else(default_regex))
+                        .map_err(|error| format!("pickers.{name}.regex: {error}"))?;
+                    if regex.is_match("") {
+                        return Err(format!("pickers.{name}.regex must not match empty text"));
+                    }
+                    Options {
+                        callback,
+                        source: Source::Scrollback(regex),
+                        enter_action: enter_action.unwrap_or(EnterAction::Navigate),
+                    }
+                }
+                Definition::FileSystem {
+                    roots,
+                    max_depth,
+                    files_only,
+                    directories_only,
+                    ..
+                } => {
+                    if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
+                        return Err(format!(
+                            "pickers.{name}: FileSystem only supports enter_action SendInput"
+                        ));
+                    }
+                    if files_only && directories_only {
+                        return Err(format!(
+                            "pickers.{name}: files_only and directories_only cannot both be true"
+                        ));
+                    }
+                    if max_depth.is_some_and(|depth| depth < 0) {
+                        return Err(format!("pickers.{name}.max_depth must be nonnegative"));
+                    }
+                    if roots
+                        .iter()
+                        .any(|root| root.trim().is_empty() || root.contains('\0'))
+                    {
+                        return Err(format!("pickers.{name}.roots must contain nonempty paths"));
+                    }
+                    Options {
+                        callback,
+                        source: Source::FileSystem(FileOptions {
+                            roots: roots.into_iter().map(std::path::PathBuf::from).collect(),
+                            max_depth: max_depth.unwrap_or(i32::MAX),
+                            files_only,
+                            directories_only,
+                        }),
+                        enter_action: EnterAction::SendInput,
+                    }
+                }
+            };
+            compiled.insert(name, options);
         }
         let keys = keys.unwrap_or_else(|| {
             if compiled.contains_key("lines") {

@@ -13,6 +13,34 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 
 type Items = StreamingItemSnapshotWithPayload<SnapshotCellRange>;
+enum Session {
+    Streaming(FuzzySearchSession<Items, SnapshotStore<Items>>),
+    #[cfg(not(windows))]
+    UnsupportedFileSystem,
+    #[cfg(windows)]
+    FileSystem(nfm_file_system::file_system_search::FileSystemSearch),
+}
+
+impl Session {
+    fn set_query(&self, query: String) {
+        match self {
+            Self::Streaming(session) => session.set_query(query),
+            #[cfg(not(windows))]
+            Self::UnsupportedFileSystem => {}
+            #[cfg(windows)]
+            Self::FileSystem(session) => session.set_query(query),
+        }
+    }
+    fn stop(&self) {
+        match self {
+            Self::Streaming(session) => session.stop(),
+            #[cfg(not(windows))]
+            Self::UnsupportedFileSystem => {}
+            #[cfg(windows)]
+            Self::FileSystem(session) => session.stop(),
+        }
+    }
+}
 const RESULT_ROWS: usize = 7;
 
 fn visible_start(start: usize, selected: usize) -> usize {
@@ -75,12 +103,14 @@ fn result_layout(
 }
 
 pub(crate) struct Picker {
-    pub(crate) generation: u64,
+    pub(crate) generation: Option<u64>,
+    pub(crate) filesystem: bool,
     pub(crate) from_copy: bool,
     pub(crate) typography: crate::picker_font::Typography,
+    callback: Option<std::rc::Rc<crate::picker_action::Callback>>,
     enter_action: crate::picker_config::EnterAction,
     session_id: u64,
-    session: FuzzySearchSession<Items, SnapshotStore<Items>>,
+    session: Session,
     store: Arc<SnapshotStore<Items>>,
     updates: Arc<std::sync::Mutex<Option<FuzzySearchUpdate>>>,
     cancelled: Arc<AtomicBool>,
@@ -99,6 +129,12 @@ pub(crate) struct Picker {
 }
 
 pub(crate) enum Action {
+    Custom(
+        std::rc::Rc<crate::picker_action::Callback>,
+        String,
+        bool,
+        Option<SnapshotCellRange>,
+    ),
     Cancel,
     Accept(SnapshotCell),
     SendInput(String),
@@ -107,18 +143,50 @@ pub(crate) enum Action {
 impl Picker {
     pub(crate) fn start(
         host: *mut Host,
-        generation: u64,
+        generation: Option<u64>,
         from_copy: bool,
         rows: u64,
         ctx: egui::Context,
-        options: crate::picker_config::Options,
+        mut options: crate::picker_config::Options,
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let session_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let store = Arc::new(SnapshotStore::new());
         let (tx, updates_rx) = crossbeam_channel::unbounded();
-        let session = FuzzySearchSession::new(session_id, store.clone(), String::new(), tx);
-        session.start();
+        let error = Arc::new(std::sync::Mutex::new(None));
+        let filesystem = matches!(options.source, crate::picker_config::Source::FileSystem(_));
+        if let crate::picker_config::Source::FileSystem(files) = &mut options.source {
+            if let Err(message) = crate::picker_files::resolve_roots(files) {
+                *error.lock().unwrap() = Some(message);
+            }
+        }
+        let session = match &options.source {
+            #[cfg(windows)]
+            crate::picker_config::Source::FileSystem(files) => Session::FileSystem(
+                nfm_file_system::file_system_search::FileSystemSearch::start(
+                    session_id,
+                    nfm_file_system::walker::ScanOptions {
+                        roots: files.roots.clone(),
+                        max_depth: files.max_depth,
+                        files_only: files.files_only,
+                        directories_only: files.directories_only,
+                    },
+                    String::new(),
+                    tx,
+                ),
+            ),
+            #[cfg(not(windows))]
+            crate::picker_config::Source::FileSystem(_) => {
+                *error.lock().unwrap() =
+                    Some("Filesystem pickers require NFM support for this platform".into());
+                Session::UnsupportedFileSystem
+            }
+            crate::picker_config::Source::Scrollback(_) => {
+                let session = FuzzySearchSession::new(session_id, store.clone(), String::new(), tx);
+                session.start();
+                Session::Streaming(session)
+            }
+        };
         let cancelled = Arc::new(AtomicBool::new(false));
         let updates = Arc::new(std::sync::Mutex::new(None));
         {
@@ -139,11 +207,11 @@ impl Picker {
                 }
             });
         }
-        let error = Arc::new(std::sync::Mutex::new(None));
-        let reader = {
+        let reader = if let crate::picker_config::Source::Scrollback(regex) = options.source {
+            let generation = generation.expect("scrollback picker requires a snapshot");
             let (store, cancelled, error) = (store.clone(), cancelled.clone(), error.clone());
             let host = host as usize;
-            thread::spawn(move || {
+            Some(thread::spawn(move || {
                 let mut publisher = PublishingStreamingItemStoreWithPayload::new(store);
                 let read = |row| {
                     if cancelled.load(Ordering::Acquire) {
@@ -178,7 +246,7 @@ impl Picker {
                         break;
                     }
                     lines.reverse();
-                    for (text, range) in logical_items(&lines, &options.regex).into_iter().rev() {
+                    for (text, range) in logical_items(&lines, &regex).into_iter().rev() {
                         if cancelled.load(Ordering::Acquire) {
                             break;
                         }
@@ -194,19 +262,23 @@ impl Picker {
                 }
                 publisher.complete();
                 ctx.request_repaint();
-            })
+            }))
+        } else {
+            None
         };
         Self {
             generation,
+            filesystem,
             from_copy,
             typography: crate::picker_font::Typography::default(),
+            callback: options.callback,
             enter_action: options.enter_action,
             session_id,
             session,
             store,
             updates,
             cancelled,
-            reader: Some(reader),
+            reader,
             query: String::new(),
             submitted_query: String::new(),
             results_query: String::new(),
@@ -417,16 +489,32 @@ impl Picker {
         }
         if action.is_none() && accept && self.results_revision == Some(self.query_revision) {
             if let Some(result) = self.results.get(self.selected) {
-                if let Some(snapshot) = self.store.snapshot() {
-                    action = Some(match self.enter_action {
+                action = if let Some(callback) = &self.callback {
+                    let range = if self.filesystem {
+                        None
+                    } else {
+                        self.store
+                            .snapshot()
+                            .map(|snapshot| *snapshot.payload(result.node_index))
+                    };
+                    Some(Action::Custom(
+                        callback.clone(),
+                        result.path.clone(),
+                        self.filesystem,
+                        range,
+                    ))
+                } else {
+                    match self.enter_action {
                         crate::picker_config::EnterAction::Navigate => {
-                            Action::Accept(snapshot.payload(result.node_index).start)
+                            self.store.snapshot().map(|snapshot| {
+                                Action::Accept(snapshot.payload(result.node_index).start)
+                            })
                         }
                         crate::picker_config::EnterAction::SendInput => {
-                            Action::SendInput(result.path.clone())
+                            Some(Action::SendInput(result.path.clone()))
                         }
-                    });
-                }
+                    }
+                };
             }
         }
         if accept && action.is_none() {
@@ -443,7 +531,9 @@ impl Drop for Picker {
         // Snapshot pages must outlive the reader. It checks cancellation
         // between row reads; fuzzy workers use only their Rust-owned store.
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            if !self.filesystem {
+                let _ = reader.join();
+            }
         }
     }
 }
@@ -502,13 +592,92 @@ fn logical_items(
 
 #[cfg(test)]
 fn logical_item(rows: &[(u64, TextRow)]) -> Option<(String, SnapshotCellRange)> {
-    logical_items(rows, &crate::picker_config::Options::default().regex)
-        .into_iter()
-        .next()
+    let crate::picker_config::Source::Scrollback(regex) =
+        crate::picker_config::Options::default().source
+    else {
+        unreachable!()
+    };
+    logical_items(rows, &regex).into_iter().next()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(windows)]
+    fn filesystem_picker_streams_and_accepts_without_a_terminal_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("ghostty-picker-session-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file with spaces.txt");
+        std::fs::write(&file, "").unwrap();
+        let ctx = egui::Context::default();
+        let mut picker = super::Picker::start(
+            std::ptr::null_mut(),
+            None,
+            false,
+            0,
+            ctx.clone(),
+            crate::picker_config::Options {
+                source: crate::picker_config::Source::FileSystem(
+                    crate::picker_config::FileOptions {
+                        roots: vec![root.clone()],
+                        max_depth: 1,
+                        files_only: true,
+                        directories_only: false,
+                    },
+                ),
+                callback: None,
+                enter_action: crate::picker_config::EnterAction::SendInput,
+            },
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                picker.show(ui.ctx(), 24.0);
+            });
+            output.textures_delta.clear();
+            if picker.done && !picker.results.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filesystem results were not published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(picker.filesystem && picker.generation.is_none());
+        picker.selected = picker
+            .results
+            .iter()
+            .position(|result| std::path::Path::new(&result.path) == file.as_path())
+            .expect("filesystem picker must include the file");
+        let mut accepted = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                if let Some(action) = picker.show(ui.ctx(), 24.0) {
+                    accepted = Some(action);
+                }
+            },
+        );
+        output.textures_delta.clear();
+        assert!(
+            matches!(accepted, Some(super::Action::SendInput(text)) if std::path::Path::new(&text) == file.as_path())
+        );
+        drop(picker);
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn position_highlights_preserve_text_and_utf8_boundaries() {
         let font = egui::FontId::monospace(14.0);
@@ -562,12 +731,19 @@ mod tests {
         let store = Arc::new(SnapshotStore::<Items>::new());
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut picker = Picker {
-            generation: 1,
+            generation: Some(1),
+            filesystem: false,
             from_copy: false,
             typography: crate::picker_font::Typography::default(),
+            callback: None,
             enter_action: crate::picker_config::EnterAction::Navigate,
             session_id: 123,
-            session: FuzzySearchSession::new(123, store.clone(), String::new(), tx),
+            session: Session::Streaming(FuzzySearchSession::new(
+                123,
+                store.clone(),
+                String::new(),
+                tx,
+            )),
             store,
             updates: Arc::new(std::sync::Mutex::new(None)),
             cancelled: Arc::new(AtomicBool::new(false)),

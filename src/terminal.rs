@@ -278,8 +278,12 @@ impl TerminalView {
         let copying = self.copy_mode.generation.is_some();
         let visual =
             copying && self.quick_select.is_none() && self.copy_mode.visual_anchor.is_some();
-        let label = if self.picker.is_some() {
-            "SCROLLBACK PICKER"
+        let label = if let Some(picker) = &self.picker {
+            if picker.filesystem {
+                "FILESYSTEM PICKER"
+            } else {
+                "SCROLLBACK PICKER"
+            }
         } else if self.quick_select.is_some() {
             "QUICK SELECT"
         } else if self.search.active {
@@ -471,33 +475,47 @@ impl TerminalView {
             shortcut.filter(|_| !was_active && !self.search.active && self.quick_select.is_none())
         {
             let from_copy = self.copy_mode.generation.is_some();
-            let generation = if let Some(generation) = self.copy_mode.generation {
-                generation
+            if matches!(options.source, crate::picker_config::Source::FileSystem(_)) {
+                self.picker = Some(crate::picker::Picker::start(
+                    self.host,
+                    self.copy_mode.generation,
+                    from_copy,
+                    0,
+                    ui.ctx().clone(),
+                    options,
+                ));
             } else {
-                let mut generation = 0;
-                if !unsafe { ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) } {
+                let generation = if let Some(generation) = self.copy_mode.generation {
+                    generation
+                } else {
+                    let mut generation = 0;
+                    if !unsafe { ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) }
+                    {
+                        return true;
+                    }
+                    generation
+                };
+                let mut view = SnapshotView::default();
+                if !unsafe {
+                    ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
+                } {
+                    if !from_copy {
+                        unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+                    }
                     return true;
                 }
-                generation
-            };
-            let mut view = SnapshotView::default();
-            if !unsafe { ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) } {
                 if !from_copy {
-                    unsafe { ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+                    self.copy_mode.start(generation, view);
                 }
-                return true;
+                self.picker = Some(crate::picker::Picker::start(
+                    self.host,
+                    Some(generation),
+                    from_copy,
+                    view.total_rows,
+                    ui.ctx().clone(),
+                    options,
+                ));
             }
-            if !from_copy {
-                self.copy_mode.start(generation, view);
-            }
-            self.picker = Some(crate::picker::Picker::start(
-                self.host,
-                generation,
-                from_copy,
-                view.total_rows,
-                ui.ctx().clone(),
-                options,
-            ));
         }
         let active = self.picker.is_some();
         if let Some(picker) = &mut self.picker {
@@ -522,7 +540,9 @@ impl TerminalView {
             });
             match action {
                 crate::picker::Action::Cancel if from_copy => {
-                    self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                    if let Some(generation) = generation {
+                        self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                    }
                 }
                 crate::picker::Action::Cancel => self.close_copy_mode(),
                 crate::picker::Action::SendInput(text) => {
@@ -531,25 +551,119 @@ impl TerminalView {
                         ffi::ghostty_egui_host_text(self.host, text.as_ptr().cast(), text.len())
                     };
                 }
+                crate::picker::Action::Custom(callback, text, filesystem, range) => {
+                    match callback.call(&text, filesystem, generation, range) {
+                        Ok(commands) => {
+                            let mut navigated = false;
+                            let mut sent = false;
+                            for command in commands {
+                                match command {
+                                    crate::picker_action::Command::Navigate(target) => {
+                                        if let Some(generation) = generation
+                                            .filter(|g| self.copy_mode.generation == Some(*g))
+                                        {
+                                            self.accept_picker_cell(generation, target);
+                                            navigated = true;
+                                        } else {
+                                            eprintln!(
+                                                "picker navigation snapshot is no longer active"
+                                            );
+                                        }
+                                    }
+                                    crate::picker_action::Command::Paste(text) => {
+                                        self.close_copy_mode();
+                                        sent = true;
+                                        unsafe {
+                                            ffi::ghostty_egui_host_text(
+                                                self.host,
+                                                text.as_ptr().cast(),
+                                                text.len(),
+                                            );
+                                        }
+                                    }
+                                    crate::picker_action::Command::SendText(text) => {
+                                        self.close_copy_mode();
+                                        sent = true;
+                                        self.send_picker_text(&text);
+                                    }
+                                }
+                            }
+                            if !sent && !navigated {
+                                if from_copy {
+                                    if let Some(generation) = generation {
+                                        self.publish_copy_decoration(
+                                            generation,
+                                            self.copy_mode.cursor,
+                                            false,
+                                        );
+                                    }
+                                } else {
+                                    self.close_copy_mode();
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("{error}");
+                            if from_copy {
+                                if let Some(generation) = generation {
+                                    self.publish_copy_decoration(
+                                        generation,
+                                        self.copy_mode.cursor,
+                                        false,
+                                    );
+                                }
+                            } else {
+                                self.close_copy_mode();
+                            }
+                        }
+                    }
+                }
                 crate::picker::Action::Accept(target) => {
-                    // A pending copy-mode word search must not move the cursor
-                    // again after accepting this picker result.
-                    self.search_worker.cancel();
-                    self.copy_search.waiting = false;
-                    self.copy_search.pending_moves.clear();
-                    self.copy_mode.visual_anchor = None;
-                    self.copy_mode.pending_yank = None;
-                    self.copy_mode.pending_visual_object = None;
-                    self.copy_mode.pending_jump = None;
-                    self.copy_mode.pending_count = None;
-                    self.copy_mode.pending_g = false;
-                    self.copy_mode.pending_z = false;
-                    self.apply_copy_target(generation, Motion::CharacterJump, target, false);
+                    let Some(generation) = generation else {
+                        return true;
+                    };
+                    self.accept_picker_cell(generation, target);
                 }
             }
             ui.ctx().request_repaint();
         }
         was_active || active || consumed
+    }
+
+    // Text is typed input; line breaks are Enter keys, never bracketed paste.
+    fn send_picker_text(&self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for (index, chunk) in normalized.split('\n').enumerate() {
+            if index > 0 {
+                unsafe {
+                    ffi::ghostty_egui_host_key(self.host, 1, 0, 0x28, 0, std::ptr::null());
+                    ffi::ghostty_egui_host_key(self.host, 0, 0, 0x28, 0, std::ptr::null());
+                }
+            }
+            if !chunk.is_empty() {
+                if let Ok(text) = std::ffi::CString::new(chunk) {
+                    unsafe {
+                        ffi::ghostty_egui_host_key(self.host, 1, 0, 0, 0, text.as_ptr());
+                    }
+                }
+            }
+        }
+    }
+
+    fn accept_picker_cell(&mut self, generation: u64, target: SnapshotCell) {
+        // A pending copy-mode word search must not move the cursor
+        // again after accepting this picker result.
+        self.search_worker.cancel();
+        self.copy_search.waiting = false;
+        self.copy_search.pending_moves.clear();
+        self.copy_mode.visual_anchor = None;
+        self.copy_mode.pending_yank = None;
+        self.copy_mode.pending_visual_object = None;
+        self.copy_mode.pending_jump = None;
+        self.copy_mode.pending_count = None;
+        self.copy_mode.pending_g = false;
+        self.copy_mode.pending_z = false;
+        self.apply_copy_target(generation, Motion::CharacterJump, target, false);
     }
 
     fn open_quick_select(&mut self) {

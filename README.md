@@ -46,7 +46,7 @@ are rejected. Rust evaluates Lua once, validates the settings, and translates th
 into Ghostty configuration arguments. Ghostty's normal configuration files remain
 the base; Lua overrides them, and explicit command-line options override Lua.
 The picker still imports Ghostty's resolved font and tracks its cell dimensions.
-Changes to Lua require restarting the app; callbacks and live reload are not yet supported.
+Changes to Lua require restarting the app; live reload is not supported.
 
 Named pickers and their shortcuts can also be defined in Lua:
 
@@ -54,15 +54,20 @@ Named pickers and their shortcuts can also be defined in Lua:
 pickers = {
   lines = { type = "Scrollback", enter_action = "Navigate" },
   words = { type = "Scrollback", regex = [[\S+]], enter_action = "SendInput" },
+  files = { type = "FileSystem", files_only = true, max_depth = 0, enter_action = "SendInput" },
 },
 keys = {
   { key = "f", mods = "CTRL|SHIFT", picker = "lines" },
   { key = "p", mods = "CTRL|SHIFT", picker = "words" },
+  { key = "o", mods = "CTRL|SHIFT", picker = "files" },
 },
 ```
 
-These fields belong inside the returned configuration table. `Scrollback` is the
-only type currently supported. Regexes extract individual candidates from logical
+These fields belong inside the returned configuration table. `Scrollback` regexes
+and `FileSystem` options have separate schemas: fields from another picker type
+are rejected. Both types support `enter_action` and `action`. Omitting `type`
+defaults to `Scrollback`. Scrollback regexes
+extract individual candidates from logical
 lines (joining soft wraps, never separate hard lines). The default extracts whole
 nonblank lines without surrounding whitespace. Extraction uses Rust's `regex`
 syntax; lookaround and backreferences are unsupported. Empty matches are skipped.
@@ -70,6 +75,47 @@ Each candidate retains its exact snapshot cell range, including Unicode text.
 `Navigate` enters copy mode at its first cell. `SendInput` returns to the live
 terminal and pastes the matched text without pressing Enter, including when the
 picker was opened from copy mode.
+
+`FileSystem` supports `roots` (a list of directory paths), `max_depth`, `files_only`,
+and `directories_only`. Empty or omitted roots use the application's working
+directory, which may differ from the shell's current directory. Relative roots
+are resolved against the application working directory. `max_depth = 1` scans
+immediate children; zero or omission means unlimited depth. File and directory
+filters cannot both be true. Filesystem pickers only support `SendInput`, pasting
+the raw path without shell quoting or Enter. Regex extraction is scrollback-only.
+There are no filesystem previews yet.
+
+A picker may override `enter_action` with a Lua callback:
+
+```lua
+files = {
+  type = "FileSystem",
+  roots = { [[G:\src]] },
+  files_only = true,
+  action = function(app, item)
+    app:paste(item.path)
+  end,
+},
+```
+
+`item.text` contains the candidate text. Filesystem items also have `item.path`.
+Scrollback items have `item.range.start` and `.end`, each with zero-based `x` and
+`y` cells, and `item.snapshot_generation`.
+
+`app:paste(text)` pastes without Enter. `app:send_text(text)` sends typed input,
+with line breaks translated to Enter keys. `app:navigate(item)` enters copy mode
+at a scrollback item's first cell. Paths are not automatically shell-quoted.
+
+Callbacks run on the UI thread after the picker stops, so keep them short.
+They retain Lua closure state between invocations. Actions are queued and applied
+in order only after a successful return; errors discard them and are printed to
+stderr. App handles expire when the callback returns. Navigation requires an
+active snapshot; perform it before any action that returns to the live terminal.
+
+Windows uses `nfm_file_system` from `G:/src/RustWin32Host/nfm-file-system`; adjust
+that Cargo path on other machines. Filesystem pickers are currently Windows-only;
+Linux support will use NFM when it becomes available. Filesystem scans do not
+capture or read terminal snapshots, and cancellation leaves existing copy mode intact.
 
 Keys accept egui names such as `f`, `Space`, and `ArrowUp`; modifiers are joined
 with `|` (`CTRL`, `SHIFT`, `ALT`; `CMD`/`SUPER` are macOS-only). Definitions and regexes are compiled
