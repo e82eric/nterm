@@ -10,6 +10,7 @@ mod picker_action;
 mod picker_config;
 mod picker_files;
 mod picker_font;
+mod picker_protocol;
 mod presentation;
 mod quick_select;
 mod search;

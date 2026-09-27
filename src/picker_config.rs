@@ -126,7 +126,10 @@ struct Binding {
     options: Options,
 }
 
-pub(crate) struct Bindings(Vec<Binding>);
+pub(crate) struct Bindings {
+    bindings: Vec<Binding>,
+    definitions: BTreeMap<String, Options>,
+}
 
 impl Bindings {
     pub(crate) fn compile(
@@ -275,7 +278,14 @@ impl Bindings {
                 .clone();
             bindings.push(Binding { key, mods, options });
         }
-        Ok(Self(bindings))
+        Ok(Self {
+            bindings,
+            definitions: compiled,
+        })
+    }
+
+    pub(crate) fn named(&self, name: &str) -> Option<Options> {
+        self.definitions.get(name).cloned()
     }
 
     pub(crate) fn consume(&self, events: &mut Vec<egui::Event>) -> (Option<Options>, bool) {
@@ -290,7 +300,7 @@ impl Bindings {
                 ..
             } = &event
             {
-                self.0.iter().find(|binding| {
+                self.bindings.iter().find(|binding| {
                     (binding.key == *key || Some(binding.key) == *physical_key)
                         && same_mods(binding.mods, *modifiers)
                 })

@@ -117,6 +117,31 @@ that Cargo path on other machines. Filesystem pickers are currently Windows-only
 Linux support will use NFM when it becomes available. Filesystem scans do not
 capture or read terminal snapshots, and cancellation leaves existing copy mode intact.
 
+Shell commands can open a named picker using the local WezTerm OSC protocol:
+
+```text
+ESC ] 9001 ; StreamingPicker ; TOKEN ; {"action":"files"} ST
+```
+
+Each terminal receives a random `WEZTERM_OSC_TOKEN` environment variable.
+For example, define this function in PowerShell inside the terminal:
+
+```powershell
+function Show-TerminalPicker([string] $Name = 'files') {
+    $json = @{ action = $Name } | ConvertTo-Json -Compress
+    [Console]::Write("$([char]27)]9001;StreamingPicker;$env:WEZTERM_OSC_TOKEN;$json$([char]27)\")
+}
+Show-TerminalPicker files
+```
+
+Names refer to the Lua `pickers` table and do not require a keybinding. Only the
+`action` field is supported for now; parameters and direct item lists are rejected.
+The OSC payload is limited to 2 KiB. BEL and ST terminators are accepted. Invalid
+tokens are rejected. Requests are ignored while search, quick select, or another
+picker is active; copy mode may open a picker normally. Pending requests coalesce
+to the latest validated request. Child processes inherit the token; it does not
+restrict programs that already have access to the terminal's environment.
+
 Keys accept egui names such as `f`, `Space`, and `ArrowUp`; modifiers are joined
 with `|` (`CTRL`, `SHIFT`, `ALT`; `CMD`/`SUPER` are macOS-only). Definitions and regexes are compiled
 at startup; unknown picker names, invalid patterns, duplicate bindings, and

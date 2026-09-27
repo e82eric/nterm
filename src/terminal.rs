@@ -26,6 +26,8 @@ struct WakeState {
     wake_pending: AtomicBool,
     frame_ready_pending: AtomicBool,
     close: AtomicBool,
+    osc_token: String,
+    protocol_request: std::sync::Mutex<Option<String>>,
 }
 
 #[unsafe(no_mangle)]
@@ -56,6 +58,22 @@ extern "C" fn ghostty_egui_close(userdata: *mut c_void) {
     let state = unsafe { &*(userdata.cast::<WakeState>()) };
     state.close.store(true, Ordering::Release);
     state.context.request_repaint();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ghostty_egui_protocol(userdata: *mut c_void, bytes: *const u8, len: usize) {
+    if bytes.is_null() || len > crate::picker_protocol::MAX_PAYLOAD {
+        return;
+    }
+    let state = unsafe { &*(userdata.cast::<WakeState>()) };
+    let payload = unsafe { std::slice::from_raw_parts(bytes, len) };
+    match crate::picker_protocol::parse(payload, &state.osc_token) {
+        Ok(name) => {
+            *state.protocol_request.lock().unwrap() = Some(name);
+            state.context.request_repaint();
+        }
+        Err(error) => eprintln!("{error}"),
+    }
 }
 
 pub(crate) struct TerminalView {
@@ -104,8 +122,11 @@ impl TerminalView {
             wake_pending: AtomicBool::new(false),
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
+            osc_token: crate::picker_protocol::new_token(),
+            protocol_request: std::sync::Mutex::new(None),
         });
         let native = current_native_context();
+        let osc_token = std::ffi::CString::new(wake.osc_token.clone()).unwrap();
         let host = unsafe {
             ffi::ghostty_egui_host_create(
                 argc,
@@ -115,6 +136,7 @@ impl TerminalView {
                 native.display,
                 native.context,
                 egui_ctx.pixels_per_point() as f64,
+                osc_token.as_ptr(),
             )
         };
         assert!(
@@ -465,12 +487,23 @@ impl TerminalView {
 
     fn handle_picker(&mut self, ui: &egui::Ui, status_height: f32) -> bool {
         let was_active = self.picker.is_some();
-        let (shortcut, consumed) =
+        let (mut shortcut, mut consumed) =
             if was_active || self.search.active || self.quick_select.is_some() {
                 (None, false)
             } else {
                 ui.input_mut(|i| self.picker_bindings.consume(&mut i.events))
             };
+        if let Some(name) = self.wake.protocol_request.lock().unwrap().take() {
+            consumed = true;
+            if !was_active && !self.search.active && self.quick_select.is_none() {
+                shortcut = self.picker_bindings.named(&name);
+                if shortcut.is_none() {
+                    eprintln!("unknown OSC picker {name:?}");
+                }
+            } else {
+                eprintln!("OSC picker request ignored while another overlay is active");
+            }
+        }
         if let Some(options) =
             shortcut.filter(|_| !was_active && !self.search.active && self.quick_select.is_none())
         {

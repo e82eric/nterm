@@ -36,6 +36,7 @@ static LRESULT CALLBACK host_window_proc(HWND window, UINT message, WPARAM wpara
 extern void ghostty_egui_wakeup(void *userdata);
 extern void ghostty_egui_frame_ready(void *userdata);
 extern void ghostty_egui_close(void *userdata);
+extern void ghostty_egui_protocol(void *userdata, const uint8_t *bytes, size_t len);
 
 static void wake(void *userdata) { ghostty_egui_wakeup(userdata); }
 static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action_value) {
@@ -43,6 +44,9 @@ static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s 
 
     void *userdata = ghostty_app_userdata(app);
     switch (action_value.tag) {
+    case GHOSTTY_ACTION_APPLICATION_PROTOCOL:
+        ghostty_egui_protocol(userdata, action_value.action.application_protocol.bytes, action_value.action.application_protocol.len);
+        return true;
     case GHOSTTY_ACTION_RENDER:
         ghostty_egui_frame_ready(userdata);
         return true;
@@ -102,7 +106,8 @@ GhosttyEguiHost *ghostty_egui_host_create(
     void *window,
     void *display,
     void *context,
-    double scale
+    double scale,
+    const char *osc_token
 ) {
     if (ghostty_init(argc, argv) != 0) return NULL;
 
@@ -132,6 +137,9 @@ GhosttyEguiHost *ghostty_egui_host_create(
     options.platform.opengl.display = display;
     options.platform.opengl.context = context;
     options.scale_factor = scale;
+    ghostty_env_var_s token_env = { .key = "WEZTERM_OSC_TOKEN", .value = osc_token };
+    options.env_vars = &token_env;
+    options.env_var_count = 1;
     ghostty_surface_t surface = ghostty_surface_new(app, &options);
     if (!surface) {
         ghostty_app_free(app);

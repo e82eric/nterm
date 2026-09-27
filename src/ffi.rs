@@ -135,6 +135,7 @@ unsafe extern "C" {
         display: *mut c_void,
         context: *mut c_void,
         scale: f64,
+        osc_token: *const c_char,
     ) -> *mut Host;
     pub(crate) fn ghostty_egui_host_destroy(host: *mut Host);
     pub(crate) fn ghostty_egui_host_tick(host: *mut Host);

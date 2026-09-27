@@ -295,6 +295,8 @@ mod tests {
         assert!(parse("return {pickers={x={enter_action='Bad'}}}").is_err());
         let empty = parse("return {keys={}}").unwrap();
         let bindings = crate::picker_config::Bindings::compile(empty.pickers, empty.keys).unwrap();
+        assert!(bindings.named("lines").is_some());
+        assert!(bindings.named("missing").is_none());
         let mut events = vec![egui::Event::Key {
             key: egui::Key::F,
             physical_key: Some(egui::Key::F),
