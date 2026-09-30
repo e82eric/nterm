@@ -11,6 +11,16 @@ zig build egui-sample -Doptimize=ReleaseFast
 .\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
 ```
 
+To build and deploy the Windows sample to another directory:
+
+```powershell
+.\example\rust-egui-terminal\deploy.ps1 C:\Apps\GhosttyEgui
+```
+
+The script copies `ghostty_egui.exe` and its required `ghostty.dll`. Use
+`-SkipBuild` to copy an existing build. It leaves any `ghostty.lua` in the
+destination untouched; the app also checks the home directory for that file.
+
 On Linux, select the embedded runtime build explicitly:
 
 ```sh
@@ -25,23 +35,36 @@ frame and frames awaiting GPU completion. That
 boundary leaves room for fixed-position overlay terminals without moving
 terminal drawing into egui.
 
+Releasing a mouse selection leaves it highlighted. Right-click copies the
+selection to the system clipboard and clears the highlight; Escape clears it
+without copying. The sample uses Ghostty's `right-click-action=copy`,
+`copy-on-select=none`, and `selection-clear-on-typing=false` settings, and
+forwards Ghostty's clipboard writes through egui. Explicit Ghostty command-line
+options can override these defaults.
+
 Lua settings are loaded at startup from the first available location:
 
 1. An explicit `--lua-config=PATH` argument.
-2. `config.lua` in the home directory (`%USERPROFILE%` on Windows, `$HOME` on Linux).
-3. `config.lua` beside the executable, regardless of the current working directory.
+2. `ghostty.lua` in the home directory (`%USERPROFILE%` on Windows, `$HOME` on Linux).
+3. `ghostty.lua` beside the executable, regardless of the current working directory.
 
 Only one file is loaded. Missing default files preserve the existing configuration.
 An explicit missing file, unreadable file, or invalid configuration reports the
 filename and exits before opening a window, without falling back to another file.
-See `config.lua` in this example for a starting configuration:
+See `ghostty.lua` in this example for a starting configuration:
 
 ```powershell
-.\zig-out\bin\ghostty_egui.exe --lua-config=example/rust-egui-terminal/config.lua --command=pwsh.exe
+.\zig-out\bin\ghostty_egui.exe --lua-config=example/rust-egui-terminal/ghostty.lua
 ```
 
 The file returns a table with optional `font.family`, `font.size` (points),
-`terminal.scrollback_limit` (bytes), and `colors.theme` settings. Unknown fields
+`terminal.scrollback_limit` (bytes), `terminal.command`, `colors.theme`, and
+`floating.padding` settings. For example,
+`floating = { padding = { top = 15, bottom = 15, left = 10, right = 10 } }`
+sets each inset as a percentage of the terminal area. Omitted sides use zero;
+the four sides must leave at least 5% width and height. Without this setting,
+the pane keeps its original centered 80% × 70% size and 1000 × 700 point caps.
+Unknown fields
 are rejected. Rust evaluates Lua once, validates the settings, and translates them
 into Ghostty configuration arguments. Ghostty's normal configuration files remain
 the base; Lua overrides them, and explicit command-line options override Lua.
@@ -52,9 +75,9 @@ Named pickers and their shortcuts can also be defined in Lua:
 
 ```lua
 pickers = {
-  lines = { type = "Scrollback", enter_action = "Navigate" },
-  words = { type = "Scrollback", regex = [[\S+]], enter_action = "SendInput" },
-  files = { type = "FileSystem", files_only = true, max_depth = 0, enter_action = "SendInput" },
+  lines = { type = "Scrollback", position = "Bottom", enter_action = "Navigate" },
+  words = { type = "Scrollback", position = "Cursor", regex = [[\S+]], enter_action = "SendInput" },
+  files = { type = "FileSystem", position = "Center", files_only = true, max_depth = 0, enter_action = "SendInput" },
 },
 keys = {
   { key = "f", mods = "CTRL|SHIFT", picker = "lines" },
@@ -63,15 +86,54 @@ keys = {
 },
 ```
 
-These fields belong inside the returned configuration table. `Scrollback` regexes
-and `FileSystem` options have separate schemas: fields from another picker type
-are rejected. Both types support `enter_action` and `action`. Omitting `type`
+These fields belong inside the returned configuration table.
+Picker names can also map to functions. The function runs when its keybinding or
+named OSC request opens the picker, and returns the same table as a static picker:
+
+```lua
+pickers = {
+  context = function(cursor)
+    local word = cursor.line_before_cursor:match("([^%s]+)$") or ""
+    return { type = "Scrollback", regex = [[\S+]],
+             initial_query = word, enter_action = "Navigate" }
+  end,
+},
+```
+
+`cursor.line` is the visible physical terminal row, `line_before_cursor` is its
+text before the cursor, and `cursor_column` is the zero-based terminal cell column.
+This is terminal output, not PSReadLine's private edit buffer. `initial_query`
+works for both static and function pickers. The function may choose `type`,
+`position`, `enter_action`, `action`, and other type-specific fields on every invocation.
+Function results use the same validation as static definitions; errors are
+printed and the picker stays closed.
+
+Every picker type accepts `position = "Top"`, `"Center"`, `"Bottom"`, or
+`"Cursor"`; the default is `"Bottom"`. Cursor placement puts the query near
+the live terminal cursor, or the copy cursor when opened from copy mode, and
+shows the panel below it when there is room, otherwise above it. The panel
+stays inside the terminal or floating pane. If the cursor is outside the
+visible viewport, placement falls back to Bottom.
+
+Set the top-level `picker_defaults = { unique = true }` to enable deduplication
+by default for Scrollback and Command pickers, including function-defined
+pickers. Individual definitions can override it with `unique = false` or
+`unique = true`. The global default is `false`; Items and FileSystem pickers
+are unaffected.
+
+`Scrollback` regexes,
+`FileSystem` options, and `Command` arguments have separate schemas: fields from another picker type
+are rejected. All types support an `action` callback; `Scrollback` also supports
+both `enter_action` values. Omitting `type`
 defaults to `Scrollback`. Scrollback regexes
 extract individual candidates from logical
 lines (joining soft wraps, never separate hard lines). The default extracts whole
 nonblank lines without surrounding whitespace. Extraction uses Rust's `regex`
 syntax; lookaround and backreferences are unsupported. Empty matches are skipped.
 Each candidate retains its exact snapshot cell range, including Unicode text.
+Set `unique = true` on a Scrollback picker to keep only the bottom-most
+occurrence of each extracted value. Matching is exact and case-sensitive;
+the default is `false`, which retains duplicates.
 `Navigate` enters copy mode at its first cell. `SendInput` returns to the live
 terminal and pastes the matched text without pressing Enter, including when the
 picker was opened from copy mode.
@@ -83,7 +145,75 @@ are resolved against the application working directory. `max_depth = 1` scans
 immediate children; zero or omission means unlimited depth. File and directory
 filters cannot both be true. Filesystem pickers only support `SendInput`, pasting
 the raw path without shell quoting or Enter. Regex extraction is scrollback-only.
-There are no filesystem previews yet.
+An optional preview can show the selected path's contents.
+
+`Items` takes its candidates from an OSC request's `params.items`, a JSON-encoded
+array of `{ "text": "display label", "value": "text to insert" }`, or from an
+`items = function() ... end` Lua provider. The provider runs each time the picker
+opens, so it can read a file that changes during the session. Lua has
+the standard `io` and `os` libraries and a `ghostty.json_parse(string)` helper.
+It has no filesystem scan or terminal snapshot. Without an action callback,
+Enter pastes the chosen value. Item lists are limited to 2,000 entries.
+
+`Command` runs the configured `args` array without a shell and streams stdout
+lines into the fuzzy picker. An argument consisting of `{pattern}` is replaced
+with the OSC request's `params.pattern`; other `{name}` arguments can use other
+request parameters. The request's `params.cwd` overrides optional configured
+`cwd`. The command stops when the picker closes. Without an `action` callback,
+Enter pastes the selected line. The sample `Ripgrep` picker shows how to use
+`rg --vimgrep` and open a result in Neovim.
+For commands whose output uses continued lines, set `line_continuation` to the
+line-ending marker (for example, `` "`" `` for PowerShell history). Continued
+lines appear as one result joined with spaces; accepting it removes the markers
+and restores newlines. An unfinished group is kept when the command exits.
+Set `unique = true` on a Command picker to retain only the first occurrence
+of each exact accepted value in the process output. Deduplication happens after
+continuation lines are joined. The default is `false`.
+
+Every picker type accepts an optional preview. `preview = { type = "Text",
+text = "{item}" }` displays literal text; `type = "Ansi"` interprets terminal
+escape sequences; `preview = { type = "Command", args = { "bat", "--color=always",
+"{item}" } }` runs a process and renders its output. `{item}` in preview text,
+arguments, or optional `cwd` is replaced with the selected item's accepted value.
+Commands run without a shell and are cancelled when selection changes or the
+picker closes. Preview output is limited to 64 KiB and displayed in 12 terminal
+rows. Ghostty's VT parser handles ANSI sequences in an isolated terminal; egui
+draws its text, colors, and basic styles using the picker's font.
+Instead of fixed `args`, a Command preview can use `command = function(item, params)`
+to return `{ args = {...}, cwd = "..." }` for each selected item. Return `nil`
+to leave that item's preview blank. `item.value` is the selected value;
+filesystem items also provide `item.path` and `item.is_directory`. The callback
+runs when the selected item changes.
+
+The returned command table may also include `center_line`, a zero-based line
+number in the command output. The initial preview centers that line, clamping
+at the beginning and end of the output. Ctrl+PageUp/PageDown then scrolls from
+that position. If `bat` starts its output at file line `start`, use
+`center_line = matched_line - start`.
+
+For example:
+
+```lua
+preview = {
+  type = "Command",
+  command = function(item)
+    if item.is_directory then
+      return { args = { "pwsh", "-NoProfile", "-CommandWithArgs",
+        "Get-ChildItem -LiteralPath $args[0] | Format-Table -AutoSize", item.path } }
+    end
+    return { args = { "bat", "--color=always", "--paging=never", item.path } }
+  end,
+}
+```
+
+For a scrollback picker, `preview = { type = "Scrollback", rows = 12 }` instead
+shows the frozen terminal rows around the selected match, retaining their
+colors and text attributes and highlighting the match. The row count can be
+1–12. Only the visible preview rows are read from the snapshot.
+Set `preview_visible = false` on any picker definition to start with its
+preview hidden. The default is `true`. While the picker is open, Ctrl+P
+toggles the preview, and Ctrl+PageUp or Ctrl+PageDown scrolls it by half a page.
+Unmodified arrow and page keys continue to navigate the results.
 
 A picker may override `enter_action` with a Lua callback:
 
@@ -99,12 +229,22 @@ files = {
 ```
 
 `item.text` contains the candidate text. Filesystem items also have `item.path`.
+`item.value` contains the text to insert (the same as `item.text` for scrollback
+and filesystem items). An action callback receives `(app, item, params)`, where
+`params` contains the OSC request's string parameters, or an empty table for a
+keybinding.
 Scrollback items have `item.range.start` and `.end`, each with zero-based `x` and
 `y` cells, and `item.snapshot_generation`.
 
 `app:paste(text)` pastes without Enter. `app:send_text(text)` sends typed input,
 with line breaks translated to Enter keys. `app:navigate(item)` enters copy mode
 at a scrollback item's first cell. Paths are not automatically shell-quoted.
+`app:replace_prompt(text, before, after)` sends `after` Delete and `before`
+Backspace key events, then pastes `text`; use the command-line cursor and length
+from the shell's OSC request to replace text on both sides of the cursor.
+For PowerShell completions, the sample Lua callback uses `app:send_text` to send
+Backspace bytes and Delete escape sequences, then `app:paste(item.value)` to
+insert the completion without submitting the command.
 
 Callbacks run on the UI thread after the picker stops, so keep them short.
 They retain Lua closure state between invocations. Actions are queued and applied
@@ -120,7 +260,7 @@ capture or read terminal snapshots, and cancellation leaves existing copy mode i
 Shell commands can open a named picker using the local WezTerm OSC protocol:
 
 ```text
-ESC ] 9001 ; StreamingPicker ; TOKEN ; {"action":"files"} ST
+ESC ] 9001 ; StreamingPicker ; TOKEN ; {"name":"files"} ST
 ```
 
 Each terminal receives a random `WEZTERM_OSC_TOKEN` environment variable.
@@ -128,15 +268,22 @@ For example, define this function in PowerShell inside the terminal:
 
 ```powershell
 function Show-TerminalPicker([string] $Name = 'files') {
-    $json = @{ action = $Name } | ConvertTo-Json -Compress
+    $json = @{ name = $Name } | ConvertTo-Json -Compress
     [Console]::Write("$([char]27)]9001;StreamingPicker;$env:WEZTERM_OSC_TOKEN;$json$([char]27)\")
 }
 Show-TerminalPicker files
 ```
 
 Names refer to the Lua `pickers` table and do not require a keybinding. Only the
-`action` field is supported for now; parameters and direct item lists are rejected.
-The OSC payload is limited to 2 KiB. BEL and ST terminators are accepted. Invalid
+`action` remains an alias for `name`. Requests can include a `params` object of
+string values. For example, `PowerShellCompletion` in the sample `ghostty.lua`
+uses `params.items` (JSON encoded), `params.replaceBefore`, and
+`params.replaceAfter` to display completions and replace text around the cursor.
+Filesystem pickers can use `params.roots`, a JSON-encoded array of paths, to
+override their configured roots for one request. `params.query` sets the initial
+fuzzy query, for example to start a history picker with the text already typed
+at the shell prompt. The OSC payload is limited to
+1 MiB. BEL and ST terminators are accepted. Invalid
 tokens are rejected. Requests are ignored while search, quick select, or another
 picker is active; copy mode may open a picker normally. Pending requests coalesce
 to the latest validated request. Child processes inherit the token; it does not
@@ -152,11 +299,13 @@ Ctrl+Shift+F opens `lines` if defined. An explicit empty `keys = {}` disables pi
 shortcuts. Explicit `pickers` and `keys` replace their respective defaults.
 
 The Rust source is divided by responsibility: `app.rs` owns the native window
-and event loop, `terminal.rs` coordinates the embedded surface, `ffi.rs`
+and event loop, `terminal.rs` handles pane layout, `terminal/pane.rs`
+coordinates the embedded surface, `ghostty_ffi.rs`
 contains the C boundary, `painter.rs` presents Ghostty's OpenGL textures,
+`picker.rs` and its `picker/` support modules implement the fuzzy picker,
 `input.rs` translates egui input, and `search.rs` owns search state and
 matching. `presentation.rs` owns presentation pacing and detects changes to
-egui's drawing commands; `frame_trace.rs` owns timing diagnostics. `main.rs`
+egui's drawing commands. `main.rs`
 loads Lua settings through `config.rs`, collects process arguments, and starts the app.
 
 Input updates run promptly, independently of presentation pacing. Completed
@@ -178,6 +327,17 @@ for the worker to stop reading before releasing the snapshot.
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>/</kbd> on Windows and Linux to
 open the search overlay. Rust consumes this shortcut before forwarding input
 to Ghostty; Ghostty search keybindings do not control the sample's search UI.
+When the floating pane is visible, the shortcut searches that pane's scrollback
+and draws the search bar inside it. Hiding, closing, or resizing the pane closes
+its search safely.
+
+Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> to show or hide a centered
+floating shell. The first press creates it; later presses toggle the same
+terminal without restarting its shell. While visible, it receives keyboard,
+paste, and mouse input. Exiting that shell closes only the floating pane.
+Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> to close the floating pane
+and its shell without closing the main terminal.
+
 Search queries, result highlighting, match selection,
 and viewport movement are owned by the Rust egui application. It asks Ghostty
 for a frozen copy of the complete scrollback, performs Unicode-aware,
@@ -197,6 +357,8 @@ and enters copy mode at the selected match's first cell, preserving the frozen
 snapshot. If a query is still running, Enter waits for its result; no matches
 or an invalid regex leave search open. In copy mode, <kbd>n</kbd>/<kbd>N</kbd>
 can continue navigating the transferred matches.
+In the floating pane, Enter places its copy cursor at the selected match;
+the same copy-mode motions and selections work there.
 
 While the search field is focused, <kbd>Ctrl</kbd>+<kbd>N</kbd> selects the
 next older match and <kbd>Ctrl</kbd>+<kbd>P</kbd> selects the previous newer
@@ -206,7 +368,8 @@ Clipboard paste is forwarded to Ghostty when the terminal has keyboard focus.
 When the search field is focused, paste remains within the search query.
 
 Press <kbd>Alt</kbd>+<kbd>Space</kbd> in terminal or copy mode to enter quick
-select. It labels visible big words using the hardcoded regex `\S+`, including
+select. When the floating pane is visible, it selects from that pane and places
+its copy cursor there. It labels visible big words using the hardcoded regex `\S+`, including
 words across soft wraps. Type a label to enter copy mode at the word's first
 cell. Hold Shift on the final hint letter to leave the snapshot and paste the
 matched text into the live terminal without submitting it. Caps Lock alone
@@ -217,6 +380,11 @@ remaining letters stay yellow. Backspace removes
 a prefix character.
 Escape (or Alt+Space again) returns to the previous mode. Quick select reuses
 the existing copy snapshot and preserves its cursor and selection on cancel.
+In copy mode, <kbd>Shift</kbd>+<kbd>Y</kbd> shows the same hints for a linewise
+yank. Completing a hint copies the logical lines from the current cursor (or
+visual anchor) through the hinted word's line and stays in copy mode. Escape
+cancels without changing the selection. Shift on the final hint letter still
+completes the yank rather than sending text to the terminal.
 Page Up/Down moves through the frozen scrollback, regenerates visible labels,
 and clears the typed prefix. Other scrolling is blocked while labels are displayed.
 Labels are rendered by
@@ -229,9 +397,9 @@ from a frozen snapshot into `nfm-search-core`. Type to filter; Ctrl+N/P, arrows,
 and Page Up/Down move through results. Enter enters copy mode at the first
 nonblank cell of the selected line. Escape returns to the originating mode.
 Results fill upward from the query, with the first result at the bottom.
-Arrow and page keys follow that visual direction; Ctrl+N/P move to the next
-or previous result in ranking order.
-There is no preview. The sample currently uses the local `nfm_search_core` crate
+Arrow and page keys follow that visual direction; Ctrl+N moves to the next
+result in ranking order. Ctrl+P toggles the preview when configured.
+The sample currently uses the local `nfm_search_core` crate
 at `G:/src/RustWin32Host/nfm-search-core`; adjust its Cargo path on other machines.
 
 The picker imports Ghostty's resolved primary regular and bold fonts and uses the current
@@ -239,9 +407,10 @@ terminal cell dimensions to size its text and rows, including zoom and DPI chang
 Matched positions use bold red text; selection uses a background highlight.
 Unsupported non-SFNT font formats use egui's monospace fallback.
 
-Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter the initial copy
+Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter copy
 mode. Ghostty freezes the visible terminal and scrollback while the live PTY
 keeps running. A steady, styled cell marks the terminal's insertion point.
+With a floating pane visible, copy mode freezes and controls that pane instead.
 A permanent 24-point status row below the terminal shows `TERMINAL` in live
 mode and a yellow `NORMAL` label in copy mode. Visual selection changes the
 label and top separator to orange and shows `VISUAL`, `V-LINE`, or `V-BLOCK`.
@@ -334,16 +503,3 @@ terminal.
 
 The native C Win32 sample remains available through
 `zig build win32-sample -Doptimize=ReleaseFast`.
-
-To record egui frame timing during an output-heavy command, set
-`GHOSTTY_EGUI_TRACE` to a CSV path before launching the sample:
-
-```powershell
-$env:GHOSTTY_EGUI_TRACE = "$PWD\egui-frame-trace.csv"
-.\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
-```
-
-The trace records when completed frames reach the UI loop, whether a redraw
-presented a new frame or deferred it for display-rate pacing, and the time
-spent in Ghostty ticks, egui layout, egui painting, and buffer swap. Close the
-sample to flush the trace.

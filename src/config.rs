@@ -2,14 +2,198 @@ use mlua::{Lua, LuaSerdeExt};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+#[derive(Default)]
+pub(crate) struct PickerContext {
+    pub(crate) line: String,
+    pub(crate) line_before_cursor: String,
+    pub(crate) cursor_column: u32,
+}
+
+pub(crate) struct PickerFactory {
+    lua: std::rc::Rc<Lua>,
+    key: mlua::RegistryKey,
+    name: String,
+}
+
+impl PickerFactory {
+    pub(crate) fn resolve(
+        &self,
+        context: &PickerContext,
+        defaults: crate::picker::config::PickerDefaults,
+    ) -> Result<crate::picker::config::Options, String> {
+        let function: mlua::Function = self
+            .lua
+            .registry_value(&self.key)
+            .map_err(|e| e.to_string())?;
+        let argument = self.lua.create_table().map_err(|e| e.to_string())?;
+        argument
+            .set("line", context.line.as_str())
+            .map_err(|e| e.to_string())?;
+        argument
+            .set("line_before_cursor", context.line_before_cursor.as_str())
+            .map_err(|e| e.to_string())?;
+        argument
+            .set("cursor_column", context.cursor_column)
+            .map_err(|e| e.to_string())?;
+        let table: mlua::Table = function
+            .call(argument)
+            .map_err(|e| format!("pickers.{}: {e}", self.name))?;
+        let definition = parse_picker_table(&self.lua, &self.name, &table)?;
+        if matches!(
+            definition,
+            crate::picker::config::Definition::Factory { .. }
+        ) {
+            return Err(format!(
+                "pickers.{}: factory must return a picker table",
+                self.name
+            ));
+        }
+        let bindings = crate::picker::config::Bindings::compile_with_defaults(
+            Some(std::collections::BTreeMap::from([(
+                self.name.clone(),
+                definition,
+            )])),
+            Some(vec![]),
+            defaults,
+        )?;
+        match bindings.named(&self.name) {
+            Some(crate::picker::config::PickerEntry::Static(options)) => Ok(options),
+            _ => Err(format!("pickers.{}: invalid picker definition", self.name)),
+        }
+    }
+}
+
+fn parse_picker_table(
+    lua: &std::rc::Rc<Lua>,
+    name: &str,
+    definition: &mlua::Table,
+) -> Result<crate::picker::config::Definition, String> {
+    // Strip callable fields from a copy: a factory may return the same table
+    // on multiple invocations, and its action/provider must remain available.
+    let copy = lua.create_table().map_err(|e| e.to_string())?;
+    for pair in definition.clone().pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair.map_err(|e| e.to_string())?;
+        copy.raw_set(key, value).map_err(|e| e.to_string())?;
+    }
+    let definition = &copy;
+    if matches!(
+        definition
+            .raw_get::<_, mlua::Value>("type")
+            .map_err(|e| e.to_string())?,
+        mlua::Value::Nil
+    ) {
+        definition
+            .raw_set("type", "Scrollback")
+            .map_err(|e| e.to_string())?;
+    }
+    let mut callback = None;
+    let action: mlua::Value = definition.raw_get("action").map_err(|e| e.to_string())?;
+    if !matches!(action, mlua::Value::Nil) {
+        let mlua::Value::Function(function) = action else {
+            return Err(format!("pickers.{name}.action must be a function"));
+        };
+        let key = lua
+            .create_registry_value(function)
+            .map_err(|e| e.to_string())?;
+        definition
+            .raw_set("action", mlua::Value::Nil)
+            .map_err(|e| e.to_string())?;
+        callback = Some(std::rc::Rc::new(crate::picker::action::Callback {
+            lua: lua.clone(),
+            key,
+            name: name.into(),
+        }));
+    }
+    let mut provider = None;
+    if let mlua::Value::Function(function) = definition
+        .raw_get::<_, mlua::Value>("items")
+        .map_err(|e| e.to_string())?
+    {
+        if definition
+            .raw_get::<_, String>("type")
+            .map_err(|e| e.to_string())?
+            != "Items"
+        {
+            return Err(format!("pickers.{name}.items requires type Items"));
+        }
+        let key = lua
+            .create_registry_value(function)
+            .map_err(|e| e.to_string())?;
+        definition
+            .raw_set("items", mlua::Value::Nil)
+            .map_err(|e| e.to_string())?;
+        provider = Some(std::rc::Rc::new(crate::picker::action::ItemsProvider {
+            lua: lua.clone(),
+            key,
+        }));
+    }
+    let mut preview_command = None;
+    if let Some(preview) = definition
+        .raw_get::<_, Option<mlua::Table>>("preview")
+        .map_err(|e| e.to_string())?
+    {
+        let command: mlua::Value = preview.raw_get("command").map_err(|e| e.to_string())?;
+        if !matches!(command, mlua::Value::Nil) {
+            if preview
+                .raw_get::<_, String>("type")
+                .map_err(|e| e.to_string())?
+                != "Command"
+            {
+                return Err(format!(
+                    "pickers.{name}.preview.command requires type Command"
+                ));
+            }
+            let mlua::Value::Function(function) = command else {
+                return Err(format!("pickers.{name}.preview.command must be a function"));
+            };
+            let key = lua
+                .create_registry_value(function)
+                .map_err(|e| e.to_string())?;
+            let copy_preview = lua.create_table().map_err(|e| e.to_string())?;
+            for pair in preview.pairs::<mlua::Value, mlua::Value>() {
+                let (key, value) = pair.map_err(|e| e.to_string())?;
+                copy_preview
+                    .raw_set(key, value)
+                    .map_err(|e| e.to_string())?;
+            }
+            copy_preview
+                .raw_set("command", mlua::Value::Nil)
+                .map_err(|e| e.to_string())?;
+            definition
+                .raw_set("preview", copy_preview)
+                .map_err(|e| e.to_string())?;
+            preview_command = Some(std::rc::Rc::new(crate::picker::action::PreviewCommand {
+                lua: lua.clone(),
+                key,
+                name: name.into(),
+            }));
+        }
+    }
+    let mut parsed: crate::picker::config::Definition = lua
+        .from_value(mlua::Value::Table(definition.clone()))
+        .map_err(|e| format!("pickers.{name}: {e}"))?;
+    if let Some(callback) = callback {
+        parsed.set_callback(callback);
+    }
+    if let Some(provider) = provider {
+        parsed.set_items_provider(provider);
+    }
+    if let Some(command) = preview_command {
+        parsed.set_preview_command(command);
+    }
+    Ok(parsed)
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AppConfig {
     font: FontConfig,
     terminal: TerminalConfig,
     colors: ColorConfig,
-    pickers: Option<std::collections::BTreeMap<String, crate::picker_config::Definition>>,
-    keys: Option<Vec<crate::picker_config::KeyBinding>>,
+    floating: FloatingConfig,
+    picker_defaults: crate::picker::config::PickerDefaults,
+    pickers: Option<std::collections::BTreeMap<String, crate::picker::config::Definition>>,
+    keys: Option<Vec<crate::picker::config::KeyBinding>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -23,6 +207,7 @@ struct FontConfig {
 #[serde(default, deny_unknown_fields)]
 struct TerminalConfig {
     scrollback_limit: Option<u64>,
+    command: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -31,9 +216,58 @@ struct ColorConfig {
     theme: Option<String>,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FloatingConfig {
+    padding: Option<FloatingPadding>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct FloatingPadding {
+    pub(crate) top: f32,
+    pub(crate) bottom: f32,
+    pub(crate) left: f32,
+    pub(crate) right: f32,
+}
+
+impl FloatingPadding {
+    fn validate(self) -> Result<Self, String> {
+        for (name, value) in [
+            ("top", self.top),
+            ("bottom", self.bottom),
+            ("left", self.left),
+            ("right", self.right),
+        ] {
+            if !value.is_finite() || !(0.0..100.0).contains(&value) {
+                return Err(format!("floating.padding.{name} must be between 0 and 100"));
+            }
+        }
+        if self.top + self.bottom >= 95.0 || self.left + self.right >= 95.0 {
+            return Err("floating.padding must leave at least 5% width and height".into());
+        }
+        Ok(self)
+    }
+}
+
 impl AppConfig {
     fn parse(source: &str, path: &Path) -> Result<Self, String> {
         let lua = std::rc::Rc::new(Lua::new());
+        let ghostty = lua.create_table().map_err(|error| error.to_string())?;
+        ghostty
+            .set(
+                "json_parse",
+                lua.create_function(|lua, source: String| {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&source).map_err(mlua::Error::external)?;
+                    lua.to_value(&value)
+                })
+                .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        lua.globals()
+            .set("ghostty", ghostty)
+            .map_err(|error| error.to_string())?;
         let name = format!("@{}", path.display());
         let value: mlua::Value = lua
             .load(source)
@@ -43,57 +277,40 @@ impl AppConfig {
         if !matches!(value, mlua::Value::Table(_)) {
             return Err("config must return a table".into());
         }
-        let mut callbacks = std::collections::BTreeMap::new();
+        let mut parsed_pickers = None;
         if let mlua::Value::Table(root) = &value {
             if let Some(pickers) = root
                 .get::<_, Option<mlua::Table>>("pickers")
                 .map_err(|e| e.to_string())?
             {
-                for pair in pickers.pairs::<String, mlua::Table>() {
-                    let (name, definition) = pair.map_err(|e| e.to_string())?;
-                    // Preserve omitted type as Scrollback before tagged deserialization.
-                    if matches!(
-                        definition
-                            .raw_get::<_, mlua::Value>("type")
-                            .map_err(|e| e.to_string())?,
-                        mlua::Value::Nil
-                    ) {
-                        definition
-                            .raw_set("type", "Scrollback")
-                            .map_err(|e| e.to_string())?;
-                    }
-                    let action: mlua::Value =
-                        definition.raw_get("action").map_err(|e| e.to_string())?;
-                    if !matches!(action, mlua::Value::Nil) {
-                        let mlua::Value::Function(function) = action else {
-                            return Err(format!("pickers.{name}.action must be a function"));
-                        };
-                        let key = lua
-                            .create_registry_value(function)
-                            .map_err(|e| e.to_string())?;
-                        definition
-                            .raw_set("action", mlua::Value::Nil)
-                            .map_err(|e| e.to_string())?;
-                        callbacks.insert(
-                            name.clone(),
-                            std::rc::Rc::new(crate::picker_action::Callback {
-                                lua: lua.clone(),
-                                key,
-                                name,
-                            }),
-                        );
-                    }
+                let mut definitions = std::collections::BTreeMap::new();
+                for pair in pickers.pairs::<String, mlua::Value>() {
+                    let (name, value) = pair.map_err(|e| e.to_string())?;
+                    let definition = match value {
+                        mlua::Value::Table(table) => parse_picker_table(&lua, &name, &table)?,
+                        mlua::Value::Function(function) => {
+                            let key = lua
+                                .create_registry_value(function)
+                                .map_err(|e| e.to_string())?;
+                            crate::picker::config::Definition::Factory {
+                                factory: Some(std::rc::Rc::new(PickerFactory {
+                                    lua: lua.clone(),
+                                    key,
+                                    name: name.clone(),
+                                })),
+                            }
+                        }
+                        _ => return Err(format!("pickers.{name} must be a table or function")),
+                    };
+                    definitions.insert(name, definition);
                 }
+                parsed_pickers = Some(definitions);
+                root.raw_set("pickers", mlua::Value::Nil)
+                    .map_err(|e| e.to_string())?;
             }
         }
         let mut config: Self = lua.from_value(value).map_err(|error| error.to_string())?;
-        if let Some(pickers) = &mut config.pickers {
-            for (name, callback) in callbacks {
-                if let Some(definition) = pickers.get_mut(&name) {
-                    definition.set_callback(callback);
-                }
-            }
-        }
+        config.pickers = parsed_pickers;
         Ok(config)
     }
 
@@ -114,6 +331,10 @@ impl AppConfig {
         }
         if let Some(limit) = self.terminal.scrollback_limit {
             args.push(format!("--scrollback-limit-bytes={limit}"));
+        }
+        if let Some(command) = &self.terminal.command {
+            validate_text("terminal.command", command)?;
+            args.push(format!("--command={command}"));
         }
         if let Some(theme) = &self.colors.theme {
             validate_text("colors.theme", theme)?;
@@ -137,11 +358,11 @@ fn default_paths() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME");
     let mut paths = Vec::new();
     if let Some(home) = home {
-        paths.push(PathBuf::from(home).join("config.lua"));
+        paths.push(PathBuf::from(home).join("ghostty.lua"));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(directory) = exe.parent() {
-            paths.push(directory.join("config.lua"));
+            paths.push(directory.join("ghostty.lua"));
         }
     }
     paths
@@ -168,7 +389,14 @@ fn read_config(
 
 pub(crate) fn prepare(
     args: Vec<String>,
-) -> Result<(Vec<String>, crate::picker_config::Bindings), String> {
+) -> Result<
+    (
+        Vec<String>,
+        crate::picker::config::Bindings,
+        Option<FloatingPadding>,
+    ),
+    String,
+> {
     let mut incoming = args.into_iter();
     let program = incoming.next().unwrap_or_else(|| "ghostty_egui".into());
     let mut remaining = Vec::new();
@@ -193,21 +421,37 @@ pub(crate) fn prepare(
             remaining.push(arg);
         }
     }
-    let mut prepared = vec![program];
-    let mut pickers = crate::picker_config::Bindings::default();
+    let mut prepared = vec![
+        program,
+        "--copy-on-select=none".into(),
+        "--right-click-action=copy".into(),
+        "--selection-clear-on-typing=false".into(),
+    ];
+    let mut pickers = crate::picker::config::Bindings::default();
+    let mut floating_padding = None;
     if let Some((path, source)) = read_config(explicit.as_deref(), &default_paths(), |path| {
         std::fs::read_to_string(path)
     })? {
-        let (options, bindings) = AppConfig::parse(&source, &path)
+        let (options, bindings, padding) = AppConfig::parse(&source, &path)
             .and_then(|config| {
                 Ok((
                     config.ghostty_args()?,
-                    crate::picker_config::Bindings::compile(config.pickers, config.keys)?,
+                    crate::picker::config::Bindings::compile_with_defaults(
+                        config.pickers,
+                        config.keys,
+                        config.picker_defaults,
+                    )?,
+                    config
+                        .floating
+                        .padding
+                        .map(FloatingPadding::validate)
+                        .transpose()?,
                 ))
             })
             .map_err(|error| format!("{}: {error}", path.display()))?;
         prepared.extend(options);
         pickers = bindings;
+        floating_padding = padding;
     }
     // Ghostty loads its normal files first, then these arguments. Explicit
     // command-line values come last and override the Lua configuration.
@@ -220,12 +464,12 @@ pub(crate) fn prepare(
         prepared.push("--font-family=".into());
     }
     prepared.extend(remaining);
-    Ok((prepared, pickers))
+    Ok((prepared, pickers, floating_padding))
 }
 
 #[cfg(test)]
 fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
-    prepare(args).map(|(args, _)| args)
+    prepare(args).map(|(args, _, _)| args)
 }
 
 #[cfg(test)]
@@ -237,9 +481,58 @@ mod tests {
             .callback()
             .unwrap();
         assert!(
-            matches!(&callback.call("file.txt", true, None, None).unwrap()[0], crate::picker_action::Command::Paste(text) if text == "file.txt")
+            matches!(&callback.call("file.txt", "file.txt", true, None, None, &Default::default()).unwrap()[0], crate::picker::action::Command::Paste(text) if text == "file.txt")
         );
         assert!(parse("return { pickers = { files = { action = 'invalid' } } }").is_err());
+    }
+
+    #[test]
+    fn sample_completion_callback_sends_edit_sequence_then_pastes_value() {
+        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let callback = config.pickers.as_ref().unwrap()["PowerShellCompletion"]
+            .callback()
+            .unwrap();
+        let params = std::collections::BTreeMap::from([
+            ("replaceBefore".into(), "2".into()),
+            ("replaceAfter".into(), "1".into()),
+        ]);
+        let commands = callback
+            .call("shown", "inserted", false, None, None, &params)
+            .unwrap();
+        assert!(
+            matches!(&commands[0], crate::picker::action::Command::SendText(text) if text == "\x08\x08\x1b[3~")
+        );
+        assert!(
+            matches!(&commands[1], crate::picker::action::Command::Paste(text) if text == "inserted")
+        );
+    }
+
+    #[test]
+    fn sample_ripgrep_callback_replaces_prompt_and_opens_match() {
+        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let callback = config.pickers.as_ref().unwrap()["Ripgrep"]
+            .callback()
+            .unwrap();
+        let params = std::collections::BTreeMap::from([
+            ("cursor".into(), "2".into()),
+            ("length".into(), "4".into()),
+        ]);
+        let commands = callback
+            .call(
+                "C:\\it's here.txt:42:3:text",
+                "C:\\it's here.txt:42:3:text",
+                false,
+                None,
+                None,
+                &params,
+            )
+            .unwrap();
+        assert!(
+            matches!(&commands[0], crate::picker::action::Command::SendText(text) if text == "\x08\x08\x1b[3~\x1b[3~")
+        );
+        assert!(
+            matches!(&commands[1], crate::picker::action::Command::SendText(text) if text == "nvim +42 'C:\\it''s here.txt'\r")
+        );
     }
     use super::*;
 
@@ -249,11 +542,11 @@ mod tests {
 
     #[test]
     fn named_pickers_compile_and_reject_bad_bindings_and_regexes() {
-        let example = parse(include_str!("../config.lua")).unwrap();
-        assert!(crate::picker_config::Bindings::compile(example.pickers, example.keys).is_ok());
+        let example = parse(include_str!("../ghostty.lua")).unwrap();
+        assert!(crate::picker::config::Bindings::compile(example.pickers, example.keys).is_ok());
         let config = parse(r#"return {pickers = {paths = {type = 'Scrollback', regex = '\\S+', enter_action = 'SendInput'}}, keys = {{key = 'p', mods = 'CTRL|SHIFT', picker = 'paths'}}}"#).unwrap();
         let bindings =
-            crate::picker_config::Bindings::compile(config.pickers, config.keys).unwrap();
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
         let mut events = vec![egui::Event::Key {
             key: egui::Key::P,
             physical_key: Some(egui::Key::P),
@@ -263,12 +556,12 @@ mod tests {
         }];
         let (options, consumed) = bindings.consume(&mut events);
         assert!(consumed && events.is_empty());
-        let options = options.unwrap();
+        let options = options.unwrap().resolve(&PickerContext::default()).unwrap();
         assert!(matches!(
             options.enter_action,
-            crate::picker_config::EnterAction::SendInput
+            crate::picker::config::EnterAction::SendInput
         ));
-        let crate::picker_config::Source::Scrollback(regex) = options.source else {
+        let crate::picker::config::Source::Scrollback { regex, .. } = options.source else {
             panic!("expected scrollback")
         };
         assert_eq!(regex.find("x y").unwrap().as_str(), "x");
@@ -282,19 +575,36 @@ mod tests {
             "return {pickers={x={type='FileSystem', enter_action='Navigate'}}}",
             "return {pickers={x={type='FileSystem', files_only=true, directories_only=true}}}",
             "return {pickers={x={type='FileSystem', max_depth=-1}}}",
+            "return {pickers={x={type='Command', args={'{program}'}}}}",
         ] {
             let config = parse(source).unwrap();
             assert!(
-                crate::picker_config::Bindings::compile(config.pickers, config.keys).is_err(),
+                crate::picker::config::Bindings::compile(config.pickers, config.keys).is_err(),
                 "{source}"
             );
         }
         assert!(parse("return {pickers={x={type='Command'}}}").is_err());
         let files = parse("return {pickers={files={type='FileSystem', roots={'G:/src'}, max_depth=2, files_only=true}},keys={{key='o',mods='CTRL|SHIFT',picker='files'}}}").unwrap();
-        assert!(crate::picker_config::Bindings::compile(files.pickers, files.keys).is_ok());
+        assert!(crate::picker::config::Bindings::compile(files.pickers, files.keys).is_ok());
+        let history = parse(
+            "return {pickers={history={type='Command', args={'history.exe'}, line_continuation='`'}}}",
+        )
+        .unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(history.pickers, history.keys).unwrap();
+        let crate::picker::config::Source::Command(command) = bindings
+            .named("history")
+            .unwrap()
+            .resolve(&PickerContext::default())
+            .unwrap()
+            .source
+        else {
+            panic!("expected command picker");
+        };
+        assert_eq!(command.line_continuation.as_deref(), Some("`"));
         assert!(parse("return {pickers={x={enter_action='Bad'}}}").is_err());
         let empty = parse("return {keys={}}").unwrap();
-        let bindings = crate::picker_config::Bindings::compile(empty.pickers, empty.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile(empty.pickers, empty.keys).unwrap();
         assert!(bindings.named("lines").is_some());
         assert!(bindings.named("missing").is_none());
         let mut events = vec![egui::Event::Key {
@@ -306,6 +616,94 @@ mod tests {
         }];
         let (open, consumed) = bindings.consume(&mut events);
         assert!(!consumed && open.is_none() && events.len() == 1);
+    }
+
+    #[test]
+    fn ripgrep_osc_request_resolves_to_command_picker() {
+        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let payload = br#"StreamingPicker;secret;{"name":"Ripgrep","params":{"pattern":"ghostty","cwd":"C:\\src\\ghostty2","cursor":"0","length":"0"}}"#;
+        let request = crate::picker::protocol::parse(payload, "secret").unwrap();
+        let options = bindings
+            .named(&request.name)
+            .unwrap()
+            .resolve(&PickerContext::default())
+            .unwrap()
+            .with_request(request.params)
+            .unwrap();
+        assert!(matches!(
+            options.source,
+            crate::picker::config::Source::Command(_)
+        ));
+        assert_eq!(options.params["pattern"], "ghostty");
+    }
+
+    #[test]
+    fn filesystem_osc_request_overrides_configured_roots() {
+        let config = parse(
+            r#"return { pickers = { files = { type = 'FileSystem', roots = { [[C:\default]] } } } }"#,
+        )
+        .unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let payload = br#"StreamingPicker;secret;{"name":"files","params":{"roots":"[\"G:\\\\src\",\"C:\\\\src\"]"}}"#;
+        let request = crate::picker::protocol::parse(payload, "secret").unwrap();
+        let options = bindings
+            .named(&request.name)
+            .unwrap()
+            .resolve(&PickerContext::default())
+            .unwrap()
+            .with_request(request.params)
+            .unwrap();
+        let crate::picker::config::Source::FileSystem(files) = options.source else {
+            panic!("expected filesystem picker");
+        };
+        assert_eq!(
+            files.roots,
+            [
+                std::path::PathBuf::from(r"G:\src"),
+                std::path::PathBuf::from(r"C:\src")
+            ]
+        );
+    }
+
+    #[test]
+    fn lua_items_provider_rereads_file_each_time() {
+        let path =
+            std::env::temp_dir().join(format!("ghostty-picker-items-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"snippets":[{"input":"first"}]}"#).unwrap();
+        let source = format!(
+            r#"return {{ pickers = {{ snippets = {{ type = 'Items', items = function()
+                local file = assert(io.open([[{}]], 'rb'))
+                local data = ghostty.json_parse(file:read('*a'))
+                file:close()
+                local items = {{}}
+                for _, snippet in ipairs(data.snippets or {{}}) do
+                    items[#items + 1] = {{ text = snippet.input, value = snippet.input }}
+                end
+                return items
+            end }} }} }}"#,
+            path.display()
+        );
+        let config = parse(&source).unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let options = bindings
+            .named("snippets")
+            .unwrap()
+            .resolve(&PickerContext::default())
+            .unwrap();
+        let crate::picker::config::Source::Items(items) = options.source else {
+            panic!("expected items picker");
+        };
+        let provider = items.provider.unwrap();
+        assert_eq!(provider.read().unwrap()[0].value, "first");
+        std::fs::write(&path, r#"{"snippets":[{"input":"second"}]}"#).unwrap();
+        assert_eq!(provider.read().unwrap()[0].value, "second");
+        std::fs::write(&path, r#"{"snippets":[]}"#).unwrap();
+        assert!(provider.read().unwrap().is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -324,21 +722,380 @@ mod tests {
         for kind in ["Scrollback", "FileSystem"] {
             let config = parse(&format!("return {{pickers={{x={{type='{kind}', enter_action='SendInput', action=function(app,item) app:paste(item.text) end}}}}}}" )).unwrap();
             assert!(config.pickers.as_ref().unwrap()["x"].callback().is_some());
-            assert!(crate::picker_config::Bindings::compile(config.pickers, config.keys).is_ok());
+            assert!(crate::picker::config::Bindings::compile(config.pickers, config.keys).is_ok());
         }
         let config = parse("return {pickers={x={regex='x'}}}").unwrap();
         assert!(matches!(
             config.pickers.as_ref().unwrap()["x"],
-            crate::picker_config::Definition::Scrollback { .. }
+            crate::picker::config::Definition::Scrollback { .. }
         ));
+    }
+
+    #[test]
+    fn picker_preview_accepts_text_ansi_and_command_sources() {
+        let config = parse(
+            r#"return { pickers = {
+            text = { type='Scrollback', preview={type='Text', text='{item}'} },
+            ansi = { type='Items', preview={type='Ansi', text='\\27[31m{item}'} },
+            command = { type='FileSystem', preview={type='Command', args={'cat', '{item}'}} },
+        } }"#,
+        )
+        .unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        for name in ["text", "ansi", "command"] {
+            let options = bindings
+                .named(name)
+                .unwrap()
+                .resolve(&Default::default())
+                .unwrap();
+            assert!(options.preview.is_some());
+        }
+        let invalid = parse("return {pickers={x={preview={type='Command', args={''}}}}}").unwrap();
+        assert!(crate::picker::config::Bindings::compile(invalid.pickers, invalid.keys).is_err());
+    }
+
+    #[test]
+    fn preview_command_callback_selects_file_or_directory_command() {
+        let config = parse(
+            r#"return { pickers = { files = { type='FileSystem',
+            preview={type='Command', command=function(item, params)
+                if item.is_directory then
+                    return {args={'dir', item.path}, cwd=params.cwd}
+                end
+                return {args={'bat', item.path}, center_line=42}
+            end}
+        } } }"#,
+        )
+        .unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let options = bindings
+            .named("files")
+            .unwrap()
+            .resolve(&Default::default())
+            .unwrap();
+        let Some(crate::picker::config::Preview::Command {
+            command: Some(command),
+            ..
+        }) = options.preview
+        else {
+            panic!("expected callback preview");
+        };
+        let params = [("cwd".into(), "C:/work".into())].into();
+        let directory = std::env::temp_dir();
+        let directory = command
+            .call(directory.to_str().unwrap(), true, &params)
+            .unwrap()
+            .unwrap();
+        assert_eq!(directory.args[0], "dir");
+        assert_eq!(directory.cwd.as_deref(), Some("C:/work"));
+        let file = command
+            .call("missing-file.txt", true, &params)
+            .unwrap()
+            .unwrap();
+        assert_eq!(file.args, ["bat", "missing-file.txt"]);
+        assert_eq!(file.center_line, Some(42));
+        assert_eq!(directory.center_line, None);
+    }
+
+    #[test]
+    fn preview_command_callback_rejects_invalid_results() {
+        for result in [
+            "{args={}}",
+            "{args={'bat'}, extra=true}",
+            "{args={'bat', '\\0'}}",
+            "{args={'bat'}, center_line=-1}",
+            "{args={'bat'}, center_line=1.5}",
+        ] {
+            let source = format!(
+                "return {{pickers={{x={{preview={{type='Command', command=function() return {result} end}}}}}}}}"
+            );
+            let config = parse(&source).unwrap();
+            let bindings =
+                crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+            let options = bindings
+                .named("x")
+                .unwrap()
+                .resolve(&Default::default())
+                .unwrap();
+            let Some(crate::picker::config::Preview::Command {
+                command: Some(command),
+                ..
+            }) = options.preview
+            else {
+                panic!("expected callback preview");
+            };
+            assert!(command.call("file", false, &Default::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn picker_defaults_unique_is_inherited_and_overridden_in_static_and_factory_pickers() {
+        for (global, global_value) in [
+            ("", false),
+            ("picker_defaults={unique=false},", false),
+            ("picker_defaults={unique=true},", true),
+        ] {
+            for (local, override_value) in [
+                ("", None),
+                (", unique=false", Some(false)),
+                (", unique=true", Some(true)),
+            ] {
+                for kind in ["Scrollback", "Command"] {
+                    for factory in [false, true] {
+                        let args = if kind == "Command" {
+                            ", args={'history.exe'}"
+                        } else {
+                            ""
+                        };
+                        let definition = format!("{{type='{kind}'{args}{local}}}");
+                        let definition = if factory {
+                            format!("function(context) return {definition} end")
+                        } else {
+                            definition
+                        };
+                        let config =
+                            parse(&format!("return {{{global}pickers={{x={definition}}}}}"))
+                                .unwrap();
+                        let bindings = crate::picker::config::Bindings::compile_with_defaults(
+                            config.pickers,
+                            config.keys,
+                            config.picker_defaults,
+                        )
+                        .unwrap();
+                        let options = bindings
+                            .named("x")
+                            .unwrap()
+                            .resolve(&PickerContext::default())
+                            .unwrap();
+                        let unique = match options.source {
+                            crate::picker::config::Source::Scrollback { unique, .. } => unique,
+                            crate::picker::config::Source::Command(options) => options.unique,
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            unique,
+                            override_value.unwrap_or(global_value),
+                            "{global} {local} {kind} factory={factory}"
+                        );
+                    }
+                }
+            }
+        }
+        let config = parse("return {picker_defaults={unique=true}}").unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_defaults(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+        )
+        .unwrap();
+        assert!(matches!(
+            bindings
+                .named("lines")
+                .unwrap()
+                .resolve(&PickerContext::default())
+                .unwrap()
+                .source,
+            crate::picker::config::Source::Scrollback { unique: true, .. }
+        ));
+        assert!(parse("return {picker_defaults={unique='yes'}}").is_err());
+        assert!(parse("return {picker_defaults={unknown=true}}").is_err());
+    }
+
+    #[test]
+    fn command_unique_accepts_lua_and_defaults_to_false() {
+        for (field, expected) in [
+            ("", false),
+            (", unique=false", false),
+            (", unique=true", true),
+        ] {
+            let config = parse(&format!("return {{pickers={{history={{type='Command', args={{'history.exe'}}, line_continuation='`'{field}}}}}}}"))
+                .unwrap();
+            let bindings =
+                crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+            let options = bindings
+                .named("history")
+                .unwrap()
+                .resolve(&PickerContext::default())
+                .unwrap();
+            let crate::picker::config::Source::Command(options) = options.source else {
+                panic!("expected command");
+            };
+            assert_eq!(options.unique, expected);
+        }
+    }
+
+    #[test]
+    fn scrollback_unique_accepts_lua_and_defaults_to_false() {
+        for (field, expected) in [
+            ("", false),
+            (", unique=false", false),
+            (", unique=true", true),
+        ] {
+            let config = parse(&format!(
+                "return {{pickers={{x={{type='Scrollback'{field}}}}}}}"
+            ))
+            .unwrap();
+            let bindings =
+                crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+            let options = bindings
+                .named("x")
+                .unwrap()
+                .resolve(&PickerContext::default())
+                .unwrap();
+            let crate::picker::config::Source::Scrollback { unique, .. } = options.source else {
+                panic!("expected scrollback");
+            };
+            assert_eq!(unique, expected);
+        }
+        assert!(parse("return {pickers={x={type='Items', unique=true}}}").is_err());
+    }
+
+    #[test]
+    fn styled_scrollback_preview_requires_scrollback_source() {
+        let config = parse(
+            "return {pickers={lines={type='Scrollback', preview={type='Scrollback', rows=8}}}}",
+        )
+        .unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let options = bindings
+            .named("lines")
+            .unwrap()
+            .resolve(&Default::default())
+            .unwrap();
+        assert!(matches!(
+            options.preview,
+            Some(crate::picker::config::Preview::Scrollback { rows: 8 })
+        ));
+        for source in [
+            "return {pickers={x={type='FileSystem', preview={type='Scrollback'}}}}",
+            "return {pickers={x={type='Scrollback', preview={type='Scrollback', rows=0}}}}",
+        ] {
+            let config = parse(source).unwrap();
+            assert!(crate::picker::config::Bindings::compile(config.pickers, config.keys).is_err());
+        }
+    }
+
+    #[test]
+    fn function_picker_uses_cursor_context_and_validates_returned_schema() {
+        let config = parse(
+            r#"return {
+            pickers = {
+                dynamic = function(context)
+                    if context.line_before_cursor == 'rg test' then
+                        return { type = 'Command', args = {'rg', '{query}'},
+                            initial_query = 'test', enter_action = 'SendInput' }
+                    end
+                    return { type = 'Scrollback', regex = 'word', initial_query = context.line }
+                end,
+            },
+            keys = {{ key = 'p', mods = 'ALT', picker = 'dynamic' }},
+        }"#,
+        )
+        .unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let entry = bindings.named("dynamic").unwrap();
+        assert!(entry.needs_context());
+        let command = entry
+            .resolve(&PickerContext {
+                line: "rg test".into(),
+                line_before_cursor: "rg test".into(),
+                cursor_column: 7,
+            })
+            .unwrap();
+        assert!(matches!(
+            command.source,
+            crate::picker::config::Source::Command(_)
+        ));
+        assert_eq!(command.params["query"], "test");
+        let scrollback = entry
+            .resolve(&PickerContext {
+                line: "other".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(
+            scrollback.source,
+            crate::picker::config::Source::Scrollback { .. }
+        ));
+        assert_eq!(scrollback.params["query"], "other");
+        let config =
+            parse("return {pickers={bad=function() return {type='FileSystem', regex='x'} end}}")
+                .unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        assert!(
+            bindings
+                .named("bad")
+                .unwrap()
+                .resolve(&PickerContext::default())
+                .is_err()
+        );
+        let config = parse("local picker={type='Items', action=function() end}; return {pickers={reused=function() return picker end}}") .unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let reused = bindings.named("reused").unwrap();
+        for _ in 0..2 {
+            assert!(
+                reused
+                    .resolve(&PickerContext::default())
+                    .unwrap()
+                    .callback
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn function_picker_ignores_text_after_cursor() {
+        let config = parse(
+            r#"return { pickers = { words = function(context)
+            local before = context.line_before_cursor:match('(%S+)$') or ''
+            return { type = 'Scrollback', regex = [[\S+]], initial_query = before,
+                action = function(app, item)
+                    app:replace_prompt(item.value, utf8.len(before) or 0, 0)
+                end }
+        end } }"#,
+        )
+        .unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let options = bindings
+            .named("words")
+            .unwrap()
+            .resolve(&PickerContext {
+                line: "PS C:\\src> foobar ghost suggestion".into(),
+                line_before_cursor: "PS C:\\src> foo".into(),
+                cursor_column: 14,
+            })
+            .unwrap();
+        assert_eq!(options.params["query"], "foo");
+        let commands = options
+            .callback
+            .unwrap()
+            .call(
+                "replacement",
+                "replacement",
+                false,
+                None,
+                None,
+                &Default::default(),
+            )
+            .unwrap();
+        assert!(
+            matches!(&commands[0], crate::picker::action::Command::ReplacePrompt { text, before: 3, after: 0 } if text == "replacement")
+        );
     }
 
     #[test]
     fn config_discovery_uses_first_file_and_only_falls_back_when_missing() {
         let explicit = Path::new("argument.lua");
         let defaults = vec![
-            PathBuf::from("home/config.lua"),
-            PathBuf::from("exe/config.lua"),
+            PathBuf::from("home/ghostty.lua"),
+            PathBuf::from("exe/ghostty.lua"),
         ];
         let loaded = read_config(Some(explicit), &defaults, |path| {
             Ok(path.display().to_string())
@@ -388,7 +1145,8 @@ mod tests {
         let config = parse(
             r#"local size = 6 * 2
             return { font = { family = "JetBrains Mono", size = size },
-                terminal = { scrollback_limit = 0 }, colors = { theme = "Gruvbox Dark" } }"#,
+                terminal = { scrollback_limit = 0, command = "pwsh.exe" },
+                colors = { theme = "Gruvbox Dark" } }"#,
         )
         .unwrap();
         assert_eq!(
@@ -398,6 +1156,7 @@ mod tests {
                 "--font-family=JetBrains Mono",
                 "--font-size=12",
                 "--scrollback-limit-bytes=0",
+                "--command=pwsh.exe",
                 "--theme=Gruvbox Dark"
             ]
         );
@@ -411,6 +1170,51 @@ mod tests {
     }
 
     #[test]
+    fn floating_padding_accepts_asymmetric_percentages_and_rejects_invalid_sizes() {
+        let config = parse(
+            "return { floating = { padding = { top = 10, bottom = 20, left = 5, right = 15 } } }",
+        )
+        .unwrap();
+        assert_eq!(
+            config.floating.padding.unwrap().validate().unwrap(),
+            FloatingPadding {
+                top: 10.0,
+                bottom: 20.0,
+                left: 5.0,
+                right: 15.0,
+            }
+        );
+        assert!(
+            parse("return { floating = { padding = { left = -1 } } }")
+                .unwrap()
+                .floating
+                .padding
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse("return { floating = { padding = { left = 50, right = 45 } } }")
+                .unwrap()
+                .floating
+                .padding
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse("return { floating = { padding = { top = math.huge } } }")
+                .unwrap()
+                .floating
+                .padding
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(parse("return { floating = { padding = { width = 10 } } }").is_err());
+    }
+
+    #[test]
     fn rejects_invalid_config_with_source_location() {
         assert!(parse("return {font = {szie = 12}}").is_err());
         assert!(parse("return {terminal = {scrollback_limit = -1}}").is_err());
@@ -420,6 +1224,7 @@ mod tests {
             "return {font = {size = 0}}",
             "return {font = {size = math.huge}}",
             "return {font = {family = ''}}",
+            "return {terminal = {command = ''}}",
         ] {
             assert!(parse(source).unwrap().ghostty_args().is_err());
         }
@@ -445,6 +1250,9 @@ mod tests {
             result.unwrap(),
             [
                 "app",
+                "--copy-on-select=none",
+                "--right-click-action=copy",
+                "--selection-clear-on-typing=false",
                 "--font-family=",
                 "--font-family=Lua Font",
                 "--font-size=12",

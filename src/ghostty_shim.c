@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -9,6 +10,8 @@
 typedef struct {
     ghostty_app_t app;
     ghostty_surface_t surface;
+    bool owns_app;
+    ghostty_platform_opengl_s platform;
 #ifdef _WIN32
     HWND window;
     WNDPROC previous_window_proc;
@@ -37,12 +40,13 @@ extern void ghostty_egui_wakeup(void *userdata);
 extern void ghostty_egui_frame_ready(void *userdata);
 extern void ghostty_egui_close(void *userdata);
 extern void ghostty_egui_protocol(void *userdata, const uint8_t *bytes, size_t len);
+extern void ghostty_egui_write_clipboard(void *userdata, const uint8_t *bytes, size_t len);
 
 static void wake(void *userdata) { ghostty_egui_wakeup(userdata); }
 static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action_value) {
     if (target.tag != GHOSTTY_TARGET_SURFACE) return false;
 
-    void *userdata = ghostty_app_userdata(app);
+    void *userdata = ghostty_surface_userdata(target.target.surface);
     switch (action_value.tag) {
     case GHOSTTY_ACTION_APPLICATION_PROTOCOL:
         ghostty_egui_protocol(userdata, action_value.action.application_protocol.bytes, action_value.action.application_protocol.len);
@@ -88,11 +92,14 @@ static void write_clipboard(
     size_t count,
     bool confirm
 ) {
-    (void)userdata;
-    (void)clipboard;
-    (void)contents;
-    (void)count;
-    (void)confirm;
+    if (clipboard != GHOSTTY_CLIPBOARD_STANDARD || confirm) return;
+    for (size_t i = 0; i < count; ++i) {
+        if (contents[i].mime && strncmp(contents[i].mime, "text/plain", 10) == 0 &&
+            contents[i].data) {
+            ghostty_egui_write_clipboard(userdata, (const uint8_t *)contents[i].data, contents[i].len);
+            return;
+        }
+    }
 }
 static void close_surface(void *userdata, bool process_alive) {
     (void)process_alive;
@@ -109,7 +116,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
     double scale,
     const char *osc_token
 ) {
-    if (ghostty_init(argc, argv) != 0) return NULL;
+    if (ghostty_init_utf8(argc, argv) != 0) return NULL;
 
     ghostty_config_t config = ghostty_config_new();
     if (!config) return NULL;
@@ -137,6 +144,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
     options.platform.opengl.display = display;
     options.platform.opengl.context = context;
     options.scale_factor = scale;
+    options.userdata = userdata;
     ghostty_env_var_s token_env = { .key = "WEZTERM_OSC_TOKEN", .value = osc_token };
     options.env_vars = &token_env;
     options.env_var_count = 1;
@@ -154,6 +162,8 @@ GhosttyEguiHost *ghostty_egui_host_create(
     }
     host->app = app;
     host->surface = surface;
+    host->owns_app = true;
+    host->platform = options.platform.opengl;
 #ifdef _WIN32
     if (SetPropW((HWND)window, host_property, host)) {
         host->previous_window_proc = (WNDPROC)SetWindowLongPtrW((HWND)window, GWLP_WNDPROC, (LONG_PTR)host_window_proc);
@@ -161,6 +171,30 @@ GhosttyEguiHost *ghostty_egui_host_create(
         else RemovePropW((HWND)window, host_property);
     }
 #endif
+    return host;
+}
+
+GhosttyEguiHost *ghostty_egui_host_create_floating(
+    GhosttyEguiHost *parent, void *userdata, double scale, const char *osc_token
+) {
+    if (!parent) return NULL;
+    GhosttyEguiHost *host = calloc(1, sizeof(*host));
+    if (!host) return NULL;
+    ghostty_surface_config_s options = ghostty_surface_config_new();
+    options.platform_tag = GHOSTTY_PLATFORM_OPENGL;
+    options.platform.opengl = parent->platform;
+    options.scale_factor = scale;
+    options.userdata = userdata;
+    ghostty_env_var_s token_env = { .key = "WEZTERM_OSC_TOKEN", .value = osc_token };
+    options.env_vars = &token_env;
+    options.env_var_count = 1;
+    host->app = parent->app;
+    host->platform = parent->platform;
+    host->surface = ghostty_surface_new(host->app, &options);
+    if (!host->surface) {
+        free(host);
+        return NULL;
+    }
     return host;
 }
 
@@ -174,7 +208,7 @@ void ghostty_egui_host_destroy(GhosttyEguiHost *host) {
     }
 #endif
     if (host->surface) ghostty_surface_free(host->surface);
-    if (host->app) ghostty_app_free(host->app);
+    if (host->owns_app && host->app) ghostty_app_free(host->app);
     free(host);
 }
 
@@ -248,6 +282,22 @@ bool ghostty_egui_host_snapshot_text_row(
 ) { return ghostty_surface_snapshot_text_row(host->surface, generation, row, result); }
 void ghostty_egui_host_snapshot_text_row_free(ghostty_snapshot_text_row_s *result) {
     ghostty_surface_snapshot_text_row_free(result);
+}
+bool ghostty_egui_host_snapshot_styled_rows(
+    GhosttyEguiHost *host, uint64_t generation, uint64_t first_row,
+    uint32_t row_count, ghostty_snapshot_styled_rows_s *result
+) { return ghostty_surface_snapshot_styled_rows(host->surface, generation, first_row, row_count, result); }
+void ghostty_egui_host_snapshot_styled_rows_free(ghostty_snapshot_styled_rows_s *result) {
+    ghostty_surface_snapshot_styled_rows_free(result);
+}
+bool ghostty_egui_host_live_cursor_line(GhosttyEguiHost *host, ghostty_live_cursor_line_s *result) {
+    return ghostty_surface_live_cursor_line(host->surface, result);
+}
+bool ghostty_egui_host_live_cursor_position(GhosttyEguiHost *host, ghostty_live_cursor_position_s *result) {
+    return ghostty_surface_live_cursor_position(host->surface, result);
+}
+void ghostty_egui_host_live_cursor_line_free(ghostty_live_cursor_line_s *result) {
+    ghostty_surface_live_cursor_line_free(result);
 }
 bool ghostty_egui_host_snapshot_apply_decorations(
     GhosttyEguiHost *host, uint64_t generation,

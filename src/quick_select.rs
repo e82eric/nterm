@@ -1,5 +1,5 @@
 use crate::copy_mode::TextRow;
-use crate::ffi::{
+use crate::ghostty_ffi::{
     SnapshotCell, SnapshotCellRange, SnapshotCellText, SnapshotDecorationStyle, SnapshotView,
 };
 use regex::Regex;
@@ -12,15 +12,96 @@ pub(crate) struct Hint {
     pub(crate) label: String,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) enum Purpose {
+    #[default]
+    Navigate,
+    YankLines {
+        origin: SnapshotCell,
+    },
+}
+
 pub(crate) struct QuickSelect {
     pub(crate) generation: u64,
     pub(crate) from_copy: bool,
     pub(crate) hints: Vec<Hint>,
     pub(crate) prefix: String,
     pub(crate) view: SnapshotView,
+    pub(crate) purpose: Purpose,
+}
+
+pub(crate) enum InputAction {
+    None,
+    Cancel,
+    Page(bool),
+    Changed,
+    Select { cell: SnapshotCell, shifted: bool },
 }
 
 impl QuickSelect {
+    pub(crate) fn input(&mut self, events: &[egui::Event], index: usize) -> InputAction {
+        match &events[index] {
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                pressed: true,
+                ..
+            } => InputAction::Cancel,
+            egui::Event::Key {
+                key: key @ (egui::Key::PageUp | egui::Key::PageDown),
+                pressed: true,
+                modifiers,
+                ..
+            } if *modifiers == egui::Modifiers::NONE => {
+                InputAction::Page(*key == egui::Key::PageDown)
+            }
+            egui::Event::Key {
+                key: egui::Key::Backspace,
+                pressed: true,
+                ..
+            } => {
+                self.prefix.pop();
+                InputAction::Changed
+            }
+            egui::Event::Text(text) => match self.type_text(text) {
+                Some(cell) => InputAction::Select {
+                    cell,
+                    shifted: shifted_hint(events, index),
+                },
+                None => InputAction::Changed,
+            },
+            _ => InputAction::None,
+        }
+    }
+
+    pub(crate) fn status_text(&self) -> String {
+        if self.hints.is_empty() {
+            "NO MATCHES · Esc".to_owned()
+        } else {
+            format!(
+                "{}  ·  {} hints",
+                self.prefix.to_ascii_uppercase(),
+                self.visible_hints().count()
+            )
+        }
+    }
+
+    pub(crate) fn decorations(
+        &self,
+    ) -> (
+        Vec<SnapshotCellRange>,
+        Vec<SnapshotCellText>,
+        SnapshotDecorationStyle,
+    ) {
+        let ranges = self.visible_hints().map(|hint| hint.range).collect();
+        let text = self.cell_text();
+        let style = SnapshotDecorationStyle {
+            foreground_rgb: 0xebdbb2,
+            background_rgb: 0x3c3836,
+            flags: 3,
+        };
+        (ranges, text, style)
+    }
+
     pub(crate) fn paged_view(mut view: SnapshotView, down: bool) -> SnapshotView {
         let height = u64::from(view.viewport_rows);
         let max_top = view.total_rows.saturating_sub(height);
@@ -84,6 +165,7 @@ impl QuickSelect {
             from_copy,
             view,
             prefix: String::new(),
+            purpose: Purpose::Navigate,
             hints: ranges
                 .into_iter()
                 .zip(labels)

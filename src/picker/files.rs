@@ -1,4 +1,4 @@
-use crate::picker_config::FileOptions;
+use crate::picker::config::FileOptions;
 
 pub(crate) fn resolve_roots(options: &mut FileOptions) -> Result<(), String> {
     if options.roots.is_empty() {

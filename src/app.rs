@@ -1,19 +1,23 @@
-use crate::frame_trace::{FrameSample, FrameTrace};
 use crate::presentation::{Presentation, UiChanges};
 use crate::terminal::TerminalView;
 use egui_winit::winit;
 use glow::HasContext as _;
 use std::ffi::{CString, c_char, c_void};
 use std::num::NonZeroU32;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(crate) fn run(args: Vec<CString>, pickers: crate::picker_config::Bindings) {
+pub(crate) fn run(
+    args: Vec<CString>,
+    pickers: crate::picker::config::Bindings,
+    floating_padding: Option<crate::config::FloatingPadding>,
+) {
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("create event loop");
     let proxy = event_loop.create_proxy();
-    let mut app = NativeApp::new(proxy, args, pickers);
+    let mut app = NativeApp::new(proxy, args, pickers, floating_padding);
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
@@ -31,8 +35,10 @@ impl ShellApp {
         gl: &glow::Context,
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
         args: Vec<CString>,
-        pickers: crate::picker_config::Bindings,
+        pickers: crate::picker::config::Bindings,
+        floating_padding: Option<crate::config::FloatingPadding>,
     ) -> Self {
+        let command_label = command_label(&args);
         let mut argv: Vec<*mut c_char> = args.iter().map(|arg| arg.as_ptr().cast_mut()).collect();
         Self {
             terminal: TerminalView::new(
@@ -41,15 +47,22 @@ impl ShellApp {
                 proxy,
                 argv.len(),
                 argv.as_mut_ptr(),
+                command_label,
                 pickers,
+                floating_padding,
             ),
             _args: args,
             _argv: argv,
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui) {
-        self.terminal.update(ui);
+    fn ui(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
+        if ui.input_mut(|input| consume_new_window_shortcut(&mut input.events))
+            && let Err(error) = open_new_window()
+        {
+            eprintln!("could not open a new terminal window: {error}");
+        }
+        self.terminal.update(ui, gl);
     }
 
     fn destroy(&mut self, gl: &glow::Context) {
@@ -57,22 +70,157 @@ impl ShellApp {
     }
 }
 
+fn command_label(args: &[CString]) -> String {
+    let mut command = None;
+    let mut args = args.iter().skip(1).map(|arg| arg.to_string_lossy());
+    while let Some(arg) = args.next() {
+        if arg == "-e" || arg == "--" {
+            command = args.next().map(|arg| arg.into_owned());
+            break;
+        }
+        if arg == "--command" {
+            command = args.next().map(|arg| arg.into_owned());
+        } else if let Some(value) = arg.strip_prefix("--command=") {
+            command = Some(value.to_owned());
+        }
+    }
+    let Some(command) = command else {
+        return "TERMINAL".into();
+    };
+    let command = command.trim();
+    let executable = if let Some(quoted) = command.strip_prefix('"') {
+        quoted.split('"').next().unwrap_or(quoted)
+    } else if let Some(end) = command.to_ascii_lowercase().find(".exe") {
+        &command[..end + 4]
+    } else {
+        command.split_whitespace().next().unwrap_or(command)
+    };
+    let executable = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+    if executable.is_empty() {
+        "TERMINAL".into()
+    } else {
+        executable.to_ascii_uppercase()
+    }
+}
+
+fn open_new_window() -> std::io::Result<()> {
+    Command::new(std::env::current_exe()?)
+        .args(std::env::args_os().skip(1))
+        .spawn()?;
+    Ok(())
+}
+
+fn consume_new_window_shortcut(events: &mut Vec<egui::Event>) -> bool {
+    let mut incoming = std::mem::take(events).into_iter().peekable();
+    let mut open = false;
+    while let Some(event) = incoming.next() {
+        if let egui::Event::Key {
+            key: egui::Key::N,
+            pressed,
+            repeat,
+            modifiers,
+            ..
+        } = &event
+            && modifiers.ctrl
+            && modifiers.shift
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+        {
+            open |= *pressed && !*repeat;
+            if *pressed && matches!(incoming.peek(), Some(egui::Event::Text(_))) {
+                incoming.next();
+            }
+        } else {
+            events.push(event);
+        }
+    }
+    open
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::consume_new_window_shortcut;
+
+    #[test]
+    fn ctrl_shift_n_opens_once_and_does_not_reach_the_terminal() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let key = |pressed, repeat, modifiers| egui::Event::Key {
+            key: egui::Key::N,
+            physical_key: Some(egui::Key::N),
+            pressed,
+            repeat,
+            modifiers,
+        };
+        let unrelated = key(true, false, egui::Modifiers::NONE);
+        let mut events = vec![
+            unrelated.clone(),
+            key(true, false, modifiers),
+            egui::Event::Text("N".into()),
+            key(true, true, modifiers),
+            key(false, false, modifiers),
+        ];
+        assert!(consume_new_window_shortcut(&mut events));
+        assert_eq!(events, vec![unrelated]);
+
+        for modifiers in [
+            egui::Modifiers::CTRL,
+            egui::Modifiers::SHIFT,
+            egui::Modifiers {
+                alt: true,
+                ..modifiers
+            },
+        ] {
+            let original = vec![key(true, false, modifiers)];
+            let mut events = original.clone();
+            assert!(!consume_new_window_shortcut(&mut events));
+            assert_eq!(events, original);
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_label_tests {
+    use super::command_label;
+    use std::ffi::CString;
+
+    #[test]
+    fn explicit_command_overrides_lua_command() {
+        let args = [
+            "ghostty",
+            "--command=cmd.exe",
+            "--command=C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        ]
+        .map(|arg| CString::new(arg).unwrap());
+        assert_eq!(command_label(&args), "PWSH.EXE");
+    }
+
+    #[test]
+    fn defaults_to_terminal_without_a_command() {
+        let args = [CString::new("ghostty").unwrap()];
+        assert_eq!(command_label(&args), "TERMINAL");
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum UserEvent {
     Repaint(Instant),
     GhosttyWake,
-    FrameReady(Instant),
+    FrameReady,
 }
 
 struct NativeApp {
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     args: Option<Vec<CString>>,
-    pickers: Option<crate::picker_config::Bindings>,
+    pickers: Option<crate::picker::config::Bindings>,
+    floating_padding: Option<crate::config::FloatingPadding>,
     gl_window: Option<GlutinWindowContext>,
     gl: Option<Arc<glow::Context>>,
     egui: Option<egui_glow::EguiGlow>,
     shell: Option<ShellApp>,
-    trace: FrameTrace,
     presentation: Presentation,
 }
 
@@ -80,31 +228,29 @@ impl NativeApp {
     fn new(
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
         args: Vec<CString>,
-        pickers: crate::picker_config::Bindings,
+        pickers: crate::picker::config::Bindings,
+        floating_padding: Option<crate::config::FloatingPadding>,
     ) -> Self {
         Self {
             proxy,
             args: Some(args),
             pickers: Some(pickers),
+            floating_padding,
             gl_window: None,
             gl: None,
             egui: None,
             shell: None,
-            trace: FrameTrace::new(),
             presentation: Presentation::default(),
         }
     }
 
     fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let started = Instant::now();
         let gl_window = self.gl_window.as_ref().expect("OpenGL window");
         let gl = self.gl.as_ref().expect("OpenGL context");
         let egui = self.egui.as_mut().expect("egui renderer");
         let shell = self.shell.as_mut().expect("terminal shell");
 
-        egui.run(gl_window.window(), |ctx| shell.ui(ctx));
-        let ran_ui = Instant::now();
-        let retired_before_paint = shell.terminal.retired_pending();
+        egui.run(gl_window.window(), |ctx| shell.ui(ctx, gl));
         if shell.terminal.should_close() {
             event_loop.exit();
             return;
@@ -119,13 +265,11 @@ impl NativeApp {
             .presentation
             .present_deadline(now)
             .is_some_and(|due| due > now);
-        let mut new_frame = false;
         if self.presentation.ready(now) {
-            new_frame = shell.terminal.acquire_frame();
+            let new_frame = shell.terminal.acquire_frames();
             // A queued notification may refer to a frame already acquired.
             self.presentation.frame_pending = new_frame;
         }
-        let generation = shell.terminal.frame_generation();
         let presented = !paced && self.presentation.ready(now);
         if presented {
             unsafe {
@@ -136,8 +280,6 @@ impl NativeApp {
         } else {
             shell.terminal.poll_retired(gl);
         }
-        let painted = Instant::now();
-        let paint_trace = shell.terminal.paint_trace();
         self.presentation
             .cleanup_pending(shell.terminal.retired_pending(), Instant::now());
         if presented {
@@ -145,22 +287,6 @@ impl NativeApp {
             gl_window.swap_buffers().expect("swap egui buffers");
             self.presentation.presented(present_started);
         }
-        let swapped = Instant::now();
-        self.trace.record(
-            &egui.egui_ctx,
-            FrameSample {
-                started,
-                ran_ui,
-                painted,
-                swapped,
-                generation,
-                new_frame,
-                presented,
-                paced,
-                retired_before_paint,
-                paint_trace,
-            },
-        );
     }
 }
 
@@ -204,6 +330,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             self.proxy.clone(),
             self.args.take().expect("application resumed twice"),
             self.pickers.take().expect("application resumed twice"),
+            self.floating_padding,
         );
         gl_window.window().set_visible(true);
         gl_window.window().request_redraw();
@@ -238,20 +365,11 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         ) {
             self.presentation.force = true;
         }
-        if matches!(
-            event,
-            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
-        ) {
-            self.trace.input_events += 1;
-            self.trace.pending_input.get_or_insert_with(Instant::now);
-        }
-
         let response = self.egui.as_mut().expect("egui renderer").on_window_event(
             self.gl_window.as_ref().expect("OpenGL window").window(),
             &event,
         );
         if response.repaint {
-            self.trace.window_repaints += 1;
             self.gl_window
                 .as_ref()
                 .expect("OpenGL window")
@@ -264,20 +382,13 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         match event {
             UserEvent::GhosttyWake => {
                 if let Some(shell) = self.shell.as_mut() {
-                    let started = Instant::now();
                     shell.terminal.tick();
-                    self.trace.tick_events += 1;
-                    self.trace.tick_time += started.elapsed();
                 }
             }
-            UserEvent::FrameReady(ready) => {
-                self.trace.pending_frame_ready = Some(ready);
-                self.trace.ready_events += 1;
+            UserEvent::FrameReady => {
                 self.presentation.frame_pending = true;
-                self.trace.frame_event_deferred |= !self.presentation.ready(Instant::now());
             }
             UserEvent::Repaint(deadline) => {
-                self.trace.repaint_events += 1;
                 self.presentation.repaint_at(deadline);
             }
         }
@@ -305,7 +416,6 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             .is_some_and(|due| due <= now);
         if repaint_due {
             self.presentation.repaint_deadline = None;
-            self.trace.timer_events += 1;
         }
         if (repaint_due || self.presentation.ready(now))
             && let Some(window) = &self.gl_window

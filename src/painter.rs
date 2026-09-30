@@ -1,25 +1,13 @@
-use crate::ffi::{GlFrame, ghostty_egui_host_release_frame};
+use crate::ghostty_ffi::{GlFrame, ghostty_egui_host_release_frame};
 use glow::HasContext as _;
 use std::ffi::c_void;
 use std::num::NonZeroU32;
-use std::time::Instant;
-
-#[derive(Default, Clone, Copy)]
-pub(crate) struct PaintTrace {
-    pub(crate) retired_us: u128,
-    pub(crate) setup_us: u128,
-    pub(crate) draw_us: u128,
-    pub(crate) fence_us: u128,
-    pub(crate) retired_count: usize,
-    pub(crate) fence_wait_failed: usize,
-}
 
 // Handles are stored as integers because egui callbacks must be Send. All GL
 // access and frame releases happen on the UI thread with its context current.
 struct OwnedFrame {
     handle: usize,
     texture: u32,
-    generation: u64,
     fence: Option<usize>,
 }
 
@@ -40,8 +28,6 @@ pub(crate) struct TerminalPainter {
     vertex_array: glow::VertexArray,
     current: Option<OwnedFrame>,
     retired: Vec<OwnedFrame>,
-    trace_enabled: bool,
-    paint_trace: PaintTrace,
 }
 
 impl TerminalPainter {
@@ -93,8 +79,6 @@ impl TerminalPainter {
                     .expect("create terminal vertex array"),
                 current: None,
                 retired: Vec::new(),
-                trace_enabled: std::env::var_os("GHOSTTY_EGUI_TRACE").is_some(),
-                paint_trace: PaintTrace::default(),
             }
         }
     }
@@ -103,7 +87,6 @@ impl TerminalPainter {
         let next = OwnedFrame {
             handle: frame.handle as usize,
             texture: frame.texture,
-            generation: frame.frame_generation,
             fence: None,
         };
         if let Some(old) = self.current.replace(next) {
@@ -116,21 +99,11 @@ impl TerminalPainter {
         }
     }
 
-    pub(crate) fn frame_generation(&self) -> Option<u64> {
-        self.current.as_ref().map(|frame| frame.generation)
-    }
-
     pub(crate) fn has_retired_frames(&self) -> bool {
         !self.retired.is_empty()
     }
 
-    pub(crate) fn paint_trace(&self) -> PaintTrace {
-        self.paint_trace
-    }
-
     pub(crate) fn poll_retired(&mut self, gl: &glow::Context) {
-        let started = Instant::now();
-        let mut fence_wait_failed = 0;
         unsafe {
             let mut i = 0;
             while i < self.retired.len() {
@@ -139,20 +112,9 @@ impl TerminalPainter {
                 if status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED {
                     self.retired.swap_remove(i).release(gl);
                 } else {
-                    if status == glow::WAIT_FAILED {
-                        fence_wait_failed += 1;
-                    }
                     i += 1;
                 }
             }
-        }
-        if self.trace_enabled {
-            self.paint_trace = PaintTrace {
-                retired_us: started.elapsed().as_micros(),
-                retired_count: self.retired.len(),
-                fence_wait_failed,
-                ..PaintTrace::default()
-            };
         }
     }
 
@@ -165,8 +127,6 @@ impl TerminalPainter {
             return;
         };
         self.poll_retired(gl);
-        let poll_trace = self.paint_trace;
-        let retired = Instant::now();
         unsafe {
             gl.disable(glow::BLEND);
             gl.use_program(Some(self.program));
@@ -174,9 +134,7 @@ impl TerminalPainter {
             gl.bind_texture(glow::TEXTURE_2D, Some(glow::NativeTexture(texture)));
             gl.uniform_1_i32(self.texture_uniform.as_ref(), 0);
             gl.bind_vertex_array(Some(self.vertex_array));
-            let prepared = Instant::now();
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
-            let drawn = Instant::now();
 
             let frame = self.current.as_mut().expect("current frame");
             if let Some(fence) = frame.fence.take() {
@@ -190,16 +148,6 @@ impl TerminalPainter {
                 // the driver rejects it, complete this read before allowing
                 // the texture to be returned to Ghostty's pool.
                 gl.finish();
-            }
-            if self.trace_enabled {
-                self.paint_trace = PaintTrace {
-                    retired_us: poll_trace.retired_us,
-                    setup_us: prepared.duration_since(retired).as_micros(),
-                    draw_us: drawn.duration_since(prepared).as_micros(),
-                    fence_us: drawn.elapsed().as_micros(),
-                    retired_count: self.retired.len(),
-                    fence_wait_failed: poll_trace.fence_wait_failed,
-                };
             }
         }
     }

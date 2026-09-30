@@ -119,6 +119,29 @@ pub(crate) struct SnapshotTextRow {
     pub(crate) wraps_to_next: bool,
 }
 
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct SnapshotStyledRows {
+    pub(crate) text: *const u8,
+    pub(crate) len: usize,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct LiveCursorLine {
+    pub(crate) text: *const u8,
+    pub(crate) len: usize,
+    pub(crate) cursor_byte: usize,
+    pub(crate) cursor_column: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct LiveCursorPosition {
+    pub(crate) column: u32,
+    pub(crate) row: u32,
+}
+
 unsafe extern "C" {
     pub(crate) fn ghostty_egui_host_read_font(
         host: *mut Host,
@@ -138,6 +161,12 @@ unsafe extern "C" {
         osc_token: *const c_char,
     ) -> *mut Host;
     pub(crate) fn ghostty_egui_host_destroy(host: *mut Host);
+    pub(crate) fn ghostty_egui_host_create_floating(
+        parent: *mut Host,
+        userdata: *mut c_void,
+        scale: f64,
+        osc_token: *const c_char,
+    ) -> *mut Host;
     pub(crate) fn ghostty_egui_host_tick(host: *mut Host);
     pub(crate) fn ghostty_egui_host_resize(host: *mut Host, width: u32, height: u32, scale: f64);
     pub(crate) fn ghostty_egui_host_focus(host: *mut Host, focused: bool);
@@ -197,6 +226,23 @@ unsafe extern "C" {
         result: *mut SnapshotTextRow,
     ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_text_row_free(result: *mut SnapshotTextRow);
+    pub(crate) fn ghostty_egui_host_snapshot_styled_rows(
+        host: *mut Host,
+        generation: u64,
+        first_row: u64,
+        row_count: u32,
+        result: *mut SnapshotStyledRows,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_snapshot_styled_rows_free(result: *mut SnapshotStyledRows);
+    pub(crate) fn ghostty_egui_host_live_cursor_line(
+        host: *mut Host,
+        result: *mut LiveCursorLine,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_live_cursor_line_free(result: *mut LiveCursorLine);
+    pub(crate) fn ghostty_egui_host_live_cursor_position(
+        host: *mut Host,
+        result: *mut LiveCursorPosition,
+    ) -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_apply_decorations(
         host: *mut Host,
         generation: u64,

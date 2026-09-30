@@ -1,7 +1,7 @@
-use crate::ffi::{SnapshotCell, SnapshotCellRange, SnapshotView};
+use crate::ghostty_ffi::{SnapshotCell, SnapshotCellRange, SnapshotView};
 use regex::RegexSet;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -476,6 +476,22 @@ pub(crate) enum ViewportPosition {
 }
 
 #[derive(Clone, Default)]
+struct CopySearch {
+    query_revision: u64,
+    matches: Arc<[SnapshotCellRange]>,
+    forward: bool,
+    waiting: bool,
+    pending_moves: Vec<(bool, u32)>,
+}
+
+pub(crate) struct CopySelection {
+    pub(crate) range: SnapshotCellRange,
+    pub(crate) linewise: bool,
+    pub(crate) trim: bool,
+    pub(crate) rectangle: bool,
+}
+
+#[derive(Clone, Default)]
 pub(crate) struct CopyMode {
     pub(crate) generation: Option<u64>,
     pub(crate) cursor: SnapshotCell,
@@ -491,8 +507,10 @@ pub(crate) struct CopyMode {
     pub(crate) pending_count: Option<u32>,
     pub(crate) pending_jump: Option<(bool, bool)>,
     pub(crate) pending_yank: Option<YankPending>,
+    skip_trigger_text: bool,
     yank_highlight: Option<YankHighlight>,
     pub(crate) last_jump: Option<Jump>,
+    search: CopySearch,
 }
 
 impl CopyMode {
@@ -511,8 +529,117 @@ impl CopyMode {
         self.pending_count = None;
         self.pending_jump = None;
         self.pending_yank = None;
+        self.skip_trigger_text = false;
         self.yank_highlight = None;
         self.last_jump = None;
+        self.search = CopySearch::default();
+    }
+
+    pub(crate) fn adopt_search(&mut self, query_revision: u64, matches: Vec<SnapshotCellRange>) {
+        self.search = CopySearch {
+            query_revision,
+            matches: matches.into(),
+            ..Default::default()
+        };
+    }
+
+    pub(crate) fn begin_search(&mut self, query_revision: u64, forward: bool, count: u32) {
+        self.search = CopySearch {
+            query_revision,
+            forward,
+            waiting: true,
+            pending_moves: vec![(forward, count)],
+            ..Default::default()
+        };
+    }
+
+    pub(crate) fn cancel_pending_search(&mut self) {
+        self.search.waiting = false;
+        self.search.pending_moves.clear();
+    }
+
+    pub(crate) fn search_accepts_result(&self, query_revision: u64) -> bool {
+        self.search.waiting && self.search.query_revision == query_revision
+    }
+
+    pub(crate) fn search_matches(&self) -> &[SnapshotCellRange] {
+        &self.search.matches
+    }
+
+    pub(crate) fn finish_search(
+        &mut self,
+        query_revision: u64,
+        matches: Vec<SnapshotCellRange>,
+    ) -> Option<SnapshotCell> {
+        if !self.search_accepts_result(query_revision) {
+            return None;
+        }
+        self.search.waiting = false;
+        self.search.matches = matches.into();
+        let mut target = self.cursor;
+        for (forward, count) in std::mem::take(&mut self.search.pending_moves) {
+            if let Some(next) = next_match_cell(&self.search.matches, target, forward, count) {
+                target = next;
+            }
+        }
+        Some(target)
+    }
+
+    pub(crate) fn navigate_search(&mut self, reverse: bool, count: u32) -> Option<SnapshotCell> {
+        if self.search.query_revision == 0 {
+            return None;
+        }
+        let forward = self.search.forward != reverse;
+        if self.search.waiting {
+            self.search.pending_moves.push((forward, count));
+            None
+        } else {
+            next_match_cell(&self.search.matches, self.cursor, forward, count)
+        }
+    }
+
+    pub(crate) fn visual_selection_to(
+        &self,
+        cursor: SnapshotCell,
+        read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<CopySelection> {
+        let range = match self.visual_mode {
+            VisualMode::Characterwise => self.visual_range_to(cursor),
+            VisualMode::Linewise => self.linewise_visual_range_to(cursor, read),
+            VisualMode::Blockwise => self.visual_rectangle_to(cursor),
+        }?;
+        Some(CopySelection {
+            range,
+            linewise: self.visual_mode == VisualMode::Linewise,
+            trim: self.visual_trim && self.visual_mode != VisualMode::Blockwise,
+            rectangle: self.visual_mode == VisualMode::Blockwise,
+        })
+    }
+
+    pub(crate) fn text_object_selection(
+        &self,
+        count: u32,
+        object: WordObject,
+        kind: CopyTextObject,
+        prompt_boundaries: &[u64],
+        read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<CopySelection> {
+        let range = match kind {
+            CopyTextObject::Word(big) => self.word_object_range(count, object, big, read),
+            CopyTextObject::Quote(quote) => self.quote_object_range(object, quote, read),
+            CopyTextObject::Delimiter(open, close) => {
+                self.delimiter_object_range(object, open, close, read)
+            }
+            CopyTextObject::Command => self.command_object_range(object, count, prompt_boundaries),
+        }?;
+        let linewise = matches!(kind, CopyTextObject::Command);
+        Some(CopySelection {
+            range,
+            linewise,
+            trim: linewise
+                || (matches!(kind, CopyTextObject::Word(_)) && object == WordObject::Inner),
+            rectangle: false,
+        })
     }
 
     pub(crate) fn move_to(
@@ -742,6 +869,15 @@ impl CopyMode {
         mut read: impl FnMut(u64) -> Option<TextRow>,
     ) -> Option<SnapshotCellRange> {
         self.logical_line_range_between(self.visual_anchor?.y, cursor.y, &mut read)
+    }
+
+    pub(crate) fn linewise_range_between(
+        &self,
+        start: SnapshotCell,
+        end: SnapshotCell,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<SnapshotCellRange> {
+        self.logical_line_range_between(start.y, end.y, &mut read)
     }
     fn logical_line_bounds(
         &self,
@@ -1597,7 +1733,8 @@ impl CopyMode {
     }
 }
 
-/// Matches are sorted by their start cell, oldest to newest.
+/// Matches are sorted by their start cell, newest to oldest, as required by
+/// Ghostty's snapshot decoration viewport filter.
 pub(crate) fn next_match_cell(
     matches: &[SnapshotCellRange],
     cursor: SnapshotCell,
@@ -1609,16 +1746,16 @@ pub(crate) fn next_match_cell(
     }
     let at = (cursor.y, cursor.x);
     let index = if forward {
-        matches.partition_point(|range| (range.start.y, range.start.x) <= at) % matches.len()
+        let newer = matches.partition_point(|range| (range.start.y, range.start.x) > at);
+        (newer + matches.len() - 1) % matches.len()
     } else {
-        let before = matches.partition_point(|range| (range.start.y, range.start.x) < at);
-        (before + matches.len() - 1) % matches.len()
+        matches.partition_point(|range| (range.start.y, range.start.x) >= at) % matches.len()
     };
     let steps = ((count - 1) as usize) % matches.len();
     let index = if forward {
-        (index + steps) % matches.len()
-    } else {
         (index + matches.len() - steps) % matches.len()
+    } else {
+        (index + steps) % matches.len()
     };
     Some(matches[index].start)
 }
@@ -1654,8 +1791,738 @@ pub(crate) fn word_search_pattern(word: &str) -> String {
     format!(r"(?i:\b{}\b)", regex::escape(word))
 }
 
+pub(crate) fn is_copy_modifier_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ShiftLeft
+            | egui::Key::ShiftRight
+            | egui::Key::ControlLeft
+            | egui::Key::ControlRight
+            | egui::Key::AltLeft
+            | egui::Key::AltRight
+            | egui::Key::SuperLeft
+            | egui::Key::SuperRight
+    )
+}
+
+pub(crate) fn copy_viewport_position_key(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+) -> Option<ViewportPosition> {
+    if modifiers != egui::Modifiers::NONE {
+        return None;
+    }
+    match key {
+        egui::Key::T => Some(ViewportPosition::Top),
+        egui::Key::Z => Some(ViewportPosition::Center),
+        egui::Key::B => Some(ViewportPosition::Bottom),
+        _ => None,
+    }
+}
+
+pub(crate) fn copy_command_shortcut(event: &egui::Event) -> Option<bool> {
+    match event {
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.mac_cmd => match key
+        {
+            egui::Key::ArrowUp => Some(false),
+            egui::Key::ArrowDown => Some(true),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(crate) fn is_copy_mode_shortcut(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Key {
+        key: egui::Key::M,
+        pressed: true,
+        modifiers,
+        ..
+    } if modifiers.ctrl && modifiers.shift)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CopyTextObject {
+    Word(bool),
+    Quote(char),
+    Delimiter(char, char),
+    Command,
+}
+
+pub(crate) fn copy_text_object_key(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+) -> Option<CopyTextObject> {
+    use egui::Key;
+    if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd {
+        return None;
+    }
+    match key {
+        Key::W => Some(CopyTextObject::Word(modifiers.shift)),
+        Key::C if !modifiers.shift => Some(CopyTextObject::Command),
+        Key::Quote => Some(CopyTextObject::Quote(if modifiers.shift {
+            '"'
+        } else {
+            '\''
+        })),
+        Key::Backtick => Some(CopyTextObject::Quote('`')),
+        Key::Num9 if modifiers.shift => Some(CopyTextObject::Delimiter('(', ')')),
+        Key::Num0 if modifiers.shift => Some(CopyTextObject::Delimiter('(', ')')),
+        Key::OpenBracket | Key::CloseBracket => Some(CopyTextObject::Delimiter('[', ']')),
+        Key::OpenCurlyBracket | Key::CloseCurlyBracket => Some(CopyTextObject::Delimiter('{', '}')),
+        Key::Comma | Key::Period if modifiers.shift => Some(CopyTextObject::Delimiter('<', '>')),
+        _ => None,
+    }
+}
+
+pub(crate) fn copy_scroll_direction(key: egui::Key, modifiers: egui::Modifiers) -> Option<bool> {
+    // egui-winit also sets `command` for Ctrl on Windows and Linux.
+    if !modifiers.ctrl || modifiers.shift || modifiers.alt || modifiers.mac_cmd {
+        return None;
+    }
+    match key {
+        egui::Key::E => Some(true),
+        egui::Key::Y => Some(false),
+        _ => None,
+    }
+}
+
+pub(crate) fn copy_motion(key: egui::Key, modifiers: egui::Modifiers) -> Option<Motion> {
+    use egui::Key;
+    if modifiers.alt || modifiers.mac_cmd {
+        return None;
+    }
+    if modifiers.ctrl {
+        return if modifiers.shift {
+            None
+        } else {
+            match key {
+                Key::U => Some(Motion::HalfPageUp),
+                Key::D => Some(Motion::HalfPageDown),
+                _ => None,
+            }
+        };
+    }
+    if modifiers.command {
+        return None;
+    }
+    if modifiers.shift {
+        return match key {
+            Key::H => Some(Motion::ViewportTop),
+            Key::M => Some(Motion::ViewportMiddle),
+            Key::L => Some(Motion::ViewportBottom),
+            Key::Num6 => Some(Motion::FirstNonblank),
+            Key::Num4 => Some(Motion::LastNonblank),
+            Key::W => Some(Motion::ForwardBigWord),
+            Key::B => Some(Motion::BackwardBigWord),
+            Key::E => Some(Motion::ForwardBigWordEnd),
+            Key::G => Some(Motion::ScrollbackBottom),
+            Key::Num5 => Some(Motion::MatchingBracket),
+            Key::Minus => Some(Motion::LineNonblank),
+            Key::Equals | Key::Plus => Some(Motion::NextLineNonblank),
+            _ => None,
+        };
+    }
+    match key {
+        Key::H | Key::ArrowLeft => Some(Motion::Left),
+        Key::J | Key::ArrowDown => Some(Motion::Down),
+        Key::K | Key::ArrowUp => Some(Motion::Up),
+        Key::L | Key::ArrowRight => Some(Motion::Right),
+        Key::W => Some(Motion::ForwardWord),
+        Key::B => Some(Motion::BackwardWord),
+        Key::E => Some(Motion::ForwardWordEnd),
+        Key::Num0 => Some(Motion::RowStart),
+        Key::Minus => Some(Motion::PreviousLineNonblank),
+        Key::Plus => Some(Motion::NextLineNonblank),
+        Key::PageUp => Some(Motion::PageUp),
+        Key::PageDown => Some(Motion::PageDown),
+        _ => None,
+    }
+}
+
+pub(crate) fn copy_digit(key: egui::Key) -> Option<u32> {
+    use egui::Key;
+    Some(match key {
+        Key::Num0 => 0,
+        Key::Num1 => 1,
+        Key::Num2 => 2,
+        Key::Num3 => 3,
+        Key::Num4 => 4,
+        Key::Num5 => 5,
+        Key::Num6 => 6,
+        Key::Num7 => 7,
+        Key::Num8 => 8,
+        Key::Num9 => 9,
+        _ => return None,
+    })
+}
+
+pub(crate) fn copy_motion_with_prefix(
+    mode: &mut CopyMode,
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+) -> Option<Motion> {
+    if mode.pending_g {
+        mode.pending_g = false;
+        if key == egui::Key::G && modifiers == egui::Modifiers::NONE {
+            return Some(Motion::ScrollbackTop);
+        }
+        if key == egui::Key::E && modifiers == egui::Modifiers::NONE {
+            return Some(Motion::PreviousWordEnd);
+        }
+        if key == egui::Key::E
+            && modifiers.shift
+            && !modifiers.ctrl
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+        {
+            return Some(Motion::PreviousBigWordEnd);
+        }
+    } else if key == egui::Key::G && modifiers == egui::Modifiers::NONE {
+        mode.pending_g = true;
+        return None;
+    }
+    copy_motion(key, modifiers)
+}
+
+pub(crate) fn copy_jump_prefix(key: egui::Key, modifiers: egui::Modifiers) -> Option<(bool, bool)> {
+    if modifiers != egui::Modifiers::NONE
+        && modifiers
+            != (egui::Modifiers {
+                shift: true,
+                ..Default::default()
+            })
+    {
+        return None;
+    }
+    match (key, modifiers.shift) {
+        (egui::Key::F, false) => Some((true, false)),
+        (egui::Key::F, true) => Some((false, false)),
+        (egui::Key::T, false) => Some((true, true)),
+        (egui::Key::T, true) => Some((false, true)),
+        _ => None,
+    }
+}
+
+pub(crate) enum CopyAction {
+    None,
+    Exit,
+    ClearSearch {
+        cancel_pending: bool,
+    },
+    Redraw,
+    Command {
+        forward: bool,
+        count: u32,
+    },
+    Position(ViewportPosition),
+    SelectObject {
+        object: WordObject,
+        kind: CopyTextObject,
+        count: u32,
+    },
+    SwapEndpoint,
+    Scroll {
+        down: bool,
+        count: u32,
+    },
+    ToggleVisual,
+    HintYank {
+        origin: SnapshotCell,
+    },
+    YankVisual,
+    Yank(YankCommand),
+    Jump {
+        jump: Jump,
+        repeat: bool,
+        count: u32,
+    },
+    SearchWord {
+        forward: bool,
+        count: u32,
+    },
+    NavigateSearch {
+        reverse: bool,
+        count: u32,
+    },
+    Motion {
+        motion: Motion,
+        count: u32,
+        explicit_count: bool,
+    },
+}
+
+pub(crate) enum YankCommand {
+    Lines(u32),
+    RowEnd(u32),
+    Object {
+        object: WordObject,
+        kind: CopyTextObject,
+        count: u32,
+    },
+    Motion {
+        motion: Motion,
+        count: u32,
+        explicit_count: bool,
+    },
+    Jump {
+        jump: Jump,
+        count: u32,
+    },
+}
+
+impl CopyMode {
+    pub(crate) fn clear_pending_for_navigation(&mut self) {
+        self.visual_anchor = None;
+        self.pending_yank = None;
+        self.pending_visual_object = None;
+        self.pending_jump = None;
+        self.pending_count = None;
+        self.pending_g = false;
+        self.pending_z = false;
+        self.skip_trigger_text = false;
+    }
+
+    pub(crate) fn begin_input_batch(&mut self) {
+        self.skip_trigger_text = false;
+    }
+
+    pub(crate) fn input(&mut self, event: &egui::Event) -> CopyAction {
+        if let Some(forward) = copy_command_shortcut(event) {
+            let count = self.take_count();
+            self.pending_g = false;
+            self.pending_z = false;
+            self.pending_jump = None;
+            self.pending_yank = None;
+            self.pending_visual_object = None;
+            return CopyAction::Command { forward, count };
+        }
+        if let egui::Event::Text(text) = event {
+            if let Some(pending) = self.pending_yank
+                && let Some((forward, till)) = pending.jump
+            {
+                if self.skip_trigger_text {
+                    self.skip_trigger_text = false;
+                    return CopyAction::None;
+                }
+                let mut graphemes = text.graphemes(true);
+                if let Some(target) = graphemes.next()
+                    && graphemes.next().is_none()
+                {
+                    self.pending_yank = None;
+                    let jump = Jump {
+                        target: target.to_owned(),
+                        forward,
+                        till,
+                    };
+                    self.last_jump = Some(jump.clone());
+                    let count = pending.count.saturating_mul(self.take_count());
+                    return CopyAction::Yank(YankCommand::Jump { jump, count });
+                }
+                return CopyAction::None;
+            }
+            if let Some((forward, till)) = self.pending_jump {
+                if self.skip_trigger_text {
+                    self.skip_trigger_text = false;
+                    return CopyAction::None;
+                }
+                let mut graphemes = text.graphemes(true);
+                if let Some(target) = graphemes.next()
+                    && graphemes.next().is_none()
+                {
+                    self.pending_jump = None;
+                    let jump = Jump {
+                        target: target.to_owned(),
+                        forward,
+                        till,
+                    };
+                    self.last_jump = Some(jump.clone());
+                    return CopyAction::Jump {
+                        jump,
+                        repeat: false,
+                        count: self.take_count(),
+                    };
+                }
+            }
+            return CopyAction::None;
+        }
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+        else {
+            return CopyAction::None;
+        };
+        let (key, modifiers) = (*key, *modifiers);
+        if is_copy_modifier_key(key) {
+            return CopyAction::None;
+        }
+        if key == egui::Key::Escape {
+            if self.pending_z {
+                self.pending_z = false;
+                self.pending_count = None;
+                return CopyAction::None;
+            }
+            if self.pending_visual_object.take().is_some() || self.pending_yank.take().is_some() {
+                self.pending_count = None;
+                return CopyAction::None;
+            }
+            if self.visual_anchor.take().is_some() {
+                self.pending_count = None;
+                self.pending_g = false;
+                self.pending_jump = None;
+                return CopyAction::Redraw;
+            }
+            if !self.search.matches.is_empty() {
+                let cancel_pending = self.search.waiting;
+                self.search = CopySearch::default();
+                return CopyAction::ClearSearch { cancel_pending };
+            }
+            return CopyAction::Exit;
+        }
+        if self.pending_z {
+            self.pending_z = false;
+            return copy_viewport_position_key(key, modifiers)
+                .map_or(CopyAction::None, CopyAction::Position);
+        }
+        if let Some((object, prefix_count)) = self.pending_visual_object {
+            if modifiers == egui::Modifiers::NONE
+                && let Some(digit) = copy_digit(key)
+                && self.add_count_digit(digit)
+            {
+                return CopyAction::None;
+            }
+            self.pending_visual_object = None;
+            let count = prefix_count.saturating_mul(self.take_count());
+            return copy_text_object_key(key, modifiers).map_or(CopyAction::None, |kind| {
+                CopyAction::SelectObject {
+                    object,
+                    kind,
+                    count,
+                }
+            });
+        }
+        if self.pending_jump.is_some() {
+            self.skip_trigger_text = false;
+            return CopyAction::None;
+        }
+        if let Some(mut pending) = self.pending_yank {
+            if pending.jump.is_some() {
+                return CopyAction::None;
+            }
+            if modifiers == egui::Modifiers::NONE
+                && let Some(digit) = copy_digit(key)
+                && self.add_count_digit(digit)
+            {
+                return CopyAction::None;
+            }
+            if pending.object.is_none()
+                && modifiers == egui::Modifiers::NONE
+                && matches!(key, egui::Key::I | egui::Key::A)
+            {
+                pending.object = Some(if key == egui::Key::I {
+                    WordObject::Inner
+                } else {
+                    WordObject::Around
+                });
+                self.pending_yank = Some(pending);
+                return CopyAction::None;
+            }
+            if pending.object.is_none()
+                && let Some(jump) = copy_jump_prefix(key, modifiers)
+            {
+                pending.jump = Some(jump);
+                self.pending_yank = Some(pending);
+                self.skip_trigger_text = true;
+                return CopyAction::None;
+            }
+            let pending_motion = if pending.object.is_none() {
+                copy_motion_with_prefix(self, key, modifiers)
+            } else {
+                None
+            };
+            if self.pending_g {
+                self.pending_yank = Some(pending);
+                return CopyAction::None;
+            }
+            self.pending_yank = None;
+            let count = pending.count.saturating_mul(self.take_count());
+            let command = if pending.object.is_none()
+                && modifiers == egui::Modifiers::NONE
+                && matches!(key, egui::Key::Semicolon | egui::Key::Comma)
+            {
+                self.last_jump.clone().map(|mut jump| {
+                    if key == egui::Key::Comma {
+                        jump.forward = !jump.forward;
+                    }
+                    YankCommand::Jump { jump, count }
+                })
+            } else {
+                match (pending.object, key, modifiers) {
+                    (None, egui::Key::Y, egui::Modifiers::NONE) => Some(YankCommand::Lines(count)),
+                    (None, egui::Key::Num4, egui::Modifiers::SHIFT) => {
+                        Some(YankCommand::RowEnd(count))
+                    }
+                    (Some(object), key, modifiers) => {
+                        copy_text_object_key(key, modifiers).map(|kind| YankCommand::Object {
+                            object,
+                            kind,
+                            count,
+                        })
+                    }
+                    _ => pending_motion.map(|motion| YankCommand::Motion {
+                        motion,
+                        count,
+                        explicit_count: pending.count > 1 || count > 1,
+                    }),
+                }
+            };
+            return command.map_or(CopyAction::None, CopyAction::Yank);
+        }
+        if !self.pending_g
+            && key == egui::Key::O
+            && (modifiers == egui::Modifiers::NONE || modifiers == egui::Modifiers::SHIFT)
+        {
+            self.pending_count = None;
+            let swapped = if modifiers.shift {
+                self.swap_visual_horizontal_endpoint()
+            } else {
+                self.swap_visual_endpoint()
+            };
+            return if swapped {
+                CopyAction::SwapEndpoint
+            } else {
+                CopyAction::None
+            };
+        }
+        if !self.pending_g
+            && let Some(down) = copy_scroll_direction(key, modifiers)
+        {
+            return CopyAction::Scroll {
+                down,
+                count: self.take_count(),
+            };
+        }
+        if modifiers == egui::Modifiers::NONE && key == egui::Key::Z {
+            self.pending_z = true;
+            self.pending_g = false;
+            self.pending_count = None;
+            return CopyAction::None;
+        }
+        if modifiers == egui::Modifiers::NONE
+            && matches!(key, egui::Key::I | egui::Key::A)
+            && self.begin_visual_object(if key == egui::Key::I {
+                WordObject::Inner
+            } else {
+                WordObject::Around
+            })
+        {
+            return CopyAction::None;
+        }
+        if key == egui::Key::Q
+            && modifiers.ctrl
+            && !modifiers.shift
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+        {
+            self.pending_count = None;
+            self.pending_g = false;
+            self.toggle_visual(VisualMode::Blockwise);
+            return CopyAction::ToggleVisual;
+        }
+        if key == egui::Key::V
+            && (modifiers == egui::Modifiers::NONE || modifiers == egui::Modifiers::SHIFT)
+        {
+            self.pending_count = None;
+            self.pending_g = false;
+            self.toggle_visual(if modifiers.shift {
+                VisualMode::Linewise
+            } else {
+                VisualMode::Characterwise
+            });
+            return CopyAction::ToggleVisual;
+        }
+        if !self.pending_g && key == egui::Key::Y && modifiers.shift {
+            let origin = self.visual_anchor.unwrap_or(self.cursor);
+            self.pending_count = None;
+            return CopyAction::HintYank { origin };
+        }
+        if modifiers == egui::Modifiers::NONE && key == egui::Key::Y {
+            self.pending_g = false;
+            if self.visual_anchor.is_some() {
+                self.pending_count = None;
+                return CopyAction::YankVisual;
+            }
+            self.pending_yank = Some(YankPending {
+                count: self.take_count(),
+                object: None,
+                jump: None,
+            });
+            return CopyAction::None;
+        }
+        if modifiers == egui::Modifiers::NONE
+            && let Some(digit) = copy_digit(key)
+            && self.add_count_digit(digit)
+        {
+            return CopyAction::None;
+        }
+        if let Some((forward, till)) = copy_jump_prefix(key, modifiers) {
+            self.pending_g = false;
+            self.pending_jump = Some((forward, till));
+            self.skip_trigger_text = true;
+            return CopyAction::None;
+        }
+        if modifiers == egui::Modifiers::NONE
+            && matches!(key, egui::Key::Semicolon | egui::Key::Comma)
+        {
+            self.pending_g = false;
+            let count = self.take_count();
+            return self.last_jump.clone().map_or(CopyAction::None, |mut jump| {
+                if key == egui::Key::Comma {
+                    jump.forward = !jump.forward;
+                }
+                CopyAction::Jump {
+                    jump,
+                    repeat: true,
+                    count,
+                }
+            });
+        }
+        if modifiers.shift
+            && !modifiers.ctrl
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+            && matches!(key, egui::Key::Num8 | egui::Key::Num3)
+        {
+            self.pending_g = false;
+            return CopyAction::SearchWord {
+                forward: key == egui::Key::Num8,
+                count: self.take_count(),
+            };
+        }
+        if !modifiers.ctrl && !modifiers.alt && !modifiers.mac_cmd && key == egui::Key::N {
+            self.pending_g = false;
+            return CopyAction::NavigateSearch {
+                reverse: modifiers.shift,
+                count: self.take_count(),
+            };
+        }
+        let explicit_count = self.pending_count.is_some();
+        let motion = copy_motion_with_prefix(self, key, modifiers);
+        let Some(motion) = motion else {
+            if !self.pending_g {
+                self.pending_count = None;
+            }
+            return CopyAction::None;
+        };
+        CopyAction::Motion {
+            motion,
+            count: self.take_count(),
+            explicit_count,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copy_input_preserves_counts_and_pending_yank_motions() {
+        use super::{CopyAction, CopyMode, Motion, YankCommand};
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut mode = CopyMode::default();
+        assert!(matches!(
+            mode.input(&key(egui::Key::Num2)),
+            CopyAction::None
+        ));
+        assert!(matches!(mode.input(&key(egui::Key::Y)), CopyAction::None));
+        assert!(matches!(
+            mode.input(&key(egui::Key::Num3)),
+            CopyAction::None
+        ));
+        assert!(matches!(
+            mode.input(&key(egui::Key::W)),
+            CopyAction::Yank(YankCommand::Motion {
+                motion: Motion::ForwardWord,
+                count: 6,
+                explicit_count: true,
+            })
+        ));
+        assert!(mode.pending_yank.is_none());
+        assert!(mode.pending_count.is_none());
+    }
+
+    #[test]
+    fn copy_input_waits_for_jump_text_after_the_prefix_key() {
+        use super::{CopyAction, CopyMode};
+        let key = egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: Some(egui::Key::F),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut mode = CopyMode::default();
+        assert!(matches!(mode.input(&key), CopyAction::None));
+        assert!(mode.skip_trigger_text);
+        assert!(matches!(
+            mode.input(&egui::Event::Text("f".into())),
+            CopyAction::None
+        ));
+        assert!(!mode.skip_trigger_text);
+        assert!(
+            matches!(mode.input(&egui::Event::Text("x".into())), CopyAction::Jump { jump, count: 1, .. } if jump.target == "x")
+        );
+    }
+
+    #[test]
+    fn copy_input_keeps_prefixes_and_escape_local_to_the_mode() {
+        use super::{CopyAction, CopyMode, Motion, ViewportPosition, VisualMode};
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut mode = CopyMode::default();
+        assert!(matches!(mode.input(&key(egui::Key::G)), CopyAction::None));
+        assert!(matches!(
+            mode.input(&key(egui::Key::G)),
+            CopyAction::Motion {
+                motion: Motion::ScrollbackTop,
+                count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(mode.input(&key(egui::Key::Z)), CopyAction::None));
+        assert!(matches!(
+            mode.input(&key(egui::Key::T)),
+            CopyAction::Position(ViewportPosition::Top)
+        ));
+        mode.toggle_visual(VisualMode::Characterwise);
+        assert!(matches!(
+            mode.input(&key(egui::Key::Escape)),
+            CopyAction::Redraw
+        ));
+        assert!(matches!(
+            mode.input(&key(egui::Key::Escape)),
+            CopyAction::Exit
+        ));
+    }
+
     use super::*;
 
     #[test]
@@ -2138,6 +3005,27 @@ mod tests {
         assert!(mode.visual_anchor.is_none());
     }
 
+    #[test]
+    fn hint_yank_range_includes_both_logical_lines_without_moving_cursor() {
+        let rows = [
+            row("older", true),
+            row("continuation", false),
+            row("middle", false),
+            row("origin", true),
+            row("wrapped", false),
+        ];
+        let mode = copy_at(3, 3, rows.len() as u64);
+        let origin = mode.cursor;
+        let range = mode
+            .linewise_range_between(origin, SnapshotCell { x: 2, y: 0 }, |y| {
+                rows.get(y as usize).cloned()
+            })
+            .unwrap();
+        assert_eq!(range.start, SnapshotCell { x: 0, y: 0 });
+        assert_eq!(range.end, SnapshotCell { x: 19, y: 4 });
+        assert_eq!(mode.cursor, origin);
+    }
+
     fn row(text: &str, wraps_to_next: bool) -> TextRow {
         TextRow {
             text: text.into(),
@@ -2158,6 +3046,153 @@ mod tests {
             },
         );
         result
+    }
+
+    #[test]
+    fn copy_search_replays_queued_moves_and_rejects_stale_or_cancelled_results() {
+        let matches = || {
+            [8, 4, 1]
+                .map(|y| {
+                    let cell = SnapshotCell { x: 0, y };
+                    SnapshotCellRange {
+                        start: cell,
+                        end: cell,
+                    }
+                })
+                .to_vec()
+        };
+        let mut mode = copy_at(0, 1, 10);
+        mode.begin_search(7, true, 1);
+        assert!(mode.navigate_search(false, 1).is_none());
+        assert!(mode.navigate_search(true, 1).is_none());
+        assert!(mode.finish_search(6, matches()).is_none());
+        assert!(mode.search_accepts_result(7));
+        let target = mode.finish_search(7, matches()).unwrap();
+        assert_eq!(target, SnapshotCell { x: 0, y: 4 });
+        mode.cursor = target;
+        assert_eq!(
+            mode.navigate_search(true, 1),
+            Some(SnapshotCell { x: 0, y: 1 })
+        );
+        assert_eq!(
+            mode.navigate_search(false, 2),
+            Some(SnapshotCell { x: 0, y: 1 })
+        );
+        assert!(mode.finish_search(7, matches()).is_none());
+        mode.begin_search(8, false, 1);
+        mode.navigate_search(false, 2);
+        mode.cancel_pending_search();
+        assert!(mode.finish_search(8, matches()).is_none());
+        assert!(mode.search_matches().is_empty());
+        mode.begin_search(9, true, 1);
+        assert_eq!(mode.finish_search(9, Vec::new()), Some(mode.cursor));
+    }
+
+    #[test]
+    fn copy_escape_clears_adopted_search_after_leaving_visual_mode() {
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: Some(egui::Key::Escape),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut mode = copy_at(0, 4, 10);
+        let cell = SnapshotCell { x: 0, y: 1 };
+        mode.adopt_search(
+            3,
+            vec![SnapshotCellRange {
+                start: cell,
+                end: cell,
+            }],
+        );
+        assert_eq!(mode.navigate_search(false, 1), Some(cell));
+        mode.toggle_visual(VisualMode::Characterwise);
+        assert!(matches!(mode.input(&escape), CopyAction::Redraw));
+        assert_eq!(mode.search_matches().len(), 1);
+        assert!(matches!(
+            mode.input(&escape),
+            CopyAction::ClearSearch {
+                cancel_pending: false
+            }
+        ));
+        assert!(mode.search_matches().is_empty());
+        assert!(mode.navigate_search(false, 1).is_none());
+        assert!(matches!(mode.input(&escape), CopyAction::Exit));
+    }
+
+    #[test]
+    fn copy_visual_selection_reports_ranges_and_yank_options_for_each_mode() {
+        let rows = [row("foo", true), row(" bar", false)];
+        let mut mode = copy_at(2, 1, 2);
+        mode.visual_anchor = Some(SnapshotCell { x: 1, y: 0 });
+        for visual_mode in [
+            VisualMode::Characterwise,
+            VisualMode::Linewise,
+            VisualMode::Blockwise,
+        ] {
+            mode.visual_mode = visual_mode;
+            let selection = mode
+                .visual_selection_to(mode.cursor, |y| rows.get(y as usize).cloned())
+                .unwrap();
+            assert_eq!(selection.linewise, visual_mode == VisualMode::Linewise);
+            assert_eq!(selection.rectangle, visual_mode == VisualMode::Blockwise);
+            assert_eq!(selection.trim, visual_mode != VisualMode::Blockwise);
+            let expected = if visual_mode == VisualMode::Linewise {
+                SnapshotCellRange {
+                    start: SnapshotCell { x: 0, y: 0 },
+                    end: SnapshotCell { x: 19, y: 1 },
+                }
+            } else {
+                SnapshotCellRange {
+                    start: SnapshotCell { x: 1, y: 0 },
+                    end: SnapshotCell { x: 2, y: 1 },
+                }
+            };
+            assert_eq!(selection.range, expected);
+        }
+        mode.visual_anchor = None;
+        assert!(mode.visual_selection_to(mode.cursor, |_| None).is_none());
+    }
+
+    #[test]
+    fn copy_text_object_selection_preserves_word_quote_delimiter_and_command_yank_rules() {
+        for (kind, text, x, expected_start, expected_end) in [
+            (CopyTextObject::Word(false), "  foo  ", 3, 2, 4),
+            (CopyTextObject::Quote('"'), "  \"foo\" ", 3, 3, 5),
+            (CopyTextObject::Delimiter('(', ')'), " (foo) ", 3, 2, 4),
+        ] {
+            let mode = copy_at(x, 0, 1);
+            let selection = mode
+                .text_object_selection(1, WordObject::Inner, kind, &[], |_| Some(row(text, false)))
+                .unwrap();
+            assert_eq!(selection.range.start.x, expected_start);
+            assert_eq!(selection.range.end.x, expected_end);
+            assert!(!selection.linewise);
+            assert!(!selection.rectangle);
+            assert_eq!(selection.trim, matches!(kind, CopyTextObject::Word(_)));
+            let around = mode
+                .text_object_selection(1, WordObject::Around, kind, &[], |_| Some(row(text, false)))
+                .unwrap();
+            assert!(!around.trim);
+        }
+        let mode = copy_at(0, 1, 6);
+        let command = mode
+            .text_object_selection(
+                1,
+                WordObject::Inner,
+                CopyTextObject::Command,
+                &[0, 3],
+                |_| None,
+            )
+            .unwrap();
+        assert!(command.linewise && command.trim && !command.rectangle);
+        assert!(
+            mode.text_object_selection(1, WordObject::Inner, CopyTextObject::Command, &[], |_| {
+                None
+            })
+            .is_none()
+        );
     }
 
     #[test]
@@ -2629,7 +3664,7 @@ mod tests {
 
     #[test]
     fn match_navigation_skips_current_and_wraps_in_both_directions() {
-        let matches = [0, 4, 9].map(|x| SnapshotCellRange {
+        let matches = [9, 4, 0].map(|x| SnapshotCellRange {
             start: SnapshotCell { x, y: 0 },
             end: SnapshotCell { x, y: 0 },
         });
@@ -2656,6 +3691,25 @@ mod tests {
                 .unwrap()
                 .x,
             4
+        );
+
+        // The same ordering is used to publish decorations; matches far
+        // apart in scrollback must remain newest-first after search accepts.
+        let rows = [900, 500, 100].map(|y| SnapshotCellRange {
+            start: SnapshotCell { x: 0, y },
+            end: SnapshotCell { x: 3, y },
+        });
+        assert_eq!(
+            next_match_cell(&rows, SnapshotCell { x: 0, y: 500 }, true, 1)
+                .unwrap()
+                .y,
+            900
+        );
+        assert_eq!(
+            next_match_cell(&rows, SnapshotCell { x: 0, y: 500 }, false, 1)
+                .unwrap()
+                .y,
+            100
         );
     }
 

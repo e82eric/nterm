@@ -1,4 +1,4 @@
-use crate::ffi::{
+use crate::ghostty_ffi::{
     Host, ghostty_egui_host_key, ghostty_egui_host_mouse_button, ghostty_egui_host_mouse_pos,
     ghostty_egui_host_mouse_scroll, ghostty_egui_host_preedit, ghostty_egui_host_text,
 };
@@ -19,6 +19,29 @@ pub(crate) fn forward(
 
     for (index, event) in events.iter().cloned().enumerate() {
         match event {
+            egui::Event::Copy if !keyboard_owned => {
+                // egui-winit consumes Ctrl+C as a clipboard shortcut before it
+                // can emit a Key event. In the terminal it must reach the PTY.
+                let (usb, unshifted) = key_to_usb(egui::Key::C).expect("C has a USB keycode");
+                unsafe {
+                    ghostty_egui_host_key(
+                        host,
+                        1,
+                        mods(egui::Modifiers::CTRL),
+                        usb,
+                        unshifted,
+                        std::ptr::null(),
+                    );
+                    ghostty_egui_host_key(
+                        host,
+                        0,
+                        mods(egui::Modifiers::CTRL),
+                        usb,
+                        unshifted,
+                        std::ptr::null(),
+                    );
+                }
+            }
             egui::Event::Key {
                 key,
                 physical_key,
@@ -35,8 +58,19 @@ pub(crate) fn forward(
                 } else {
                     None
                 };
-                let Some((usb, unshifted)) = key_to_usb(physical_key.unwrap_or(key))
-                    .or_else(|| text.as_ref().map(|_| (0, 0)))
+                let native_key = physical_key.unwrap_or(key);
+                #[cfg(windows)]
+                if let Some(sequence) = win32_picker_key(native_key, modifiers, pressed) {
+                    // ConPTY accepts Win32 key events as CSI ... _. This preserves
+                    // Ctrl+Shift for PSReadLine, which asks for mode 9001; the
+                    // legacy Ctrl+G byte loses Shift before it reaches it.
+                    unsafe {
+                        ghostty_egui_host_key(host, 1, 0, 0, 0, sequence.as_ptr());
+                    }
+                    continue;
+                }
+                let Some((usb, unshifted)) =
+                    key_to_usb(native_key).or_else(|| text.as_ref().map(|_| (0, 0)))
                 else {
                     continue;
                 };
@@ -87,12 +121,8 @@ pub(crate) fn forward(
             egui::Event::PointerMoved(pos)
                 if !pointer_owned && !modal_input_blocked && rect.contains(pos) =>
             unsafe {
-                ghostty_egui_host_mouse_pos(
-                    host,
-                    ((pos.x - rect.left()) * scale) as f64,
-                    ((pos.y - rect.top()) * scale) as f64,
-                    mods(ui.input(|i| i.modifiers)),
-                );
+                let (x, y) = surface_pointer_position(pos, rect);
+                ghostty_egui_host_mouse_pos(host, x, y, mods(ui.input(|i| i.modifiers)));
             },
             egui::Event::PointerButton {
                 pos,
@@ -107,12 +137,8 @@ pub(crate) fn forward(
                     _ => continue,
                 };
                 unsafe {
-                    ghostty_egui_host_mouse_pos(
-                        host,
-                        ((pos.x - rect.left()) * scale) as f64,
-                        ((pos.y - rect.top()) * scale) as f64,
-                        mods(modifiers),
-                    );
+                    let (x, y) = surface_pointer_position(pos, rect);
+                    ghostty_egui_host_mouse_pos(host, x, y, mods(modifiers));
                     ghostty_egui_host_mouse_button(
                         host,
                         if pressed { 1 } else { 0 },
@@ -121,7 +147,15 @@ pub(crate) fn forward(
                     );
                 }
             }
-            egui::Event::MouseWheel { unit, delta, .. } if !pointer_owned => {
+            egui::Event::MouseWheel { unit, delta, .. }
+                if !pointer_owned
+                    && ui.input(|input| {
+                        input
+                            .pointer
+                            .hover_pos()
+                            .is_some_and(|pos| rect.contains(pos))
+                    }) =>
+            {
                 let (factor, scroll_mods) = match unit {
                     egui::MouseWheelUnit::Point => (scale as f64, 1),
                     egui::MouseWheelUnit::Line => (1.0, 0),
@@ -143,11 +177,37 @@ pub(crate) fn forward(
     scrolled
 }
 
+fn surface_pointer_position(pos: egui::Pos2, rect: egui::Rect) -> (f64, f64) {
+    // Ghostty's embedded surface converts these logical coordinates to pixels
+    // using its content scale. Scaling here would apply the factor twice.
+    ((pos.x - rect.left()) as f64, (pos.y - rect.top()) as f64)
+}
+
 fn mods(value: egui::Modifiers) -> i32 {
     (if value.shift { 1 } else { 0 })
         | (if value.ctrl { 2 } else { 0 })
         | (if value.alt { 4 } else { 0 })
         | (if value.mac_cmd { 8 } else { 0 })
+}
+
+#[cfg(windows)]
+fn win32_picker_key(key: egui::Key, modifiers: egui::Modifiers, pressed: bool) -> Option<CString> {
+    if !modifiers.ctrl || !modifiers.shift || modifiers.alt || modifiers.mac_cmd {
+        return None;
+    }
+    let (virtual_key, scan_code, unicode) = match key {
+        egui::Key::B => (66, 48, 2),
+        egui::Key::G => (71, 34, 7),
+        egui::Key::H => (72, 35, 8),
+        egui::Key::P => (80, 25, 16),
+        _ => return None,
+    };
+    // CSI Vk;Sc;Uc;Kd;Cs;Rc _, with SHIFT_PRESSED | LEFT_CTRL_PRESSED.
+    CString::new(format!(
+        "\x1b[{virtual_key};{scan_code};{unicode};{};24;1_",
+        u8::from(pressed)
+    ))
+    .ok()
 }
 
 fn paired_key_text(events: &[egui::Event], index: usize) -> Option<&str> {
@@ -166,7 +226,7 @@ fn text_follows_key(events: &[egui::Event], index: usize) -> bool {
     )
 }
 
-fn key_to_usb(key: egui::Key) -> Option<(u32, u32)> {
+pub(crate) fn key_to_usb(key: egui::Key) -> Option<(u32, u32)> {
     use egui::Key;
     let pair = match key {
         Key::A => (0x04, 'a'),
@@ -251,7 +311,48 @@ fn key_to_usb(key: egui::Key) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{key_to_usb, paired_key_text, text_follows_key};
+    use super::{key_to_usb, paired_key_text, surface_pointer_position, text_follows_key};
+
+    #[test]
+    fn pointer_coordinates_are_local_and_unscaled_for_ghostty() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(800.0, 500.0));
+        assert_eq!(
+            surface_pointer_position(egui::pos2(300.0, 175.0), rect),
+            (200.0, 125.0)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn powershell_picker_chords_preserve_control_and_shift() {
+        use super::win32_picker_key;
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        assert_eq!(
+            win32_picker_key(egui::Key::B, modifiers, true)
+                .unwrap()
+                .to_bytes(),
+            b"\x1b[66;48;2;1;24;1_"
+        );
+        assert_eq!(
+            win32_picker_key(egui::Key::G, modifiers, true)
+                .unwrap()
+                .to_bytes(),
+            b"\x1b[71;34;7;1;24;1_"
+        );
+        assert_eq!(
+            win32_picker_key(egui::Key::H, modifiers, false)
+                .unwrap()
+                .to_bytes(),
+            b"\x1b[72;35;8;0;24;1_"
+        );
+        assert_eq!(
+            win32_picker_key(egui::Key::P, modifiers, true)
+                .unwrap()
+                .to_bytes(),
+            b"\x1b[80;25;16;1;24;1_"
+        );
+        assert!(win32_picker_key(egui::Key::G, egui::Modifiers::CTRL, true).is_none());
+    }
 
     #[test]
     fn keys_include_the_usb_keyboard_usage_page() {

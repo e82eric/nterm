@@ -1,4 +1,4 @@
-use crate::ffi::{self, Host};
+use crate::ghostty_ffi::{self, Host};
 
 #[derive(Clone)]
 pub(crate) struct Typography {
@@ -27,8 +27,8 @@ impl PickerFont {
     pub(crate) fn new(ctx: &egui::Context, host: *mut Host) -> Self {
         let mut definitions = egui::FontDefinitions::default();
         let mut load = |bold, name: &str| {
-            let mut data = ffi::FontData::default();
-            if !unsafe { ffi::ghostty_egui_host_read_font(host, bold, &mut data) } {
+            let mut data = ghostty_ffi::FontData::default();
+            if !unsafe { ghostty_ffi::ghostty_egui_host_read_font(host, bold, &mut data) } {
                 eprintln!(
                     "picker: terminal font cannot be exported; using egui monospace fallback"
                 );
@@ -37,7 +37,7 @@ impl PickerFont {
             let bytes = unsafe { std::slice::from_raw_parts(data.data, data.len) }.to_vec();
             let mut font = egui::FontData::from_owned(bytes);
             font.index = data.face_index;
-            unsafe { ffi::ghostty_font_data_free(&mut data) };
+            unsafe { ghostty_ffi::ghostty_font_data_free(&mut data) };
             let family = egui::FontFamily::Name(name.into());
             definitions
                 .font_data
@@ -58,7 +58,7 @@ impl PickerFont {
     }
 
     pub(crate) fn typography(&mut self, ctx: &egui::Context, host: *mut Host) -> Typography {
-        let size = unsafe { ffi::ghostty_egui_host_surface_size(host) };
+        let size = unsafe { ghostty_ffi::ghostty_egui_host_surface_size(host) };
         self.for_cells(ctx, size.cell_width_px, size.cell_height_px)
     }
 

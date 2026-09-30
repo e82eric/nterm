@@ -1,5 +1,14 @@
+pub(crate) mod action;
+pub(crate) mod command;
+pub(crate) mod config;
+pub(crate) mod files;
+pub(crate) mod font;
+pub(crate) mod preview;
+pub(crate) mod protocol;
+pub(crate) mod style;
+
 use crate::copy_mode::TextRow;
-use crate::ffi::{self, Host, SnapshotCell, SnapshotCellRange};
+use crate::ghostty_ffi::{self, Host, SnapshotCell, SnapshotCellRange};
 use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
 use nfm_search_core::search::{SearchResult, resolve_match_positions};
 use nfm_search_core::snapshot_store::SnapshotStore;
@@ -11,6 +20,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 type Items = StreamingItemSnapshotWithPayload<SnapshotCellRange>;
 enum Session {
@@ -43,6 +53,79 @@ impl Session {
 }
 const RESULT_ROWS: usize = 7;
 
+fn preview_rows(height: f32, row_height: f32) -> usize {
+    ((height - RESULT_ROWS as f32 * row_height - 72.0 - 2.0 * style::DIVIDER_EXTRA) / row_height)
+        .floor()
+        .clamp(1.0, 12.0) as usize
+}
+
+fn picker_anchor(
+    position: crate::picker::config::Position,
+    cursor_row: Option<u32>,
+    row_height: f32,
+    bounds: egui::Rect,
+    screen: egui::Rect,
+    measured_size: Option<egui::Vec2>,
+) -> (egui::Align2, egui::Vec2) {
+    use crate::picker::config::Position;
+    let x = bounds.center().x - screen.center().x;
+    match position {
+        Position::Top => (
+            egui::Align2::CENTER_TOP,
+            egui::vec2(x, bounds.top() + 10.0 - screen.top()),
+        ),
+        Position::Center => (
+            egui::Align2::CENTER_CENTER,
+            egui::vec2(x, bounds.center().y - screen.center().y),
+        ),
+        Position::Bottom => (
+            egui::Align2::CENTER_BOTTOM,
+            egui::vec2(x, bounds.bottom() - screen.bottom() - 10.0),
+        ),
+        Position::Cursor => {
+            let Some(row) = cursor_row else {
+                return picker_anchor(
+                    Position::Bottom,
+                    None,
+                    row_height,
+                    bounds,
+                    screen,
+                    measured_size,
+                );
+            };
+            let height = measured_size
+                .map_or((RESULT_ROWS as f32 + 1.0) * row_height + 32.0, |size| {
+                    size.y
+                });
+            let below_top = bounds.top() + (row as f32 + 1.0) * row_height + 10.0;
+            // When there is no room below, let the picker overlap the cursor row.
+            let above_bottom = bounds.top() + (row as f32 + 1.0) * row_height;
+            let min_top = bounds.top() + 10.0;
+            let max_bottom = bounds.bottom() - 10.0;
+            if below_top + height <= max_bottom {
+                (
+                    egui::Align2::CENTER_TOP,
+                    egui::vec2(x, below_top - screen.top()),
+                )
+            } else if above_bottom - height >= min_top && above_bottom <= max_bottom {
+                (
+                    egui::Align2::CENTER_BOTTOM,
+                    egui::vec2(x, above_bottom - screen.bottom()),
+                )
+            } else if max_bottom - below_top >= above_bottom - min_top {
+                let top = below_top.clamp(min_top, (max_bottom - height).max(min_top));
+                (egui::Align2::CENTER_TOP, egui::vec2(x, top - screen.top()))
+            } else {
+                let bottom = above_bottom.clamp((min_top + height).min(max_bottom), max_bottom);
+                (
+                    egui::Align2::CENTER_BOTTOM,
+                    egui::vec2(x, bottom - screen.bottom()),
+                )
+            }
+        }
+    }
+}
+
 fn visible_start(start: usize, selected: usize) -> usize {
     if selected < start {
         selected
@@ -57,6 +140,37 @@ fn result_index(start: usize, slot: usize) -> usize {
     start + RESULT_ROWS - 1 - slot
 }
 
+fn paint_loading_indicator(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
+    let center = rect.center();
+    let dot_size = rect.height() / 4.0;
+    let dot_step = (rect.height() - dot_size) / 2.0;
+    let phase = (ui.input(|input| input.time) * 12.0) as usize % 8;
+    let dots = [
+        (-1.0, -1.0),
+        (0.0, -1.0),
+        (1.0, -1.0),
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (-1.0, 1.0),
+        (-1.0, 0.0),
+    ];
+    for (dot, (x, y)) in dots.into_iter().enumerate() {
+        let distance = (dot + 8 - phase) % 8;
+        let alpha = 1.0 - distance as f32 * 0.11;
+        ui.painter().rect_filled(
+            egui::Rect::from_center_size(
+                center + egui::vec2(x * dot_step, y * dot_step),
+                egui::vec2(dot_size, dot_size),
+            ),
+            0.0,
+            color.gamma_multiply(alpha),
+        );
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(80));
+}
+
 fn result_layout(
     text: &str,
     query: &str,
@@ -65,7 +179,7 @@ fn result_layout(
 ) -> egui::text::LayoutJob {
     let normal = egui::TextFormat {
         font_id: font.clone(),
-        color: egui::Color32::from_rgb(235, 219, 178),
+        color: style::TEXT,
         ..Default::default()
     };
     let matched = egui::TextFormat {
@@ -103,12 +217,22 @@ fn result_layout(
 }
 
 pub(crate) struct Picker {
+    pub(crate) cursor_row: Option<u32>,
+    position: crate::picker::config::Position,
     pub(crate) generation: Option<u64>,
     pub(crate) filesystem: bool,
+    pub(crate) command: bool,
     pub(crate) from_copy: bool,
-    pub(crate) typography: crate::picker_font::Typography,
-    callback: Option<std::rc::Rc<crate::picker_action::Callback>>,
-    enter_action: crate::picker_config::EnterAction,
+    pub(crate) typography: crate::picker::font::Typography,
+    preview: Option<crate::picker::preview::PickerPreview>,
+    preview_visible: bool,
+    presented_once: bool,
+    callback: Option<std::rc::Rc<crate::picker::action::Callback>>,
+    request_params: std::collections::BTreeMap<String, String>,
+    item_values: Vec<String>,
+    command_values: Option<crate::picker::command::CommandValues>,
+    pub(crate) items: bool,
+    enter_action: crate::picker::config::EnterAction,
     session_id: u64,
     session: Session,
     store: Arc<SnapshotStore<Items>>,
@@ -121,19 +245,23 @@ pub(crate) struct Picker {
     query_revision: u64,
     results_revision: Option<u64>,
     results: Vec<SearchResult>,
+    matched: usize,
+    total: usize,
     selected: usize,
     visible_start: usize,
-    results_shown: bool,
+    copied_until: Option<Instant>,
     done: bool,
     error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 pub(crate) enum Action {
     Custom(
-        std::rc::Rc<crate::picker_action::Callback>,
+        std::rc::Rc<crate::picker::action::Callback>,
         String,
         bool,
         Option<SnapshotCellRange>,
+        String,
+        std::collections::BTreeMap<String, String>,
     ),
     Cancel,
     Accept(SnapshotCell),
@@ -147,22 +275,57 @@ impl Picker {
         from_copy: bool,
         rows: u64,
         ctx: egui::Context,
-        mut options: crate::picker_config::Options,
+        mut options: crate::picker::config::Options,
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let session_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let store = Arc::new(SnapshotStore::new());
         let (tx, updates_rx) = crossbeam_channel::unbounded();
         let error = Arc::new(std::sync::Mutex::new(None));
-        let filesystem = matches!(options.source, crate::picker_config::Source::FileSystem(_));
-        if let crate::picker_config::Source::FileSystem(files) = &mut options.source {
-            if let Err(message) = crate::picker_files::resolve_roots(files) {
+        if let crate::picker::config::Source::Items(items) = &mut options.source {
+            if let Some(provider) = &items.provider {
+                match provider.read() {
+                    Ok(values) => items.values = values,
+                    Err(message) => *error.lock().unwrap() = Some(message),
+                }
+            }
+        }
+        let filesystem = matches!(options.source, crate::picker::config::Source::FileSystem(_));
+        let command = matches!(options.source, crate::picker::config::Source::Command(_));
+        let items = matches!(options.source, crate::picker::config::Source::Items(_));
+        let initial_query: String = options
+            .params
+            .get("query")
+            .map(|query| query.chars().take(4096).collect())
+            .unwrap_or_default();
+        let item_values = if let crate::picker::config::Source::Items(items) = &options.source {
+            items.values.iter().map(|item| item.value.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let command_values = match &options.source {
+            crate::picker::config::Source::Command(config)
+                if config.line_continuation.is_some() =>
+            {
+                Some(Arc::default())
+            }
+            _ => None,
+        };
+        let snapshot_columns = generation
+            .and_then(|generation| {
+                let mut view = ghostty_ffi::SnapshotView::default();
+                unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view) }
+                    .then_some(view.columns as usize)
+            })
+            .unwrap_or(80);
+        if let crate::picker::config::Source::FileSystem(files) = &mut options.source {
+            if let Err(message) = crate::picker::files::resolve_roots(files) {
                 *error.lock().unwrap() = Some(message);
             }
         }
         let session = match &options.source {
             #[cfg(windows)]
-            crate::picker_config::Source::FileSystem(files) => Session::FileSystem(
+            crate::picker::config::Source::FileSystem(files) => Session::FileSystem(
                 nfm_file_system::file_system_search::FileSystemSearch::start(
                     session_id,
                     nfm_file_system::walker::ScanOptions {
@@ -171,18 +334,21 @@ impl Picker {
                         files_only: files.files_only,
                         directories_only: files.directories_only,
                     },
-                    String::new(),
+                    initial_query.clone(),
                     tx,
                 ),
             ),
             #[cfg(not(windows))]
-            crate::picker_config::Source::FileSystem(_) => {
+            crate::picker::config::Source::FileSystem(_) => {
                 *error.lock().unwrap() =
                     Some("Filesystem pickers require NFM support for this platform".into());
                 Session::UnsupportedFileSystem
             }
-            crate::picker_config::Source::Scrollback(_) => {
-                let session = FuzzySearchSession::new(session_id, store.clone(), String::new(), tx);
+            crate::picker::config::Source::Scrollback { .. }
+            | crate::picker::config::Source::Items(_)
+            | crate::picker::config::Source::Command(_) => {
+                let session =
+                    FuzzySearchSession::new(session_id, store.clone(), initial_query.clone(), tx);
                 session.start();
                 Session::Streaming(session)
             }
@@ -207,7 +373,20 @@ impl Picker {
                 }
             });
         }
-        let reader = if let crate::picker_config::Source::Scrollback(regex) = options.source {
+        let reader = if let crate::picker::config::Source::Command(config) = &options.source {
+            Some(crate::picker::command::start(
+                config.clone(),
+                options.params.clone(),
+                store.clone(),
+                cancelled.clone(),
+                error.clone(),
+                ctx.clone(),
+                command_values.clone(),
+            ))
+        } else if let crate::picker::config::Source::Scrollback { regex, unique } = &options.source
+        {
+            let regex = regex.clone();
+            let mut seen = unique.then(std::collections::HashSet::new);
             let generation = generation.expect("scrollback picker requires a snapshot");
             let (store, cancelled, error) = (store.clone(), cancelled.clone(), error.clone());
             let host = host as usize;
@@ -246,7 +425,7 @@ impl Picker {
                         break;
                     }
                     lines.reverse();
-                    for (text, range) in logical_items(&lines, &regex).into_iter().rev() {
+                    for (text, range) in newest_logical_items(&lines, &regex, &mut seen) {
                         if cancelled.load(Ordering::Acquire) {
                             break;
                         }
@@ -264,14 +443,40 @@ impl Picker {
                 ctx.request_repaint();
             }))
         } else {
+            if let crate::picker::config::Source::Items(items) = &options.source {
+                let mut publisher = PublishingStreamingItemStoreWithPayload::new(store.clone());
+                for item in &items.values {
+                    publisher.add_item(item.text.as_bytes(), SnapshotCellRange::default());
+                }
+                publisher.complete();
+                ctx.request_repaint();
+            }
             None
         };
         Self {
+            cursor_row: None,
+            position: options.position,
             generation,
             filesystem,
+            command,
             from_copy,
-            typography: crate::picker_font::Typography::default(),
+            typography: crate::picker::font::Typography::default(),
+            preview: options.preview.map(|source| {
+                crate::picker::preview::PickerPreview::new(
+                    source,
+                    host,
+                    generation,
+                    rows,
+                    snapshot_columns,
+                )
+            }),
+            preview_visible: options.preview_visible,
+            presented_once: false,
             callback: options.callback,
+            request_params: options.params,
+            item_values,
+            command_values,
+            items,
             enter_action: options.enter_action,
             session_id,
             session,
@@ -279,21 +484,59 @@ impl Picker {
             updates,
             cancelled,
             reader,
-            query: String::new(),
-            submitted_query: String::new(),
+            query: initial_query.clone(),
+            submitted_query: initial_query,
             results_query: String::new(),
             query_revision: 0,
             results_revision: None,
             results: Vec::new(),
+            matched: 0,
+            total: 0,
             selected: 0,
             visible_start: 0,
-            results_shown: false,
+            copied_until: None,
             done: false,
             error,
         }
     }
 
+    fn accepted_value(&self, result: &SearchResult) -> String {
+        if let Some(value) = self.item_values.get(result.node_index as usize) {
+            return value.clone();
+        }
+        if let Some(values) = &self.command_values {
+            if let Some(value) = values.lock().unwrap().get(&result.node_index) {
+                return value.clone();
+            }
+        }
+        result.path.clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn show(&mut self, ctx: &egui::Context, bottom_margin: f32) -> Option<Action> {
+        let mut bounds = ctx.content_rect();
+        bounds.max.y -= bottom_margin;
+        self.show_in_bounds(ctx, bounds)
+    }
+
+    pub(crate) fn show_in_bounds(
+        &mut self,
+        ctx: &egui::Context,
+        bounds: egui::Rect,
+    ) -> Option<Action> {
+        self.show_in_bounds_mode(ctx, bounds, true)
+    }
+
+    pub(crate) fn show_background_in_bounds(&mut self, ctx: &egui::Context, bounds: egui::Rect) {
+        self.show_in_bounds_mode(ctx, bounds, false);
+    }
+
+    fn show_in_bounds_mode(
+        &mut self,
+        ctx: &egui::Context,
+        bounds: egui::Rect,
+        interactive: bool,
+    ) -> Option<Action> {
         let latest = self.updates.lock().unwrap().take().filter(|update| {
             update.session_id == self.session_id
                 && update.generation == self.query_revision
@@ -304,6 +547,8 @@ impl Picker {
                 .then(|| self.results.get(self.selected).map(|r| r.node_index))
                 .flatten();
             self.results = update.results;
+            self.matched = update.matched;
+            self.total = update.total;
             self.selected = selected_id
                 .and_then(|id| self.results.iter().position(|r| r.node_index == id))
                 .unwrap_or(0);
@@ -312,83 +557,198 @@ impl Picker {
             self.results_revision = Some(update.generation);
             self.done = update.source_done;
         }
-        // Measure and focus immediately, but reveal the panel with its first
-        // useful contents. Once shown, keep it visible during later searches.
-        self.results_shown |=
-            !self.results.is_empty() || self.done || self.error.lock().unwrap().is_some();
         let mut action = None;
         let mut accept = false;
-        ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
-                action = Some(Action::Cancel);
-            }
-            for (key, mods, delta) in [
-                (egui::Key::N, egui::Modifiers::CTRL, 1isize),
-                (egui::Key::P, egui::Modifiers::CTRL, -1),
-                (egui::Key::ArrowDown, egui::Modifiers::NONE, -1),
-                (egui::Key::ArrowUp, egui::Modifiers::NONE, 1),
-                (
-                    egui::Key::PageDown,
-                    egui::Modifiers::NONE,
-                    -(RESULT_ROWS as isize),
-                ),
-                (
-                    egui::Key::PageUp,
-                    egui::Modifiers::NONE,
-                    RESULT_ROWS as isize,
-                ),
-            ] {
-                if i.consume_key(mods, key) && !self.results.is_empty() {
-                    self.selected = self
-                        .selected
-                        .saturating_add_signed(delta)
-                        .min(self.results.len() - 1);
-                    self.visible_start = visible_start(self.visible_start, self.selected);
+        let mut copy = false;
+        let mut preview_toggled_off = false;
+        let mut preview_page = 0;
+        if interactive {
+            ctx.input_mut(|i| {
+                // egui-winit turns Ctrl+C into Copy before a Key event reaches us.
+                // Keep the query TextEdit from copying its own selection instead.
+                i.events.retain(|event| {
+                    if matches!(event, egui::Event::Copy) {
+                        copy = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                    action = Some(Action::Cancel);
                 }
+                if i.consume_key(egui::Modifiers::CTRL, egui::Key::P) && self.preview.is_some() {
+                    self.preview_visible = !self.preview_visible;
+                    preview_toggled_off = !self.preview_visible;
+                }
+                if i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp) {
+                    preview_page = -1;
+                }
+                if i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown) {
+                    preview_page = 1;
+                }
+                for (key, mods, delta) in [
+                    (egui::Key::N, egui::Modifiers::CTRL, 1isize),
+                    (egui::Key::ArrowDown, egui::Modifiers::NONE, -1),
+                    (egui::Key::ArrowUp, egui::Modifiers::NONE, 1),
+                    (
+                        egui::Key::PageDown,
+                        egui::Modifiers::NONE,
+                        -(RESULT_ROWS as isize),
+                    ),
+                    (
+                        egui::Key::PageUp,
+                        egui::Modifiers::NONE,
+                        RESULT_ROWS as isize,
+                    ),
+                ] {
+                    if i.consume_key(mods, key) && !self.results.is_empty() {
+                        self.selected = self
+                            .selected
+                            .saturating_add_signed(delta)
+                            .min(self.results.len() - 1);
+                        self.visible_start = visible_start(self.visible_start, self.selected);
+                    }
+                }
+                accept = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            });
+        }
+        if preview_toggled_off {
+            self.preview.as_mut().unwrap().select(
+                None,
+                None,
+                1,
+                1,
+                ctx,
+                self.filesystem,
+                &self.request_params,
+            );
+        }
+        if preview_page != 0 && self.preview_visible {
+            if let Some(preview) = &mut self.preview {
+                preview.scroll_half_page(preview_page, ctx);
             }
-            accept = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
-        });
+        }
+        if copy && let Some(result) = self.results.get(self.selected) {
+            ctx.copy_text(result.path.clone());
+            self.copied_until = Some(Instant::now() + Duration::from_secs(2));
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
+        if let Some(preview) = self.preview.as_mut().filter(|_| self.preview_visible) {
+            let range = self.results.get(self.selected).and_then(|result| {
+                self.store
+                    .snapshot()
+                    .map(|snapshot| *snapshot.payload(result.node_index))
+            });
+            let item = self.results.get(self.selected).map(|result| {
+                self.item_values
+                    .get(result.node_index as usize)
+                    .cloned()
+                    .or_else(|| {
+                        self.command_values.as_ref().and_then(|values| {
+                            values.lock().unwrap().get(&result.node_index).cloned()
+                        })
+                    })
+                    .unwrap_or_else(|| result.path.clone())
+            });
+            let width = ctx
+                .fonts_mut(|fonts| fonts.glyph_width(&self.typography.font, 'M'))
+                .max(1.0);
+            let columns = ((bounds.width() - style::PANEL_CONTENT_INSET) / width)
+                .floor()
+                .max(1.0) as usize;
+            let rows =
+                preview_rows(bounds.height(), self.typography.row_height).min(preview.row_limit());
+            preview.select(
+                item.as_deref(),
+                range,
+                columns,
+                rows,
+                ctx,
+                self.filesystem,
+                &self.request_params,
+            );
+        }
+        let ready_to_present = self
+            .preview
+            .as_mut()
+            .filter(|_| self.preview_visible)
+            .is_none_or(|preview| preview.ready_to_present(ctx));
         // Auto-generated widget IDs change when streaming result rows appear.
         // Give the sole input a stable session ID and focus it before it reads
         // events, including the Area's initial sizing pass.
         let query_id = egui::Id::new(("scrollback_picker_query", self.session_id));
-        ctx.memory_mut(|memory| memory.request_focus(query_id));
-        let area_id = egui::Id::new("scrollback_picker");
+        if interactive {
+            ctx.memory_mut(|memory| memory.request_focus(query_id));
+        }
+        let area_id = egui::Id::new(("scrollback_picker", self.session_id));
         let previous_size = ctx.memory(|memory| memory.area_rect(area_id).map(|rect| rect.size()));
+        let measured_size = previous_size.or_else(|| {
+            self.preview
+                .as_ref()
+                .filter(|_| self.preview_visible)
+                .map(|_| {
+                    let rows = preview_rows(bounds.height(), self.typography.row_height).min(
+                        self.preview
+                            .as_ref()
+                            .map_or(12, |preview| preview.row_limit()),
+                    );
+                    egui::vec2(
+                        0.0,
+                        (RESULT_ROWS + rows + 1) as f32 * self.typography.row_height
+                            + 44.0
+                            + 2.0 * style::DIVIDER_EXTRA,
+                    )
+                })
+        });
+        let (align, offset) = picker_anchor(
+            self.position,
+            self.cursor_row,
+            self.typography.row_height,
+            bounds,
+            ctx.content_rect(),
+            measured_size,
+        );
         let area = egui::Area::new(area_id)
             .fade_in(false)
-            .anchor(
-                egui::Align2::CENTER_BOTTOM,
-                egui::vec2(0.0, -bottom_margin - 10.0),
-            )
-            .order(egui::Order::Foreground)
+            .anchor(align, offset)
+            .interactable(interactive)
+            .order(if interactive {
+                egui::Order::Foreground
+            } else {
+                egui::Order::Middle
+            })
             .show(ctx, |ui| {
-                if !self.results_shown {
+                if !ready_to_present && !self.presented_once {
                     ui.set_opacity(0.0);
                 }
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(40, 40, 40))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(215, 153, 33),
-                    ))
-                    .corner_radius(5)
-                    .inner_margin(8)
+                    .fill(style::BACKGROUND)
+                    .stroke(egui::Stroke::new(1.0, style::BORDER))
+                    .corner_radius(style::PANEL_RADIUS)
+                    .inner_margin(egui::Margin::symmetric(18, 10))
                     .show(ui, |ui| {
-                        // Ten points outside each edge, plus frame padding/stroke.
-                        ui.set_width((ctx.content_rect().width() - 38.0).max(1.0));
-                        ui.visuals_mut().override_text_color =
-                            Some(egui::Color32::from_rgb(235, 219, 178));
-                        ui.visuals_mut().text_cursor.stroke =
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(235, 219, 178));
-                        ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgb(80, 73, 69);
-                        ui.visuals_mut().selection.stroke.color =
-                            egui::Color32::from_rgb(235, 219, 178);
+                        // Ten points outside each edge, plus frame padding and stroke.
+                        ui.set_width((bounds.width() - style::PANEL_CONTENT_INSET).max(1.0));
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.visuals_mut().override_text_color = Some(style::TEXT);
+                        ui.visuals_mut().text_cursor.stroke = egui::Stroke::new(2.0, style::TEXT);
+                        ui.visuals_mut().selection.bg_fill = style::SELECTION;
+                        ui.visuals_mut().selection.stroke.color = style::TEXT;
+                        if let Some(preview) =
+                            self.preview.as_mut().filter(|_| self.preview_visible)
+                        {
+                            let rows = preview_rows(bounds.height(), self.typography.row_height)
+                                .min(preview.row_limit());
+                            preview.show(ui, &self.typography, rows);
+                            style::divider(ui);
+                        }
                         let error = self.error.lock().unwrap().clone();
                         // Keep the bottom-anchored Area's measured height stable.
                         // Otherwise new rows render using the previous height
                         // before the anchor catches up on the following frame.
                         let row_height = self.typography.row_height;
+                        let mut results_top = None;
                         for slot in 0..RESULT_ROWS {
                             // Rank zero sits directly above the query; empty
                             // slots stay above short result lists.
@@ -399,8 +759,7 @@ impl Picker {
                                 } else if self.done {
                                     "No matches".into()
                                 } else {
-                                    // Avoid flashing a loading label before the
-                                    // first batch of real results arrives.
+                                    // The query row carries the loading indicator.
                                     " ".into()
                                 }
                             } else {
@@ -410,11 +769,18 @@ impl Picker {
                                 egui::vec2(ui.available_width(), row_height),
                                 egui::Sense::hover(),
                             );
+                            if slot == 0 {
+                                results_top = Some(row_rect);
+                            }
                             if index == self.selected && self.results.get(index).is_some() {
+                                ui.painter().rect_filled(row_rect, 4, style::SELECTION);
                                 ui.painter().rect_filled(
-                                    row_rect,
-                                    2,
-                                    egui::Color32::from_rgb(80, 73, 69),
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(row_rect.left() + 1.5, row_rect.center().y),
+                                        egui::vec2(3.0, 16.0),
+                                    ),
+                                    1.5,
+                                    style::ACCENT,
                                 );
                             }
                             let painter = ui
@@ -432,11 +798,11 @@ impl Picker {
                                 let galley = painter.layout_job(job);
                                 painter.galley(
                                     egui::pos2(
-                                        row_rect.left(),
+                                        row_rect.left() + 12.0,
                                         row_rect.center().y - galley.size().y / 2.0,
                                     ),
                                     galley,
-                                    egui::Color32::from_rgb(235, 219, 178),
+                                    style::TEXT,
                                 );
                             } else {
                                 painter.text(
@@ -444,38 +810,149 @@ impl Picker {
                                     egui::Align2::LEFT_CENTER,
                                     text,
                                     self.typography.font.clone(),
-                                    egui::Color32::from_rgb(235, 219, 178),
+                                    if error.is_some() {
+                                        style::ERROR
+                                    } else {
+                                        style::MUTED
+                                    },
                                 );
                             }
                         }
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(">").font(self.typography.font.clone()),
-                            ));
-                            let response = ui.add_sized(
-                                [ui.available_width(), self.typography.row_height],
-                                egui::TextEdit::singleline(&mut self.query)
-                                    .id(query_id)
-                                    .font(self.typography.font.clone())
-                                    .vertical_align(egui::Align::Center)
-                                    .desired_width(f32::INFINITY)
-                                    .frame(egui::Frame::NONE),
+                        if self
+                            .copied_until
+                            .is_some_and(|until| until > Instant::now())
+                            && let Some(top) = results_top
+                        {
+                            let label = "Copied to clipboard";
+                            let galley = ui.painter().layout_no_wrap(
+                                label.to_owned(),
+                                self.typography.font.clone(),
+                                style::TEXT,
                             );
-                            if !response.has_focus() {
-                                response.request_focus();
-                                ctx.request_repaint();
+                            let toast = egui::Rect::from_min_size(
+                                egui::pos2(top.right() - galley.size().x - 20.0, top.top() + 2.0),
+                                galley.size() + egui::vec2(16.0, 6.0),
+                            );
+                            ui.painter().rect_filled(toast, 3, style::SELECTION);
+                            ui.painter().galley(
+                                toast.min + egui::vec2(8.0, 3.0),
+                                galley,
+                                style::TEXT,
+                            );
+                        }
+                        style::divider(ui);
+                        ui.horizontal(|ui| {
+                            let prompt_width =
+                                ui.fonts_mut(|fonts| fonts.glyph_width(&self.typography.font, '>'));
+                            let (prompt_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(prompt_width, self.typography.row_height),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().text(
+                                prompt_rect.left_center(),
+                                egui::Align2::LEFT_CENTER,
+                                ">",
+                                self.typography.font.clone(),
+                                style::ACCENT,
+                            );
+                            let count = format!("{}/{}", self.matched, self.total);
+                            let count_size = ui
+                                .painter()
+                                .layout_no_wrap(
+                                    format!("{0}/{0}", self.total),
+                                    self.typography.font.clone(),
+                                    style::TEXT,
+                                )
+                                .size();
+                            let indicator_size = 12.0;
+                            let status_width = count_size.x + indicator_size + 12.0;
+                            let query_width =
+                                (ui.available_width() - status_width - ui.spacing().item_spacing.x)
+                                    .max(1.0);
+                            if interactive {
+                                let response = ui.add_sized(
+                                    [query_width, self.typography.row_height],
+                                    egui::TextEdit::singleline(&mut self.query)
+                                        .id(query_id)
+                                        .font(self.typography.font.clone())
+                                        .vertical_align(egui::Align::Center)
+                                        .margin(0)
+                                        .desired_width(f32::INFINITY)
+                                        .frame(egui::Frame::NONE),
+                                );
+                                if !response.has_focus() {
+                                    response.request_focus();
+                                    ctx.request_repaint();
+                                }
+                                if response.changed() && self.query != self.submitted_query {
+                                    self.query_revision += 1;
+                                    self.submitted_query = self.query.clone();
+                                    self.session.set_query(self.query.clone());
+                                    self.matched = 0;
+                                    self.selected = 0;
+                                    self.visible_start = 0;
+                                }
+                            } else {
+                                let (query_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(query_width, self.typography.row_height),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().text(
+                                    query_rect.left_center(),
+                                    egui::Align2::LEFT_CENTER,
+                                    &self.query,
+                                    self.typography.font.clone(),
+                                    style::TEXT,
+                                );
                             }
-                            if response.changed() && self.query != self.submitted_query {
-                                self.query_revision += 1;
-                                self.submitted_query = self.query.clone();
-                                self.session.set_query(self.query.clone());
-                                self.selected = 0;
-                                self.visible_start = 0;
+                            let (status_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(status_width, self.typography.row_height),
+                                egui::Sense::hover(),
+                            );
+                            let color = style::MUTED;
+                            if error.is_none()
+                                && (self
+                                    .preview
+                                    .as_ref()
+                                    .filter(|_| self.preview_visible)
+                                    .is_some_and(|preview| preview.pending())
+                                    || !self.done
+                                    || self.results_revision != Some(self.query_revision))
+                            {
+                                let text_size = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        count.clone(),
+                                        self.typography.font.clone(),
+                                        color,
+                                    )
+                                    .size();
+                                let center = egui::pos2(
+                                    status_rect.right() - text_size.x - indicator_size / 2.0 - 8.0,
+                                    status_rect.center().y,
+                                );
+                                paint_loading_indicator(
+                                    ui,
+                                    egui::Rect::from_center_size(
+                                        center,
+                                        egui::vec2(indicator_size, indicator_size),
+                                    ),
+                                    color,
+                                );
                             }
+                            ui.painter().text(
+                                status_rect.right_center(),
+                                egui::Align2::RIGHT_CENTER,
+                                count,
+                                self.typography.font.clone(),
+                                color,
+                            );
                         });
                     });
             });
+        if ready_to_present {
+            self.presented_once = true;
+        }
         if action.is_none()
             && !accept
             && previous_size.is_none_or(|size| {
@@ -490,7 +967,7 @@ impl Picker {
         if action.is_none() && accept && self.results_revision == Some(self.query_revision) {
             if let Some(result) = self.results.get(self.selected) {
                 action = if let Some(callback) = &self.callback {
-                    let range = if self.filesystem {
+                    let range = if self.filesystem || self.items || self.command {
                         None
                     } else {
                         self.store
@@ -502,16 +979,18 @@ impl Picker {
                         result.path.clone(),
                         self.filesystem,
                         range,
+                        self.accepted_value(result),
+                        self.request_params.clone(),
                     ))
                 } else {
                     match self.enter_action {
-                        crate::picker_config::EnterAction::Navigate => {
+                        crate::picker::config::EnterAction::Navigate => {
                             self.store.snapshot().map(|snapshot| {
                                 Action::Accept(snapshot.payload(result.node_index).start)
                             })
                         }
-                        crate::picker_config::EnterAction::SendInput => {
-                            Some(Action::SendInput(result.path.clone()))
+                        crate::picker::config::EnterAction::SendInput => {
+                            Some(Action::SendInput(self.accepted_value(result)))
                         }
                     }
                 };
@@ -531,7 +1010,7 @@ impl Drop for Picker {
         // Snapshot pages must outlive the reader. It checks cancellation
         // between row reads; fuzzy workers use only their Rust-owned store.
         if let Some(reader) = self.reader.take() {
-            if !self.filesystem {
+            if !self.filesystem && !self.command {
                 let _ = reader.join();
             }
         }
@@ -539,8 +1018,10 @@ impl Drop for Picker {
 }
 
 fn read_row(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
-    let mut result = ffi::SnapshotTextRow::default();
-    if !unsafe { ffi::ghostty_egui_host_snapshot_text_row(host, generation, row, &mut result) } {
+    let mut result = ghostty_ffi::SnapshotTextRow::default();
+    if !unsafe {
+        ghostty_ffi::ghostty_egui_host_snapshot_text_row(host, generation, row, &mut result)
+    } {
         return None;
     }
     let (text, columns) = if result.len == 0 {
@@ -554,7 +1035,7 @@ fn read_row(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
         }
     };
     let wraps_to_next = result.wraps_to_next;
-    unsafe { ffi::ghostty_egui_host_snapshot_text_row_free(&mut result) };
+    unsafe { ghostty_ffi::ghostty_egui_host_snapshot_text_row_free(&mut result) };
     Some(TextRow {
         text: String::from_utf8(text).ok()?,
         columns,
@@ -590,10 +1071,22 @@ fn logical_items(
         .collect()
 }
 
+fn newest_logical_items(
+    rows: &[(u64, TextRow)],
+    regex: &regex::Regex,
+    seen: &mut Option<std::collections::HashSet<String>>,
+) -> Vec<(String, SnapshotCellRange)> {
+    logical_items(rows, regex)
+        .into_iter()
+        .rev()
+        .filter(|(text, _)| seen.as_mut().is_none_or(|seen| seen.insert(text.clone())))
+        .collect()
+}
+
 #[cfg(test)]
 fn logical_item(rows: &[(u64, TextRow)]) -> Option<(String, SnapshotCellRange)> {
-    let crate::picker_config::Source::Scrollback(regex) =
-        crate::picker_config::Options::default().source
+    let crate::picker::config::Source::Scrollback { regex, .. } =
+        crate::picker::config::Options::default().source
     else {
         unreachable!()
     };
@@ -602,6 +1095,214 @@ fn logical_item(rows: &[(u64, TextRow)]) -> Option<(String, SnapshotCellRange)> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ctrl_p_toggles_configured_preview() {
+        let ctx = egui::Context::default();
+        let mut picker = super::Picker::start(
+            std::ptr::null_mut(),
+            None,
+            false,
+            0,
+            ctx.clone(),
+            crate::picker::config::Options {
+                source: crate::picker::config::Source::Items(crate::picker::config::ItemsOptions {
+                    values: Vec::new(),
+                    provider: None,
+                }),
+                preview: Some(crate::picker::config::Preview::Text { text: "x".into() }),
+                preview_visible: false,
+                ..Default::default()
+            },
+        );
+        assert!(!picker.preview_visible);
+        let mut initial = ctx.run_ui(egui::RawInput::default(), |ui| {
+            picker.show(ui.ctx(), 0.0);
+        });
+        initial.textures_delta.clear();
+        assert!(picker.presented_once);
+        for visible in [true, false] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::P,
+                        physical_key: Some(egui::Key::P),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::CTRL,
+                    }],
+                    ..Default::default()
+                },
+                |ui| {
+                    picker.show(ui.ctx(), 0.0);
+                },
+            );
+            output.textures_delta.clear();
+            assert_eq!(picker.preview_visible, visible);
+        }
+    }
+
+    #[test]
+    fn background_picker_remains_visible_without_taking_foreground_focus() {
+        let ctx = egui::Context::default();
+        let make_picker = || {
+            super::Picker::start(
+                std::ptr::null_mut(),
+                None,
+                false,
+                0,
+                ctx.clone(),
+                crate::picker::config::Options {
+                    position: crate::picker::config::Position::Bottom,
+                    source: crate::picker::config::Source::Items(
+                        crate::picker::config::ItemsOptions {
+                            values: Vec::new(),
+                            provider: None,
+                        },
+                    ),
+                    callback: None,
+                    enter_action: crate::picker::config::EnterAction::SendInput,
+                    params: Default::default(),
+                    preview: None,
+                    preview_visible: true,
+                },
+            )
+        };
+        let mut background = make_picker();
+        let mut foreground = make_picker();
+        let main = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0));
+        let floating =
+            egui::Rect::from_min_size(egui::pos2(200.0, 100.0), egui::vec2(600.0, 400.0));
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(main),
+                    ..Default::default()
+                },
+                |ui| {
+                    background.show_background_in_bounds(ui.ctx(), main);
+                    foreground.show_in_bounds(ui.ctx(), floating);
+                },
+            );
+            output.textures_delta.clear();
+        }
+        for picker in [&background, &foreground] {
+            assert!(ctx.memory(|m| m.area_rect(egui::Id::new(("scrollback_picker", picker.session_id)))).is_some());
+        }
+        let query_id = egui::Id::new(("scrollback_picker_query", foreground.session_id));
+        assert!(ctx.memory(|m| m.has_focus(query_id)));
+    }
+
+    #[test]
+    fn picker_positions_use_the_owner_bounds_and_clamp_cursor() {
+        use crate::picker::config::Position;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let bounds = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 500.0));
+        let size = Some(egui::vec2(560.0, 180.0));
+        let anchor =
+            |position, row| super::picker_anchor(position, row, 20.0, bounds, screen, size);
+        assert_eq!(
+            anchor(Position::Top, None),
+            (egui::Align2::CENTER_TOP, egui::vec2(-100.0, 110.0))
+        );
+        assert_eq!(
+            anchor(Position::Center, None),
+            (egui::Align2::CENTER_CENTER, egui::vec2(-100.0, -50.0))
+        );
+        assert_eq!(
+            anchor(Position::Bottom, None),
+            (egui::Align2::CENTER_BOTTOM, egui::vec2(-100.0, -210.0))
+        );
+        assert_eq!(
+            anchor(Position::Cursor, Some(0)),
+            (egui::Align2::CENTER_TOP, egui::vec2(-100.0, 130.0))
+        );
+        assert_eq!(
+            anchor(Position::Cursor, Some(14)),
+            (egui::Align2::CENTER_TOP, egui::vec2(-100.0, 410.0))
+        );
+        assert_eq!(
+            anchor(Position::Cursor, Some(16)),
+            (egui::Align2::CENTER_BOTTOM, egui::vec2(-100.0, -360.0))
+        );
+        assert_eq!(anchor(Position::Cursor, Some(40)).1.y, -210.0);
+        assert_eq!(
+            anchor(Position::Cursor, None),
+            anchor(Position::Bottom, None)
+        );
+    }
+
+    #[test]
+    fn item_picker_accepts_insert_value_instead_of_display_text() {
+        let ctx = egui::Context::default();
+        let mut picker = super::Picker::start(
+            std::ptr::null_mut(),
+            None,
+            false,
+            0,
+            ctx.clone(),
+            crate::picker::config::Options {
+                position: crate::picker::config::Position::Bottom,
+                source: crate::picker::config::Source::Items(crate::picker::config::ItemsOptions {
+                    values: vec![crate::picker::protocol::Item {
+                        text: "shown".into(),
+                        value: "inserted".into(),
+                    }],
+                    provider: None,
+                }),
+                callback: None,
+                enter_action: crate::picker::config::EnterAction::SendInput,
+                params: [("query".to_string(), "sho".to_string())].into(),
+                preview: None,
+                preview_visible: true,
+            },
+        );
+        assert_eq!(picker.query, "sho");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while picker.results.is_empty() {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                picker.show(ui.ctx(), 24.0);
+            });
+            output.textures_delta.clear();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "item results were not published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ui| assert!(picker.show(ui.ctx(), 24.0).is_none()),
+        );
+        output.textures_delta.clear();
+        assert!(
+            output
+                .platform_output
+                .commands
+                .contains(&egui::OutputCommand::CopyText("shown".into()))
+        );
+        assert_eq!(picker.query, "sho");
+        assert!(picker.copied_until.is_some());
+        let mut accepted = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| accepted = picker.show(ui.ctx(), 24.0),
+        );
+        output.textures_delta.clear();
+        assert!(matches!(accepted, Some(super::Action::SendInput(text)) if text == "inserted"));
+    }
+
     #[test]
     #[cfg(windows)]
     fn filesystem_picker_streams_and_accepts_without_a_terminal_snapshot() {
@@ -617,9 +1318,10 @@ mod tests {
             false,
             0,
             ctx.clone(),
-            crate::picker_config::Options {
-                source: crate::picker_config::Source::FileSystem(
-                    crate::picker_config::FileOptions {
+            crate::picker::config::Options {
+                position: crate::picker::config::Position::Bottom,
+                source: crate::picker::config::Source::FileSystem(
+                    crate::picker::config::FileOptions {
                         roots: vec![root.clone()],
                         max_depth: 1,
                         files_only: true,
@@ -627,7 +1329,10 @@ mod tests {
                     },
                 ),
                 callback: None,
-                enter_action: crate::picker_config::EnterAction::SendInput,
+                enter_action: crate::picker::config::EnterAction::SendInput,
+                params: Default::default(),
+                preview: None,
+                preview_visible: true,
             },
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -679,6 +1384,47 @@ mod tests {
     }
 
     #[test]
+    fn picker_stays_within_floating_pane_bounds() {
+        let ctx = egui::Context::default();
+        let mut picker = super::Picker::start(
+            std::ptr::null_mut(),
+            None,
+            false,
+            0,
+            ctx.clone(),
+            crate::picker::config::Options {
+                source: crate::picker::config::Source::Items(crate::picker::config::ItemsOptions {
+                    values: Vec::new(),
+                    provider: None,
+                }),
+                ..Default::default()
+            },
+        );
+        let bounds = egui::Rect::from_min_size(egui::pos2(200.0, 100.0), egui::vec2(600.0, 400.0));
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    picker.show_in_bounds(ui.ctx(), bounds);
+                },
+            );
+            output.textures_delta.clear();
+        }
+        let panel = ctx
+            .memory(|m| m.area_rect(egui::Id::new(("scrollback_picker", picker.session_id))))
+            .unwrap();
+        assert!((panel.center().x - bounds.center().x).abs() < 1.0);
+        assert!((panel.bottom() - (bounds.bottom() - 10.0)).abs() < 1.0);
+        assert!(panel.left() >= bounds.left() && panel.right() <= bounds.right());
+    }
+
+    #[test]
     fn position_highlights_preserve_text_and_utf8_boundaries() {
         let font = egui::FontId::monospace(14.0);
         let bold = egui::FontId::new(14.0, egui::FontFamily::Name("bold".into()));
@@ -703,7 +1449,7 @@ mod tests {
         assert!(
             job.sections
                 .iter()
-                .all(|section| section.format.color == egui::Color32::from_rgb(235, 219, 178))
+                .all(|section| section.format.color == style::TEXT)
         );
     }
 
@@ -731,12 +1477,22 @@ mod tests {
         let store = Arc::new(SnapshotStore::<Items>::new());
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut picker = Picker {
+            cursor_row: None,
+            position: crate::picker::config::Position::Bottom,
             generation: Some(1),
             filesystem: false,
+            command: false,
             from_copy: false,
-            typography: crate::picker_font::Typography::default(),
+            typography: crate::picker::font::Typography::default(),
+            preview: None,
+            preview_visible: true,
+            presented_once: false,
             callback: None,
-            enter_action: crate::picker_config::EnterAction::Navigate,
+            request_params: Default::default(),
+            item_values: Vec::new(),
+            command_values: None,
+            items: false,
+            enter_action: crate::picker::config::EnterAction::Navigate,
             session_id: 123,
             session: Session::Streaming(FuzzySearchSession::new(
                 123,
@@ -754,9 +1510,11 @@ mod tests {
             query_revision: 0,
             results_revision: None,
             results: Vec::new(),
+            matched: 0,
+            total: 0,
             selected: 0,
             visible_start: 0,
-            results_shown: false,
+            copied_until: None,
             done: false,
             error: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -765,19 +1523,18 @@ mod tests {
             picker.show(ui.ctx(), 24.0);
         });
         output.textures_delta.clear();
-        // The first Area pass measures its contents before making them visible.
+        // The Area keeps its height stable while results stream in.
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             picker.show(ui.ctx(), 24.0);
         });
         output.textures_delta.clear();
         assert!(ctx.memory(|m| m.has_focus(query_id)));
-        assert!(!picker.results_shown);
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             picker.show(ui.ctx(), 24.0);
         });
         output.textures_delta.clear();
         let panel = ctx
-            .memory(|m| m.area_rect(egui::Id::new("scrollback_picker")))
+            .memory(|m| m.area_rect(egui::Id::new(("scrollback_picker", 123u64))))
             .unwrap();
         for (rows, text) in [(0, "w"), (7, "in"), (1, "dows")] {
             picker.results = (0..rows)
@@ -796,9 +1553,8 @@ mod tests {
             });
             output.textures_delta.clear();
             assert!(ctx.memory(|m| m.has_focus(query_id)));
-            assert_eq!(picker.results_shown, rows != 0);
             assert_eq!(
-                ctx.memory(|m| m.area_rect(egui::Id::new("scrollback_picker")))
+                ctx.memory(|m| m.area_rect(egui::Id::new(("scrollback_picker", 123u64))))
                     .unwrap(),
                 panel
             );
@@ -809,10 +1565,6 @@ mod tests {
             picker.show(ui.ctx(), 24.0);
         });
         output.textures_delta.clear();
-        assert!(
-            picker.results_shown,
-            "later empty updates must not hide the panel"
-        );
         let range = SnapshotCellRange {
             start: SnapshotCell { x: 4, y: 19 },
             end: SnapshotCell { x: 9, y: 19 },
@@ -829,8 +1581,8 @@ mod tests {
         picker.visible_start = 0;
         picker.results_revision = Some(picker.query_revision);
         for enter_action in [
-            crate::picker_config::EnterAction::Navigate,
-            crate::picker_config::EnterAction::SendInput,
+            crate::picker::config::EnterAction::Navigate,
+            crate::picker::config::EnterAction::SendInput,
         ] {
             picker.enter_action = enter_action;
             let input = egui::RawInput {
@@ -851,10 +1603,10 @@ mod tests {
             });
             output.textures_delta.clear();
             match (enter_action, accepted) {
-                (crate::picker_config::EnterAction::Navigate, Some(Action::Accept(cell))) => {
+                (crate::picker::config::EnterAction::Navigate, Some(Action::Accept(cell))) => {
                     assert_eq!(cell, range.start)
                 }
-                (crate::picker_config::EnterAction::SendInput, Some(Action::SendInput(text))) => {
+                (crate::picker::config::EnterAction::SendInput, Some(Action::SendInput(text))) => {
                     assert_eq!(text, "chosen")
                 }
                 _ => panic!("configured Enter action was not used"),
@@ -899,6 +1651,52 @@ mod tests {
         assert_eq!(update.matched, 2);
         assert!(update.source_done);
     }
+    #[test]
+    fn unique_scrollback_keeps_newest_unicode_match_and_its_cell_range() {
+        let regex = regex::Regex::new(r"\S+").unwrap();
+        let newest = [
+            (
+                9,
+                TextRow {
+                    text: "猫 x ".into(),
+                    columns: vec![0, 0, 0, 2, 3, 4],
+                    wraps_to_next: true,
+                },
+            ),
+            (
+                10,
+                TextRow {
+                    text: "猫".into(),
+                    columns: vec![0, 0, 0],
+                    wraps_to_next: false,
+                },
+            ),
+        ];
+        let older = [(
+            8,
+            TextRow {
+                text: "猫 X".into(),
+                columns: vec![0, 0, 0, 2, 3],
+                wraps_to_next: false,
+            },
+        )];
+        let mut seen = Some(std::collections::HashSet::new());
+        let items = newest_logical_items(&newest, &regex, &mut seen);
+        assert_eq!(
+            items.iter().map(|item| item.0.as_str()).collect::<Vec<_>>(),
+            ["猫", "x"]
+        );
+        assert_eq!(items[0].1.start, SnapshotCell { x: 0, y: 10 });
+        assert_eq!(items[0].1.end, SnapshotCell { x: 0, y: 10 });
+        let older_items = newest_logical_items(&older, &regex, &mut seen);
+        assert_eq!(older_items.len(), 1);
+        assert_eq!(older_items[0].0, "X");
+
+        let mut seen = None;
+        assert_eq!(newest_logical_items(&newest, &regex, &mut seen).len(), 3);
+        assert_eq!(newest_logical_items(&older, &regex, &mut seen).len(), 2);
+    }
+
     #[test]
     fn logical_lines_preserve_unicode_cells_and_soft_wraps() {
         let rows = vec![
