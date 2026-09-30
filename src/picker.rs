@@ -5,52 +5,31 @@ pub(crate) mod files;
 pub(crate) mod font;
 pub(crate) mod preview;
 pub(crate) mod protocol;
+mod source;
 pub(crate) mod style;
+use source::PickerSource;
 
+#[cfg(test)]
 use crate::copy_mode::TextRow;
 use crate::ghostty_ffi::{self, Host, SnapshotCell, SnapshotCellRange};
-use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
+#[cfg(test)]
+use nfm_search_core::fuzzy_search_session::FuzzySearchSession;
+use nfm_search_core::fuzzy_search_session::FuzzySearchUpdate;
 use nfm_search_core::search::{SearchResult, resolve_match_positions};
+#[cfg(test)]
 use nfm_search_core::snapshot_store::SnapshotStore;
-use nfm_search_core::store::{
-    PublishingStreamingItemStoreWithPayload, StreamingItemSnapshotWithPayload,
-};
+#[cfg(test)]
+use nfm_search_core::store::PublishingStreamingItemStoreWithPayload;
+use nfm_search_core::store::StreamingItemSnapshotWithPayload;
+#[cfg(test)]
+use source::{logical_item, logical_items, newest_logical_items};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 type Items = StreamingItemSnapshotWithPayload<SnapshotCellRange>;
-enum Session {
-    Streaming(FuzzySearchSession<Items, SnapshotStore<Items>>),
-    #[cfg(not(windows))]
-    UnsupportedFileSystem,
-    #[cfg(windows)]
-    FileSystem(nfm_file_system::file_system_search::FileSystemSearch),
-}
-
-impl Session {
-    fn set_query(&self, query: String) {
-        match self {
-            Self::Streaming(session) => session.set_query(query),
-            #[cfg(not(windows))]
-            Self::UnsupportedFileSystem => {}
-            #[cfg(windows)]
-            Self::FileSystem(session) => session.set_query(query),
-        }
-    }
-    fn stop(&self) {
-        match self {
-            Self::Streaming(session) => session.stop(),
-            #[cfg(not(windows))]
-            Self::UnsupportedFileSystem => {}
-            #[cfg(windows)]
-            Self::FileSystem(session) => session.stop(),
-        }
-    }
-}
 const RESULT_ROWS: usize = 7;
 
 fn preview_rows(height: f32, row_height: f32) -> usize {
@@ -220,8 +199,6 @@ pub(crate) struct Picker {
     pub(crate) cursor_row: Option<u32>,
     position: crate::picker::config::Position,
     pub(crate) generation: Option<u64>,
-    pub(crate) filesystem: bool,
-    pub(crate) command: bool,
     pub(crate) from_copy: bool,
     pub(crate) typography: crate::picker::font::Typography,
     preview: Option<crate::picker::preview::PickerPreview>,
@@ -229,16 +206,10 @@ pub(crate) struct Picker {
     presented_once: bool,
     callback: Option<std::rc::Rc<crate::picker::action::Callback>>,
     request_params: std::collections::BTreeMap<String, String>,
-    item_values: Vec<String>,
-    command_values: Option<crate::picker::command::CommandValues>,
-    pub(crate) items: bool,
     enter_action: crate::picker::config::EnterAction,
+    source: PickerSource,
     session_id: u64,
-    session: Session,
-    store: Arc<SnapshotStore<Items>>,
     updates: Arc<std::sync::Mutex<Option<FuzzySearchUpdate>>>,
-    cancelled: Arc<AtomicBool>,
-    reader: Option<JoinHandle<()>>,
     query: String,
     submitted_query: String,
     results_query: String,
@@ -269,6 +240,10 @@ pub(crate) enum Action {
 }
 
 impl Picker {
+    pub(crate) fn label(&self) -> &'static str {
+        self.source.label()
+    }
+
     pub(crate) fn start(
         host: *mut Host,
         generation: Option<u64>,
@@ -279,38 +254,11 @@ impl Picker {
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let session_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let store = Arc::new(SnapshotStore::new());
-        let (tx, updates_rx) = crossbeam_channel::unbounded();
-        let error = Arc::new(std::sync::Mutex::new(None));
-        if let crate::picker::config::Source::Items(items) = &mut options.source {
-            if let Some(provider) = &items.provider {
-                match provider.read() {
-                    Ok(values) => items.values = values,
-                    Err(message) => *error.lock().unwrap() = Some(message),
-                }
-            }
-        }
-        let filesystem = matches!(options.source, crate::picker::config::Source::FileSystem(_));
-        let command = matches!(options.source, crate::picker::config::Source::Command(_));
-        let items = matches!(options.source, crate::picker::config::Source::Items(_));
         let initial_query: String = options
             .params
             .get("query")
             .map(|query| query.chars().take(4096).collect())
             .unwrap_or_default();
-        let item_values = if let crate::picker::config::Source::Items(items) = &options.source {
-            items.values.iter().map(|item| item.value.clone()).collect()
-        } else {
-            Vec::new()
-        };
-        let command_values = match &options.source {
-            crate::picker::config::Source::Command(config)
-                if config.line_continuation.is_some() =>
-            {
-                Some(Arc::default())
-            }
-            _ => None,
-        };
         let snapshot_columns = generation
             .and_then(|generation| {
                 let mut view = ghostty_ffi::SnapshotView::default();
@@ -318,147 +266,19 @@ impl Picker {
                     .then_some(view.columns as usize)
             })
             .unwrap_or(80);
-        if let crate::picker::config::Source::FileSystem(files) = &mut options.source {
-            if let Err(message) = crate::picker::files::resolve_roots(files) {
-                *error.lock().unwrap() = Some(message);
-            }
-        }
-        let session = match &options.source {
-            #[cfg(windows)]
-            crate::picker::config::Source::FileSystem(files) => Session::FileSystem(
-                nfm_file_system::file_system_search::FileSystemSearch::start(
-                    session_id,
-                    nfm_file_system::walker::ScanOptions {
-                        roots: files.roots.clone(),
-                        max_depth: files.max_depth,
-                        files_only: files.files_only,
-                        directories_only: files.directories_only,
-                    },
-                    initial_query.clone(),
-                    tx,
-                ),
-            ),
-            #[cfg(not(windows))]
-            crate::picker::config::Source::FileSystem(_) => {
-                *error.lock().unwrap() =
-                    Some("Filesystem pickers require NFM support for this platform".into());
-                Session::UnsupportedFileSystem
-            }
-            crate::picker::config::Source::Scrollback { .. }
-            | crate::picker::config::Source::Items(_)
-            | crate::picker::config::Source::Command(_) => {
-                let session =
-                    FuzzySearchSession::new(session_id, store.clone(), initial_query.clone(), tx);
-                session.start();
-                Session::Streaming(session)
-            }
-        };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let updates = Arc::new(std::sync::Mutex::new(None));
-        {
-            let (updates, cancelled, ctx) = (updates.clone(), cancelled.clone(), ctx.clone());
-            thread::spawn(move || {
-                while !cancelled.load(Ordering::Acquire) {
-                    match updates_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                        Ok(mut update) => {
-                            while let Ok(newer) = updates_rx.try_recv() {
-                                update = newer;
-                            }
-                            *updates.lock().unwrap() = Some(update);
-                            ctx.request_repaint();
-                        }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-            });
-        }
-        let reader = if let crate::picker::config::Source::Command(config) = &options.source {
-            Some(crate::picker::command::start(
-                config.clone(),
-                options.params.clone(),
-                store.clone(),
-                cancelled.clone(),
-                error.clone(),
-                ctx.clone(),
-                command_values.clone(),
-            ))
-        } else if let crate::picker::config::Source::Scrollback { regex, unique } = &options.source
-        {
-            let regex = regex.clone();
-            let mut seen = unique.then(std::collections::HashSet::new);
-            let generation = generation.expect("scrollback picker requires a snapshot");
-            let (store, cancelled, error) = (store.clone(), cancelled.clone(), error.clone());
-            let host = host as usize;
-            Some(thread::spawn(move || {
-                let mut publisher = PublishingStreamingItemStoreWithPayload::new(store);
-                let read = |row| {
-                    if cancelled.load(Ordering::Acquire) {
-                        return None;
-                    }
-                    let result = read_row(host as *mut Host, generation, row);
-                    if result.is_none() {
-                        *error.lock().unwrap() = Some("Unable to read scrollback snapshot".into());
-                    }
-                    result
-                };
-                let mut bottom = rows;
-                let mut batch = 0;
-                while bottom > 0 && !cancelled.load(Ordering::Acquire) {
-                    let end = bottom - 1;
-                    let mut start = end;
-                    let Some(last) = read(end) else {
-                        break;
-                    };
-                    let mut lines = vec![(end, last)];
-                    while start > 0 {
-                        let Some(previous) = read(start - 1) else {
-                            break;
-                        };
-                        if !previous.wraps_to_next {
-                            break;
-                        }
-                        start -= 1;
-                        lines.push((start, previous));
-                    }
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    lines.reverse();
-                    for (text, range) in newest_logical_items(&lines, &regex, &mut seen) {
-                        if cancelled.load(Ordering::Acquire) {
-                            break;
-                        }
-                        publisher.add_item(text.as_bytes(), range);
-                        batch += 1;
-                        if batch >= 128 {
-                            publisher.publish();
-                            batch = 0;
-                            ctx.request_repaint();
-                        }
-                    }
-                    bottom = start;
-                }
-                publisher.complete();
-                ctx.request_repaint();
-            }))
-        } else {
-            if let crate::picker::config::Source::Items(items) = &options.source {
-                let mut publisher = PublishingStreamingItemStoreWithPayload::new(store.clone());
-                for item in &items.values {
-                    publisher.add_item(item.text.as_bytes(), SnapshotCellRange::default());
-                }
-                publisher.complete();
-                ctx.request_repaint();
-            }
-            None
-        };
+        let (source, updates, error) = PickerSource::start(
+            host,
+            generation,
+            rows,
+            ctx.clone(),
+            &mut options,
+            session_id,
+            initial_query.clone(),
+        );
         Self {
             cursor_row: None,
             position: options.position,
             generation,
-            filesystem,
-            command,
             from_copy,
             typography: crate::picker::font::Typography::default(),
             preview: options.preview.map(|source| {
@@ -474,16 +294,10 @@ impl Picker {
             presented_once: false,
             callback: options.callback,
             request_params: options.params,
-            item_values,
-            command_values,
-            items,
             enter_action: options.enter_action,
+            source,
             session_id,
-            session,
-            store,
             updates,
-            cancelled,
-            reader,
             query: initial_query.clone(),
             submitted_query: initial_query,
             results_query: String::new(),
@@ -501,15 +315,7 @@ impl Picker {
     }
 
     fn accepted_value(&self, result: &SearchResult) -> String {
-        if let Some(value) = self.item_values.get(result.node_index as usize) {
-            return value.clone();
-        }
-        if let Some(values) = &self.command_values {
-            if let Some(value) = values.lock().unwrap().get(&result.node_index) {
-                return value.clone();
-            }
-        }
-        result.path.clone()
+        self.source.accepted_value(result)
     }
 
     #[cfg(test)]
@@ -620,7 +426,7 @@ impl Picker {
                 1,
                 1,
                 ctx,
-                self.filesystem,
+                self.source.is_filesystem(),
                 &self.request_params,
             );
         }
@@ -635,22 +441,14 @@ impl Picker {
             ctx.request_repaint_after(Duration::from_secs(2));
         }
         if let Some(preview) = self.preview.as_mut().filter(|_| self.preview_visible) {
-            let range = self.results.get(self.selected).and_then(|result| {
-                self.store
-                    .snapshot()
-                    .map(|snapshot| *snapshot.payload(result.node_index))
-            });
-            let item = self.results.get(self.selected).map(|result| {
-                self.item_values
-                    .get(result.node_index as usize)
-                    .cloned()
-                    .or_else(|| {
-                        self.command_values.as_ref().and_then(|values| {
-                            values.lock().unwrap().get(&result.node_index).cloned()
-                        })
-                    })
-                    .unwrap_or_else(|| result.path.clone())
-            });
+            let range = self
+                .results
+                .get(self.selected)
+                .and_then(|result| self.source.range(result));
+            let item = self
+                .results
+                .get(self.selected)
+                .map(|result| self.source.accepted_value(result));
             let width = ctx
                 .fonts_mut(|fonts| fonts.glyph_width(&self.typography.font, 'M'))
                 .max(1.0);
@@ -665,7 +463,7 @@ impl Picker {
                 columns,
                 rows,
                 ctx,
-                self.filesystem,
+                self.source.is_filesystem(),
                 &self.request_params,
             );
         }
@@ -887,7 +685,7 @@ impl Picker {
                                 if response.changed() && self.query != self.submitted_query {
                                     self.query_revision += 1;
                                     self.submitted_query = self.query.clone();
-                                    self.session.set_query(self.query.clone());
+                                    self.source.set_query(self.query.clone());
                                     self.matched = 0;
                                     self.selected = 0;
                                     self.visible_start = 0;
@@ -967,28 +765,21 @@ impl Picker {
         if action.is_none() && accept && self.results_revision == Some(self.query_revision) {
             if let Some(result) = self.results.get(self.selected) {
                 action = if let Some(callback) = &self.callback {
-                    let range = if self.filesystem || self.items || self.command {
-                        None
-                    } else {
-                        self.store
-                            .snapshot()
-                            .map(|snapshot| *snapshot.payload(result.node_index))
-                    };
+                    let range = self.source.range(result);
                     Some(Action::Custom(
                         callback.clone(),
                         result.path.clone(),
-                        self.filesystem,
+                        self.source.is_filesystem(),
                         range,
                         self.accepted_value(result),
                         self.request_params.clone(),
                     ))
                 } else {
                     match self.enter_action {
-                        crate::picker::config::EnterAction::Navigate => {
-                            self.store.snapshot().map(|snapshot| {
-                                Action::Accept(snapshot.payload(result.node_index).start)
-                            })
-                        }
+                        crate::picker::config::EnterAction::Navigate => self
+                            .source
+                            .range(result)
+                            .map(|range| Action::Accept(range.start)),
                         crate::picker::config::EnterAction::SendInput => {
                             Some(Action::SendInput(self.accepted_value(result)))
                         }
@@ -1001,96 +792,6 @@ impl Picker {
         }
         action
     }
-}
-
-impl Drop for Picker {
-    fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.session.stop();
-        // Snapshot pages must outlive the reader. It checks cancellation
-        // between row reads; fuzzy workers use only their Rust-owned store.
-        if let Some(reader) = self.reader.take() {
-            if !self.filesystem && !self.command {
-                let _ = reader.join();
-            }
-        }
-    }
-}
-
-fn read_row(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
-    let mut result = ghostty_ffi::SnapshotTextRow::default();
-    if !unsafe {
-        ghostty_ffi::ghostty_egui_host_snapshot_text_row(host, generation, row, &mut result)
-    } {
-        return None;
-    }
-    let (text, columns) = if result.len == 0 {
-        (Vec::new(), Vec::new())
-    } else {
-        unsafe {
-            (
-                std::slice::from_raw_parts(result.text, result.len).to_vec(),
-                std::slice::from_raw_parts(result.columns, result.len).to_vec(),
-            )
-        }
-    };
-    let wraps_to_next = result.wraps_to_next;
-    unsafe { ghostty_ffi::ghostty_egui_host_snapshot_text_row_free(&mut result) };
-    Some(TextRow {
-        text: String::from_utf8(text).ok()?,
-        columns,
-        wraps_to_next,
-    })
-}
-
-fn logical_items(
-    rows: &[(u64, TextRow)],
-    regex: &regex::Regex,
-) -> Vec<(String, SnapshotCellRange)> {
-    let mut text = String::new();
-    let mut points = Vec::new();
-    for (y, row) in rows {
-        if row.text.len() != row.columns.len() {
-            return Vec::new();
-        }
-        text.push_str(&row.text);
-        points.extend(row.columns.iter().map(|&x| SnapshotCell { x, y: *y }));
-    }
-    regex
-        .find_iter(&text)
-        .filter(|matched| !matched.as_str().trim().is_empty())
-        .map(|matched| {
-            (
-                matched.as_str().to_owned(),
-                SnapshotCellRange {
-                    start: points[matched.start()],
-                    end: points[matched.end() - 1],
-                },
-            )
-        })
-        .collect()
-}
-
-fn newest_logical_items(
-    rows: &[(u64, TextRow)],
-    regex: &regex::Regex,
-    seen: &mut Option<std::collections::HashSet<String>>,
-) -> Vec<(String, SnapshotCellRange)> {
-    logical_items(rows, regex)
-        .into_iter()
-        .rev()
-        .filter(|(text, _)| seen.as_mut().is_none_or(|seen| seen.insert(text.clone())))
-        .collect()
-}
-
-#[cfg(test)]
-fn logical_item(rows: &[(u64, TextRow)]) -> Option<(String, SnapshotCellRange)> {
-    let crate::picker::config::Source::Scrollback { regex, .. } =
-        crate::picker::config::Options::default().source
-    else {
-        unreachable!()
-    };
-    logical_items(rows, &regex).into_iter().next()
 }
 
 #[cfg(test)]
@@ -1350,7 +1051,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(picker.filesystem && picker.generation.is_none());
+        assert!(picker.source.is_filesystem() && picker.generation.is_none());
         picker.selected = picker
             .results
             .iter()
@@ -1480,8 +1181,6 @@ mod tests {
             cursor_row: None,
             position: crate::picker::config::Position::Bottom,
             generation: Some(1),
-            filesystem: false,
-            command: false,
             from_copy: false,
             typography: crate::picker::font::Typography::default(),
             preview: None,
@@ -1489,21 +1188,13 @@ mod tests {
             presented_once: false,
             callback: None,
             request_params: Default::default(),
-            item_values: Vec::new(),
-            command_values: None,
-            items: false,
             enter_action: crate::picker::config::EnterAction::Navigate,
             session_id: 123,
-            session: Session::Streaming(FuzzySearchSession::new(
-                123,
+            source: PickerSource::test_scrollback(
                 store.clone(),
-                String::new(),
-                tx,
-            )),
-            store,
+                FuzzySearchSession::new(123, store.clone(), String::new(), tx),
+            ),
             updates: Arc::new(std::sync::Mutex::new(None)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            reader: None,
             query: String::new(),
             submitted_query: String::new(),
             results_query: String::new(),
@@ -1569,7 +1260,8 @@ mod tests {
             start: SnapshotCell { x: 4, y: 19 },
             end: SnapshotCell { x: 9, y: 19 },
         };
-        let mut publisher = PublishingStreamingItemStoreWithPayload::new(picker.store.clone());
+        let mut publisher =
+            PublishingStreamingItemStoreWithPayload::new(picker.source.store().clone());
         publisher.add_item(b"chosen", range);
         publisher.complete();
         picker.results = vec![SearchResult {

@@ -381,15 +381,7 @@ impl TerminalPane {
         let visual =
             copying && self.quick_select.is_none() && self.copy_mode.visual_anchor.is_some();
         let label = if let Some(picker) = &self.picker {
-            if picker.filesystem {
-                "FILESYSTEM PICKER"
-            } else if picker.command {
-                "COMMAND PICKER"
-            } else if picker.items {
-                "ITEMS PICKER"
-            } else {
-                "SCROLLBACK PICKER"
-            }
+            picker.label()
         } else if let Some(quick) = &self.quick_select {
             if matches!(quick.purpose, QuickSelectPurpose::YankLines { .. }) {
                 "YANK LINES"
