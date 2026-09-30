@@ -16,6 +16,48 @@ return {
   --   padding = { top = 15, bottom = 15, left = 10, right = 10 }, -- Percent of terminal area.
   -- },
   pickers = {
+    CodexSuggestions = function(context)
+      local cursor_row = context.line_before_cursor
+      local input_start = cursor_row:match(".*#()")
+      if not input_start then
+        error("Codex suggestions: the current prompt does not contain a # marker")
+      end
+      local current_input = cursor_row:sub(input_start)
+      local erase_count = utf8.len(current_input) or #current_input
+      local terminal_context = table.concat(context.recent_lines, "\n")
+      if terminal_context == "" then
+        error("Codex suggestions: no terminal context is available")
+      end
+      local prompt = table.concat({
+        "Generate exactly 10 likely command completions or alternatives.",
+        "",
+        "In the current cursor row, # marks the beginning of editable input.",
+        "Everything before and including # is non-editable prompt text.",
+        "Return only the completed editable command.",
+        "Never include the prompt or the # marker.",
+        "Return one command per line.",
+        "Do not number the commands.",
+        "Do not use Markdown or code fences.",
+        "",
+        "Current cursor row:", cursor_row,
+        "",
+        "Terminal context:", terminal_context,
+      }, "\n")
+      return {
+        type = "Command",
+        args = {
+          "codex", "exec", "--ephemeral", "--skip-git-repo-check",
+          "--color", "never", "--model", "gpt-5.6-luna",
+          "--config", 'model_reasoning_effort="none"', prompt,
+        },
+        position = "Cursor",
+        sort = "Source",
+        preview_visible = false,
+        action = function(app, item)
+          app:replace_prompt(item.value, erase_count, 0)
+        end,
+      }
+    end,
     commands = {
       type = "CommandPalette",
       position = "Cursor",
@@ -84,5 +126,6 @@ return {
     { key = "f", mods = "CTRL|SHIFT", picker = "lines" },
     { key = "p", mods = "CTRL|SHIFT", picker = "words" },
     { key = "o", mods = "CTRL|SHIFT", picker = "files" },
+    { key = "k", mods = "CTRL|SHIFT", picker = "CodexSuggestions" },
   },
 }

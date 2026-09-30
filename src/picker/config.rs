@@ -18,6 +18,24 @@ pub(crate) enum Position {
     Cursor,
 }
 
+#[derive(Clone, Copy, Default, Deserialize)]
+pub(crate) enum Sort {
+    #[serde(alias = "score")]
+    Score,
+    #[default]
+    #[serde(rename = "Source", alias = "SourceOrder", alias = "source")]
+    SourceOrder,
+}
+
+impl Sort {
+    pub(super) fn mode(self) -> nfm_search_core::search::SearchSortMode {
+        match self {
+            Self::Score => nfm_search_core::search::SearchSortMode::Score,
+            Self::SourceOrder => nfm_search_core::search::SearchSortMode::SourceOrder,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub(crate) enum Preview {
@@ -92,6 +110,8 @@ pub(crate) enum Definition {
         #[serde(default)]
         position: Position,
         #[serde(default)]
+        sort: Sort,
+        #[serde(default)]
         initial_query: Option<String>,
         #[serde(default)]
         preview: Option<Preview>,
@@ -105,6 +125,8 @@ pub(crate) enum Definition {
     Scrollback {
         #[serde(default)]
         position: Position,
+        #[serde(default)]
+        sort: Sort,
         #[serde(default)]
         regex: Option<String>,
         #[serde(default)]
@@ -124,6 +146,8 @@ pub(crate) enum Definition {
         #[serde(default)]
         position: Position,
         #[serde(default)]
+        sort: Sort,
+        #[serde(default)]
         items: Vec<crate::picker::protocol::Item>,
         #[serde(default)]
         enter_action: Option<EnterAction>,
@@ -141,6 +165,8 @@ pub(crate) enum Definition {
     Command {
         #[serde(default)]
         position: Position,
+        #[serde(default)]
+        sort: Sort,
         args: Vec<String>,
         #[serde(default)]
         cwd: Option<String>,
@@ -162,6 +188,8 @@ pub(crate) enum Definition {
     FileSystem {
         #[serde(default)]
         position: Position,
+        #[serde(default)]
+        sort: Sort,
         #[serde(default)]
         roots: Vec<String>,
         #[serde(default)]
@@ -316,6 +344,7 @@ impl<'de> Deserialize<'de> for KeyBinding {
 #[derive(Clone)]
 pub(crate) struct Options {
     pub(crate) position: Position,
+    pub(crate) sort: Sort,
     pub(crate) callback: Option<std::rc::Rc<crate::picker::action::Callback>>,
     pub(crate) source: Source,
     pub(crate) enter_action: EnterAction,
@@ -386,6 +415,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             position: Position::Bottom,
+            sort: Sort::default(),
             callback: None,
             source: Source::Scrollback {
                 regex: Regex::new(&default_regex()).unwrap(),
@@ -451,6 +481,7 @@ impl Bindings {
                     "lines".into(),
                     Definition::Scrollback {
                         position: Position::Bottom,
+                        sort: Sort::default(),
                         unique: None,
                         callback: None,
                         regex: None,
@@ -464,6 +495,7 @@ impl Bindings {
                     "commands".into(),
                     Definition::CommandPalette {
                         position: Position::Cursor,
+                        sort: Sort::default(),
                         initial_query: None,
                         preview: None,
                         preview_visible: false,
@@ -490,6 +522,14 @@ impl Bindings {
                 | Definition::Command { position, .. }
                 | Definition::FileSystem { position, .. }
                 | Definition::CommandPalette { position, .. } => *position,
+                Definition::Factory { .. } => unreachable!(),
+            };
+            let sort = match &definition {
+                Definition::Command { sort, .. }
+                | Definition::Scrollback { sort, .. }
+                | Definition::Items { sort, .. }
+                | Definition::FileSystem { sort, .. }
+                | Definition::CommandPalette { sort, .. } => *sort,
                 Definition::Factory { .. } => unreachable!(),
             };
             let initial_query = match &definition {
@@ -534,6 +574,7 @@ impl Bindings {
             let mut options = match definition {
                 Definition::CommandPalette { .. } => Options {
                     position,
+                    sort,
                     callback: None,
                     source: Source::CommandPalette(Vec::new()),
                     enter_action: EnterAction::SendInput,
@@ -550,6 +591,7 @@ impl Bindings {
                     }
                     Options {
                         position,
+                        sort,
                         callback,
                         source: Source::Scrollback {
                             regex,
@@ -572,6 +614,7 @@ impl Bindings {
                     }
                     Options {
                         position,
+                        sort,
                         callback,
                         source: Source::Items(ItemsOptions {
                             values: items,
@@ -611,6 +654,7 @@ impl Bindings {
                     }
                     Options {
                         position,
+                        sort,
                         callback,
                         source: Source::Command(CommandOptions {
                             args,
@@ -652,6 +696,7 @@ impl Bindings {
                     }
                     Options {
                         position,
+                        sort,
                         callback,
                         source: Source::FileSystem(FileOptions {
                             roots: roots.into_iter().map(std::path::PathBuf::from).collect(),
@@ -1097,6 +1142,46 @@ mod tests {
             }
             .allows(&AppAction::ExitCopyMode, egui::Modifiers::CTRL)
         );
+    }
+
+    #[test]
+    fn every_picker_accepts_sort_and_defaults_to_source_order() {
+        for kind in [
+            "CommandPalette",
+            "Scrollback",
+            "Items",
+            "Command",
+            "FileSystem",
+        ] {
+            for sort in [
+                None,
+                Some("Source"),
+                Some("SourceOrder"),
+                Some("source"),
+                Some("Score"),
+            ] {
+                let mut definition = serde_json::json!({ "type": kind });
+                if kind == "Command" {
+                    definition["args"] = serde_json::json!(["cmd"]);
+                }
+                if let Some(sort) = sort {
+                    definition["sort"] = serde_json::json!(sort);
+                }
+                let definitions =
+                    BTreeMap::from([("test".into(), serde_json::from_value(definition).unwrap())]);
+                let bindings = Bindings::compile(Some(definitions), Some(Vec::new())).unwrap();
+                let options = bindings
+                    .named("test")
+                    .unwrap()
+                    .resolve(&Default::default())
+                    .unwrap();
+                assert_eq!(
+                    matches!(options.sort, Sort::Score),
+                    sort == Some("Score"),
+                    "{kind}: {sort:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -71,6 +71,23 @@ the base; Lua overrides them, and explicit command-line options override Lua.
 The picker still imports Ghostty's resolved font and tracks its cell dimensions.
 Changes to Lua require restarting the app; live reload is not supported.
 
+## Codex suggestions
+
+The sample defines `CodexSuggestions` on **Ctrl+Shift+K**, matching the WezTerm
+configuration. It uses the last `#` in the text before the cursor to identify
+editable input, sends that row and recent terminal context to `codex exec`, and
+streams ten suggestions into a cursor-positioned picker. Enter replaces the input
+before the cursor with the selected suggestion; it does not execute the command.
+The model and CLI arguments are configured in the Lua factory.
+
+Picker factories receive `context.recent_lines`: up to ten recent nonblank terminal
+rows, in chronological order, read from at most the last 256 snapshot rows.
+Pickers use the original seven-row layout. All picker definitions accept `sort`.
+The default, `sort = "Source"`, preserves source order while filtering. Use
+`sort = "Score"` for fuzzy match ranking. `"SourceOrder"` remains an alias for
+`"Source"`. Source order means input order for Items and Command, catalog order
+for CommandPalette, newest-first for Scrollback, and scan order for FileSystem.
+
 ## Command palette
 
 The command palette is a named picker with `type = "CommandPalette"`. The default

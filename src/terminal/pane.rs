@@ -575,6 +575,7 @@ impl TerminalPane {
                 line,
                 line_before_cursor: before,
                 cursor_column: row.cursor_column,
+                recent_lines: self.recent_picker_lines(),
             };
             unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line_free(&mut row) };
             context
@@ -1567,6 +1568,38 @@ impl TerminalPane {
             working.moved(Motion::CharacterJump, cell);
         }
         Some(working.cursor)
+    }
+
+    fn recent_picker_lines(&self) -> Vec<String> {
+        let mut generation = self.copy_mode.generation.unwrap_or_default();
+        let temporary = self.copy_mode.generation.is_none();
+        if temporary
+            && !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) }
+        {
+            return Vec::new();
+        }
+        let mut view = SnapshotView::default();
+        let mut lines = Vec::new();
+        if unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) }
+        {
+            // Bound the synchronous read even when the terminal has huge scrollback.
+            for row in (view.total_rows.saturating_sub(256)..view.total_rows).rev() {
+                if let Some(row) = self.read_snapshot_row(generation, row) {
+                    let text = row.text.trim_end().to_owned();
+                    if !text.trim().is_empty() {
+                        lines.push(text);
+                        if lines.len() == 10 {
+                            break;
+                        }
+                    }
+                }
+            }
+            lines.reverse();
+        }
+        if temporary {
+            unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+        }
+        lines
     }
 
     fn read_snapshot_row(&self, generation: u64, row: u64) -> Option<TextRow> {

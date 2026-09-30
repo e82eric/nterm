@@ -7,6 +7,7 @@ pub(crate) struct PickerContext {
     pub(crate) line: String,
     pub(crate) line_before_cursor: String,
     pub(crate) cursor_column: u32,
+    pub(crate) recent_lines: Vec<String>,
 }
 
 pub(crate) struct PickerFactory {
@@ -38,6 +39,9 @@ impl PickerFactory {
             .map_err(|e| e.to_string())?;
         argument
             .set("cursor_column", context.cursor_column)
+            .map_err(|e| e.to_string())?;
+        argument
+            .set("recent_lines", context.recent_lines.clone())
             .map_err(|e| e.to_string())?;
         let table: mlua::Table = function
             .call(argument)
@@ -555,6 +559,67 @@ mod tests {
     }
 
     #[test]
+    fn sample_codex_picker_uses_terminal_context_and_replaces_unicode_input() {
+        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let entry = bindings.named("CodexSuggestions").unwrap();
+        let options = entry
+            .resolve(&PickerContext {
+                line: "PS # echo café trailing".into(),
+                line_before_cursor: "PS # echo café".into(),
+                recent_lines: vec!["previous command".into(), "previous output".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(
+            options.sort,
+            crate::picker::config::Sort::SourceOrder
+        ));
+        assert!(!options.preview_visible);
+        let crate::picker::config::Source::Command(command) = options.source else {
+            panic!("expected command");
+        };
+        assert_eq!(&command.args[..2], &["codex", "exec"]);
+        let prompt = command.args.last().unwrap();
+        assert!(prompt.contains("PS # echo café"));
+        assert!(!prompt.contains("trailing"));
+        assert!(prompt.contains("previous command\nprevious output"));
+        let actions = options
+            .callback
+            .unwrap()
+            .call(
+                "echo done",
+                "echo done",
+                false,
+                None,
+                None,
+                &Default::default(),
+            )
+            .unwrap();
+        assert!(
+            matches!(&actions[0], crate::picker::action::Command::ReplacePrompt { text, before: 10, after: 0 } if text == "echo done")
+        );
+        assert!(
+            entry
+                .resolve(&PickerContext {
+                    line_before_cursor: "PS > echo".into(),
+                    recent_lines: vec!["output".into()],
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        assert!(
+            entry
+                .resolve(&PickerContext {
+                    line_before_cursor: "PS # echo".into(),
+                    ..Default::default()
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
     fn sample_ripgrep_callback_replaces_prompt_and_opens_match() {
         let config = parse(include_str!("../ghostty.lua")).unwrap();
         let callback = config.pickers.as_ref().unwrap()["Ripgrep"]
@@ -632,6 +697,9 @@ mod tests {
             "return {pickers={x={type='FileSystem', files_only=true, directories_only=true}}}",
             "return {pickers={x={type='FileSystem', max_depth=-1}}}",
             "return {pickers={x={type='Command', args={'{program}'}}}}",
+            "return {pickers={x={type='Command', args={'cmd'}, result_rows=0}}}",
+            "return {pickers={x={type='Command', args={'cmd'}, result_rows=31}}}",
+            "return {pickers={x={type='Command', args={'cmd'}, sort='Invalid'}}}",
         ] {
             let result = parse(source).and_then(|config| {
                 crate::picker::config::Bindings::compile(config.pickers, config.keys)
@@ -1059,6 +1127,7 @@ mod tests {
                 line: "rg test".into(),
                 line_before_cursor: "rg test".into(),
                 cursor_column: 7,
+                ..Default::default()
             })
             .unwrap();
         assert!(matches!(
@@ -1125,6 +1194,7 @@ mod tests {
                 line: "PS C:\\src> foobar ghost suggestion".into(),
                 line_before_cursor: "PS C:\\src> foo".into(),
                 cursor_column: 14,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(options.params["query"], "foo");

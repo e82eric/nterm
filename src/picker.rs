@@ -898,6 +898,68 @@ mod tests {
     }
 
     #[test]
+    fn command_picker_preserves_source_order_with_a_query() {
+        let ctx = egui::Context::default();
+        let mut picker = Picker::start(
+            std::ptr::null_mut(),
+            None,
+            false,
+            0,
+            ctx.clone(),
+            crate::picker::config::Options {
+                sort: crate::picker::config::Sort::SourceOrder,
+                source: crate::picker::config::Source::Command(
+                    crate::picker::config::CommandOptions {
+                        args: if cfg!(windows) {
+                            vec![
+                                "cmd.exe".into(),
+                                "/d".into(),
+                                "/c".into(),
+                                "echo xxa&& echo a".into(),
+                            ]
+                        } else {
+                            vec!["sh".into(), "-c".into(), "printf 'xxa\\na\\n'".into()]
+                        },
+                        cwd: None,
+                        line_continuation: None,
+                        unique: false,
+                    },
+                ),
+                params: [("query".into(), "a".into())].into(),
+                ..Default::default()
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                picker.show(ui.ctx(), 24.0);
+            });
+            output.textures_delta.clear();
+            if picker.done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "command results not published");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            picker
+                .results
+                .iter()
+                .map(|r| r.path.trim())
+                .collect::<Vec<_>>(),
+            ["xxa", "a"]
+        );
+        assert_eq!(
+            picker
+                .results
+                .iter()
+                .map(|r| r.node_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
     fn ctrl_p_toggles_configured_preview() {
         let ctx = egui::Context::default();
         let mut picker = super::Picker::start(
@@ -955,6 +1017,7 @@ mod tests {
                 ctx.clone(),
                 crate::picker::config::Options {
                     position: crate::picker::config::Position::Bottom,
+                    sort: crate::picker::config::Sort::Score,
                     source: crate::picker::config::Source::Items(
                         crate::picker::config::ItemsOptions {
                             values: Vec::new(),
@@ -1044,6 +1107,7 @@ mod tests {
             ctx.clone(),
             crate::picker::config::Options {
                 position: crate::picker::config::Position::Bottom,
+                sort: crate::picker::config::Sort::Score,
                 source: crate::picker::config::Source::Items(crate::picker::config::ItemsOptions {
                     values: vec![crate::picker::protocol::Item {
                         text: "shown".into(),
@@ -1122,6 +1186,7 @@ mod tests {
             ctx.clone(),
             crate::picker::config::Options {
                 position: crate::picker::config::Position::Bottom,
+                sort: crate::picker::config::Sort::Score,
                 source: crate::picker::config::Source::FileSystem(
                     crate::picker::config::FileOptions {
                         roots: vec![root.clone()],

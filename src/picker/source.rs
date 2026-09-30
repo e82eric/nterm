@@ -26,7 +26,13 @@ enum Session {
     #[cfg(not(windows))]
     UnsupportedFileSystem,
     #[cfg(windows)]
-    FileSystem(nfm_file_system::file_system_search::FileSystemSearch),
+    FileSystem {
+        session: FuzzySearchSession<
+            nfm_file_system::walker::PublishedSnapshot,
+            nfm_file_system::walker_search_store::FileSystemSearchStore,
+        >,
+        scan: nfm_file_system::walker::FileWalkerScan,
+    },
 }
 
 impl Session {
@@ -37,7 +43,7 @@ impl Session {
             #[cfg(not(windows))]
             Self::UnsupportedFileSystem => {}
             #[cfg(windows)]
-            Self::FileSystem(session) => session.set_query(query),
+            Self::FileSystem { session, .. } => session.set_query(query),
         }
     }
     fn stop(&self) {
@@ -47,7 +53,10 @@ impl Session {
             #[cfg(not(windows))]
             Self::UnsupportedFileSystem => {}
             #[cfg(windows)]
-            Self::FileSystem(session) => session.stop(),
+            Self::FileSystem { session, scan } => {
+                scan.cancel();
+                session.stop();
+            }
         }
     }
 }
@@ -121,19 +130,28 @@ impl PickerSource {
         }
         let session = match &options.source {
             #[cfg(windows)]
-            crate::picker::config::Source::FileSystem(files) => Session::FileSystem(
-                nfm_file_system::file_system_search::FileSystemSearch::start(
-                    session_id,
+            crate::picker::config::Source::FileSystem(files) => {
+                let shared =
+                    Arc::new(nfm_file_system::walker_search_store::FileSystemSearchStore::new());
+                let scan = nfm_file_system::walker::start_scan(
                     nfm_file_system::walker::ScanOptions {
                         roots: files.roots.clone(),
                         max_depth: files.max_depth,
                         files_only: files.files_only,
                         directories_only: files.directories_only,
                     },
+                    shared.clone(),
+                );
+                let session = FuzzySearchSession::new_with_sort(
+                    session_id,
+                    shared,
                     initial_query.clone(),
                     tx,
-                ),
-            ),
+                    options.sort.mode(),
+                );
+                session.start();
+                Session::FileSystem { session, scan }
+            }
             #[cfg(not(windows))]
             crate::picker::config::Source::FileSystem(_) => {
                 *error.lock().unwrap() =
@@ -156,16 +174,26 @@ impl PickerSource {
                 let shared = Arc::new(SnapshotStore::new());
                 shared.publish(snapshot.clone());
                 shared.complete();
-                let session =
-                    FuzzySearchSession::new(session_id, shared, initial_query.clone(), tx);
+                let session = FuzzySearchSession::new_with_sort(
+                    session_id,
+                    shared,
+                    initial_query.clone(),
+                    tx,
+                    options.sort.mode(),
+                );
                 session.start();
                 Session::Structured { session, snapshot }
             }
             crate::picker::config::Source::Scrollback { .. }
             | crate::picker::config::Source::Items(_)
             | crate::picker::config::Source::Command(_) => {
-                let session =
-                    FuzzySearchSession::new(session_id, store.clone(), initial_query.clone(), tx);
+                let session = FuzzySearchSession::new_with_sort(
+                    session_id,
+                    store.clone(),
+                    initial_query.clone(),
+                    tx,
+                    options.sort.mode(),
+                );
                 session.start();
                 Session::Streaming(session)
             }
