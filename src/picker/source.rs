@@ -1,9 +1,13 @@
 use super::{Items, command, config};
 use crate::copy_mode::TextRow;
 use crate::ghostty_ffi::{self, Host, SnapshotCell, SnapshotCellRange};
+use nfm_picker_sources::structured::{
+    StructuredSchema, StructuredStreamingSnapshot, StructuredStreamingStore,
+};
 use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
 use nfm_search_core::search::SearchResult;
 use nfm_search_core::snapshot_store::SnapshotStore;
+use nfm_search_core::store::ItemsSource;
 use nfm_search_core::store::PublishingStreamingItemStoreWithPayload;
 use std::sync::{
     Arc,
@@ -12,6 +16,13 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 enum Session {
     Streaming(FuzzySearchSession<Items, SnapshotStore<Items>>),
+    Structured {
+        session: FuzzySearchSession<
+            StructuredStreamingSnapshot,
+            SnapshotStore<StructuredStreamingSnapshot>,
+        >,
+        snapshot: Arc<StructuredStreamingSnapshot>,
+    },
     #[cfg(not(windows))]
     UnsupportedFileSystem,
     #[cfg(windows)]
@@ -22,6 +33,7 @@ impl Session {
     fn set_query(&self, query: String) {
         match self {
             Self::Streaming(session) => session.set_query(query),
+            Self::Structured { session, .. } => session.set_query(query),
             #[cfg(not(windows))]
             Self::UnsupportedFileSystem => {}
             #[cfg(windows)]
@@ -31,6 +43,7 @@ impl Session {
     fn stop(&self) {
         match self {
             Self::Streaming(session) => session.stop(),
+            Self::Structured { session, .. } => session.stop(),
             #[cfg(not(windows))]
             Self::UnsupportedFileSystem => {}
             #[cfg(windows)]
@@ -127,8 +140,28 @@ impl PickerSource {
                     Some("Filesystem pickers require NFM support for this platform".into());
                 Session::UnsupportedFileSystem
             }
+            crate::picker::config::Source::CommandPalette(entries) => {
+                let schema = StructuredSchema::new(vec!["Action".into(), "Shortcut".into()])
+                    .expect("valid command palette schema");
+                let mut structured = StructuredStreamingStore::new(schema);
+                for entry in entries {
+                    structured
+                        .add_record(&csv::StringRecord::from(vec![
+                            entry.label.as_str(),
+                            entry.shortcut.as_deref().unwrap_or_default(),
+                        ]))
+                        .expect("palette row matches schema");
+                }
+                let snapshot = structured.snapshot();
+                let shared = Arc::new(SnapshotStore::new());
+                shared.publish(snapshot.clone());
+                shared.complete();
+                let session =
+                    FuzzySearchSession::new(session_id, shared, initial_query.clone(), tx);
+                session.start();
+                Session::Structured { session, snapshot }
+            }
             crate::picker::config::Source::Scrollback { .. }
-            | crate::picker::config::Source::CommandPalette(_)
             | crate::picker::config::Source::Items(_)
             | crate::picker::config::Source::Command(_) => {
                 let session =
@@ -227,18 +260,6 @@ impl PickerSource {
                 ctx.request_repaint();
             }))
         } else {
-            if let config::Source::CommandPalette(entries) = &options.source {
-                let mut publisher = PublishingStreamingItemStoreWithPayload::new(store.clone());
-                for entry in entries {
-                    let text = match &entry.shortcut {
-                        Some(shortcut) => format!("{}    {shortcut}", entry.label),
-                        None => entry.label.clone(),
-                    };
-                    publisher.add_item(text.as_bytes(), SnapshotCellRange::default());
-                }
-                publisher.complete();
-                ctx.request_repaint();
-            }
             if let crate::picker::config::Source::Items(items) = &options.source {
                 let mut publisher = PublishingStreamingItemStoreWithPayload::new(store.clone());
                 for item in &items.values {
@@ -298,6 +319,12 @@ impl PickerSource {
     }
     pub(super) fn set_query(&self, query: String) {
         self.runtime().session.set_query(query);
+    }
+    pub(super) fn effective_query(&self, query: &str) -> String {
+        match &self.runtime().session {
+            Session::Structured { snapshot, .. } => snapshot.effective_query(query),
+            _ => query.to_owned(),
+        }
     }
     pub(super) fn accepted_value(&self, result: &SearchResult) -> String {
         let value = match self {

@@ -593,7 +593,7 @@ impl Picker {
                                 // a newer edit is still being searched.
                                 let job = result_layout(
                                     &result.path,
-                                    &self.results_query,
+                                    &self.source.effective_query(&self.results_query),
                                     &self.typography.font,
                                     &self.typography.matched_font,
                                 );
@@ -828,7 +828,10 @@ mod tests {
             crate::picker::config::Options {
                 source: crate::picker::config::Source::CommandPalette(entries),
                 position: crate::picker::config::Position::Top,
-                params: std::collections::BTreeMap::from([("query".into(), "files".into())]),
+                params: std::collections::BTreeMap::from([(
+                    "query".into(),
+                    "/:Action=~files".into(),
+                )]),
                 preview: Some(crate::picker::config::Preview::Text {
                     text: "Choose an action".into(),
                 }),
@@ -854,6 +857,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(picker.accepted_value(&picker.results[0]), "picker.files");
+        assert!(picker.results[0].path.starts_with("Open picker: files"));
+        assert!(!picker.results[0].path.contains(','));
         let mut selected = None;
         let mut output = ctx.run_ui(
             egui::RawInput {

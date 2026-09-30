@@ -78,6 +78,10 @@ configuration and sample bind it to **Ctrl+Shift+Space**. Type to filter actions
 use the arrow keys to select one, and press Enter to run it. Escape closes the
 palette and preserves the terminal's current copy mode and cursor.
 
+Palette entries use NFM's structured store with aligned `Action` and `Shortcut`
+columns. Ordinary text uses fuzzy matching; structured queries can filter or sort
+columns, for example `/:Action=~floating` or `/!Ascending==Action`.
+
 The palette lists new window, floating pane, search, copy mode, quick select,
 command navigation, and named picker actions. It displays configured picker
 shortcuts and includes pickers without a binding. Unavailable actions are omitted:
