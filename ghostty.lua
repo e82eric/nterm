@@ -1,6 +1,50 @@
 -- Config lookup: --lua-config=PATH, then ~/ghostty.lua, then ghostty.lua beside
 -- the executable. Only the first available file is loaded.
+local snippets_path = (os.getenv("USERPROFILE") or os.getenv("HOME")) .. "/.wtd/.wt.json"
 return {
+  actions = {
+    SaveSnippet = {
+      label = "Save selection as snippet",
+      action = function(app)
+        local selection = app:get_selection_text()
+        if selection == "" then
+          app:show_toast("Snippets", "No text is selected", 3000)
+          return
+        end
+        local file, read_error = io.open(snippets_path, "rb")
+        if not file then
+          app:show_toast("Snippets", "Unable to read snippets file: " .. tostring(read_error), 5000)
+          return
+        end
+        local content = file:read("*a")
+        file:close()
+        local parsed, data = pcall(ghostty.json_parse, content)
+        if not parsed or type(data) ~= "table" then
+          app:show_toast("Snippets", "Unable to parse snippets JSON: " .. tostring(data), 5000)
+          return
+        end
+        if type(data.snippets) ~= "table" then data.snippets = {} end
+        table.insert(data.snippets, { input = selection })
+        local encoded, json = pcall(ghostty.json_encode_pretty, data)
+        if not encoded then
+          app:show_toast("Snippets", "Unable to encode snippets JSON: " .. tostring(json), 5000)
+          return
+        end
+        local output, open_error = io.open(snippets_path, "wb")
+        if not output then
+          app:show_toast("Snippets", "Unable to save snippet: " .. tostring(open_error), 5000)
+          return
+        end
+        local saved, save_error = output:write(json .. "\n")
+        output:close()
+        if not saved then
+          app:show_toast("Snippets", "Unable to save snippet: " .. tostring(save_error), 5000)
+          return
+        end
+        app:show_toast("Snippet saved", selection, 2000)
+      end,
+    },
+  },
   font = {
     -- family = "JetBrains Mono", -- Uncomment and choose an installed font.
     size = 12,
@@ -112,6 +156,7 @@ return {
     },
   },
   keys = {
+    { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
     -- An explicit keys table replaces all top-level action and picker defaults.
     { key = "n", mods = "CTRL|SHIFT", action = "NewWindow" },
     { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },

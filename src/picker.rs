@@ -38,7 +38,7 @@ fn preview_rows(height: f32, row_height: f32) -> usize {
         .clamp(1.0, 12.0) as usize
 }
 
-fn picker_anchor(
+pub(crate) fn picker_anchor(
     position: crate::picker::config::Position,
     cursor_row: Option<u32>,
     row_height: f32,

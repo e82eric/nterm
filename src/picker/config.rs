@@ -321,11 +321,10 @@ impl<'de> Deserialize<'de> for KeyBinding {
         }
         let raw = RawBinding::deserialize(deserializer)?;
         let target = match (raw.action, raw.picker) {
-            (Some(name), None) => {
-                BindingTarget::Action(crate::actions::AppAction::from_name(&name).ok_or_else(
-                    || serde::de::Error::custom(format!("unknown action {name:?} in key binding")),
-                )?)
-            }
+            (Some(name), None) => BindingTarget::Action(
+                crate::actions::AppAction::from_name(&name)
+                    .unwrap_or(crate::actions::AppAction::Lua(name)),
+            ),
             (None, Some(name)) => BindingTarget::Picker(name),
             _ => {
                 return Err(serde::de::Error::custom(
@@ -460,6 +459,7 @@ impl PickerEntry {
 pub(crate) struct Bindings {
     bindings: Vec<Binding>,
     definitions: BTreeMap<String, PickerEntry>,
+    actions: BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
 }
 
 impl Bindings {
@@ -474,6 +474,15 @@ impl Bindings {
         definitions: Option<BTreeMap<String, Definition>>,
         keys: Option<Vec<KeyBinding>>,
         defaults: PickerDefaults,
+    ) -> Result<Self, String> {
+        Self::compile_with_actions(definitions, keys, defaults, BTreeMap::new())
+    }
+
+    pub(crate) fn compile_with_actions(
+        definitions: Option<BTreeMap<String, Definition>>,
+        keys: Option<Vec<KeyBinding>>,
+        defaults: PickerDefaults,
+        actions: BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
     ) -> Result<Self, String> {
         let definitions = definitions.unwrap_or_else(|| {
             BTreeMap::from([
@@ -783,7 +792,14 @@ impl Bindings {
                 ));
             }
             let action = match binding.target {
-                BindingTarget::Action(action) => action,
+                BindingTarget::Action(action) => {
+                    if let crate::actions::AppAction::Lua(name) = &action {
+                        if !actions.contains_key(name) {
+                            return Err(format!("unknown action {name:?} in key binding"));
+                        }
+                    }
+                    action
+                }
                 BindingTarget::Picker(name) => {
                     if !compiled.contains_key(&name) {
                         return Err(format!("unknown picker {name:?} in key binding"));
@@ -796,11 +812,22 @@ impl Bindings {
         Ok(Self {
             bindings,
             definitions: compiled,
+            actions,
         })
     }
 
     pub(crate) fn named(&self, name: &str) -> Option<PickerEntry> {
         self.definitions.get(name).cloned()
+    }
+
+    pub(crate) fn lua_action(&self, name: &str) -> Option<std::rc::Rc<crate::actions::LuaAction>> {
+        self.actions.get(name).cloned()
+    }
+
+    pub(crate) fn lua_actions(&self) -> impl Iterator<Item = (&str, &crate::actions::LuaAction)> {
+        self.actions
+            .iter()
+            .map(|(name, action)| (name.as_str(), action.as_ref()))
     }
 
     pub(crate) fn palette_entries(&self) -> impl Iterator<Item = (&str, Option<String>)> {

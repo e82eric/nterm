@@ -109,6 +109,36 @@ mod tests {
     }
 
     #[test]
+    fn named_action_handles_expire_and_toasts_validate_duration() {
+        let callback = callback(
+            "local saved; return function(app) if saved then saved:get_selection_text() else saved = app; app:show_toast('Title', app:get_selection_text()) end end",
+        );
+        let commands = callback.call_action("selected".into()).unwrap();
+        assert!(
+            matches!(&commands[0], Command::ShowToast { message, duration_ms: 2000, .. } if message == "selected")
+        );
+        assert_eq!(commands.len(), 1);
+        assert!(callback.call_action("next".into()).is_err());
+        for duration in [0, 60001] {
+            let callback = self::callback(&format!(
+                "return function(app) app:show_toast('Title', 'Message', {duration}) end"
+            ));
+            assert!(callback.call_action(String::new()).is_err());
+        }
+        let callback =
+            self::callback("return function(app) app:show_toast('Picker', 'Complete', 1000) end");
+        assert!(matches!(
+            &callback
+                .call("", "", false, None, None, &Default::default())
+                .unwrap()[0],
+            Command::ShowToast {
+                duration_ms: 1000,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn closures_keep_state_and_queue_actions_in_order() {
         let callback = callback(
             "local count = 0; return function(app, item) count = count + 1; app:paste(item.path); app:send_text(tostring(count) .. '\\n') end",
@@ -218,14 +248,42 @@ pub(crate) enum Command {
         after: u32,
     },
     Navigate(SnapshotCell),
+    ShowToast {
+        title: String,
+        message: String,
+        duration_ms: u64,
+    },
 }
 struct App {
     commands: Rc<RefCell<Vec<Command>>>,
     active: Rc<Cell<bool>>,
     generation: Option<u64>,
+    selection: String,
 }
 impl UserData for App {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+        methods.add_method("get_selection_text", |_, app, ()| {
+            if !app.active.get() {
+                return Err(mlua::Error::external("action has already returned"));
+            }
+            Ok(app.selection.clone())
+        });
+        methods.add_method(
+            "show_toast",
+            |_, app, (title, message, duration): (String, String, Option<u64>)| {
+                let duration_ms = duration.unwrap_or(2000);
+                if !(1..=60000).contains(&duration_ms) {
+                    return Err(mlua::Error::external(
+                        "toast duration must be between 1 and 60000 milliseconds",
+                    ));
+                }
+                app.push(Command::ShowToast {
+                    title,
+                    message,
+                    duration_ms,
+                })
+            },
+        );
         methods.add_method("paste", |_, app, text: String| {
             app.push(Command::Paste(text))
         });
@@ -265,7 +323,7 @@ impl UserData for App {
 impl App {
     fn push(&self, command: Command) -> mlua::Result<()> {
         if !self.active.get() {
-            return Err(mlua::Error::external("picker action has already returned"));
+            return Err(mlua::Error::external("action has already returned"));
         }
         if matches!(&command, Command::Paste(text) | Command::SendText(text) if text.contains('\0'))
         {
@@ -276,6 +334,23 @@ impl App {
     }
 }
 impl Callback {
+    pub(crate) fn call_action(&self, selection: String) -> Result<Vec<Command>, String> {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let active = Rc::new(Cell::new(true));
+        let result = (|| -> mlua::Result<()> {
+            let function: mlua::Function = self.lua.registry_value(&self.key)?;
+            function.call(App {
+                commands: commands.clone(),
+                active: active.clone(),
+                generation: None,
+                selection,
+            })
+        })();
+        active.set(false);
+        result.map_err(|error| format!("action {}: {error}", self.name))?;
+        Ok(commands.take())
+    }
+    #[cfg(test)]
     pub(crate) fn call(
         &self,
         text: &str,
@@ -284,6 +359,27 @@ impl Callback {
         generation: Option<u64>,
         range: Option<SnapshotCellRange>,
         params: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<Command>, String> {
+        self.call_with_selection(
+            text,
+            value,
+            filesystem,
+            generation,
+            range,
+            params,
+            String::new(),
+        )
+    }
+
+    pub(crate) fn call_with_selection(
+        &self,
+        text: &str,
+        value: &str,
+        filesystem: bool,
+        generation: Option<u64>,
+        range: Option<SnapshotCellRange>,
+        params: &std::collections::BTreeMap<String, String>,
+        selection: String,
     ) -> Result<Vec<Command>, String> {
         let commands = Rc::new(RefCell::new(Vec::new()));
         let active = Rc::new(Cell::new(true));
@@ -315,6 +411,7 @@ impl Callback {
                     commands: commands.clone(),
                     active: active.clone(),
                     generation: if filesystem { None } else { generation },
+                    selection,
                 },
                 item,
                 lua_params,

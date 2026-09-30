@@ -12,6 +12,7 @@ pub(crate) enum AppAction {
     OpenQuickSelect,
     PreviousCommand,
     NextCommand,
+    Lua(String),
 }
 
 impl AppAction {
@@ -195,7 +196,18 @@ pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) ->
         shortcut,
         action: AppAction::OpenPicker(name.to_owned()),
     }));
+    entries.extend(bindings.lua_actions().map(|(name, action)| Entry {
+        id: format!("action.{name}"),
+        label: action.label.clone(),
+        shortcut: bindings.shortcut_for(&AppAction::Lua(name.to_owned())),
+        action: AppAction::Lua(name.to_owned()),
+    }));
     entries
+}
+
+pub(crate) struct LuaAction {
+    pub(crate) label: String,
+    pub(crate) callback: std::rc::Rc<crate::picker::action::Callback>,
 }
 
 #[cfg(test)]

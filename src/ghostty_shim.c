@@ -244,6 +244,24 @@ bool ghostty_egui_host_key(
 bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *snapshot_generation) {
     return ghostty_surface_snapshot_begin(host->surface, snapshot_generation);
 }
+bool ghostty_egui_host_selection_text(GhosttyEguiHost *host, ghostty_snapshot_selection_text_s *result) {
+    ghostty_text_s text = {0};
+    memset(result, 0, sizeof(*result));
+    if (!ghostty_surface_read_selection(host->surface, &text)) return false;
+    char *copy = malloc(text.text_len + 1);
+    if (copy) {
+        if (text.text_len) memcpy(copy, text.text, text.text_len);
+        copy[text.text_len] = 0;
+        result->text = copy;
+        result->len = text.text_len;
+    }
+    ghostty_surface_free_text(host->surface, &text);
+    return copy != NULL;
+}
+void ghostty_egui_host_selection_text_free(ghostty_snapshot_selection_text_s *result) {
+    free((void *)result->text);
+    memset(result, 0, sizeof(*result));
+}
 bool ghostty_egui_host_snapshot_end(GhosttyEguiHost *host, uint64_t snapshot_generation) {
     return ghostty_surface_snapshot_end(host->surface, snapshot_generation);
 }

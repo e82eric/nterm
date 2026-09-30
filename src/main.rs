@@ -12,6 +12,7 @@ mod presentation;
 mod quick_select;
 mod search;
 mod terminal;
+mod toast;
 
 use std::ffi::CString;
 

@@ -71,6 +71,41 @@ the base; Lua overrides them, and explicit command-line options override Lua.
 The picker still imports Ghostty's resolved font and tracks its cell dimensions.
 Changes to Lua require restarting the app; live reload is not supported.
 
+## Lua actions and toasts
+
+Define named actions alongside `pickers` and reference them in `keys`. Actions
+also appear in the command palette with their configured label and shortcuts:
+
+```lua
+actions = {
+  SaveSnippet = {
+    label = "Save selection as snippet",
+    action = function(app)
+      local selection = app:get_selection_text()
+      app:show_toast("Selected text", selection, 2000)
+    end,
+  },
+},
+keys = {
+  { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
+},
+```
+
+An action may also be defined directly as a function; its name becomes its label.
+`get_selection_text()` returns the active pane's live selection or copy-mode
+visual selection, and returns an empty string if none exists. Toast duration is in milliseconds
+(default 2000, allowed range 1–60000). Toasts use the picker's `Cursor` placement
+within the originating pane: centered below the cursor when space permits, above
+it otherwise, with the same bounds checks and bottom fallback when the cursor is unavailable,
+without taking keyboard focus. Both methods are also
+available in picker action callbacks. App handles expire when the callback returns.
+
+The sample binds **Ctrl+Shift+S** to save the selection in `~/.wtd/.wt.json`,
+matching WezTerm's shortcut and file format. It preserves other JSON fields and
+leaves the text selected after saving. The file must already exist. Success and errors are
+shown as toasts. `ghostty.json_encode_pretty(value)` encodes JSON. The action
+writes directly using Lua's `io.open(path, "wb")`, matching the WezTerm config.
+
 ## Codex suggestions
 
 The sample defines `CodexSuggestions` on **Ctrl+Shift+K**, matching the WezTerm

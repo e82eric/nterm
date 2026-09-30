@@ -184,6 +184,11 @@ unsafe extern "C" {
         host: *mut Host,
         snapshot_generation: *mut u64,
     ) -> bool;
+    pub(crate) fn ghostty_egui_host_selection_text(
+        host: *mut Host,
+        result: *mut SnapshotSelectionText,
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_selection_text_free(result: *mut SnapshotSelectionText);
     pub(crate) fn ghostty_egui_host_snapshot_end(host: *mut Host, snapshot_generation: u64)
     -> bool;
     pub(crate) fn ghostty_egui_host_snapshot_view(

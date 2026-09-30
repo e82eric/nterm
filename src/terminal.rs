@@ -120,6 +120,11 @@ impl TerminalView {
             AppAction::CloseFloatingPane => self.close_floating(gl),
             _ => {
                 let has_floating = self.floating.is_some();
+                let lua_action = if let AppAction::Lua(name) = &action {
+                    self.picker_bindings.lua_action(name)
+                } else {
+                    None
+                };
                 let entry = if let AppAction::OpenPicker(name) = &action {
                     self.picker_bindings.named(name)
                 } else {
@@ -133,7 +138,9 @@ impl TerminalView {
                 } else {
                     &mut self.main
                 };
-                if let Some(entry) = entry {
+                if let Some(lua_action) = lua_action {
+                    pane.execute_lua_action(&lua_action, ctx);
+                } else if let Some(entry) = entry {
                     pane.open_picker(ctx, entry, None, &self.picker_bindings, has_floating);
                 } else {
                     pane.execute_action(&action, ctx);
@@ -293,6 +300,10 @@ impl TerminalView {
 
         if self.should_close() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        self.main.show_toasts(ui.ctx(), rect);
+        if let Some(floating) = self.floating.as_mut().filter(|pane| pane.visible) {
+            floating.show_toasts(ui.ctx(), floating_rect);
         }
     }
 

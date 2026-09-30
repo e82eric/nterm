@@ -107,6 +107,7 @@ pub(super) struct TerminalPane {
     quick_select: Option<QuickSelect>,
     picker: Option<crate::picker::Picker>,
     picker_font: crate::picker::font::PickerFont,
+    toasts: crate::toast::Toasts,
     copy_search_cursor: usize,
     prompt_boundaries: Option<(u64, Vec<u64>)>,
 }
@@ -137,6 +138,7 @@ impl TerminalPane {
             quick_select: None,
             picker: None,
             picker_font,
+            toasts: crate::toast::Toasts::default(),
             copy_search_cursor: 0,
             prompt_boundaries: None,
         }
@@ -605,24 +607,7 @@ impl TerminalPane {
         let copy_generation = self.copy_mode.generation;
         let from_copy = copy_generation.is_some();
         let cursor_row = if options.position == crate::picker::config::Position::Cursor {
-            if let Some(generation) = copy_generation {
-                let copy_cursor = Some(self.copy_mode.cursor);
-                let mut view = SnapshotView::default();
-                if unsafe {
-                    ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view)
-                } {
-                    copy_cursor
-                        .and_then(|cursor| cursor.y.checked_sub(view.viewport_top))
-                        .filter(|row| *row < u64::from(view.viewport_rows))
-                        .and_then(|row| u32::try_from(row).ok())
-                } else {
-                    None
-                }
-            } else {
-                let mut cursor = ghostty_ffi::LiveCursorPosition::default();
-                unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_position(host, &mut cursor) }
-                    .then_some(cursor.row)
-            }
+            self.picker_cursor_row()
         } else {
             None
         };
@@ -697,6 +682,131 @@ impl TerminalPane {
     }
     pub(super) fn copying(&self) -> bool {
         self.copy_mode.generation.is_some()
+    }
+
+    pub(super) fn show_toasts(&mut self, ctx: &egui::Context, bounds: egui::Rect) {
+        if self.toasts.is_empty() {
+            return;
+        }
+        let cursor_row = self.picker_cursor_row();
+        let size = unsafe { ghostty_ffi::ghostty_egui_host_surface_size(self.host) };
+        let row_height = (size.cell_height_px as f32 / ctx.pixels_per_point()).max(1.0);
+        self.toasts.show(
+            ctx,
+            bounds,
+            egui::Id::new(("terminal-toasts", self.host as usize)),
+            cursor_row,
+            row_height,
+        );
+    }
+
+    fn picker_cursor_row(&self) -> Option<u32> {
+        if let Some(generation) = self.copy_mode.generation {
+            let mut view = SnapshotView::default();
+            if !unsafe {
+                ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
+            } {
+                return None;
+            }
+            self.copy_mode
+                .cursor
+                .y
+                .checked_sub(view.viewport_top)
+                .filter(|row| *row < u64::from(view.viewport_rows))
+                .and_then(|row| u32::try_from(row).ok())
+        } else {
+            let mut cursor = ghostty_ffi::LiveCursorPosition::default();
+            unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_position(self.host, &mut cursor) }
+                .then_some(cursor.row)
+        }
+    }
+
+    fn selected_text(&self) -> String {
+        let mut result = ghostty_ffi::SnapshotSelectionText::default();
+        let copied = if let Some(generation) = self.copy_mode.generation {
+            let Some(selection) = self
+                .copy_mode
+                .visual_selection_to(self.copy_mode.cursor, |row| {
+                    self.read_snapshot_row(generation, row)
+                })
+            else {
+                return String::new();
+            };
+            unsafe {
+                ghostty_ffi::ghostty_egui_host_snapshot_selection_text(
+                    self.host,
+                    generation,
+                    selection.range,
+                    selection.trim,
+                    selection.rectangle,
+                    &mut result,
+                )
+            }
+        } else {
+            unsafe { ghostty_ffi::ghostty_egui_host_selection_text(self.host, &mut result) }
+        };
+        if !copied {
+            return String::new();
+        }
+        let text = if result.len == 0 {
+            String::new()
+        } else {
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(result.text, result.len) })
+                .into_owned()
+        };
+        unsafe {
+            if self.copy_mode.generation.is_some() {
+                ghostty_ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result);
+            } else {
+                ghostty_ffi::ghostty_egui_host_selection_text_free(&mut result);
+            }
+        }
+        text
+    }
+
+    pub(super) fn execute_lua_action(
+        &mut self,
+        action: &crate::actions::LuaAction,
+        ctx: &egui::Context,
+    ) {
+        match action.callback.call_action(self.selected_text()) {
+            Ok(commands) => {
+                for command in commands {
+                    match command {
+                        crate::picker::action::Command::ShowToast {
+                            title,
+                            message,
+                            duration_ms,
+                        } => self.toasts.push(title, message, duration_ms),
+                        crate::picker::action::Command::Paste(text) => {
+                            self.close_copy_mode();
+                            unsafe {
+                                ghostty_ffi::ghostty_egui_host_text(
+                                    self.host,
+                                    text.as_ptr().cast(),
+                                    text.len(),
+                                );
+                            }
+                        }
+                        crate::picker::action::Command::SendText(text) => {
+                            self.close_copy_mode();
+                            Self::send_picker_text(self.host, &text);
+                        }
+                        crate::picker::action::Command::ReplacePrompt {
+                            text,
+                            before,
+                            after,
+                        } => {
+                            self.close_copy_mode();
+                            Self::replace_picker_prompt(self.host, &text, before, after);
+                        }
+                        crate::picker::action::Command::Navigate(_) => {}
+                    }
+                }
+            }
+            Err(error) => self.toasts.push("Action failed".into(), error, 5000),
+        }
+        ctx.request_repaint();
     }
 
     pub(super) fn execute_action(
@@ -828,12 +938,25 @@ impl TerminalPane {
                 };
             }
             crate::picker::Action::Custom(callback, text, filesystem, range, value, params) => {
-                match callback.call(&text, &value, filesystem, generation, range, &params) {
+                match callback.call_with_selection(
+                    &text,
+                    &value,
+                    filesystem,
+                    generation,
+                    range,
+                    &params,
+                    self.selected_text(),
+                ) {
                     Ok(commands) => {
                         let mut navigated = false;
                         let mut sent = false;
                         for command in commands {
                             match command {
+                                crate::picker::action::Command::ShowToast {
+                                    title,
+                                    message,
+                                    duration_ms,
+                                } => self.toasts.push(title, message, duration_ms),
                                 crate::picker::action::Command::Navigate(target) => {
                                     if let Some(generation) =
                                         generation.filter(|g| self.copy_mode.generation == Some(*g))

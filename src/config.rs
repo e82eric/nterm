@@ -211,6 +211,8 @@ struct AppConfig {
     picker_defaults: crate::picker::config::PickerDefaults,
     pickers: Option<std::collections::BTreeMap<String, crate::picker::config::Definition>>,
     keys: Option<Vec<crate::picker::config::KeyBinding>>,
+    #[serde(skip)]
+    actions: std::collections::BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -282,6 +284,16 @@ impl AppConfig {
                 .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
+        ghostty
+            .set(
+                "json_encode_pretty",
+                lua.create_function(|lua, value: mlua::Value| {
+                    let json: serde_json::Value = lua.from_value(value)?;
+                    serde_json::to_string_pretty(&json).map_err(mlua::Error::external)
+                })
+                .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
         lua.globals()
             .set("ghostty", ghostty)
             .map_err(|error| error.to_string())?;
@@ -295,7 +307,61 @@ impl AppConfig {
             return Err("config must return a table".into());
         }
         let mut parsed_pickers = None;
+        let mut actions = std::collections::BTreeMap::new();
         if let mlua::Value::Table(root) = &value {
+            if let Some(configured) = root
+                .get::<_, Option<mlua::Table>>("actions")
+                .map_err(|e| e.to_string())?
+            {
+                for pair in configured.pairs::<String, mlua::Value>() {
+                    let (name, definition) = pair.map_err(|e| e.to_string())?;
+                    if name.trim().is_empty()
+                        || crate::actions::AppAction::from_name(&name).is_some()
+                    {
+                        return Err(format!("invalid or reserved action name {name:?}"));
+                    }
+                    let (label, callback) = match definition {
+                        mlua::Value::Function(function) => (name.clone(), function),
+                        mlua::Value::Table(table) => {
+                            for field in table.clone().pairs::<String, mlua::Value>() {
+                                let (field, _) = field.map_err(|e| e.to_string())?;
+                                if field != "label" && field != "action" {
+                                    return Err(format!("actions.{name}: unknown field {field}"));
+                                }
+                            }
+                            (
+                                table
+                                    .get::<_, Option<String>>("label")
+                                    .map_err(|e| e.to_string())?
+                                    .unwrap_or(name.clone()),
+                                table
+                                    .get::<_, mlua::Function>("action")
+                                    .map_err(|e| e.to_string())?,
+                            )
+                        }
+                        _ => return Err(format!("actions.{name} must be a function or table")),
+                    };
+                    if label.trim().is_empty() {
+                        return Err(format!("actions.{name}.label must not be empty"));
+                    }
+                    let key = lua
+                        .create_registry_value(callback)
+                        .map_err(|e| e.to_string())?;
+                    actions.insert(
+                        name.clone(),
+                        std::rc::Rc::new(crate::actions::LuaAction {
+                            label,
+                            callback: std::rc::Rc::new(crate::picker::action::Callback {
+                                lua: lua.clone(),
+                                key,
+                                name,
+                            }),
+                        }),
+                    );
+                }
+                root.raw_set("actions", mlua::Value::Nil)
+                    .map_err(|e| e.to_string())?;
+            }
             if let Some(pickers) = root
                 .get::<_, Option<mlua::Table>>("pickers")
                 .map_err(|e| e.to_string())?
@@ -328,6 +394,7 @@ impl AppConfig {
         }
         let mut config: Self = lua.from_value(value).map_err(|error| error.to_string())?;
         config.pickers = parsed_pickers;
+        config.actions = actions;
         Ok(config)
     }
 
@@ -453,10 +520,11 @@ pub(crate) fn prepare(
             .and_then(|config| {
                 Ok((
                     config.ghostty_args()?,
-                    crate::picker::config::Bindings::compile_with_defaults(
+                    crate::picker::config::Bindings::compile_with_actions(
                         config.pickers,
                         config.keys,
                         config.picker_defaults,
+                        config.actions,
                     )?,
                     config
                         .floating
@@ -491,6 +559,117 @@ fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn named_lua_actions_bind_and_appear_in_palette() {
+        let config = parse(
+            r#"return {
+            actions = { Save = { label = 'Save selection', action = function(app)
+                app:show_toast('Saved', app:get_selection_text(), 1500)
+            end }, Unbound = function(app) app:show_toast('Hello', 'world') end },
+            keys = {{key='s', mods='CTRL|SHIFT', action='Save'}}
+        }"#,
+        )
+        .unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+        let catalog = crate::actions::catalog(&bindings, false, false);
+        assert!(catalog.iter().any(|entry| entry.id == "action.Save"
+            && entry.label == "Save selection"
+            && entry.shortcut.as_deref() == Some("Ctrl+Shift+S")));
+        assert!(
+            catalog
+                .iter()
+                .any(|entry| entry.id == "action.Unbound" && entry.shortcut.is_none())
+        );
+        let commands = bindings
+            .lua_action("Save")
+            .unwrap()
+            .callback
+            .call_action("selected text".into())
+            .unwrap();
+        assert!(
+            matches!(&commands[0], crate::picker::action::Command::ShowToast { title, message, duration_ms: 1500 } if title == "Saved" && message == "selected text")
+        );
+        assert_eq!(commands.len(), 1);
+        for source in [
+            "return {actions={NewWindow=function() end}}",
+            "return {actions={bad={label='', action=function() end}}}",
+            "return {actions={bad={action=function() end, typo=true}}}",
+            "return {actions={bad='not a function'}}",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn save_snippet_preserves_json_and_reports_success_and_errors() {
+        let directory = std::env::temp_dir().join(format!(
+            "ghostty-snippet-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("snippets.json");
+        std::fs::write(
+            &path,
+            r#"{"snippets":[{"input":"old","extra":42}],"metadata":{"keep":true},"empty":[]}"#,
+        )
+        .unwrap();
+        let sample = include_str!("../ghostty.lua");
+        let begin = sample.find("local snippets_path = ").unwrap();
+        let end = begin + sample[begin..].find('\n').unwrap();
+        let source = format!(
+            "{}local snippets_path = {}{}",
+            &sample[..begin],
+            serde_json::to_string(&path.to_string_lossy()).unwrap(),
+            &sample[end..]
+        );
+        let config = parse(&source).unwrap();
+        let callback = &config.actions["SaveSnippet"].callback;
+        let commands = callback
+            .call_action("echo café\nsecond line".into())
+            .unwrap();
+        assert!(
+            matches!(&commands[0], crate::picker::action::Command::ShowToast { title, .. } if title == "Snippet saved")
+        );
+        assert_eq!(commands.len(), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved["snippets"][0]["extra"], 42);
+        assert_eq!(saved["snippets"][1]["input"], "echo café\nsecond line");
+        assert_eq!(saved["metadata"]["keep"], true);
+        assert_eq!(saved["empty"], serde_json::json!([]));
+        let commands = callback.call_action(String::new()).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            matches!(&commands[0], crate::picker::action::Command::ShowToast { message, .. } if message == "No text is selected")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::write(&path, "invalid JSON").unwrap();
+        let commands = callback.call_action("keep selection".into()).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            matches!(&commands[0], crate::picker::action::Command::ShowToast { message, .. } if message.contains("Unable to parse"))
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "invalid JSON");
+        std::fs::remove_file(&path).unwrap();
+        let commands = callback.call_action("keep selection".into()).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            matches!(&commands[0], crate::picker::action::Command::ShowToast { message, .. } if message.contains("Unable to read"))
+        );
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
     #[test]
     fn palette_is_a_named_picker_and_defers_picker_factories() {
         let config = parse("return { pickers = { commands = { type = 'CommandPalette', position = 'Center', preview_visible = false }, dynamic = function() error('factory must not run during catalog enumeration') end }, keys = { { key = 'k', mods = 'CTRL|SHIFT', picker = 'commands' } } }").unwrap();
@@ -561,8 +740,13 @@ mod tests {
     #[test]
     fn sample_codex_picker_uses_terminal_context_and_replaces_unicode_input() {
         let config = parse(include_str!("../ghostty.lua")).unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let entry = bindings.named("CodexSuggestions").unwrap();
         let options = entry
             .resolve(&PickerContext {
@@ -655,10 +839,23 @@ mod tests {
     #[test]
     fn named_pickers_compile_and_reject_bad_bindings_and_regexes() {
         let example = parse(include_str!("../ghostty.lua")).unwrap();
-        assert!(crate::picker::config::Bindings::compile(example.pickers, example.keys).is_ok());
+        assert!(
+            crate::picker::config::Bindings::compile_with_actions(
+                example.pickers,
+                example.keys,
+                example.picker_defaults,
+                example.actions
+            )
+            .is_ok()
+        );
         let config = parse(r#"return {pickers = {paths = {type = 'Scrollback', regex = '\\S+', enter_action = 'SendInput'}}, keys = {{key = 'p', mods = 'CTRL|SHIFT', picker = 'paths'}}}"#).unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let mut events = vec![egui::Event::Key {
             key: egui::Key::P,
             physical_key: Some(egui::Key::P),
@@ -702,19 +899,37 @@ mod tests {
             "return {pickers={x={type='Command', args={'cmd'}, sort='Invalid'}}}",
         ] {
             let result = parse(source).and_then(|config| {
-                crate::picker::config::Bindings::compile(config.pickers, config.keys)
+                crate::picker::config::Bindings::compile_with_actions(
+                    config.pickers,
+                    config.keys,
+                    config.picker_defaults,
+                    config.actions,
+                )
             });
             assert!(result.is_err(), "{source}");
         }
         assert!(parse("return {pickers={x={type='Command'}}}").is_err());
         let files = parse("return {pickers={files={type='FileSystem', roots={'G:/src'}, max_depth=2, files_only=true}},keys={{key='o',mods='CTRL|SHIFT',picker='files'}}}").unwrap();
-        assert!(crate::picker::config::Bindings::compile(files.pickers, files.keys).is_ok());
+        assert!(
+            crate::picker::config::Bindings::compile_with_actions(
+                files.pickers,
+                files.keys,
+                files.picker_defaults,
+                files.actions
+            )
+            .is_ok()
+        );
         let history = parse(
             "return {pickers={history={type='Command', args={'history.exe'}, line_continuation='`'}}}",
         )
         .unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(history.pickers, history.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            history.pickers,
+            history.keys,
+            history.picker_defaults,
+            history.actions,
+        )
+        .unwrap();
         let crate::picker::config::Source::Command(command) = bindings
             .named("history")
             .unwrap()
@@ -727,7 +942,13 @@ mod tests {
         assert_eq!(command.line_continuation.as_deref(), Some("`"));
         assert!(parse("return {pickers={x={enter_action='Bad'}}}").is_err());
         let empty = parse("return {keys={}}").unwrap();
-        let bindings = crate::picker::config::Bindings::compile(empty.pickers, empty.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            empty.pickers,
+            empty.keys,
+            empty.picker_defaults,
+            empty.actions,
+        )
+        .unwrap();
         assert!(bindings.named("lines").is_some());
         assert!(bindings.named("missing").is_none());
         let mut events = vec![egui::Event::Key {
@@ -744,8 +965,13 @@ mod tests {
     #[test]
     fn ripgrep_osc_request_resolves_to_command_picker() {
         let config = parse(include_str!("../ghostty.lua")).unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let payload = br#"StreamingPicker;secret;{"name":"Ripgrep","params":{"pattern":"ghostty","cwd":"C:\\src\\ghostty2","cursor":"0","length":"0"}}"#;
         let request = crate::picker::protocol::parse(payload, "secret").unwrap();
         let options = bindings
@@ -768,8 +994,13 @@ mod tests {
             r#"return { pickers = { files = { type = 'FileSystem', roots = { [[C:\default]] } } } }"#,
         )
         .unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let payload = br#"StreamingPicker;secret;{"name":"files","params":{"roots":"[\"G:\\\\src\",\"C:\\\\src\"]"}}"#;
         let request = crate::picker::protocol::parse(payload, "secret").unwrap();
         let options = bindings
@@ -810,8 +1041,13 @@ mod tests {
             path.display()
         );
         let config = parse(&source).unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let options = bindings
             .named("snippets")
             .unwrap()
@@ -845,7 +1081,15 @@ mod tests {
         for kind in ["Scrollback", "FileSystem"] {
             let config = parse(&format!("return {{pickers={{x={{type='{kind}', enter_action='SendInput', action=function(app,item) app:paste(item.text) end}}}}}}" )).unwrap();
             assert!(config.pickers.as_ref().unwrap()["x"].callback().is_some());
-            assert!(crate::picker::config::Bindings::compile(config.pickers, config.keys).is_ok());
+            assert!(
+                crate::picker::config::Bindings::compile_with_actions(
+                    config.pickers,
+                    config.keys,
+                    config.picker_defaults,
+                    config.actions
+                )
+                .is_ok()
+            );
         }
         let config = parse("return {pickers={x={regex='x'}}}").unwrap();
         assert!(matches!(
@@ -864,8 +1108,13 @@ mod tests {
         } }"#,
         )
         .unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         for name in ["text", "ansi", "command"] {
             let options = bindings
                 .named(name)
@@ -875,7 +1124,15 @@ mod tests {
             assert!(options.preview.is_some());
         }
         let invalid = parse("return {pickers={x={preview={type='Command', args={''}}}}}").unwrap();
-        assert!(crate::picker::config::Bindings::compile(invalid.pickers, invalid.keys).is_err());
+        assert!(
+            crate::picker::config::Bindings::compile_with_actions(
+                invalid.pickers,
+                invalid.keys,
+                invalid.picker_defaults,
+                invalid.actions
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -891,8 +1148,13 @@ mod tests {
         } } }"#,
         )
         .unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let options = bindings
             .named("files")
             .unwrap()
@@ -935,8 +1197,13 @@ mod tests {
                 "return {{pickers={{x={{preview={{type='Command', command=function() return {result} end}}}}}}}}"
             );
             let config = parse(&source).unwrap();
-            let bindings =
-                crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+            let bindings = crate::picker::config::Bindings::compile_with_actions(
+                config.pickers,
+                config.keys,
+                config.picker_defaults,
+                config.actions,
+            )
+            .unwrap();
             let options = bindings
                 .named("x")
                 .unwrap()
@@ -1035,8 +1302,13 @@ mod tests {
         ] {
             let config = parse(&format!("return {{pickers={{history={{type='Command', args={{'history.exe'}}, line_continuation='`'{field}}}}}}}"))
                 .unwrap();
-            let bindings =
-                crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+            let bindings = crate::picker::config::Bindings::compile_with_actions(
+                config.pickers,
+                config.keys,
+                config.picker_defaults,
+                config.actions,
+            )
+            .unwrap();
             let options = bindings
                 .named("history")
                 .unwrap()
@@ -1060,8 +1332,13 @@ mod tests {
                 "return {{pickers={{x={{type='Scrollback'{field}}}}}}}"
             ))
             .unwrap();
-            let bindings =
-                crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+            let bindings = crate::picker::config::Bindings::compile_with_actions(
+                config.pickers,
+                config.keys,
+                config.picker_defaults,
+                config.actions,
+            )
+            .unwrap();
             let options = bindings
                 .named("x")
                 .unwrap()
@@ -1081,8 +1358,13 @@ mod tests {
             "return {pickers={lines={type='Scrollback', preview={type='Scrollback', rows=8}}}}",
         )
         .unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let options = bindings
             .named("lines")
             .unwrap()
@@ -1097,7 +1379,15 @@ mod tests {
             "return {pickers={x={type='Scrollback', preview={type='Scrollback', rows=0}}}}",
         ] {
             let config = parse(source).unwrap();
-            assert!(crate::picker::config::Bindings::compile(config.pickers, config.keys).is_err());
+            assert!(
+                crate::picker::config::Bindings::compile_with_actions(
+                    config.pickers,
+                    config.keys,
+                    config.picker_defaults,
+                    config.actions
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1118,8 +1408,13 @@ mod tests {
         }"#,
         )
         .unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let entry = bindings.named("dynamic").unwrap();
         assert!(entry.needs_context());
         let command = entry
@@ -1149,8 +1444,13 @@ mod tests {
         let config =
             parse("return {pickers={bad=function() return {type='FileSystem', regex='x'} end}}")
                 .unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         assert!(
             bindings
                 .named("bad")
@@ -1159,8 +1459,13 @@ mod tests {
                 .is_err()
         );
         let config = parse("local picker={type='Items', action=function() end}; return {pickers={reused=function() return picker end}}") .unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let reused = bindings.named("reused").unwrap();
         for _ in 0..2 {
             assert!(
@@ -1185,8 +1490,13 @@ mod tests {
         end } }"#,
         )
         .unwrap();
-        let bindings =
-            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
         let options = bindings
             .named("words")
             .unwrap()
