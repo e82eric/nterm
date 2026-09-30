@@ -16,6 +16,11 @@ return {
   --   padding = { top = 15, bottom = 15, left = 10, right = 10 }, -- Percent of terminal area.
   -- },
   pickers = {
+    commands = {
+      type = "CommandPalette",
+      position = "Cursor",
+      preview_visible = false,
+    },
     lines = {
       type = "Scrollback",
       preview = { type = "Scrollback", rows = 12 },
@@ -65,6 +70,17 @@ return {
     },
   },
   keys = {
+    -- An explicit keys table replaces all top-level action and picker defaults.
+    { key = "n", mods = "CTRL|SHIFT", action = "NewWindow" },
+    { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },
+    { key = "w", mods = "CTRL|SHIFT", action = "CloseFloatingPane" },
+    { key = "/", mods = "CTRL|SHIFT", action = "OpenSearch" },
+    { key = "m", mods = "CTRL|SHIFT", action = "EnterCopyMode" },
+    { key = "Space", mods = "ALT", action = "OpenQuickSelect" },
+    { key = "ArrowUp", mods = "CTRL|SHIFT", action = "PreviousCommand" },
+    { key = "ArrowDown", mods = "CTRL|SHIFT", action = "NextCommand" },
+    -- On macOS you can also bind { key = "f", mods = "CMD", action = "OpenSearch" }.
+    { key = "Space", mods = "CTRL|SHIFT", picker = "commands" },
     { key = "f", mods = "CTRL|SHIFT", picker = "lines" },
     { key = "p", mods = "CTRL|SHIFT", picker = "words" },
     { key = "o", mods = "CTRL|SHIFT", picker = "files" },

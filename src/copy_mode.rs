@@ -1820,32 +1820,6 @@ pub(crate) fn copy_viewport_position_key(
     }
 }
 
-pub(crate) fn copy_command_shortcut(event: &egui::Event) -> Option<bool> {
-    match event {
-        egui::Event::Key {
-            key,
-            pressed: true,
-            modifiers,
-            ..
-        } if modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.mac_cmd => match key
-        {
-            egui::Key::ArrowUp => Some(false),
-            egui::Key::ArrowDown => Some(true),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-pub(crate) fn is_copy_mode_shortcut(event: &egui::Event) -> bool {
-    matches!(event, egui::Event::Key {
-        key: egui::Key::M,
-        pressed: true,
-        modifiers,
-        ..
-    } if modifiers.ctrl && modifiers.shift)
-}
-
 #[derive(Clone, Copy)]
 pub(crate) enum CopyTextObject {
     Word(bool),
@@ -2016,10 +1990,6 @@ pub(crate) enum CopyAction {
         cancel_pending: bool,
     },
     Redraw,
-    Command {
-        forward: bool,
-        count: u32,
-    },
     Position(ViewportPosition),
     SelectObject {
         object: WordObject,
@@ -2088,20 +2058,21 @@ impl CopyMode {
         self.skip_trigger_text = false;
     }
 
+    pub(crate) fn command_navigation_count(&mut self) -> u32 {
+        let count = self.take_count();
+        self.pending_g = false;
+        self.pending_z = false;
+        self.pending_jump = None;
+        self.pending_yank = None;
+        self.pending_visual_object = None;
+        count
+    }
+
     pub(crate) fn begin_input_batch(&mut self) {
         self.skip_trigger_text = false;
     }
 
     pub(crate) fn input(&mut self, event: &egui::Event) -> CopyAction {
-        if let Some(forward) = copy_command_shortcut(event) {
-            let count = self.take_count();
-            self.pending_g = false;
-            self.pending_z = false;
-            self.pending_jump = None;
-            self.pending_yank = None;
-            self.pending_visual_object = None;
-            return CopyAction::Command { forward, count };
-        }
         if let egui::Event::Text(text) = event {
             if let Some(pending) = self.pending_yank
                 && let Some((forward, till)) = pending.jump
@@ -2432,6 +2403,33 @@ impl CopyMode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn application_command_navigation_uses_counts_without_a_hardcoded_shortcut() {
+        let anchor = SnapshotCell { x: 3, y: 9 };
+        let mut mode = CopyMode {
+            pending_count: Some(3),
+            pending_g: true,
+            pending_z: true,
+            visual_anchor: Some(anchor),
+            ..Default::default()
+        };
+        assert_eq!(mode.command_navigation_count(), 3);
+        assert!(!mode.pending_g && !mode.pending_z);
+        assert_eq!(mode.visual_anchor, Some(anchor));
+        assert_eq!(mode.command_navigation_count(), 1);
+        let mut mode = CopyMode::default();
+        assert!(matches!(
+            mode.input(&egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: Some(egui::Key::ArrowUp),
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                pressed: true,
+                repeat: false
+            }),
+            CopyAction::None
+        ));
+    }
+
     #[test]
     fn copy_input_preserves_counts_and_pending_yank_motions() {
         use super::{CopyAction, CopyMode, Motion, YankCommand};

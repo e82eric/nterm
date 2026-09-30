@@ -226,6 +226,7 @@ pub(crate) struct Picker {
 }
 
 pub(crate) enum Action {
+    Execute(crate::actions::AppAction),
     Custom(
         std::rc::Rc<crate::picker::action::Callback>,
         String,
@@ -240,6 +241,9 @@ pub(crate) enum Action {
 }
 
 impl Picker {
+    pub(crate) fn is_command_palette(&self) -> bool {
+        self.source.is_command_palette()
+    }
     pub(crate) fn label(&self) -> &'static str {
         self.source.label()
     }
@@ -764,7 +768,9 @@ impl Picker {
         }
         if action.is_none() && accept && self.results_revision == Some(self.query_revision) {
             if let Some(result) = self.results.get(self.selected) {
-                action = if let Some(callback) = &self.callback {
+                action = if let Some(action) = self.source.application_action(result) {
+                    Some(Action::Execute(action))
+                } else if let Some(callback) = &self.callback {
                     let range = self.source.range(result);
                     Some(Action::Custom(
                         callback.clone(),
@@ -796,6 +802,96 @@ impl Picker {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_palette_source_returns_typed_actions_and_preserves_picker_options() {
+        let ctx = egui::Context::default();
+        let entries = vec![
+            crate::actions::Entry {
+                id: "floating.toggle".into(),
+                label: "Toggle floating pane".into(),
+                shortcut: Some("Ctrl+Shift+E".into()),
+                action: crate::actions::AppAction::ToggleFloatingPane,
+            },
+            crate::actions::Entry {
+                id: "picker.files".into(),
+                label: "Open picker: files".into(),
+                shortcut: None,
+                action: crate::actions::AppAction::OpenPicker("files".into()),
+            },
+        ];
+        let mut picker = Picker::start(
+            std::ptr::null_mut(),
+            None,
+            true,
+            0,
+            ctx.clone(),
+            crate::picker::config::Options {
+                source: crate::picker::config::Source::CommandPalette(entries),
+                position: crate::picker::config::Position::Top,
+                params: std::collections::BTreeMap::from([("query".into(), "files".into())]),
+                preview: Some(crate::picker::config::Preview::Text {
+                    text: "Choose an action".into(),
+                }),
+                preview_visible: false,
+                ..Default::default()
+            },
+        );
+        assert!(picker.is_command_palette());
+        assert_eq!(picker.label(), "COMMAND PALETTE");
+        assert_eq!(picker.position, crate::picker::config::Position::Top);
+        assert!(!picker.preview_visible);
+        assert!(picker.from_copy && picker.generation.is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                assert!(picker.show(ui.ctx(), 24.0).is_none());
+            });
+            output.textures_delta.clear();
+            if picker.done && picker.results.len() == 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(picker.accepted_value(&picker.results[0]), "picker.files");
+        let mut selected = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                selected = picker.show(ui.ctx(), 24.0);
+            },
+        );
+        output.textures_delta.clear();
+        assert!(
+            matches!(selected, Some(Action::Execute(crate::actions::AppAction::OpenPicker(name))) if name == "files")
+        );
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: Some(egui::Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                assert!(matches!(picker.show(ui.ctx(), 24.0), Some(Action::Cancel)));
+            },
+        );
+        output.textures_delta.clear();
+    }
+
     #[test]
     fn ctrl_p_toggles_configured_preview() {
         let ctx = egui::Context::default();

@@ -16,6 +16,10 @@ pub(crate) struct PickerFactory {
 }
 
 impl PickerFactory {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(crate) fn resolve(
         &self,
         context: &PickerContext,
@@ -89,6 +93,15 @@ fn parse_picker_table(
     let mut callback = None;
     let action: mlua::Value = definition.raw_get("action").map_err(|e| e.to_string())?;
     if !matches!(action, mlua::Value::Nil) {
+        if definition
+            .raw_get::<_, String>("type")
+            .map_err(|e| e.to_string())?
+            == "CommandPalette"
+        {
+            return Err(format!(
+                "pickers.{name}: CommandPalette uses built-in actions"
+            ));
+        }
         let mlua::Value::Function(function) = action else {
             return Err(format!("pickers.{name}.action must be a function"));
         };
@@ -475,6 +488,40 @@ fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn palette_is_a_named_picker_and_defers_picker_factories() {
+        let config = parse("return { pickers = { commands = { type = 'CommandPalette', position = 'Center', preview_visible = false }, dynamic = function() error('factory must not run during catalog enumeration') end }, keys = { { key = 'k', mods = 'CTRL|SHIFT', picker = 'commands' } } }").unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_defaults(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+        )
+        .unwrap();
+        let options = bindings
+            .named("commands")
+            .unwrap()
+            .resolve(&Default::default())
+            .unwrap();
+        assert!(matches!(
+            options.source,
+            crate::picker::config::Source::CommandPalette(_)
+        ));
+        assert_eq!(options.position, crate::picker::config::Position::Center);
+        assert!(!options.preview_visible);
+        let entries = crate::actions::catalog(&bindings, false, false);
+        assert!(
+            entries.iter().any(
+                |entry| entry.action == crate::actions::AppAction::OpenPicker("dynamic".into())
+            )
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.action
+                    == crate::actions::AppAction::OpenPicker("commands".into()))
+        );
+        assert!(parse("return { command_palette = { key = 'k' } }").is_err());
+    }
+    #[test]
     fn picker_callbacks_survive_config_parsing() {
         let config = parse("return { pickers = { files = { type = 'FileSystem', action = function(app, item) app:paste(item.path) end } } }").unwrap();
         let callback = config.pickers.as_ref().unwrap()["files"]
@@ -556,7 +603,14 @@ mod tests {
         }];
         let (options, consumed) = bindings.consume(&mut events);
         assert!(consumed && events.is_empty());
-        let options = options.unwrap().resolve(&PickerContext::default()).unwrap();
+        let crate::actions::AppAction::OpenPicker(name) = options.unwrap() else {
+            panic!("expected picker action")
+        };
+        let options = bindings
+            .named(&name)
+            .unwrap()
+            .resolve(&PickerContext::default())
+            .unwrap();
         assert!(matches!(
             options.enter_action,
             crate::picker::config::EnterAction::SendInput
@@ -570,18 +624,19 @@ mod tests {
             "return {pickers={x={regex='a*'}}}",
             "return {keys={{key='p', picker='missing'}}}",
             "return {keys={{key='f', mods='BAD', picker='lines'}}}",
-            "return {keys={{key='/', mods='CTRL|SHIFT', picker='lines'}}}",
+            "return {keys={{key='p', action='UnknownAction'}}}",
+            "return {keys={{key='p', action='OpenSearch', picker='lines'}}}",
+            "return {keys={{key='p'}}}",
             "return {keys={{key='p', picker='lines'}, {key='p', picker='lines'}}}",
             "return {pickers={x={type='FileSystem', enter_action='Navigate'}}}",
             "return {pickers={x={type='FileSystem', files_only=true, directories_only=true}}}",
             "return {pickers={x={type='FileSystem', max_depth=-1}}}",
             "return {pickers={x={type='Command', args={'{program}'}}}}",
         ] {
-            let config = parse(source).unwrap();
-            assert!(
-                crate::picker::config::Bindings::compile(config.pickers, config.keys).is_err(),
-                "{source}"
-            );
+            let result = parse(source).and_then(|config| {
+                crate::picker::config::Bindings::compile(config.pickers, config.keys)
+            });
+            assert!(result.is_err(), "{source}");
         }
         assert!(parse("return {pickers={x={type='Command'}}}").is_err());
         let files = parse("return {pickers={files={type='FileSystem', roots={'G:/src'}, max_depth=2, files_only=true}},keys={{key='o',mods='CTRL|SHIFT',picker='files'}}}").unwrap();

@@ -47,6 +47,10 @@ pub(super) struct Runtime {
 }
 
 pub(super) enum PickerSource {
+    CommandPalette {
+        runtime: Runtime,
+        entries: Vec<crate::actions::Entry>,
+    },
     FileSystem(Runtime),
     Scrollback(Runtime),
     Items {
@@ -124,6 +128,7 @@ impl PickerSource {
                 Session::UnsupportedFileSystem
             }
             crate::picker::config::Source::Scrollback { .. }
+            | crate::picker::config::Source::CommandPalette(_)
             | crate::picker::config::Source::Items(_)
             | crate::picker::config::Source::Command(_) => {
                 let session =
@@ -222,6 +227,18 @@ impl PickerSource {
                 ctx.request_repaint();
             }))
         } else {
+            if let config::Source::CommandPalette(entries) = &options.source {
+                let mut publisher = PublishingStreamingItemStoreWithPayload::new(store.clone());
+                for entry in entries {
+                    let text = match &entry.shortcut {
+                        Some(shortcut) => format!("{}    {shortcut}", entry.label),
+                        None => entry.label.clone(),
+                    };
+                    publisher.add_item(text.as_bytes(), SnapshotCellRange::default());
+                }
+                publisher.complete();
+                ctx.request_repaint();
+            }
             if let crate::picker::config::Source::Items(items) = &options.source {
                 let mut publisher = PublishingStreamingItemStoreWithPayload::new(store.clone());
                 for item in &items.values {
@@ -240,6 +257,10 @@ impl PickerSource {
             reader,
         };
         let source = match &options.source {
+            config::Source::CommandPalette(entries) => Self::CommandPalette {
+                runtime,
+                entries: entries.clone(),
+            },
             config::Source::FileSystem(_) => Self::FileSystem(runtime),
             config::Source::Scrollback { .. } => Self::Scrollback(runtime),
             config::Source::Items(_) => Self::Items {
@@ -259,6 +280,7 @@ impl PickerSource {
             Self::FileSystem(runtime)
             | Self::Scrollback(runtime)
             | Self::Items { runtime, .. }
+            | Self::CommandPalette { runtime, .. }
             | Self::Command { runtime, .. } => runtime,
         }
     }
@@ -271,6 +293,7 @@ impl PickerSource {
             Self::Scrollback(_) => "SCROLLBACK PICKER",
             Self::Items { .. } => "ITEMS PICKER",
             Self::Command { .. } => "COMMAND PICKER",
+            Self::CommandPalette { .. } => "COMMAND PALETTE",
         }
     }
     pub(super) fn set_query(&self, query: String) {
@@ -278,6 +301,9 @@ impl PickerSource {
     }
     pub(super) fn accepted_value(&self, result: &SearchResult) -> String {
         let value = match self {
+            Self::CommandPalette { entries, .. } => entries
+                .get(result.node_index as usize)
+                .map(|entry| entry.id.clone()),
             Self::Items { values, .. } => values.get(result.node_index as usize).cloned(),
             Self::Command {
                 values: Some(values),
@@ -293,6 +319,23 @@ impl PickerSource {
                 .store
                 .snapshot()
                 .map(|snapshot| *snapshot.payload(result.node_index))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn is_command_palette(&self) -> bool {
+        matches!(self, Self::CommandPalette { .. })
+    }
+
+    pub(super) fn application_action(
+        &self,
+        result: &SearchResult,
+    ) -> Option<crate::actions::AppAction> {
+        if let Self::CommandPalette { entries, .. } = self {
+            entries
+                .get(result.node_index as usize)
+                .map(|entry| entry.action.clone())
         } else {
             None
         }
@@ -322,6 +365,7 @@ impl Drop for PickerSource {
             Self::FileSystem(runtime)
             | Self::Scrollback(runtime)
             | Self::Items { runtime, .. }
+            | Self::CommandPalette { runtime, .. }
             | Self::Command { runtime, .. } => runtime,
         };
         runtime.cancelled.store(true, Ordering::Release);

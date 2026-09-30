@@ -250,36 +250,6 @@ fn labels(count: usize) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn consume_shortcut(events: &mut Vec<egui::Event>) -> (bool, bool) {
-    let mut incoming = std::mem::take(events).into_iter().peekable();
-    let mut open = false;
-    let mut consumed = false;
-    while let Some(event) = incoming.next() {
-        if let egui::Event::Key {
-            key: egui::Key::Space,
-            pressed,
-            repeat,
-            modifiers,
-            ..
-        } = &event
-            && modifiers.alt
-            && !modifiers.ctrl
-            && !modifiers.shift
-            && !modifiers.command
-            && !modifiers.mac_cmd
-        {
-            consumed = true;
-            open |= *pressed && !*repeat;
-            if *pressed && matches!(incoming.peek(), Some(egui::Event::Text(_))) {
-                incoming.next();
-            }
-        } else {
-            events.push(event);
-        }
-    }
-    (open, consumed)
-}
-
 /// Use the physical modifier from the paired key, not uppercase text (Caps Lock).
 pub(crate) fn shifted_hint(events: &[egui::Event], text_index: usize) -> bool {
     matches!(text_index.checked_sub(1).and_then(|i| events.get(i)),
@@ -345,48 +315,6 @@ mod tests {
         assert_eq!(paged.hints.len(), 3);
         assert_eq!(paged.hints[0].range.start.y, 3);
         assert_eq!(paged.hints[2].range.start.y, 1);
-    }
-
-    #[test]
-    fn alt_space_is_consumed_once_with_its_paired_text() {
-        let key = |pressed, repeat, modifiers| egui::Event::Key {
-            key: egui::Key::Space,
-            physical_key: Some(egui::Key::Space),
-            pressed,
-            repeat,
-            modifiers,
-        };
-        let modifiers = egui::Modifiers {
-            alt: true,
-            ..Default::default()
-        };
-        let mut events = vec![
-            key(true, false, modifiers),
-            egui::Event::Text(" ".into()),
-            egui::Event::Text("a".into()),
-        ];
-        assert_eq!(consume_shortcut(&mut events), (true, true));
-        assert!(matches!(events.as_slice(), [egui::Event::Text(text)] if text == "a"));
-        for (pressed, repeat) in [(true, true), (false, false)] {
-            let mut events = vec![key(pressed, repeat, modifiers)];
-            assert_eq!(consume_shortcut(&mut events), (false, true));
-            assert!(events.is_empty());
-        }
-        for modifiers in [
-            egui::Modifiers::NONE,
-            egui::Modifiers {
-                ctrl: true,
-                ..modifiers
-            },
-            egui::Modifiers {
-                shift: true,
-                ..modifiers
-            },
-        ] {
-            let mut events = vec![key(true, false, modifiers)];
-            assert_eq!(consume_shortcut(&mut events), (false, false));
-            assert_eq!(events.len(), 1);
-        }
     }
 
     #[test]

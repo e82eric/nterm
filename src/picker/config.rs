@@ -88,6 +88,16 @@ pub(crate) struct PickerDefaults {
 #[derive(Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub(crate) enum Definition {
+    CommandPalette {
+        #[serde(default)]
+        position: Position,
+        #[serde(default)]
+        initial_query: Option<String>,
+        #[serde(default)]
+        preview: Option<Preview>,
+        #[serde(default)]
+        preview_visible: bool,
+    },
     Factory {
         #[serde(skip)]
         factory: Option<std::rc::Rc<crate::config::PickerFactory>>,
@@ -186,7 +196,8 @@ impl Definition {
             Self::Scrollback { preview, .. }
             | Self::Items { preview, .. }
             | Self::Command { preview, .. }
-            | Self::FileSystem { preview, .. } => {
+            | Self::FileSystem { preview, .. }
+            | Self::CommandPalette { preview, .. } => {
                 if let Some(preview) = preview {
                     preview.set_command(value);
                 }
@@ -208,7 +219,7 @@ impl Definition {
             | Self::FileSystem { callback, .. }
             | Self::Command { callback, .. }
             | Self::Items { callback, .. } => *callback = Some(value),
-            Self::Factory { .. } => {}
+            Self::Factory { .. } | Self::CommandPalette { .. } => {}
         }
     }
 
@@ -239,7 +250,7 @@ impl Definition {
                 enter_action,
                 ..
             } => (callback.clone(), *enter_action),
-            Self::Factory { .. } => (None, None),
+            Self::Factory { .. } | Self::CommandPalette { .. } => (None, None),
         }
     }
 
@@ -250,7 +261,7 @@ impl Definition {
             | Self::FileSystem { callback, .. }
             | Self::Command { callback, .. }
             | Self::Items { callback, .. } => callback.as_ref(),
-            Self::Factory { .. } => None,
+            Self::Factory { .. } | Self::CommandPalette { .. } => None,
         }
     }
 }
@@ -258,13 +269,48 @@ fn default_regex() -> String {
     r"\S(?:[^\r\n]*\S)?".into()
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct KeyBinding {
-    key: String,
-    #[serde(default)]
-    mods: String,
-    picker: String,
+    pub(crate) key: String,
+    pub(crate) mods: String,
+    pub(crate) target: BindingTarget,
+}
+
+pub(crate) enum BindingTarget {
+    Action(crate::actions::AppAction),
+    Picker(String),
+}
+
+impl<'de> Deserialize<'de> for KeyBinding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawBinding {
+            key: String,
+            #[serde(default)]
+            mods: String,
+            picker: Option<String>,
+            action: Option<String>,
+        }
+        let raw = RawBinding::deserialize(deserializer)?;
+        let target = match (raw.action, raw.picker) {
+            (Some(name), None) => {
+                BindingTarget::Action(crate::actions::AppAction::from_name(&name).ok_or_else(
+                    || serde::de::Error::custom(format!("unknown action {name:?} in key binding")),
+                )?)
+            }
+            (None, Some(name)) => BindingTarget::Picker(name),
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "key binding must specify exactly one of action or picker",
+                ));
+            }
+        };
+        Ok(Self {
+            key: raw.key,
+            mods: raw.mods,
+            target,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -280,6 +326,7 @@ pub(crate) struct Options {
 
 #[derive(Clone)]
 pub(crate) enum Source {
+    CommandPalette(Vec<crate::actions::Entry>),
     Scrollback { regex: Regex, unique: bool },
     FileSystem(FileOptions),
     Items(ItemsOptions),
@@ -353,9 +400,9 @@ impl Default for Options {
 }
 
 struct Binding {
+    action: crate::actions::AppAction,
     key: egui::Key,
     mods: egui::Modifiers,
-    options: PickerEntry,
 }
 
 #[derive(Clone)]
@@ -399,19 +446,30 @@ impl Bindings {
         defaults: PickerDefaults,
     ) -> Result<Self, String> {
         let definitions = definitions.unwrap_or_else(|| {
-            BTreeMap::from([(
-                "lines".into(),
-                Definition::Scrollback {
-                    position: Position::Bottom,
-                    unique: None,
-                    callback: None,
-                    regex: None,
-                    enter_action: None,
-                    initial_query: None,
-                    preview: None,
-                    preview_visible: true,
-                },
-            )])
+            BTreeMap::from([
+                (
+                    "lines".into(),
+                    Definition::Scrollback {
+                        position: Position::Bottom,
+                        unique: None,
+                        callback: None,
+                        regex: None,
+                        enter_action: None,
+                        initial_query: None,
+                        preview: None,
+                        preview_visible: true,
+                    },
+                ),
+                (
+                    "commands".into(),
+                    Definition::CommandPalette {
+                        position: Position::Cursor,
+                        initial_query: None,
+                        preview: None,
+                        preview_visible: false,
+                    },
+                ),
+            ])
         });
         let mut compiled = BTreeMap::new();
         for (name, definition) in definitions {
@@ -430,21 +488,24 @@ impl Bindings {
                 Definition::Scrollback { position, .. }
                 | Definition::Items { position, .. }
                 | Definition::Command { position, .. }
-                | Definition::FileSystem { position, .. } => *position,
+                | Definition::FileSystem { position, .. }
+                | Definition::CommandPalette { position, .. } => *position,
                 Definition::Factory { .. } => unreachable!(),
             };
             let initial_query = match &definition {
                 Definition::Scrollback { initial_query, .. }
                 | Definition::Items { initial_query, .. }
                 | Definition::Command { initial_query, .. }
-                | Definition::FileSystem { initial_query, .. } => initial_query.clone(),
+                | Definition::FileSystem { initial_query, .. }
+                | Definition::CommandPalette { initial_query, .. } => initial_query.clone(),
                 Definition::Factory { .. } => unreachable!(),
             };
             let preview = match &definition {
                 Definition::Scrollback { preview, .. }
                 | Definition::Items { preview, .. }
                 | Definition::Command { preview, .. }
-                | Definition::FileSystem { preview, .. } => preview.clone(),
+                | Definition::FileSystem { preview, .. }
+                | Definition::CommandPalette { preview, .. } => preview.clone(),
                 Definition::Factory { .. } => unreachable!(),
             };
             let preview_visible = match &definition {
@@ -459,6 +520,9 @@ impl Bindings {
                 }
                 | Definition::FileSystem {
                     preview_visible, ..
+                }
+                | Definition::CommandPalette {
+                    preview_visible, ..
                 } => *preview_visible,
                 Definition::Factory { .. } => unreachable!(),
             };
@@ -468,6 +532,15 @@ impl Bindings {
                     .map_err(|error| format!("pickers.{name}.preview: {error}"))?;
             }
             let mut options = match definition {
+                Definition::CommandPalette { .. } => Options {
+                    position,
+                    callback: None,
+                    source: Source::CommandPalette(Vec::new()),
+                    enter_action: EnterAction::SendInput,
+                    params: BTreeMap::new(),
+                    preview: None,
+                    preview_visible,
+                },
                 Definition::Factory { .. } => unreachable!(),
                 Definition::Scrollback { regex, unique, .. } => {
                     let regex = Regex::new(&regex.unwrap_or_else(default_regex))
@@ -607,15 +680,30 @@ impl Bindings {
             compiled.insert(name, PickerEntry::Static(options));
         }
         let keys = keys.unwrap_or_else(|| {
+            let mut keys = crate::actions::default_bindings();
             if compiled.contains_key("lines") {
-                vec![KeyBinding {
+                keys.push(KeyBinding {
                     key: "f".into(),
                     mods: "CTRL|SHIFT".into(),
-                    picker: "lines".into(),
-                }]
-            } else {
-                vec![]
+                    target: BindingTarget::Picker("lines".into()),
+                });
             }
+            if compiled.get("commands").is_some_and(|entry| {
+                matches!(
+                    entry,
+                    PickerEntry::Static(Options {
+                        source: Source::CommandPalette(_),
+                        ..
+                    })
+                )
+            }) {
+                keys.push(KeyBinding {
+                    key: "Space".into(),
+                    mods: "CTRL|SHIFT".into(),
+                    target: BindingTarget::Picker("commands".into()),
+                });
+            }
+            keys
         });
         let mut bindings: Vec<Binding> = Vec::new();
         for binding in keys {
@@ -625,7 +713,7 @@ impl Bindings {
                 binding.key.clone()
             };
             let key = egui::Key::from_name(&key_name)
-                .ok_or_else(|| format!("unknown picker key {:?}", binding.key))?;
+                .ok_or_else(|| format!("unknown key binding key {:?}", binding.key))?;
             let mut mods = egui::Modifiers::NONE;
             for part in binding
                 .mods
@@ -637,47 +725,28 @@ impl Bindings {
                     "SHIFT" => mods.shift = true,
                     "ALT" => mods.alt = true,
                     "CMD" | "SUPER" if cfg!(target_os = "macos") => mods.mac_cmd = true,
-                    _ => return Err(format!("unknown picker modifier {part:?}")),
+                    _ => return Err(format!("unknown key binding modifier {part:?}")),
                 }
-            }
-            let reserved = (mods.ctrl
-                && mods.shift
-                && !mods.alt
-                && !mods.mac_cmd
-                && matches!(
-                    key,
-                    egui::Key::Slash
-                        | egui::Key::Questionmark
-                        | egui::Key::M
-                        | egui::Key::ArrowUp
-                        | egui::Key::ArrowDown
-                ))
-                || (mods.mac_cmd && !mods.ctrl && !mods.shift && !mods.alt && key == egui::Key::F)
-                || (mods.alt
-                    && !mods.ctrl
-                    && !mods.shift
-                    && !mods.mac_cmd
-                    && key == egui::Key::Space);
-            if reserved {
-                return Err(format!(
-                    "picker binding {}+{} conflicts with an app shortcut",
-                    binding.mods, binding.key
-                ));
             }
             if bindings
                 .iter()
                 .any(|existing| existing.key == key && same_mods(existing.mods, mods))
             {
                 return Err(format!(
-                    "duplicate picker binding {}+{}",
+                    "duplicate key binding {}+{}",
                     binding.mods, binding.key
                 ));
             }
-            let options = compiled
-                .get(&binding.picker)
-                .ok_or_else(|| format!("unknown picker {:?} in key binding", binding.picker))?
-                .clone();
-            bindings.push(Binding { key, mods, options });
+            let action = match binding.target {
+                BindingTarget::Action(action) => action,
+                BindingTarget::Picker(name) => {
+                    if !compiled.contains_key(&name) {
+                        return Err(format!("unknown picker {name:?} in key binding"));
+                    }
+                    crate::actions::AppAction::OpenPicker(name)
+                }
+            };
+            bindings.push(Binding { action, key, mods });
         }
         Ok(Self {
             bindings,
@@ -689,7 +758,54 @@ impl Bindings {
         self.definitions.get(name).cloned()
     }
 
-    pub(crate) fn consume(&self, events: &mut Vec<egui::Event>) -> (Option<PickerEntry>, bool) {
+    pub(crate) fn palette_entries(&self) -> impl Iterator<Item = (&str, Option<String>)> {
+        self.definitions
+            .iter()
+            .filter(|(_, entry)| match entry {
+                PickerEntry::Factory(..) => true,
+                PickerEntry::Static(options) => match &options.source {
+                    Source::CommandPalette(_) => false,
+                    Source::Items(items) => !items.values.is_empty() || items.provider.is_some(),
+                    Source::Command(command) => command.args.iter().all(|arg| {
+                        arg.strip_prefix('{')
+                            .and_then(|arg| arg.strip_suffix('}'))
+                            .is_none_or(|name| options.params.contains_key(name))
+                    }),
+                    _ => true,
+                },
+            })
+            .map(|(name, _)| {
+                (
+                    name.as_str(),
+                    self.shortcut_for(&crate::actions::AppAction::OpenPicker(name.clone())),
+                )
+            })
+    }
+
+    pub(crate) fn shortcut_for(&self, action: &crate::actions::AppAction) -> Option<String> {
+        let text = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.action == *action)
+            .map(|binding| crate::actions::shortcut_label(binding.key, binding.mods))
+            .collect::<Vec<_>>()
+            .join(", ");
+        (!text.is_empty()).then_some(text)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn consume(
+        &self,
+        events: &mut Vec<egui::Event>,
+    ) -> (Option<crate::actions::AppAction>, bool) {
+        self.consume_when(events, |_, _| true)
+    }
+
+    pub(crate) fn consume_when(
+        &self,
+        events: &mut Vec<egui::Event>,
+        allows: impl Fn(&crate::actions::AppAction, egui::Modifiers) -> bool,
+    ) -> (Option<crate::actions::AppAction>, bool) {
         let mut incoming = std::mem::take(events).into_iter().peekable();
         let mut open = None;
         let mut consumed = false;
@@ -704,6 +820,7 @@ impl Bindings {
                 self.bindings.iter().find(|binding| {
                     (binding.key == *key || Some(binding.key) == *physical_key)
                         && same_mods(binding.mods, *modifiers)
+                        && allows(&binding.action, binding.mods)
                 })
             } else {
                 None
@@ -717,7 +834,7 @@ impl Bindings {
                 };
                 consumed = true;
                 if pressed && !repeat {
-                    open = Some(binding.options.clone());
+                    open = Some(binding.action.clone());
                 }
                 if pressed && matches!(incoming.peek(), Some(egui::Event::Text(_))) {
                     incoming.next();
@@ -744,11 +861,334 @@ fn same_mods(a: egui::Modifiers, b: egui::Modifiers) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::actions::{ActionContext, AppAction};
+
+    fn key_event(
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+        pressed: bool,
+        repeat: bool,
+    ) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            modifiers,
+            pressed,
+            repeat,
+        }
+    }
+
+    #[test]
+    fn omitted_keys_preserve_the_original_action_bindings() {
+        let bindings = Bindings::default();
+        let ctrl_shift = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        for (key, mods, expected) in [
+            (egui::Key::N, ctrl_shift, AppAction::NewWindow),
+            (egui::Key::E, ctrl_shift, AppAction::ToggleFloatingPane),
+            (egui::Key::W, ctrl_shift, AppAction::CloseFloatingPane),
+            (egui::Key::Slash, ctrl_shift, AppAction::OpenSearch),
+            (egui::Key::M, ctrl_shift, AppAction::EnterCopyMode),
+            (
+                egui::Key::Space,
+                egui::Modifiers::ALT,
+                AppAction::OpenQuickSelect,
+            ),
+            (egui::Key::ArrowUp, ctrl_shift, AppAction::PreviousCommand),
+            (egui::Key::ArrowDown, ctrl_shift, AppAction::NextCommand),
+        ] {
+            let mut events = vec![key_event(key, mods, true, false)];
+            assert_eq!(bindings.consume(&mut events), (Some(expected), true));
+            assert!(events.is_empty());
+        }
+        let mut events = vec![
+            egui::Event::Key {
+                key: egui::Key::Questionmark,
+                physical_key: Some(egui::Key::Slash),
+                modifiers: ctrl_shift,
+                pressed: true,
+                repeat: false,
+            },
+            egui::Event::Text("?".into()),
+        ];
+        assert_eq!(
+            bindings.consume(&mut events),
+            (Some(AppAction::OpenSearch), true)
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn action_rebinding_replaces_defaults_and_updates_palette_shortcuts() {
+        let keys = serde_json::from_value(serde_json::json!([
+            { "key": "k", "mods": "CTRL", "action": "ToggleFloatingPane" },
+            { "key": "k", "mods": "ALT", "action": "ToggleFloatingPane" },
+            { "key": "e", "mods": "CTRL|SHIFT", "picker": "lines" },
+            { "key": "x", "mods": "CTRL|SHIFT", "action": "ExitCopyMode" }
+        ]))
+        .unwrap();
+        let bindings = Bindings::compile(None, Some(keys)).unwrap();
+        let mut events = vec![key_event(egui::Key::K, egui::Modifiers::CTRL, true, false)];
+        assert_eq!(
+            bindings.consume(&mut events),
+            (Some(AppAction::ToggleFloatingPane), true)
+        );
+        let mut events = vec![key_event(
+            egui::Key::E,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            true,
+            false,
+        )];
+        assert_eq!(
+            bindings.consume(&mut events),
+            (Some(AppAction::OpenPicker("lines".into())), true)
+        );
+        let mut events = vec![key_event(
+            egui::Key::N,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            true,
+            false,
+        )];
+        assert_eq!(bindings.consume(&mut events), (None, false));
+        assert_eq!(events.len(), 1);
+        let catalog = crate::actions::catalog(&bindings, true, true);
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|entry| entry.action == AppAction::ToggleFloatingPane)
+                .unwrap()
+                .shortcut
+                .as_deref(),
+            Some("Ctrl+K, Alt+K")
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|entry| entry.action == AppAction::OpenSearch)
+                .unwrap()
+                .shortcut,
+            None
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|entry| entry.action == AppAction::ExitCopyMode)
+                .unwrap()
+                .shortcut
+                .as_deref(),
+            Some("Ctrl+Shift+X")
+        );
+    }
+
+    #[test]
+    fn explicit_empty_keys_leave_every_action_unbound() {
+        let bindings = Bindings::compile(None, Some(Vec::new())).unwrap();
+        assert!(
+            crate::actions::catalog(&bindings, true, false)
+                .iter()
+                .all(|entry| entry.shortcut.is_none())
+        );
+        for (key, mods) in [
+            (egui::Key::N, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+            (egui::Key::M, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+            (egui::Key::Space, egui::Modifiers::ALT),
+        ] {
+            let mut events = vec![key_event(key, mods, true, false)];
+            assert_eq!(bindings.consume(&mut events), (None, false));
+            assert_eq!(events.len(), 1);
+        }
+    }
+
+    #[test]
+    fn actions_consume_paired_text_repeats_and_releases_without_retriggering() {
+        let bindings = Bindings::default();
+        for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
+            let mut events = vec![key_event(
+                egui::Key::N,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                pressed,
+                repeat,
+            )];
+            if pressed {
+                events.push(egui::Event::Text("N".into()));
+            }
+            events.push(egui::Event::Paste("unrelated".into()));
+            assert_eq!(
+                bindings.consume(&mut events),
+                ((pressed && !repeat).then_some(AppAction::NewWindow), true)
+            );
+            assert_eq!(events, vec![egui::Event::Paste("unrelated".into())]);
+        }
+    }
+
+    #[test]
+    fn scoped_actions_preserve_modal_query_input() {
+        let keys =
+            serde_json::from_value(serde_json::json!([{ "key": "s", "action": "OpenSearch" }]))
+                .unwrap();
+        let bindings = Bindings::compile(None, Some(keys)).unwrap();
+        let original = vec![
+            key_event(egui::Key::S, egui::Modifiers::NONE, true, false),
+            egui::Event::Text("s".into()),
+        ];
+        for context in [
+            ActionContext {
+                picker: true,
+                ..Default::default()
+            },
+            ActionContext {
+                quick_select: true,
+                ..Default::default()
+            },
+            ActionContext {
+                palette: true,
+                ..Default::default()
+            },
+        ] {
+            let mut events = original.clone();
+            assert_eq!(
+                bindings.consume_when(&mut events, |action, mods| context.allows(action, mods)),
+                (None, false)
+            );
+            assert_eq!(events, original);
+        }
+        let search = ActionContext {
+            search: true,
+            ..Default::default()
+        };
+        let mut events = original.clone();
+        assert_eq!(
+            bindings.consume_when(&mut events, |action, mods| search.allows(action, mods)),
+            (None, false)
+        );
+        assert_eq!(events, original);
+        let defaults = Bindings::default();
+        let mut events = vec![key_event(
+            egui::Key::Slash,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            true,
+            false,
+        )];
+        assert_eq!(
+            defaults.consume_when(&mut events, |action, mods| search.allows(action, mods)),
+            (Some(AppAction::OpenSearch), true)
+        );
+        assert!(events.is_empty());
+        assert!(!search.allows(&AppAction::NewWindow, egui::Modifiers::NONE));
+        assert!(search.allows(&AppAction::NewWindow, egui::Modifiers::CTRL));
+        assert!(
+            !ActionContext {
+                palette: true,
+                ..Default::default()
+            }
+            .allows(&AppAction::NewWindow, egui::Modifiers::CTRL)
+        );
+        assert!(
+            ActionContext {
+                quick_select: true,
+                ..Default::default()
+            }
+            .allows(&AppAction::OpenQuickSelect, egui::Modifiers::ALT)
+        );
+        assert!(!ActionContext::default().allows(&AppAction::ExitCopyMode, egui::Modifiers::CTRL));
+        assert!(
+            ActionContext {
+                copying: true,
+                ..Default::default()
+            }
+            .allows(&AppAction::ExitCopyMode, egui::Modifiers::CTRL)
+        );
+    }
+
+    #[test]
+    fn invalid_targets_and_cross_target_duplicates_are_rejected() {
+        for keys in [
+            serde_json::json!([{ "key": "k", "action": "Missing" }]),
+            serde_json::json!([{ "key": "k", "action": "OpenPicker" }]),
+            serde_json::json!([{ "key": "k" }]),
+            serde_json::json!([{ "key": "k", "action": "OpenSearch", "picker": "lines" }]),
+            serde_json::json!([{ "key": "k", "action": "OpenSearch" }, { "key": "k", "picker": "lines" }]),
+        ] {
+            let result = serde_json::from_value(keys)
+                .map_err(|error| error.to_string())
+                .and_then(|keys| Bindings::compile(None, Some(keys)));
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn palettes_use_normal_bindings_and_exclude_all_palette_definitions() {
+        let definitions = serde_json::from_value(serde_json::json!({
+            "commands": { "type": "CommandPalette" },
+            "alternate": { "type": "CommandPalette", "position": "Top", "initial_query": "floating" },
+            "lines": { "type": "Scrollback" }
+        })).unwrap();
+        let keys = serde_json::from_value(serde_json::json!([
+            { "key": "k", "mods": "CTRL|SHIFT", "picker": "alternate" }
+        ]))
+        .unwrap();
+        let bindings = Bindings::compile(Some(definitions), Some(keys)).unwrap();
+        assert!(
+            bindings
+                .palette_entries()
+                .all(|(name, _)| name != "commands" && name != "alternate")
+        );
+        let mods = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Default::default()
+        };
+        for repeat in [false, true] {
+            let mut events = vec![
+                egui::Event::Key {
+                    key: egui::Key::K,
+                    physical_key: Some(egui::Key::K),
+                    pressed: true,
+                    repeat,
+                    modifiers: mods,
+                },
+                egui::Event::Text("K".into()),
+                egui::Event::Text("unrelated".into()),
+            ];
+            let (open, consumed) = bindings.consume(&mut events);
+            assert!(consumed);
+            assert_eq!(open.is_some(), !repeat);
+            if let Some(entry) = open {
+                let crate::actions::AppAction::OpenPicker(name) = entry else {
+                    panic!("expected picker action")
+                };
+                let options = bindings
+                    .named(&name)
+                    .unwrap()
+                    .resolve(&Default::default())
+                    .unwrap();
+                assert!(matches!(options.source, Source::CommandPalette(_)));
+                assert_eq!(
+                    options.params.get("query").map(String::as_str),
+                    Some("floating")
+                );
+            }
+            assert!(matches!(&events[..], [egui::Event::Text(text)] if text == "unrelated"));
+        }
+        assert!(
+            serde_json::from_str::<Definition>(
+                r#"{"type":"CommandPalette","enter_action":"SendInput"}"#
+            )
+            .is_err()
+        );
+    }
+
     use super::*;
 
     #[test]
     fn every_picker_type_accepts_position_and_defaults_to_bottom() {
-        for kind in ["Scrollback", "Items", "Command", "FileSystem"] {
+        for kind in [
+            "Scrollback",
+            "Items",
+            "Command",
+            "FileSystem",
+            "CommandPalette",
+        ] {
             for (name, expected) in [
                 ("Top", Position::Top),
                 ("Center", Position::Center),
@@ -780,8 +1220,18 @@ mod tests {
 
     #[test]
     fn every_picker_type_accepts_preview_visibility() {
-        for kind in ["Scrollback", "Items", "Command", "FileSystem"] {
-            for (field, expected) in [("", true), (",\"preview_visible\":false", false)] {
+        for kind in [
+            "Scrollback",
+            "Items",
+            "Command",
+            "FileSystem",
+            "CommandPalette",
+        ] {
+            for (field, expected) in [
+                ("", kind != "CommandPalette"),
+                (",\"preview_visible\":false", false),
+                (",\"preview_visible\":true", true),
+            ] {
                 let args = if kind == "Command" {
                     ",\"args\":[\"cmd\"]"
                 } else {

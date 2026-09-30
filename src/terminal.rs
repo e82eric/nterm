@@ -1,3 +1,4 @@
+use crate::actions::AppAction;
 use crate::app::UserEvent;
 use std::ffi::c_char;
 
@@ -96,6 +97,52 @@ impl TerminalView {
         }
     }
 
+    fn execute_action(
+        &mut self,
+        action: AppAction,
+        floating_target: bool,
+        ctx: &egui::Context,
+        gl: &glow::Context,
+    ) {
+        match action {
+            AppAction::NewWindow => {
+                if let Err(error) = crate::app::open_new_window() {
+                    eprintln!("could not open a new terminal window: {error}");
+                }
+            }
+            AppAction::ToggleFloatingPane => {
+                if let Some(floating) = self.floating.as_mut() {
+                    floating.visible = !floating.visible;
+                } else {
+                    self.floating = FloatingTerminal::new(self, gl);
+                }
+            }
+            AppAction::CloseFloatingPane => self.close_floating(gl),
+            _ => {
+                let has_floating = self.floating.is_some();
+                let entry = if let AppAction::OpenPicker(name) = &action {
+                    self.picker_bindings.named(name)
+                } else {
+                    None
+                };
+                let pane = if floating_target {
+                    let Some(floating) = &mut self.floating else {
+                        return;
+                    };
+                    &mut floating.pane
+                } else {
+                    &mut self.main
+                };
+                if let Some(entry) = entry {
+                    pane.open_picker(ctx, entry, None, &self.picker_bindings, has_floating);
+                } else {
+                    pane.execute_action(&action, ctx);
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn floating_rect(
         content: egui::Rect,
         padding: Option<crate::config::FloatingPadding>,
@@ -146,43 +193,20 @@ impl TerminalView {
         ui.ctx().move_to_top(layer_id);
     }
     pub(crate) fn update(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
-        let (toggle, close) = ui.input_mut(|input| {
-            let mut toggle = false;
-            let mut close = false;
-            input.events.retain(|event| {
-                if let egui::Event::Key {
-                    key: key @ (egui::Key::E | egui::Key::W),
-                    pressed,
-                    modifiers,
-                    ..
-                } = event
-                    && modifiers.ctrl
-                    && modifiers.shift
-                    && !modifiers.alt
-                    && !modifiers.mac_cmd
-                {
-                    if *pressed {
-                        match key {
-                            egui::Key::E => toggle = true,
-                            egui::Key::W => close = true,
-                            _ => unreachable!(),
-                        }
-                    }
-                    return false;
-                }
-                true
-            });
-            (toggle, close)
+        let context = self.active_pane_ref().action_context();
+        let (shortcut, shortcut_consumed) = ui.input_mut(|input| {
+            self.picker_bindings
+                .consume_when(&mut input.events, |action, mods| {
+                    context.allows(action, mods)
+                })
         });
-        if close {
-            self.close_floating(gl);
-        } else if toggle {
-            if let Some(floating) = self.floating.as_mut() {
-                floating.visible = !floating.visible;
-            } else {
-                self.floating = FloatingTerminal::new(self, gl);
+        let pane_shortcut = match shortcut {
+            Some(action) if action.is_global() => {
+                self.execute_action(action, false, ui.ctx(), gl);
+                None
             }
-        }
+            action => action,
+        };
         if self
             .floating
             .as_ref()
@@ -228,18 +252,25 @@ impl TerminalView {
             self.main.show_background_overlays(ui.ctx(), rect);
         }
         self.main.refresh_decorations(false, resized);
+        // Snapshot-based actions must observe the resized pane, just like
+        // pane-local input handlers do.
+        if let Some(action) = pane_shortcut {
+            self.execute_action(action, floating_active, ui.ctx(), gl);
+        }
         let active_bounds = if floating_active { floating_rect } else { rect };
+        let has_floating = self.floating.is_some();
         let active_pane = if floating_active {
             &mut self.floating.as_mut().expect("visible floating pane").pane
         } else {
             &mut self.main
         };
-        let input = active_pane.handle_input(ui, active_bounds, &mut self.picker_bindings);
+        let input =
+            active_pane.handle_input(ui, active_bounds, &mut self.picker_bindings, has_floating);
         active_pane.forward_input(
             ui,
             active_bounds,
-            input.keyboard_blocked,
-            input.suppress_forward,
+            input.keyboard_blocked || shortcut_consumed,
+            input.suppress_forward || shortcut_consumed,
         );
         self.show_mode_status(ui, status_rect);
 
@@ -252,6 +283,9 @@ impl TerminalView {
             self.main.show_search_overlay(ui.ctx(), rect);
         }
 
+        if let Some(action) = input.action {
+            self.execute_action(action, floating_active, ui.ctx(), gl);
+        }
         self.main.drain_clipboard(ui.ctx());
         if let Some(floating) = &self.floating {
             floating.drain_clipboard(ui.ctx());

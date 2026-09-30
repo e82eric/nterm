@@ -57,11 +57,6 @@ impl ShellApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
-        if ui.input_mut(|input| consume_new_window_shortcut(&mut input.events))
-            && let Err(error) = open_new_window()
-        {
-            eprintln!("could not open a new terminal window: {error}");
-        }
         self.terminal.update(ui, gl);
     }
 
@@ -103,83 +98,11 @@ fn command_label(args: &[CString]) -> String {
     }
 }
 
-fn open_new_window() -> std::io::Result<()> {
+pub(crate) fn open_new_window() -> std::io::Result<()> {
     Command::new(std::env::current_exe()?)
         .args(std::env::args_os().skip(1))
         .spawn()?;
     Ok(())
-}
-
-fn consume_new_window_shortcut(events: &mut Vec<egui::Event>) -> bool {
-    let mut incoming = std::mem::take(events).into_iter().peekable();
-    let mut open = false;
-    while let Some(event) = incoming.next() {
-        if let egui::Event::Key {
-            key: egui::Key::N,
-            pressed,
-            repeat,
-            modifiers,
-            ..
-        } = &event
-            && modifiers.ctrl
-            && modifiers.shift
-            && !modifiers.alt
-            && !modifiers.mac_cmd
-        {
-            open |= *pressed && !*repeat;
-            if *pressed && matches!(incoming.peek(), Some(egui::Event::Text(_))) {
-                incoming.next();
-            }
-        } else {
-            events.push(event);
-        }
-    }
-    open
-}
-
-#[cfg(test)]
-mod shortcut_tests {
-    use super::consume_new_window_shortcut;
-
-    #[test]
-    fn ctrl_shift_n_opens_once_and_does_not_reach_the_terminal() {
-        let modifiers = egui::Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Default::default()
-        };
-        let key = |pressed, repeat, modifiers| egui::Event::Key {
-            key: egui::Key::N,
-            physical_key: Some(egui::Key::N),
-            pressed,
-            repeat,
-            modifiers,
-        };
-        let unrelated = key(true, false, egui::Modifiers::NONE);
-        let mut events = vec![
-            unrelated.clone(),
-            key(true, false, modifiers),
-            egui::Event::Text("N".into()),
-            key(true, true, modifiers),
-            key(false, false, modifiers),
-        ];
-        assert!(consume_new_window_shortcut(&mut events));
-        assert_eq!(events, vec![unrelated]);
-
-        for modifiers in [
-            egui::Modifiers::CTRL,
-            egui::Modifiers::SHIFT,
-            egui::Modifiers {
-                alt: true,
-                ..modifiers
-            },
-        ] {
-            let original = vec![key(true, false, modifiers)];
-            let mut events = original.clone();
-            assert!(!consume_new_window_shortcut(&mut events));
-            assert_eq!(events, original);
-        }
-    }
 }
 
 #[cfg(test)]

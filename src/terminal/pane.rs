@@ -2,8 +2,7 @@ use crate::app::UserEvent;
 use crate::copy_mode::{
     CopyAction, CopyMode, CopySelection, CopyTextObject, Jump, Motion, MotionEvaluation,
     MotionResult, SCROLL_PADDING_ROWS, TextRow, ViewportPosition, VisualMode, WordObject,
-    YANK_HIGHLIGHT_DURATION, YankCommand, copy_command_shortcut, find_prompt_boundaries,
-    is_copy_mode_shortcut, word_search_pattern,
+    YANK_HIGHLIGHT_DURATION, YankCommand, find_prompt_boundaries, word_search_pattern,
 };
 #[cfg(test)]
 use crate::copy_mode::{
@@ -274,6 +273,7 @@ impl TerminalPane {
 pub(super) struct PaneInput {
     pub(super) keyboard_blocked: bool,
     pub(super) suppress_forward: bool,
+    pub(super) action: Option<crate::actions::AppAction>,
 }
 
 pub(super) struct PaneStatus<'a> {
@@ -439,35 +439,24 @@ impl TerminalPane {
         ui: &egui::Ui,
         bounds: egui::Rect,
         bindings: &mut crate::picker::config::Bindings,
+        has_floating: bool,
     ) -> PaneInput {
-        let picker_consumed = self.handle_picker(ui, bounds, bindings);
+        let (picker_consumed, action) = self.handle_picker(ui, bounds, bindings, has_floating);
         let quick_consumed = !picker_consumed && self.handle_quick_select_keys(ui);
-        let search_shortcut_consumed =
-            !picker_consumed && !quick_consumed && self.handle_search_shortcut(ui);
         let copy_consumed = !picker_consumed && !quick_consumed && self.handle_copy_keys(ui);
         PaneInput {
             keyboard_blocked: picker_consumed
                 || quick_consumed
-                || search_shortcut_consumed
                 || copy_consumed
                 || self.search.active,
             suppress_forward: picker_consumed || quick_consumed,
+            action,
         }
     }
 
     fn handle_quick_select_keys(&mut self, ui: &egui::Ui) -> bool {
-        let was_active = self.quick_select.is_some();
-        let (open, consumed) =
-            ui.input_mut(|input| quick_select::consume_shortcut(&mut input.events));
-        if open && !self.search.active {
-            if was_active {
-                self.cancel_quick_select();
-            } else {
-                self.open_quick_select();
-            }
-        }
         if self.quick_select.is_none() {
-            return was_active || consumed;
+            return false;
         }
         let events = ui.input(|input| input.events.clone());
         for index in 0..events.len() {
@@ -559,19 +548,207 @@ impl TerminalPane {
         }
         unsafe { ghostty_ffi::ghostty_egui_host_text(host, text.as_ptr().cast(), text.len()) };
     }
+    pub(super) fn open_picker(
+        &mut self,
+        ctx: &egui::Context,
+        entry: crate::picker::config::PickerEntry,
+        request_params: Option<std::collections::BTreeMap<String, String>>,
+        bindings: &crate::picker::config::Bindings,
+        has_floating: bool,
+    ) {
+        let host = self.host;
+        let context = if entry.needs_context() {
+            let mut row = ghostty_ffi::LiveCursorLine::default();
+            if !unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line(host, &mut row) } {
+                eprintln!("unable to read live cursor line for picker");
+                return;
+            }
+            let bytes = if row.len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(row.text, row.len) }
+            };
+            let line = String::from_utf8_lossy(bytes).into_owned();
+            let before =
+                String::from_utf8_lossy(&bytes[..row.cursor_byte.min(bytes.len())]).into_owned();
+            let context = crate::config::PickerContext {
+                line,
+                line_before_cursor: before,
+                cursor_column: row.cursor_column,
+            };
+            unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line_free(&mut row) };
+            context
+        } else {
+            crate::config::PickerContext::default()
+        };
+        let mut options = match entry
+            .resolve(&context)
+            .and_then(|options| match request_params {
+                Some(params) => options.with_request(params),
+                None => Ok(options),
+            }) {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("picker: {error}");
+                return;
+            }
+        };
+        if let crate::picker::config::Source::CommandPalette(entries) = &mut options.source {
+            *entries = crate::actions::catalog(bindings, has_floating, self.copying());
+            // A factory's source is only known after resolving it. Exclude
+            // the current factory too, without evaluating other factories.
+            if let crate::picker::config::PickerEntry::Factory(factory, _) = &entry {
+                entries.retain(|entry| !matches!(&entry.action, crate::actions::AppAction::OpenPicker(name) if name == factory.name()));
+            }
+        }
+        let copy_generation = self.copy_mode.generation;
+        let from_copy = copy_generation.is_some();
+        let cursor_row = if options.position == crate::picker::config::Position::Cursor {
+            if let Some(generation) = copy_generation {
+                let copy_cursor = Some(self.copy_mode.cursor);
+                let mut view = SnapshotView::default();
+                if unsafe {
+                    ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view)
+                } {
+                    copy_cursor
+                        .and_then(|cursor| cursor.y.checked_sub(view.viewport_top))
+                        .filter(|row| *row < u64::from(view.viewport_rows))
+                        .and_then(|row| u32::try_from(row).ok())
+                } else {
+                    None
+                }
+            } else {
+                let mut cursor = ghostty_ffi::LiveCursorPosition::default();
+                unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_position(host, &mut cursor) }
+                    .then_some(cursor.row)
+            }
+        } else {
+            None
+        };
+        if matches!(
+            options.source,
+            crate::picker::config::Source::CommandPalette(_)
+                | crate::picker::config::Source::FileSystem(_)
+                | crate::picker::config::Source::Items(_)
+                | crate::picker::config::Source::Command(_)
+        ) {
+            self.picker = Some(crate::picker::Picker::start(
+                host,
+                if matches!(
+                    options.source,
+                    crate::picker::config::Source::CommandPalette(_)
+                ) {
+                    None
+                } else {
+                    copy_generation
+                },
+                from_copy,
+                0,
+                ctx.clone(),
+                options,
+            ));
+        } else {
+            let generation = if let Some(generation) = copy_generation {
+                generation
+            } else {
+                let mut generation = 0;
+                if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(host, &mut generation) }
+                {
+                    return;
+                }
+                generation
+            };
+            let mut view = SnapshotView::default();
+            if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view) }
+            {
+                if !from_copy {
+                    unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(host, generation) };
+                }
+                return;
+            }
+            if !from_copy {
+                self.copy_mode.start(generation, view);
+            }
+            self.picker = Some(crate::picker::Picker::start(
+                host,
+                Some(generation),
+                from_copy,
+                view.total_rows,
+                ctx.clone(),
+                options,
+            ));
+        }
+        if let Some(picker) = self.picker.as_mut() {
+            picker.cursor_row = cursor_row;
+        }
+    }
+    pub(super) fn action_context(&self) -> crate::actions::ActionContext {
+        crate::actions::ActionContext {
+            copying: self.copying(),
+            picker: self.picker.is_some(),
+            search: self.search.active,
+            quick_select: self.quick_select.is_some(),
+            palette: self
+                .picker
+                .as_ref()
+                .is_some_and(crate::picker::Picker::is_command_palette),
+        }
+    }
+    pub(super) fn copying(&self) -> bool {
+        self.copy_mode.generation.is_some()
+    }
+
+    pub(super) fn execute_action(
+        &mut self,
+        action: &crate::actions::AppAction,
+        ctx: &egui::Context,
+    ) {
+        use crate::actions::AppAction;
+        match action {
+            AppAction::OpenSearch => {
+                if self.search.active {
+                    self.search.focus_requested = true;
+                } else {
+                    self.open_search(String::new());
+                }
+            }
+            AppAction::EnterCopyMode => {
+                if !self.copying() {
+                    self.open_copy_mode();
+                }
+            }
+            AppAction::ExitCopyMode => self.close_copy_mode(),
+            AppAction::PreviousCommand | AppAction::NextCommand => {
+                if !self.copying() {
+                    self.open_copy_mode();
+                }
+                if self.copying() {
+                    let count = self.copy_mode.command_navigation_count();
+                    self.navigate_copy_command(matches!(action, AppAction::NextCommand), count);
+                }
+            }
+            AppAction::OpenQuickSelect => {
+                if self.quick_select.is_some() {
+                    self.cancel_quick_select();
+                } else {
+                    self.open_quick_select();
+                }
+            }
+            _ => {}
+        }
+        ctx.request_repaint();
+    }
     fn handle_picker(
         &mut self,
         ui: &egui::Ui,
         bounds: egui::Rect,
         bindings: &mut crate::picker::config::Bindings,
-    ) -> bool {
+        has_floating: bool,
+    ) -> (bool, Option<crate::actions::AppAction>) {
         let was_active = self.picker.as_ref().is_some();
         let modal_active = self.search.active || self.quick_select.is_some();
-        let (mut shortcut, mut consumed) = if was_active || modal_active {
-            (None, false)
-        } else {
-            ui.input_mut(|i| bindings.consume(&mut i.events))
-        };
+        let mut shortcut = None;
+        let mut consumed = false;
         let mut request_params = None;
         let request = self.wake.protocol_request.lock().unwrap().take();
         if let Some(request) = request {
@@ -588,119 +765,7 @@ impl TerminalPane {
             }
         }
         if let Some(entry) = shortcut.filter(|_| !was_active && !modal_active) {
-            let host = self.host;
-            let context = if entry.needs_context() {
-                let mut row = ghostty_ffi::LiveCursorLine::default();
-                if !unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line(host, &mut row) } {
-                    eprintln!("unable to read live cursor line for picker");
-                    return true;
-                }
-                let bytes = if row.len == 0 {
-                    &[][..]
-                } else {
-                    unsafe { std::slice::from_raw_parts(row.text, row.len) }
-                };
-                let line = String::from_utf8_lossy(bytes).into_owned();
-                let before = String::from_utf8_lossy(&bytes[..row.cursor_byte.min(bytes.len())])
-                    .into_owned();
-                let context = crate::config::PickerContext {
-                    line,
-                    line_before_cursor: before,
-                    cursor_column: row.cursor_column,
-                };
-                unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line_free(&mut row) };
-                context
-            } else {
-                crate::config::PickerContext::default()
-            };
-            let options = match entry
-                .resolve(&context)
-                .and_then(|options| match request_params {
-                    Some(params) => options.with_request(params),
-                    None => Ok(options),
-                }) {
-                Ok(options) => options,
-                Err(error) => {
-                    eprintln!("picker: {error}");
-                    return true;
-                }
-            };
-            let copy_generation = self.copy_mode.generation;
-            let from_copy = copy_generation.is_some();
-            let cursor_row = if options.position == crate::picker::config::Position::Cursor {
-                if let Some(generation) = copy_generation {
-                    let copy_cursor = Some(self.copy_mode.cursor);
-                    let mut view = SnapshotView::default();
-                    if unsafe {
-                        ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view)
-                    } {
-                        copy_cursor
-                            .and_then(|cursor| cursor.y.checked_sub(view.viewport_top))
-                            .filter(|row| *row < u64::from(view.viewport_rows))
-                            .and_then(|row| u32::try_from(row).ok())
-                    } else {
-                        None
-                    }
-                } else {
-                    let mut cursor = ghostty_ffi::LiveCursorPosition::default();
-                    unsafe {
-                        ghostty_ffi::ghostty_egui_host_live_cursor_position(host, &mut cursor)
-                    }
-                    .then_some(cursor.row)
-                }
-            } else {
-                None
-            };
-            if matches!(
-                options.source,
-                crate::picker::config::Source::FileSystem(_)
-                    | crate::picker::config::Source::Items(_)
-                    | crate::picker::config::Source::Command(_)
-            ) {
-                self.picker = Some(crate::picker::Picker::start(
-                    host,
-                    copy_generation,
-                    from_copy,
-                    0,
-                    ui.ctx().clone(),
-                    options,
-                ));
-            } else {
-                let generation = if let Some(generation) = copy_generation {
-                    generation
-                } else {
-                    let mut generation = 0;
-                    if !unsafe {
-                        ghostty_ffi::ghostty_egui_host_snapshot_begin(host, &mut generation)
-                    } {
-                        return true;
-                    }
-                    generation
-                };
-                let mut view = SnapshotView::default();
-                if !unsafe {
-                    ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view)
-                } {
-                    if !from_copy {
-                        unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(host, generation) };
-                    }
-                    return true;
-                }
-                if !from_copy {
-                    self.copy_mode.start(generation, view);
-                }
-                self.picker = Some(crate::picker::Picker::start(
-                    host,
-                    Some(generation),
-                    from_copy,
-                    view.total_rows,
-                    ui.ctx().clone(),
-                    options,
-                ));
-            }
-            if let Some(picker) = self.picker.as_mut() {
-                picker.cursor_row = cursor_row;
-            }
+            self.open_picker(ui.ctx(), entry, request_params, bindings, has_floating);
         }
         let active = self.picker.as_ref().is_some();
         let host = self.host;
@@ -712,6 +777,7 @@ impl TerminalPane {
             .picker
             .as_mut()
             .and_then(|picker| picker.show_in_bounds(ui.ctx(), bounds));
+        let mut application_action = None;
         if let Some(action) = action {
             let picker = self
                 .picker
@@ -725,10 +791,10 @@ impl TerminalPane {
                     m.surrender_focus(id);
                 }
             });
-            self.handle_picker_action(action, generation, from_copy);
+            application_action = self.handle_picker_action(action, generation, from_copy);
             ui.ctx().request_repaint();
         }
-        was_active || active || consumed
+        (was_active || active || consumed, application_action)
     }
 
     fn handle_picker_action(
@@ -736,7 +802,7 @@ impl TerminalPane {
         action: crate::picker::Action,
         generation: Option<u64>,
         from_copy: bool,
-    ) {
+    ) -> Option<crate::actions::AppAction> {
         let restore_copy = |pane: &mut Self| {
             if from_copy {
                 if let Some(generation) = generation {
@@ -747,6 +813,7 @@ impl TerminalPane {
             }
         };
         match action {
+            crate::picker::Action::Execute(action) => return Some(action),
             crate::picker::Action::Cancel => restore_copy(self),
             crate::picker::Action::Accept(target) => {
                 if let Some(generation) = generation {
@@ -814,6 +881,7 @@ impl TerminalPane {
                 }
             }
         }
+        None
     }
 
     fn accept_picker_cell(&mut self, generation: u64, target: SnapshotCell) {
@@ -1004,19 +1072,6 @@ impl TerminalPane {
         self.close_copy_mode();
     }
 
-    fn handle_search_shortcut(&mut self, ui: &egui::Ui) -> bool {
-        let (open, consumed) = ui.input_mut(|input| consume_search_shortcut(&mut input.events));
-        if open {
-            if self.search.active {
-                self.search.focus_requested = true;
-                ui.ctx().request_repaint();
-            } else {
-                self.close_search();
-                self.open_search(String::new());
-            }
-        }
-        consumed
-    }
     fn open_search(&mut self, needle: String) {
         self.copy_mode.cancel_pending_search();
         self.close_copy_mode();
@@ -1186,21 +1241,10 @@ impl TerminalPane {
     fn handle_copy_keys(&mut self, ui: &egui::Ui) -> bool {
         let was_active = self.copy_mode.generation.is_some();
         let events = ui.input(|input| input.events.clone());
-        let mut handled = false;
         self.copy_mode.begin_input_batch();
         for event in &events {
             if self.copy_mode.generation.is_none() {
-                let command_direction = copy_command_shortcut(event);
-                if !self.search.active
-                    && (is_copy_mode_shortcut(event) || command_direction.is_some())
-                {
-                    self.open_copy_mode();
-                    handled = true;
-                    if let Some(forward) = command_direction {
-                        self.navigate_copy_command(forward, 1);
-                    }
-                }
-                continue;
+                break;
             }
             let action = self.copy_mode.input(event);
             let generation = self.copy_mode.generation.expect("copy mode is active");
@@ -1219,9 +1263,6 @@ impl TerminalPane {
                 CopyAction::Redraw | CopyAction::ToggleVisual => {
                     self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
                     true
-                }
-                CopyAction::Command { forward, count } => {
-                    self.navigate_copy_command(forward, count)
                 }
                 CopyAction::Position(position) => self.position_copy_viewport(position),
                 CopyAction::SelectObject {
@@ -1282,7 +1323,7 @@ impl TerminalPane {
                 break;
             }
         }
-        was_active || self.copy_mode.generation.is_some() || handled
+        was_active || self.copy_mode.generation.is_some()
     }
 
     fn execute_copy_yank(
@@ -2013,43 +2054,6 @@ impl TerminalPane {
     }
 }
 
-/// Consume the app shortcut and its paired Text event before either copy
-/// mode, the search field, or Ghostty sees them. Repeats do not reopen search.
-fn consume_search_shortcut(events: &mut Vec<egui::Event>) -> (bool, bool) {
-    let mut incoming = std::mem::take(events).into_iter().peekable();
-    let mut open = false;
-    let mut consumed = false;
-    while let Some(event) = incoming.next() {
-        if let egui::Event::Key {
-            key,
-            pressed,
-            repeat,
-            modifiers,
-            ..
-        } = &event
-            && !modifiers.alt
-            && ((matches!(key, egui::Key::Slash | egui::Key::Questionmark)
-                && modifiers.ctrl
-                && modifiers.shift
-                && !modifiers.mac_cmd)
-                || (cfg!(target_os = "macos")
-                    && *key == egui::Key::F
-                    && modifiers.mac_cmd
-                    && !modifiers.ctrl
-                    && !modifiers.shift))
-        {
-            consumed = true;
-            open |= *pressed && !*repeat;
-            if *pressed && matches!(incoming.peek(), Some(egui::Event::Text(_))) {
-                incoming.next();
-            }
-        } else {
-            events.push(event);
-        }
-    }
-    (open, consumed)
-}
-
 #[cfg(test)]
 mod copy_shortcut_tests {
     #[test]
@@ -2113,100 +2117,9 @@ mod copy_shortcut_tests {
     }
 
     use super::{
-        CopyTextObject, consume_search_shortcut, copy_command_shortcut, copy_digit,
-        copy_jump_prefix, copy_motion, copy_motion_with_prefix, copy_text_object_key,
-        is_copy_mode_shortcut, is_copy_modifier_key,
+        CopyTextObject, copy_digit, copy_jump_prefix, copy_motion, copy_motion_with_prefix,
+        copy_text_object_key, is_copy_modifier_key,
     };
-
-    #[test]
-    fn search_shortcut_consumes_key_and_paired_text_only() {
-        let key = |modifiers, pressed, repeat| egui::Event::Key {
-            key: egui::Key::Questionmark,
-            physical_key: Some(egui::Key::Slash),
-            pressed,
-            repeat,
-            modifiers,
-        };
-        let modifiers = egui::Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Default::default()
-        };
-        let mut events = vec![
-            key(modifiers, true, false),
-            egui::Event::Text("?".into()),
-            egui::Event::Paste("query".into()),
-        ];
-        assert_eq!(consume_search_shortcut(&mut events), (true, true));
-        assert_eq!(events, vec![egui::Event::Paste("query".into())]);
-
-        for (pressed, repeat) in [(true, true), (false, false)] {
-            let mut events = vec![key(modifiers, pressed, repeat)];
-            assert_eq!(consume_search_shortcut(&mut events), (false, true));
-            assert!(events.is_empty());
-        }
-        for modifiers in [
-            egui::Modifiers::NONE,
-            egui::Modifiers::CTRL,
-            egui::Modifiers::SHIFT,
-            egui::Modifiers {
-                alt: true,
-                ..modifiers
-            },
-        ] {
-            let original = vec![key(modifiers, true, false), egui::Event::Text("f".into())];
-            let mut events = original.clone();
-            assert_eq!(consume_search_shortcut(&mut events), (false, false));
-            assert_eq!(events, original);
-        }
-    }
-
-    #[test]
-    fn command_shortcuts_require_ctrl_shift_arrows_and_a_key_press() {
-        let event = |key, modifiers, pressed| egui::Event::Key {
-            key,
-            physical_key: Some(key),
-            pressed,
-            repeat: false,
-            modifiers,
-        };
-        let modifiers = egui::Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            copy_command_shortcut(&event(egui::Key::ArrowUp, modifiers, true)),
-            Some(false)
-        );
-        assert_eq!(
-            copy_command_shortcut(&event(egui::Key::ArrowDown, modifiers, true)),
-            Some(true)
-        );
-        assert_eq!(
-            copy_command_shortcut(&event(egui::Key::ArrowUp, modifiers, false)),
-            None
-        );
-        assert_eq!(
-            copy_command_shortcut(&event(egui::Key::ArrowUp, egui::Modifiers::CTRL, true)),
-            None
-        );
-        assert_eq!(
-            copy_command_shortcut(&event(egui::Key::ArrowUp, egui::Modifiers::SHIFT, true)),
-            None
-        );
-        assert_eq!(
-            copy_command_shortcut(&event(
-                egui::Key::ArrowUp,
-                egui::Modifiers {
-                    alt: true,
-                    ..modifiers
-                },
-                true
-            )),
-            None
-        );
-    }
 
     #[test]
     fn standalone_modifier_events_do_not_consume_yank_targets() {
@@ -2249,32 +2162,6 @@ mod copy_shortcut_tests {
             copy_text_object_key(egui::Key::C, egui::Modifiers::NONE),
             Some(CopyTextObject::Command)
         ));
-    }
-
-    #[test]
-    fn copy_mode_shortcut_requires_ctrl_shift_m() {
-        let ctrl_shift = egui::Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Default::default()
-        };
-        let key_event = |key, modifiers| egui::Event::Key {
-            key,
-            physical_key: Some(key),
-            pressed: true,
-            repeat: false,
-            modifiers,
-        };
-        assert!(is_copy_mode_shortcut(&key_event(egui::Key::M, ctrl_shift)));
-        assert!(!is_copy_mode_shortcut(&key_event(
-            egui::Key::M,
-            egui::Modifiers {
-                ctrl: true,
-                ..Default::default()
-            },
-        )));
-        assert!(!is_copy_mode_shortcut(&key_event(egui::Key::X, ctrl_shift)));
-        assert!(!is_copy_mode_shortcut(&egui::Event::Cut));
     }
 
     #[test]

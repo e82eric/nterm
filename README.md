@@ -71,6 +71,49 @@ the base; Lua overrides them, and explicit command-line options override Lua.
 The picker still imports Ghostty's resolved font and tracks its cell dimensions.
 Changes to Lua require restarting the app; live reload is not supported.
 
+## Command palette
+
+The command palette is a named picker with `type = "CommandPalette"`. The default
+configuration and sample bind it to **Ctrl+Shift+Space**. Type to filter actions,
+use the arrow keys to select one, and press Enter to run it. Escape closes the
+palette and preserves the terminal's current copy mode and cursor.
+
+The palette lists new window, floating pane, search, copy mode, quick select,
+command navigation, and named picker actions. It displays configured picker
+shortcuts and includes pickers without a binding. Unavailable actions are omitted:
+closing a floating pane requires an existing pane, and entering or exiting copy
+mode depends on the target pane's state. Empty Items sources without a provider
+and Command sources requiring unresolved OSC parameters are omitted. Lua factories
+run only when their picker is selected.
+
+The palette uses the normal picker layout and opens within the active pane.
+Pane actions target that pane; choosing an action closes the picker before dispatching it. Terminal
+input is blocked while the palette is open. Close another picker, search, or quick
+select overlay before opening the palette.
+
+Define it and its shortcut alongside other pickers in the returned Lua table:
+
+```lua
+pickers = {
+  commands = {
+    type = "CommandPalette",
+    position = "Center",
+    preview_visible = false,
+  },
+},
+keys = {
+  { key = "Space", mods = "CTRL|SHIFT", picker = "commands" },
+},
+```
+
+Duplicate shortcuts across picker and action bindings are rejected.
+Add these entries to your existing `pickers` and `keys` tables. You can choose any
+name or binding and use normal `position`, `initial_query`, `preview`, and
+`preview_visible` options. Previews start hidden by default for this source.
+Palette pickers are excluded from the catalog. Selection always dispatches the
+catalog's typed action; `enter_action` and custom Lua `action` are unsupported.
+The separate top-level `command_palette` setting has been removed.
+
 Named pickers and their shortcuts can also be defined in Lua:
 
 ```lua
@@ -87,6 +130,43 @@ keys = {
 ```
 
 These fields belong inside the returned configuration table.
+
+### Action bindings
+
+The same `keys` table accepts top-level application actions. Each binding must
+specify exactly one of `action` or `picker`:
+
+```lua
+keys = {
+  { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },
+  { key = "w", mods = "CTRL|SHIFT", action = "CloseFloatingPane" },
+  { key = "f", mods = "CTRL|SHIFT", action = "OpenSearch" },
+  { key = "Space", mods = "CTRL|SHIFT", picker = "commands" },
+},
+```
+
+Supported action names are `NewWindow`, `ToggleFloatingPane`, `CloseFloatingPane`,
+`OpenSearch`, `EnterCopyMode`, `ExitCopyMode`, `OpenQuickSelect`, `PreviousCommand`,
+and `NextCommand`. Use `picker = "name"` to open a named picker. Multiple different
+shortcuts may invoke the same action; the command palette displays their actual
+configured bindings. Actions without bindings remain available in the palette.
+
+Omitting `keys` preserves the built-in shortcuts and default picker bindings.
+Providing `keys` replaces the complete list; `keys = {}` disables all top-level
+shortcuts. The sample Lua config explicitly includes the original bindings.
+Unknown actions, missing or ambiguous targets, and duplicate shortcuts fail
+configuration validation. Shortcuts that were previously reserved for app
+actions can now be assigned to any action or picker.
+
+Picker, preview, search, quick-select, and copy-mode controls retain their local
+bindings. Top-level bindings do not intercept modal query input. Window and
+floating-pane actions remain available in ordinary overlays; the command palette
+keeps its input modal. Search and quick select can still be focused or toggled
+using their configured bindings while active. In query and hint overlays, bindings
+without Ctrl, Alt, or Cmd are left to local text input. `ExitCopyMode` is available only
+while copying; Escape retains its existing copy-mode behavior, including clearing
+pending motions, visual selection, and search before exiting.
+
 Picker names can also map to functions. The function runs when its keybinding or
 named OSC request opens the picker, and returns the same table as a static picker:
 
@@ -291,12 +371,14 @@ restrict programs that already have access to the terminal's environment.
 
 Keys accept egui names such as `f`, `Space`, and `ArrowUp`; modifiers are joined
 with `|` (`CTRL`, `SHIFT`, `ALT`; `CMD`/`SUPER` are macOS-only). Definitions and regexes are compiled
-at startup; unknown picker names, invalid patterns, duplicate bindings, and
-conflicts with reserved app shortcuts report configuration errors. Bindings only
-trigger from terminal or copy mode, leaving modal query input unaffected.
-Without `pickers`, the built-in `lines` picker remains available. Without `keys`,
-Ctrl+Shift+F opens `lines` if defined. An explicit empty `keys = {}` disables picker
-shortcuts. Explicit `pickers` and `keys` replace their respective defaults.
+at startup; unknown action or picker names, invalid patterns, ambiguous targets,
+and duplicate bindings report configuration errors. Picker bindings trigger from
+terminal or copy mode, leaving modal query input unaffected.
+Without `pickers`, the built-in `lines` and `commands` pickers remain available.
+Without `keys`, built-in action bindings are retained, Ctrl+Shift+F opens `lines`
+if defined, and Ctrl+Shift+Space opens the built-in `commands` palette if defined.
+An explicit empty `keys = {}` disables top-level action and picker shortcuts.
+Explicit `pickers` and `keys` replace their respective defaults.
 
 The Rust source is divided by responsibility: `app.rs` owns the native window
 and event loop, `terminal.rs` handles pane layout, `terminal/pane.rs`

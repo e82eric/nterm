@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+mod actions;
 mod app;
 mod config;
 mod copy_mode;
