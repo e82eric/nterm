@@ -95,8 +95,8 @@ impl QuickSelect {
         let ranges = self.visible_hints().map(|hint| hint.range).collect();
         let text = self.cell_text();
         let style = SnapshotDecorationStyle {
-            foreground_rgb: 0xebdbb2,
-            background_rgb: 0x3c3836,
+            foreground_rgb: crate::colors::rgb(crate::colors::palette().selection_text),
+            background_rgb: crate::colors::rgb(crate::colors::palette().panel_background),
             flags: 3,
         };
         (ranges, text, style)
@@ -219,8 +219,8 @@ impl QuickSelect {
                     cell: SnapshotCell { x, y: start.y },
                     codepoint: u32::from(ch.to_ascii_uppercase()),
                     style: SnapshotDecorationStyle {
-                        foreground_rgb: 0xd79921,
-                        background_rgb: 0x282828,
+                        foreground_rgb: crate::colors::rgb(crate::colors::palette().accent),
+                        background_rgb: crate::colors::rgb(crate::colors::palette().background),
                         flags: 3, // Hints use plain background, even on styled cells.
                     },
                     bold: true,

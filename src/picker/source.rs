@@ -13,7 +13,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 enum Session {
     Streaming(FuzzySearchSession<Items, SnapshotStore<Items>>),
     Structured {
@@ -72,6 +72,7 @@ pub(super) enum PickerSource {
     CommandPalette {
         runtime: Runtime,
         entries: Vec<crate::actions::Entry>,
+        error_history: bool,
     },
     FileSystem(Runtime),
     Scrollback(Runtime),
@@ -106,7 +107,14 @@ impl PickerSource {
             if let Some(provider) = &items.provider {
                 match provider.read() {
                     Ok(values) => items.values = values,
-                    Err(message) => *error.lock().unwrap() = Some(message),
+                    Err(message) => {
+                        crate::error_log::error(
+                            "picker provider",
+                            "Unable to load items",
+                            &message,
+                        );
+                        *error.lock().unwrap() = Some(message);
+                    }
                 }
             }
         }
@@ -125,6 +133,7 @@ impl PickerSource {
         };
         if let crate::picker::config::Source::FileSystem(files) = &mut options.source {
             if let Err(message) = crate::picker::files::resolve_roots(files) {
+                crate::error_log::error("picker filesystem", "Unable to resolve roots", &message);
                 *error.lock().unwrap() = Some(message);
             }
         }
@@ -157,6 +166,9 @@ impl PickerSource {
                 *error.lock().unwrap() =
                     Some("Filesystem pickers require NFM support for this platform".into());
                 Session::UnsupportedFileSystem
+            }
+            crate::picker::config::Source::Themes | crate::picker::config::Source::ErrorLog => {
+                unreachable!("theme source must be resolved before starting")
             }
             crate::picker::config::Source::CommandPalette(entries) => {
                 let schema = StructuredSchema::new(vec!["Action".into(), "Shortcut".into()])
@@ -202,24 +214,36 @@ impl PickerSource {
         let updates = Arc::new(std::sync::Mutex::new(None));
         {
             let (updates, cancelled, ctx) = (updates.clone(), cancelled.clone(), ctx.clone());
-            thread::spawn(move || {
-                while !cancelled.load(Ordering::Acquire) {
-                    match updates_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                        Ok(mut update) => {
-                            while let Ok(newer) = updates_rx.try_recv() {
-                                update = newer;
+            let failure_error = error.clone();
+            let failure_ctx = ctx.clone();
+            crate::worker::spawn(
+                "picker update worker",
+                move || {
+                    while !cancelled.load(Ordering::Acquire) {
+                        match updates_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                            Ok(mut update) => {
+                                while let Ok(newer) = updates_rx.try_recv() {
+                                    update = newer;
+                                }
+                                *updates.lock().unwrap() = Some(update);
+                                ctx.request_repaint();
                             }
-                            *updates.lock().unwrap() = Some(update);
-                            ctx.request_repaint();
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
-                }
-            });
+                },
+                move |message| {
+                    crate::error_log::error("picker", "Search update worker failed", &message);
+                    *failure_error
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(message);
+                    failure_ctx.request_repaint();
+                },
+            );
         }
         let reader = if let crate::picker::config::Source::Command(config) = &options.source {
-            Some(crate::picker::command::start(
+            crate::picker::command::start(
                 config.clone(),
                 options.params.clone(),
                 store.clone(),
@@ -227,7 +251,7 @@ impl PickerSource {
                 error.clone(),
                 ctx.clone(),
                 command_values.clone(),
-            ))
+            )
         } else if let crate::picker::config::Source::Scrollback { regex, unique } = &options.source
         {
             let regex = regex.clone();
@@ -235,58 +259,78 @@ impl PickerSource {
             let generation = generation.expect("scrollback picker requires a snapshot");
             let (store, cancelled, error) = (store.clone(), cancelled.clone(), error.clone());
             let host = host as usize;
-            Some(thread::spawn(move || {
-                let mut publisher = PublishingStreamingItemStoreWithPayload::new(store);
-                let read = |row| {
-                    if cancelled.load(Ordering::Acquire) {
-                        return None;
-                    }
-                    let result = read_row(host as *mut Host, generation, row);
-                    if result.is_none() {
-                        *error.lock().unwrap() = Some("Unable to read scrollback snapshot".into());
-                    }
-                    result
-                };
-                let mut bottom = rows;
-                let mut batch = 0;
-                while bottom > 0 && !cancelled.load(Ordering::Acquire) {
-                    let end = bottom - 1;
-                    let mut start = end;
-                    let Some(last) = read(end) else {
-                        break;
+            let failure_error = error.clone();
+            let failure_ctx = ctx.clone();
+            let failure_store = store.clone();
+            crate::worker::spawn(
+                "picker scrollback worker",
+                move || {
+                    let mut publisher = PublishingStreamingItemStoreWithPayload::new(store);
+                    let read = |row| {
+                        if cancelled.load(Ordering::Acquire) {
+                            return None;
+                        }
+                        let result = read_row(host as *mut Host, generation, row);
+                        if result.is_none() && error.lock().unwrap().is_none() {
+                            crate::error_log::error(
+                                "picker",
+                                "Unable to read scrollback snapshot",
+                                "The terminal snapshot could not be read",
+                            );
+                            *error.lock().unwrap() =
+                                Some("Unable to read scrollback snapshot".into());
+                        }
+                        result
                     };
-                    let mut lines = vec![(end, last)];
-                    while start > 0 {
-                        let Some(previous) = read(start - 1) else {
+                    let mut bottom = rows;
+                    let mut batch = 0;
+                    while bottom > 0 && !cancelled.load(Ordering::Acquire) {
+                        let end = bottom - 1;
+                        let mut start = end;
+                        let Some(last) = read(end) else {
                             break;
                         };
-                        if !previous.wraps_to_next {
-                            break;
+                        let mut lines = vec![(end, last)];
+                        while start > 0 {
+                            let Some(previous) = read(start - 1) else {
+                                break;
+                            };
+                            if !previous.wraps_to_next {
+                                break;
+                            }
+                            start -= 1;
+                            lines.push((start, previous));
                         }
-                        start -= 1;
-                        lines.push((start, previous));
-                    }
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    lines.reverse();
-                    for (text, range) in newest_logical_items(&lines, &regex, &mut seen) {
                         if cancelled.load(Ordering::Acquire) {
                             break;
                         }
-                        publisher.add_item(text.as_bytes(), range);
-                        batch += 1;
-                        if batch >= 128 {
-                            publisher.publish();
-                            batch = 0;
-                            ctx.request_repaint();
+                        lines.reverse();
+                        for (text, range) in newest_logical_items(&lines, &regex, &mut seen) {
+                            if cancelled.load(Ordering::Acquire) {
+                                break;
+                            }
+                            publisher.add_item(text.as_bytes(), range);
+                            batch += 1;
+                            if batch >= 128 {
+                                publisher.publish();
+                                batch = 0;
+                                ctx.request_repaint();
+                            }
                         }
+                        bottom = start;
                     }
-                    bottom = start;
-                }
-                publisher.complete();
-                ctx.request_repaint();
-            }))
+                    publisher.complete();
+                    ctx.request_repaint();
+                },
+                move |message| {
+                    crate::error_log::error("picker", "Scrollback worker failed", &message);
+                    *failure_error
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(message);
+                    PublishingStreamingItemStoreWithPayload::new(failure_store.clone()).complete();
+                    failure_ctx.request_repaint();
+                },
+            )
         } else {
             if let crate::picker::config::Source::Items(items) = &options.source {
                 let mut publisher = PublishingStreamingItemStoreWithPayload::new(store.clone());
@@ -306,9 +350,13 @@ impl PickerSource {
             reader,
         };
         let source = match &options.source {
+            config::Source::Themes | crate::picker::config::Source::ErrorLog => {
+                unreachable!("theme source must be resolved before starting")
+            }
             config::Source::CommandPalette(entries) => Self::CommandPalette {
                 runtime,
                 entries: entries.clone(),
+                error_history: options.params.contains_key("__error_history"),
             },
             config::Source::FileSystem(_) => Self::FileSystem(runtime),
             config::Source::Scrollback { .. } => Self::Scrollback(runtime),
@@ -342,6 +390,17 @@ impl PickerSource {
             Self::Scrollback(_) => "SCROLLBACK PICKER",
             Self::Items { .. } => "ITEMS PICKER",
             Self::Command { .. } => "COMMAND PICKER",
+            Self::CommandPalette { entries, .. }
+                if entries.first().is_some_and(|entry| {
+                    matches!(entry.action, crate::actions::AppAction::ApplyTheme(_))
+                }) =>
+            {
+                "GHOSTTY THEMES"
+            }
+            Self::CommandPalette {
+                error_history: true,
+                ..
+            } => "ERROR HISTORY",
             Self::CommandPalette { .. } => "COMMAND PALETTE",
         }
     }

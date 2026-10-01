@@ -32,6 +32,7 @@ static uint32_t style_color(GhosttyStyleColor color,
 bool ghostty_egui_preview_parse(const uint8_t *bytes, size_t length,
                                 uint16_t columns, uint16_t rows,
                                 size_t scroll_offset,
+                                uint32_t default_foreground, uint32_t default_background,
                                 GhosttyEguiPreviewCell *cells,
                                 size_t *out_total_rows) {
     if (!cells || !out_total_rows || !columns || !rows || (length && !bytes)) return false;
@@ -75,8 +76,8 @@ bool ghostty_egui_preview_parse(const uint8_t *bytes, size_t length,
             style.size = sizeof(style);
             if (ghostty_grid_ref_style(&ref, &style) != GHOSTTY_SUCCESS)
                 continue;
-            out->foreground = style_color(style.fg_color, palette, 0xebdbb2);
-            out->background = style_color(style.bg_color, palette, 0x282828);
+            out->foreground = style_color(style.fg_color, palette, default_foreground);
+            out->background = style_color(style.bg_color, palette, default_background);
             out->underline_color = style_color(style.underline_color, palette, out->foreground);
             out->flags = (style.bold ? 1 : 0) | (style.italic ? 2 : 0) |
                          (style.strikethrough ? 4 : 0) | (style.inverse ? 8 : 0) |

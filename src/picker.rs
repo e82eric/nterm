@@ -4,6 +4,7 @@ pub(crate) mod config;
 pub(crate) mod files;
 pub(crate) mod font;
 pub(crate) mod preview;
+mod process;
 pub(crate) mod protocol;
 mod source;
 pub(crate) mod style;
@@ -155,14 +156,19 @@ fn result_layout(
     query: &str,
     font: &egui::FontId,
     matched_font: &egui::FontId,
+    selected: bool,
 ) -> egui::text::LayoutJob {
     let normal = egui::TextFormat {
         font_id: font.clone(),
-        color: style::TEXT,
+        color: if selected {
+            crate::colors::palette().selection_text
+        } else {
+            crate::colors::palette().text
+        },
         ..Default::default()
     };
     let matched = egui::TextFormat {
-        color: egui::Color32::from_rgb(251, 73, 52),
+        color: crate::colors::palette().match_highlight,
         font_id: matched_font.clone(),
         ..normal.clone()
     };
@@ -525,18 +531,21 @@ impl Picker {
                     ui.set_opacity(0.0);
                 }
                 egui::Frame::new()
-                    .fill(style::BACKGROUND)
-                    .stroke(egui::Stroke::new(1.0, style::BORDER))
+                    .fill(crate::colors::palette().panel_background)
+                    .stroke(egui::Stroke::new(1.0, crate::colors::palette().border))
                     .corner_radius(style::PANEL_RADIUS)
                     .inner_margin(egui::Margin::symmetric(18, 10))
                     .show(ui, |ui| {
                         // Ten points outside each edge, plus frame padding and stroke.
                         ui.set_width((bounds.width() - style::PANEL_CONTENT_INSET).max(1.0));
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.visuals_mut().override_text_color = Some(style::TEXT);
-                        ui.visuals_mut().text_cursor.stroke = egui::Stroke::new(2.0, style::TEXT);
-                        ui.visuals_mut().selection.bg_fill = style::SELECTION;
-                        ui.visuals_mut().selection.stroke.color = style::TEXT;
+                        ui.visuals_mut().override_text_color = Some(crate::colors::palette().text);
+                        ui.visuals_mut().text_cursor.stroke =
+                            egui::Stroke::new(2.0, crate::colors::palette().text);
+                        ui.visuals_mut().selection.bg_fill =
+                            crate::colors::palette().selection_background;
+                        ui.visuals_mut().selection.stroke.color =
+                            crate::colors::palette().selection_text;
                         if let Some(preview) =
                             self.preview.as_mut().filter(|_| self.preview_visible)
                         {
@@ -574,15 +583,32 @@ impl Picker {
                             if slot == 0 {
                                 results_top = Some(row_rect);
                             }
+                            if matches!(self.source.label(), "GHOSTTY THEMES" | "ERROR HISTORY")
+                                && self.results.get(index).is_some()
+                                && ui
+                                    .interact(
+                                        row_rect,
+                                        ui.id().with(("theme-row", index)),
+                                        egui::Sense::click(),
+                                    )
+                                    .clicked()
+                            {
+                                self.selected = index;
+                                accept = true;
+                            }
                             if index == self.selected && self.results.get(index).is_some() {
-                                ui.painter().rect_filled(row_rect, 4, style::SELECTION);
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    4,
+                                    crate::colors::palette().selection_background,
+                                );
                                 ui.painter().rect_filled(
                                     egui::Rect::from_center_size(
                                         egui::pos2(row_rect.left() + 1.5, row_rect.center().y),
                                         egui::vec2(3.0, 16.0),
                                     ),
                                     1.5,
-                                    style::ACCENT,
+                                    crate::colors::palette().accent,
                                 );
                             }
                             let painter = ui
@@ -596,6 +622,7 @@ impl Picker {
                                     &self.source.effective_query(&self.results_query),
                                     &self.typography.font,
                                     &self.typography.matched_font,
+                                    index == self.selected,
                                 );
                                 let galley = painter.layout_job(job);
                                 painter.galley(
@@ -604,7 +631,7 @@ impl Picker {
                                         row_rect.center().y - galley.size().y / 2.0,
                                     ),
                                     galley,
-                                    style::TEXT,
+                                    crate::colors::palette().text,
                                 );
                             } else {
                                 painter.text(
@@ -613,9 +640,9 @@ impl Picker {
                                     text,
                                     self.typography.font.clone(),
                                     if error.is_some() {
-                                        style::ERROR
+                                        crate::colors::palette().error
                                     } else {
-                                        style::MUTED
+                                        crate::colors::palette().muted_text
                                     },
                                 );
                             }
@@ -629,17 +656,21 @@ impl Picker {
                             let galley = ui.painter().layout_no_wrap(
                                 label.to_owned(),
                                 self.typography.font.clone(),
-                                style::TEXT,
+                                crate::colors::palette().success,
                             );
                             let toast = egui::Rect::from_min_size(
                                 egui::pos2(top.right() - galley.size().x - 20.0, top.top() + 2.0),
                                 galley.size() + egui::vec2(16.0, 6.0),
                             );
-                            ui.painter().rect_filled(toast, 3, style::SELECTION);
+                            ui.painter().rect_filled(
+                                toast,
+                                3,
+                                crate::colors::palette().selection_background,
+                            );
                             ui.painter().galley(
                                 toast.min + egui::vec2(8.0, 3.0),
                                 galley,
-                                style::TEXT,
+                                crate::colors::palette().text,
                             );
                         }
                         style::divider(ui);
@@ -655,7 +686,7 @@ impl Picker {
                                 egui::Align2::LEFT_CENTER,
                                 ">",
                                 self.typography.font.clone(),
-                                style::ACCENT,
+                                crate::colors::palette().accent,
                             );
                             let count = format!("{}/{}", self.matched, self.total);
                             let count_size = ui
@@ -663,7 +694,7 @@ impl Picker {
                                 .layout_no_wrap(
                                     format!("{0}/{0}", self.total),
                                     self.typography.font.clone(),
-                                    style::TEXT,
+                                    crate::colors::palette().text,
                                 )
                                 .size();
                             let indicator_size = 12.0;
@@ -704,14 +735,14 @@ impl Picker {
                                     egui::Align2::LEFT_CENTER,
                                     &self.query,
                                     self.typography.font.clone(),
-                                    style::TEXT,
+                                    crate::colors::palette().text,
                                 );
                             }
                             let (status_rect, _) = ui.allocate_exact_size(
                                 egui::vec2(status_width, self.typography.row_height),
                                 egui::Sense::hover(),
                             );
-                            let color = style::MUTED;
+                            let color = crate::colors::palette().muted_text;
                             if error.is_none()
                                 && (self
                                     .preview
@@ -923,6 +954,7 @@ mod tests {
                         cwd: None,
                         line_continuation: None,
                         unique: false,
+                        success_exit_codes: None,
                     },
                 ),
                 params: [("query".into(), "a".into())].into(),
@@ -1296,27 +1328,29 @@ mod tests {
         let font = egui::FontId::monospace(14.0);
         let bold = egui::FontId::new(14.0, egui::FontFamily::Name("bold".into()));
         for (text, query, expected) in [("alpha-beta", "ab", "ab"), ("café", "é", "é")] {
-            let job = super::result_layout(text, query, &font, &bold);
+            let job = super::result_layout(text, query, &font, &bold, false);
             assert_eq!(job.text, text);
             let highlighted: String = job
                 .sections
                 .iter()
-                .filter(|section| section.format.color == egui::Color32::from_rgb(251, 73, 52))
+                .filter(|section| section.format.color == crate::colors::palette().match_highlight)
                 .map(|section| &job.text[section.byte_range.start.0..section.byte_range.end.0])
                 .collect();
             assert_eq!(highlighted, expected);
             assert!(
                 job.sections
                     .iter()
-                    .filter(|section| section.format.color == egui::Color32::from_rgb(251, 73, 52))
+                    .filter(
+                        |section| section.format.color == crate::colors::palette().match_highlight
+                    )
                     .all(|section| section.format.font_id == bold)
             );
         }
-        let job = super::result_layout("plain", "", &font, &bold);
+        let job = super::result_layout("plain", "", &font, &bold, false);
         assert!(
             job.sections
                 .iter()
-                .all(|section| section.format.color == style::TEXT)
+                .all(|section| section.format.color == crate::colors::palette().text)
         );
     }
 

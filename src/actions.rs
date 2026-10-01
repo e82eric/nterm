@@ -3,6 +3,11 @@ use crate::picker::config::{BindingTarget, Bindings, KeyBinding};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppAction {
     NewWindow,
+    ShowMessages,
+    OpenErrorLog,
+    ShowErrorRecord(Box<crate::error_log::Record>),
+    OpenThemePicker,
+    ApplyTheme(String),
     ToggleFloatingPane,
     CloseFloatingPane,
     OpenPicker(String),
@@ -19,6 +24,9 @@ impl AppAction {
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "NewWindow" => Self::NewWindow,
+            "ShowMessages" => Self::ShowMessages,
+            "OpenErrorLog" => Self::OpenErrorLog,
+            "OpenThemePicker" => Self::OpenThemePicker,
             "ToggleFloatingPane" => Self::ToggleFloatingPane,
             "CloseFloatingPane" => Self::CloseFloatingPane,
             "OpenSearch" => Self::OpenSearch,
@@ -34,7 +42,14 @@ impl AppAction {
     pub(crate) fn is_global(&self) -> bool {
         matches!(
             self,
-            Self::NewWindow | Self::ToggleFloatingPane | Self::CloseFloatingPane
+            Self::NewWindow
+                | Self::ShowMessages
+                | Self::OpenErrorLog
+                | Self::ShowErrorRecord(_)
+                | Self::OpenThemePicker
+                | Self::ApplyTheme(_)
+                | Self::ToggleFloatingPane
+                | Self::CloseFloatingPane
         )
     }
 }
@@ -137,6 +152,24 @@ pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) ->
     let mut entries = Vec::new();
     for (id, label, action, available) in [
         ("window.new", "New window", AppAction::NewWindow, true),
+        (
+            "errors.open",
+            "Error history",
+            AppAction::OpenErrorLog,
+            !bindings.has_error_log_picker(),
+        ),
+        (
+            "themes.open",
+            "Choose theme",
+            AppAction::OpenThemePicker,
+            !bindings.has_themes_picker(),
+        ),
+        (
+            "messages.show",
+            "Show messages",
+            AppAction::ShowMessages,
+            true,
+        ),
         (
             "floating.toggle",
             "Toggle floating pane",

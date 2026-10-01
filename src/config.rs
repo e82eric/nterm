@@ -97,13 +97,15 @@ fn parse_picker_table(
     let mut callback = None;
     let action: mlua::Value = definition.raw_get("action").map_err(|e| e.to_string())?;
     if !matches!(action, mlua::Value::Nil) {
-        if definition
-            .raw_get::<_, String>("type")
-            .map_err(|e| e.to_string())?
-            == "CommandPalette"
-        {
+        if matches!(
+            definition
+                .raw_get::<_, String>("type")
+                .map_err(|e| e.to_string())?
+                .as_str(),
+            "CommandPalette" | "Themes" | "ErrorLog"
+        ) {
             return Err(format!(
-                "pickers.{name}: CommandPalette uses built-in actions"
+                "pickers.{name}: CommandPalette, Themes, and ErrorLog use built-in actions"
             ));
         }
         let mlua::Value::Function(function) = action else {
@@ -207,6 +209,7 @@ struct AppConfig {
     font: FontConfig,
     terminal: TerminalConfig,
     colors: ColorConfig,
+    theme_colors: std::collections::BTreeMap<String, crate::colors::UiOverrides>,
     floating: FloatingConfig,
     picker_defaults: crate::picker::config::PickerDefaults,
     pickers: Option<std::collections::BTreeMap<String, crate::picker::config::Definition>>,
@@ -233,6 +236,7 @@ struct TerminalConfig {
 #[serde(default, deny_unknown_fields)]
 struct ColorConfig {
     theme: Option<String>,
+    ui: crate::colors::UiOverrides,
 }
 
 #[derive(Default, Deserialize)]
@@ -473,11 +477,13 @@ fn read_config(
 
 pub(crate) fn prepare(
     args: Vec<String>,
+    issues: &mut Vec<String>,
 ) -> Result<
     (
         Vec<String>,
         crate::picker::config::Bindings,
         Option<FloatingPadding>,
+        crate::colors::ColorOverrides,
     ),
     String,
 > {
@@ -513,30 +519,46 @@ pub(crate) fn prepare(
     ];
     let mut pickers = crate::picker::config::Bindings::default();
     let mut floating_padding = None;
-    if let Some((path, source)) = read_config(explicit.as_deref(), &default_paths(), |path| {
-        std::fs::read_to_string(path)
-    })? {
-        let (options, bindings, padding) = AppConfig::parse(&source, &path)
-            .and_then(|config| {
-                Ok((
-                    config.ghostty_args()?,
-                    crate::picker::config::Bindings::compile_with_actions(
-                        config.pickers,
-                        config.keys,
-                        config.picker_defaults,
-                        config.actions,
-                    )?,
-                    config
-                        .floating
-                        .padding
-                        .map(FloatingPadding::validate)
-                        .transpose()?,
-                ))
-            })
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        prepared.extend(options);
-        pickers = bindings;
-        floating_padding = padding;
+    let mut ui_colors = crate::colors::ColorOverrides::default();
+    let loaded = (|| {
+        if let Some((path, source)) = read_config(explicit.as_deref(), &default_paths(), |path| {
+            std::fs::read_to_string(path)
+        })? {
+            let (options, bindings, padding, overrides) = AppConfig::parse(&source, &path)
+                .and_then(|config| {
+                    Ok((
+                        config.ghostty_args()?,
+                        crate::picker::config::Bindings::compile_with_actions(
+                            config.pickers,
+                            config.keys,
+                            config.picker_defaults,
+                            config.actions,
+                        )?,
+                        config
+                            .floating
+                            .padding
+                            .map(FloatingPadding::validate)
+                            .transpose()?,
+                        crate::colors::ColorOverrides {
+                            global: config.colors.ui,
+                            themes: config.theme_colors,
+                        },
+                    ))
+                })
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            return Ok(Some((options, bindings, padding, overrides)));
+        }
+        Ok::<_, String>(None)
+    })();
+    match loaded {
+        Ok(Some((options, bindings, padding, overrides))) => {
+            prepared.extend(options);
+            pickers = bindings;
+            floating_padding = padding;
+            ui_colors = overrides;
+        }
+        Ok(None) => {}
+        Err(error) => issues.push(format!("Lua configuration was not loaded. Using defaults for Lua settings.\nFix the configuration and restart the app.\n\n{error}")),
     }
     // Ghostty loads its normal files first, then these arguments. Explicit
     // command-line values come last and override the Lua configuration.
@@ -549,16 +571,105 @@ pub(crate) fn prepare(
         prepared.push("--font-family=".into());
     }
     prepared.extend(remaining);
-    Ok((prepared, pickers, floating_padding))
+    Ok((prepared, pickers, floating_padding, ui_colors))
 }
 
 #[cfg(test)]
 fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
-    prepare(args).map(|(args, _, _)| args)
+    let mut issues = Vec::new();
+    let (args, _, _, _) = prepare(args, &mut issues)?;
+    match issues.into_iter().next() {
+        Some(error) => Err(error),
+        None => Ok(args),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn theme_overrides_parse_and_validate_like_global_colors() {
+        let config = parse(
+            r##"return {
+            colors = { ui = { warning = '#abcdef' } },
+            theme_colors = { ['Gruvbox Dark'] = { accent = '#fabd2f' } }
+        }"##,
+        )
+        .unwrap();
+        let palette =
+            config.theme_colors["Gruvbox Dark"].apply(crate::colors::UiPalette::default());
+        assert_eq!(crate::colors::rgb(palette.accent), 0xfabd2f);
+        assert!(
+            parse(r##"return { theme_colors = { ['Gruvbox Dark'] = { accent = '#bad' } } }"##)
+                .is_err()
+        );
+        assert!(
+            parse(r##"return { theme_colors = { ['Gruvbox Dark'] = { unknown = '#fabd2f' } } }"##)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn lua_ui_overrides_parse_and_invalid_colors_report_config_issue() {
+        let config = parse(r##"return { colors = { theme = 'Gruvbox Dark', ui = { accent = '#123456', warning = 'abcdef' } } }"##).unwrap();
+        let palette = config.colors.ui.apply(crate::colors::UiPalette::default());
+        assert_eq!(crate::colors::rgb(palette.accent), 0x123456);
+        assert_eq!(crate::colors::rgb(palette.warning), 0xabcdef);
+        assert!(
+            config
+                .ghostty_args()
+                .unwrap()
+                .contains(&"--theme=Gruvbox Dark".to_owned())
+        );
+        assert!(parse(r##"return { colors = { ui = { accent = '#bad' } } }"##).is_err());
+    }
+    #[test]
+    fn invalid_lua_config_starts_with_defaults_and_keeps_diagnostic() {
+        let path =
+            std::env::temp_dir().join(format!("ghostty-feedback-{}.lua", std::process::id()));
+        for source in [
+            "return {\nfont = { size =",
+            "return { font = { size = 'large' } }",
+            "return { colors = { ui = { accent = '#invalid' } } }",
+        ] {
+            std::fs::write(&path, source).unwrap();
+            let mut issues = Vec::new();
+            let result = super::prepare(
+                vec!["ghostty".into(), format!("--lua-config={}", path.display())],
+                &mut issues,
+            );
+            let (args, _, padding, overrides) = result.unwrap();
+            assert_eq!(issues.len(), 1);
+            assert!(issues[0].contains(&path.display().to_string()));
+            assert!(!args.iter().any(|arg| arg.starts_with("--font-size=")));
+            assert!(padding.is_none());
+            assert!(overrides.global.accent.is_none());
+            assert!(overrides.themes.is_empty());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_explicit_config_preserves_cli_and_reports_issue() {
+        let path = std::env::temp_dir().join(format!("ghostty-missing-{}.lua", std::process::id()));
+        let mut issues = Vec::new();
+        let (args, _, padding, _) = super::prepare(
+            vec![
+                "ghostty".into(),
+                format!("--lua-config={}", path.display()),
+                "--font-size=18".into(),
+                "-e".into(),
+                "cmd.exe".into(),
+            ],
+            &mut issues,
+        )
+        .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains(&path.display().to_string()));
+        assert!(issues[0].contains("Using defaults"));
+        assert!(padding.is_none());
+        assert!(args.ends_with(&["--font-size=18".into(), "-e".into(), "cmd.exe".into()]));
+    }
+
     #[test]
     fn named_lua_actions_bind_and_appear_in_palette() {
         let config = parse(
@@ -668,6 +779,90 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn command_picker_exit_codes_are_configurable_and_validated() {
+        let config = parse("return { pickers = { command = { type = 'Command', args = {'cmd.exe'}, success_exit_codes = {0, 1} } } }").unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_defaults(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+        )
+        .unwrap();
+        let options = bindings
+            .named("command")
+            .unwrap()
+            .resolve(&Default::default())
+            .unwrap();
+        assert!(
+            matches!(options.source, crate::picker::config::Source::Command(command) if command.success_exit_codes == Some(vec![0, 1]))
+        );
+        let config = parse("return { pickers = { command = { type = 'Command', args = {'cmd.exe'}, success_exit_codes = {-1} } } }").unwrap();
+        assert!(
+            crate::picker::config::Bindings::compile_with_defaults(
+                config.pickers,
+                config.keys,
+                config.picker_defaults
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn error_log_is_a_named_picker_with_cursor_position() {
+        let config = parse("return { pickers = { errors = { type = 'ErrorLog', position = 'Cursor' } }, keys = { { key = 'h', mods = 'CTRL|SHIFT', picker = 'errors' } } }").unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_defaults(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+        )
+        .unwrap();
+        let options = bindings
+            .named("errors")
+            .unwrap()
+            .resolve(&Default::default())
+            .unwrap();
+        assert!(matches!(
+            options.source,
+            crate::picker::config::Source::ErrorLog
+        ));
+        assert_eq!(options.position, crate::picker::config::Position::Cursor);
+        assert!(
+            parse(
+                "return { pickers = { errors = { type = 'ErrorLog', action = function() end } } }"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn themes_is_a_named_picker_with_cursor_position() {
+        let config = parse("return { pickers = { themes = { type = 'Themes', position = 'Cursor', initial_query = 'Rose Pine' } }, keys = { { key = 't', mods = 'CTRL|SHIFT', picker = 'themes' } } }").unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_defaults(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+        )
+        .unwrap();
+        let options = bindings
+            .named("themes")
+            .unwrap()
+            .resolve(&Default::default())
+            .unwrap();
+        assert!(matches!(
+            options.source,
+            crate::picker::config::Source::Themes
+        ));
+        assert_eq!(options.position, crate::picker::config::Position::Cursor);
+        assert_eq!(
+            options.params.get("query").map(String::as_str),
+            Some("Rose Pine")
+        );
+        assert!(
+            parse("return { pickers = { themes = { type = 'Themes', action = function() end } } }")
+                .is_err()
+        );
     }
 
     #[test]

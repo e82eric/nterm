@@ -33,61 +33,78 @@ struct WakeState {
     osc_token: String,
     protocol_request: std::sync::Mutex<Option<crate::picker::protocol::PickerRequest>>,
     clipboard_text: std::sync::Mutex<Option<String>>,
+    config_issues: std::sync::Mutex<Vec<String>>,
+    runtime_issues: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn ghostty_egui_wakeup(userdata: *mut c_void) {
-    let state = unsafe { &*(userdata.cast::<WakeState>()) };
-    if !state.wake_pending.swap(true, Ordering::AcqRel)
-        && state.proxy.send_event(UserEvent::GhosttyWake).is_err()
-    {
-        state.wake_pending.store(false, Ordering::Release);
-    }
+    crate::native_error::ffi_boundary("handle native callback ghostty_egui_wakeup", || {
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        if !state.wake_pending.swap(true, Ordering::AcqRel)
+            && state.proxy.send_event(UserEvent::GhosttyWake).is_err()
+        {
+            state.wake_pending.store(false, Ordering::Release);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn ghostty_egui_frame_ready(userdata: *mut c_void) {
-    let state = unsafe { &*(userdata.cast::<WakeState>()) };
-    if !state.frame_ready_pending.swap(true, Ordering::AcqRel)
-        && state.proxy.send_event(UserEvent::FrameReady).is_err()
-    {
-        state.frame_ready_pending.store(false, Ordering::Release);
-    }
+    crate::native_error::ffi_boundary("handle native callback ghostty_egui_frame_ready", || {
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        if !state.frame_ready_pending.swap(true, Ordering::AcqRel)
+            && state.proxy.send_event(UserEvent::FrameReady).is_err()
+        {
+            state.frame_ready_pending.store(false, Ordering::Release);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn ghostty_egui_close(userdata: *mut c_void) {
-    let state = unsafe { &*(userdata.cast::<WakeState>()) };
-    state.close.store(true, Ordering::Release);
-    state.context.request_repaint();
+    crate::native_error::ffi_boundary("handle native callback ghostty_egui_close", || {
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        state.close.store(true, Ordering::Release);
+        state.context.request_repaint();
+    });
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn ghostty_egui_protocol(userdata: *mut c_void, bytes: *const u8, len: usize) {
-    if bytes.is_null() || len > crate::picker::protocol::MAX_PAYLOAD {
-        return;
-    }
-    let state = unsafe { &*(userdata.cast::<WakeState>()) };
-    let payload = unsafe { std::slice::from_raw_parts(bytes, len) };
-    match crate::picker::protocol::parse(payload, &state.osc_token) {
-        Ok(request) => {
-            *state.protocol_request.lock().unwrap() = Some(request);
-            state.context.request_repaint();
+    crate::native_error::ffi_boundary("handle native callback ghostty_egui_protocol", || {
+        if bytes.is_null() || len > crate::picker::protocol::MAX_PAYLOAD {
+            return;
         }
-        Err(error) => eprintln!("{error}"),
-    }
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        let payload = unsafe { std::slice::from_raw_parts(bytes, len) };
+        match crate::picker::protocol::parse(payload, &state.osc_token) {
+            Ok(request) => {
+                *state.protocol_request.lock().unwrap() = Some(request);
+                state.context.request_repaint();
+            }
+            Err(error) => {
+                crate::error_log::error("protocol", "Rejected terminal picker request", &error)
+            }
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn ghostty_egui_write_clipboard(userdata: *mut c_void, bytes: *const u8, len: usize) {
-    if bytes.is_null() {
-        return;
-    }
-    let state = unsafe { &*(userdata.cast::<WakeState>()) };
-    let text =
-        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(bytes, len) }).into_owned();
-    *state.clipboard_text.lock().unwrap() = Some(text);
-    state.context.request_repaint();
+    crate::native_error::ffi_boundary(
+        "handle native callback ghostty_egui_write_clipboard",
+        || {
+            if bytes.is_null() {
+                return;
+            }
+            let state = unsafe { &*(userdata.cast::<WakeState>()) };
+            let text = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(bytes, len) })
+                .into_owned();
+            *state.clipboard_text.lock().unwrap() = Some(text);
+            state.context.request_repaint();
+        },
+    );
 }
 
 pub(super) struct TerminalPane {
@@ -112,16 +129,164 @@ pub(super) struct TerminalPane {
     prompt_boundaries: Option<(u64, Vec<u64>)>,
 }
 
+#[unsafe(no_mangle)]
+extern "C" fn ghostty_egui_config_issue(userdata: *mut c_void, message: *const c_char) {
+    crate::native_error::ffi_boundary("handle native callback ghostty_egui_config_issue", || {
+        if message.is_null() {
+            return;
+        }
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        let message = unsafe { std::ffi::CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned();
+        state.config_issues.lock().unwrap().push(format!("Ghostty configuration issue. Invalid settings were ignored.\nFix the configuration and restart the app.\n\n{message}"));
+    });
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ghostty_egui_runtime_issue(
+    userdata: *mut c_void,
+    operation: *const c_char,
+    cause: *const c_char,
+) {
+    crate::native_error::ffi_boundary("report a native operational failure", || {
+        if operation.is_null() || cause.is_null() {
+            return;
+        }
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        let operation = unsafe { std::ffi::CStr::from_ptr(operation) }
+            .to_string_lossy()
+            .into_owned();
+        let cause = unsafe { std::ffi::CStr::from_ptr(cause) }
+            .to_string_lossy()
+            .into_owned();
+        crate::error_log::error("libghostty", &operation, &cause);
+        let mut issues = state
+            .runtime_issues
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if issues.len() < 32
+            && !issues
+                .iter()
+                .any(|issue| issue == &(operation.clone(), cause.clone()))
+        {
+            issues.push((operation, cause));
+        }
+        state.context.request_repaint();
+    });
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ghostty_egui_theme_colors(
+    userdata: *mut c_void,
+    colors: *const crate::colors::ThemeColors,
+    name: *const u8,
+    name_len: usize,
+) {
+    crate::native_error::ffi_boundary("handle native callback ghostty_egui_theme_colors", || {
+        if colors.is_null() {
+            return;
+        }
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        let name = if name.is_null() {
+            None
+        } else {
+            std::str::from_utf8(unsafe { std::slice::from_raw_parts(name, name_len) }).ok()
+        };
+        crate::colors::COLORS.apply_theme(&state.context, unsafe { &*colors }, name);
+    });
+}
+
 impl TerminalPane {
-    fn new(host: *mut Host, wake: Box<WakeState>, gl: &glow::Context) -> Self {
-        let painter = Arc::new(egui::mutex::Mutex::new(TerminalPainter::new(gl)));
+    pub(super) fn show_error(&mut self, title: &str, error: String) {
+        crate::error_log::error("terminal", title, &error);
+        self.toasts.push(title.into(), error, 10000);
+    }
+
+    pub(super) fn show_notice(&mut self, title: &str, message: String) {
+        self.toasts.push(title.into(), message, 3000);
+    }
+
+    pub(super) fn open_theme_picker(&mut self, ctx: &egui::Context) {
+        let names = match crate::themes::installed_themes() {
+            Ok(names) if !names.is_empty() => names,
+            Ok(_) => {
+                self.show_error(
+                    "No themes found",
+                    "Check your Ghostty resources/themes directory".into(),
+                );
+                return;
+            }
+            Err(error) => {
+                self.show_error("Unable to list themes", error);
+                return;
+            }
+        };
+        let options = crate::themes::picker_options(names);
+        self.picker = Some(crate::picker::Picker::start(
+            self.host,
+            None,
+            false,
+            0,
+            ctx.clone(),
+            options,
+        ));
+    }
+    pub(super) fn open_error_log(&mut self, ctx: &egui::Context) {
+        let options = crate::error_log::picker_options();
+        self.picker = Some(crate::picker::Picker::start(
+            self.host,
+            None,
+            false,
+            0,
+            ctx.clone(),
+            options,
+        ));
+    }
+    pub(super) fn apply_theme(&self, name: &str) -> Result<(), String> {
+        let name = std::ffi::CString::new(name).map_err(|_| "Theme name contains NUL")?;
+        let mut error = [0u8; 4096];
+        if unsafe {
+            ghostty_ffi::ghostty_egui_host_apply_theme(
+                self.host,
+                name.as_ptr(),
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
+        } {
+            self.wake.context.request_repaint();
+            Ok(())
+        } else {
+            Err(
+                String::from_utf8_lossy(error.split(|byte| *byte == 0).next().unwrap_or_default())
+                    .into_owned(),
+            )
+        }
+    }
+    pub(super) fn take_config_issues(&self) -> Vec<String> {
+        std::mem::take(&mut *self.wake.config_issues.lock().unwrap())
+    }
+    fn new(
+        host: *mut Host,
+        wake: Box<WakeState>,
+        gl: &glow::Context,
+    ) -> Result<Self, crate::native_error::FatalError> {
+        let painter = match TerminalPainter::new(gl) {
+            Ok(painter) => painter,
+            Err(error) => {
+                // Keep callback userdata alive until the native host is freed.
+                unsafe { ghostty_ffi::ghostty_egui_host_destroy(host) };
+                return Err(error);
+            }
+        };
+        let painter = Arc::new(egui::mutex::Mutex::new(painter));
         let callback_painter = Arc::clone(&painter);
         let paint_callback = Arc::new(egui_glow::CallbackFn::new(move |_info, glow_painter| {
             callback_painter.lock().paint(glow_painter.gl());
         }));
         let picker_font = crate::picker::font::PickerFont::new(&wake.context, host);
         let search_worker = SearchWorker::new(wake.context.clone());
-        Self {
+        Ok(Self {
             host,
             wake,
             painter,
@@ -141,7 +306,7 @@ impl TerminalPane {
             toasts: crate::toast::Toasts::default(),
             copy_search_cursor: 0,
             prompt_boundaries: None,
-        }
+        })
     }
 
     pub(super) fn acquire_frame(&mut self) -> bool {
@@ -292,19 +457,22 @@ impl TerminalPane {
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
         argc: usize,
         argv: *mut *mut c_char,
-    ) -> Self {
+    ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
             context: egui_ctx.clone(),
             proxy,
             wake_pending: AtomicBool::new(false),
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
-            osc_token: crate::picker::protocol::new_token(),
+            osc_token: crate::picker::protocol::new_token()?,
             protocol_request: std::sync::Mutex::new(None),
+            config_issues: std::sync::Mutex::new(Vec::new()),
+            runtime_issues: std::sync::Mutex::new(Vec::new()),
             clipboard_text: std::sync::Mutex::new(None),
         });
         let native = current_native_context();
         let osc_token = std::ffi::CString::new(wake.osc_token.clone()).unwrap();
+        let mut error_buffer = [0 as c_char; 2048];
         let host = unsafe {
             ghostty_ffi::ghostty_egui_host_create(
                 argc,
@@ -315,40 +483,61 @@ impl TerminalPane {
                 native.context,
                 egui_ctx.pixels_per_point() as f64,
                 osc_token.as_ptr(),
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
             )
         };
-        assert!(
-            !host.is_null(),
-            "failed to initialize the embedded Ghostty surface"
-        );
+        if host.is_null() {
+            let detail =
+                unsafe { std::ffi::CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
+            return Err(crate::native_error::FatalError::new(
+                "initialize the main terminal",
+                detail,
+            ));
+        }
 
         Self::new(host, wake, gl)
     }
 
-    pub(super) fn create_floating(&self, gl: &glow::Context) -> Option<Self> {
+    pub(super) fn create_floating(
+        &self,
+        gl: &glow::Context,
+    ) -> Result<Option<Self>, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
             context: self.wake.context.clone(),
             proxy: self.wake.proxy.clone(),
             wake_pending: AtomicBool::new(false),
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
-            osc_token: crate::picker::protocol::new_token(),
+            osc_token: crate::picker::protocol::new_token()?,
             protocol_request: std::sync::Mutex::new(None),
+            config_issues: std::sync::Mutex::new(Vec::new()),
+            runtime_issues: std::sync::Mutex::new(Vec::new()),
             clipboard_text: std::sync::Mutex::new(None),
         });
-        let osc_token = std::ffi::CString::new(wake.osc_token.clone()).ok()?;
+        let osc_token = std::ffi::CString::new(wake.osc_token.clone()).map_err(|error| {
+            crate::native_error::FatalError::new("create the floating terminal token", error)
+        })?;
+        let mut error_buffer = [0 as c_char; 2048];
         let host = unsafe {
             ghostty_ffi::ghostty_egui_host_create_floating(
                 self.host,
                 (&mut *wake as *mut WakeState).cast(),
                 self.scale as f64,
                 osc_token.as_ptr(),
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
             )
         };
         if host.is_null() {
-            return None;
+            let detail =
+                unsafe { std::ffi::CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
+            return Err(crate::native_error::FatalError::new(
+                "create the floating terminal",
+                detail,
+            ));
         }
-        Some(Self::new(host, wake, gl))
+        Self::new(host, wake, gl).map(Some)
     }
 
     pub(super) fn tick(&mut self) {
@@ -404,16 +593,16 @@ impl TerminalPane {
             command_label
         };
         let accent = if visual {
-            egui::Color32::from_rgb(0xd6, 0x5d, 0x0e)
+            crate::colors::palette().accent
         } else if copying || self.search.active {
-            egui::Color32::from_rgb(0xd7, 0x99, 0x21)
+            crate::colors::palette().accent
         } else {
-            egui::Color32::from_rgb(0x92, 0x83, 0x74)
+            crate::colors::palette().muted_text
         };
         let separator = if copying || self.search.active {
             accent
         } else {
-            egui::Color32::from_rgb(0x3c, 0x38, 0x36)
+            crate::colors::palette().panel_background
         };
         let detail = self
             .quick_select
@@ -562,7 +751,10 @@ impl TerminalPane {
         let context = if entry.needs_context() {
             let mut row = ghostty_ffi::LiveCursorLine::default();
             if !unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line(host, &mut row) } {
-                eprintln!("unable to read live cursor line for picker");
+                self.show_error(
+                    "Picker could not open",
+                    "Unable to read live cursor line".into(),
+                );
                 return;
             }
             let bytes = if row.len == 0 {
@@ -592,11 +784,32 @@ impl TerminalPane {
             }) {
             Ok(options) => options,
             Err(error) => {
-                eprintln!("picker: {error}");
+                self.show_error("Picker could not open", error);
                 return;
             }
         };
-        if let crate::picker::config::Source::CommandPalette(entries) = &mut options.source {
+        if matches!(options.source, crate::picker::config::Source::ErrorLog) {
+            options.source = crate::error_log::picker_options().source;
+            options
+                .params
+                .insert("__error_history".into(), "true".into());
+        } else if matches!(options.source, crate::picker::config::Source::Themes) {
+            let names = match crate::themes::installed_themes() {
+                Ok(names) if !names.is_empty() => names,
+                Ok(_) => {
+                    self.show_error(
+                        "No themes found",
+                        "Check your Ghostty resources/themes directory".into(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    self.show_error("Unable to list themes", error);
+                    return;
+                }
+            };
+            options.source = crate::themes::picker_options(names).source;
+        } else if let crate::picker::config::Source::CommandPalette(entries) = &mut options.source {
             *entries = crate::actions::catalog(bindings, has_floating, self.copying());
             // A factory's source is only known after resolving it. Exclude
             // the current factory too, without evaluating other factories.
@@ -640,6 +853,10 @@ impl TerminalPane {
                 let mut generation = 0;
                 if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(host, &mut generation) }
                 {
+                    self.show_error(
+                        "Picker unavailable",
+                        "Unable to create the scrollback snapshot".into(),
+                    );
                     return;
                 }
                 generation
@@ -650,6 +867,13 @@ impl TerminalPane {
                 if !from_copy {
                     unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(host, generation) };
                 }
+                if from_copy {
+                    self.close_copy_mode();
+                }
+                self.show_error(
+                    "Picker unavailable",
+                    "Unable to read the scrollback snapshot".into(),
+                );
                 return;
             }
             if !from_copy {
@@ -685,6 +909,26 @@ impl TerminalPane {
     }
 
     pub(super) fn show_toasts(&mut self, ctx: &egui::Context, bounds: egui::Rect) {
+        let issues = std::mem::take(
+            &mut *self
+                .wake
+                .runtime_issues
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for (operation, cause) in issues {
+            if matches!(cause.as_str(), "SnapshotExpired" | "SnapshotUnavailable") {
+                self.picker = None;
+                self.cancel_quick_select();
+                self.close_search();
+                self.close_copy_mode();
+            }
+            self.toasts.push(
+                "Terminal operation failed".into(),
+                format!("{operation}: {cause}"),
+                10000,
+            );
+        }
         if self.toasts.is_empty() {
             return;
         }
@@ -804,7 +1048,7 @@ impl TerminalPane {
                     }
                 }
             }
-            Err(error) => self.toasts.push("Action failed".into(), error, 5000),
+            Err(error) => self.show_error("Action failed", error),
         }
         ctx.request_repaint();
     }
@@ -869,7 +1113,7 @@ impl TerminalPane {
                     shortcut = Some(entry);
                     request_params = Some(request.params);
                 } else {
-                    eprintln!("unknown OSC picker {:?}", request.name);
+                    crate::error_log::error("protocol", "Unknown OSC picker", &request.name);
                 }
             } else {
                 eprintln!("OSC picker request ignored while another overlay is active");
@@ -964,7 +1208,10 @@ impl TerminalPane {
                                         self.accept_picker_cell(generation, target);
                                         navigated = true;
                                     } else {
-                                        eprintln!("picker navigation snapshot is no longer active");
+                                        self.show_error(
+                                            "Picker navigation failed",
+                                            "The snapshot is no longer active".into(),
+                                        );
                                     }
                                 }
                                 crate::picker::action::Command::Paste(text) => {
@@ -999,7 +1246,7 @@ impl TerminalPane {
                         }
                     }
                     Err(error) => {
-                        eprintln!("{error}");
+                        self.show_error("Picker action failed", error);
                         restore_copy(self);
                     }
                 }
@@ -1026,6 +1273,10 @@ impl TerminalPane {
         } else {
             let mut generation = 0;
             if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(host, &mut generation) } {
+                self.show_error(
+                    "Quick select unavailable",
+                    "Unable to create the terminal snapshot".into(),
+                );
                 return;
             }
             generation
@@ -1035,6 +1286,10 @@ impl TerminalPane {
             if !from_copy {
                 unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(host, generation) };
             }
+            self.show_error(
+                "Quick select unavailable",
+                "Unable to read the terminal snapshot".into(),
+            );
             return;
         }
         if !from_copy {
@@ -1051,6 +1306,10 @@ impl TerminalPane {
         }
         if !self.publish_quick_select() {
             self.cancel_quick_select();
+            self.show_error(
+                "Quick select failed",
+                "Unable to display selection labels".into(),
+            );
         }
         self.wake.context.request_repaint();
     }
@@ -1067,6 +1326,11 @@ impl TerminalPane {
         let host = self.quick_host();
         let mut view = SnapshotView::default();
         if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view) } {
+            self.cancel_quick_select();
+            self.show_error(
+                "Quick select failed",
+                "The terminal snapshot is no longer available".into(),
+            );
             return false;
         }
         let view = QuickSelect::paged_view(view, down);
@@ -1172,6 +1436,10 @@ impl TerminalPane {
             )
         } {
             self.cancel_quick_select();
+            self.show_error(
+                "Quick select paste failed",
+                "Unable to read the selected text".into(),
+            );
             return;
         }
         // Own the original text before releasing the snapshot. Ghostty's
@@ -1219,6 +1487,10 @@ impl TerminalPane {
         if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(host, &mut snapshot_generation) }
         {
             self.close_search();
+            self.show_error(
+                "Search unavailable",
+                "Unable to create terminal snapshot".into(),
+            );
             return;
         }
 
@@ -1228,6 +1500,10 @@ impl TerminalPane {
         if cursor.is_null() {
             unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(host, snapshot_generation) };
             self.close_search();
+            self.show_error(
+                "Search unavailable",
+                "Unable to create snapshot cursor".into(),
+            );
             return;
         }
 
@@ -1261,7 +1537,10 @@ impl TerminalPane {
         self.close_search();
         let mut generation = 0;
         if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) } {
-            eprintln!("copy mode: failed to create terminal snapshot");
+            self.show_error(
+                "Copy mode failed",
+                "Failed to create terminal snapshot".into(),
+            );
             return;
         }
         let mut state = SnapshotView::default();
@@ -1278,7 +1557,10 @@ impl TerminalPane {
         };
         if !ready || !self.publish_copy_decoration(generation, actual, true) {
             unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
-            eprintln!("copy mode: failed to initialize snapshot cursor");
+            self.show_error(
+                "Copy mode failed",
+                "Failed to initialize snapshot cursor".into(),
+            );
             return;
         }
         state.cursor = actual;
@@ -1306,6 +1588,11 @@ impl TerminalPane {
         let host = self.search_host();
         let mut view = SnapshotView::default();
         if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view) } {
+            self.close_search();
+            self.show_error(
+                "Search navigation failed",
+                "The search snapshot is no longer available".into(),
+            );
             return;
         }
         let mut actual = SnapshotCell::default();
@@ -1318,6 +1605,11 @@ impl TerminalPane {
                 &mut actual,
             )
         } {
+            self.close_search();
+            self.show_error(
+                "Search navigation failed",
+                "Unable to resolve the selected match".into(),
+            );
             return;
         }
         self.search_worker.cancel_and_wait();
@@ -1524,15 +1816,27 @@ impl TerminalPane {
             ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
         } {
             self.close_copy_mode();
+            self.show_error(
+                "Copy navigation failed",
+                "The snapshot or target could not be used".into(),
+            );
             return false;
         }
         let Some((top, requested)) = self.copy_mode.scrolled_viewport_target(down, count, view)
         else {
             self.close_copy_mode();
+            self.show_error(
+                "Copy navigation failed",
+                "The snapshot or target could not be used".into(),
+            );
             return false;
         };
         let Some(actual) = self.resolve_copy_cell(generation, requested, false) else {
             self.close_copy_mode();
+            self.show_error(
+                "Copy navigation failed",
+                "The snapshot or target could not be used".into(),
+            );
             return false;
         };
         let viewport = SnapshotViewportOptions {
@@ -1541,6 +1845,10 @@ impl TerminalPane {
         };
         if !self.publish_copy_decoration_with_viewport(generation, actual, &viewport) {
             self.close_copy_mode();
+            self.show_error(
+                "Copy navigation failed",
+                "The snapshot or target could not be used".into(),
+            );
             return false;
         }
         self.copy_mode
@@ -1556,10 +1864,18 @@ impl TerminalPane {
             ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
         } {
             self.close_copy_mode();
+            self.show_error(
+                "Copy navigation failed",
+                "The snapshot or target could not be used".into(),
+            );
             return false;
         }
         let Some(top) = self.copy_mode.positioned_viewport_top(position, view) else {
             self.close_copy_mode();
+            self.show_error(
+                "Copy navigation failed",
+                "The snapshot or target could not be used".into(),
+            );
             return false;
         };
         let viewport = SnapshotViewportOptions {
@@ -1569,6 +1885,10 @@ impl TerminalPane {
         if !self.publish_copy_decoration_with_viewport(generation, self.copy_mode.cursor, &viewport)
         {
             self.close_copy_mode();
+            self.show_error(
+                "Copy navigation failed",
+                "The snapshot or target could not be used".into(),
+            );
             return false;
         }
         self.wake.context.request_repaint();
@@ -1589,6 +1909,10 @@ impl TerminalPane {
             true
         } else {
             self.close_copy_mode();
+            self.show_error(
+                "Copy navigation failed",
+                "The snapshot or target could not be used".into(),
+            );
             false
         }
     }
@@ -1649,6 +1973,10 @@ impl TerminalPane {
             }
             MotionEvaluation::InvalidSnapshot => {
                 self.close_copy_mode();
+                self.show_error(
+                    "Copy navigation failed",
+                    "The snapshot or target could not be used".into(),
+                );
                 false
             }
         }
@@ -1797,8 +2125,17 @@ impl TerminalPane {
             self.search.cursor,
         );
         self.search.query_revision =
-            self.search_worker
-                .submit(snapshot_generation, query, regex, cursor);
+            match self
+                .search_worker
+                .submit(snapshot_generation, query, regex, cursor)
+            {
+                Ok(revision) => revision,
+                Err(error) => {
+                    self.close_search();
+                    self.show_error("Search unavailable", error);
+                    return;
+                }
+            };
         self.search.waiting = true;
     }
 
@@ -1806,8 +2143,15 @@ impl TerminalPane {
         if self.quick_select.is_some() || self.picker.is_some() {
             return;
         }
-        let Some(result) = self.search_worker.take_latest_result() else {
-            return;
+        let result = match self.search_worker.take_latest_result() {
+            Ok(Some(result)) => result,
+            Ok(None) => return,
+            Err(error) => {
+                self.copy_mode.cancel_pending_search();
+                self.close_search();
+                self.show_error("Search failed", error);
+                return;
+            }
         };
         if self.copy_mode.generation == Some(result.snapshot_generation)
             && self.copy_mode.search_accepts_result(result.query_revision)
@@ -1829,6 +2173,11 @@ impl TerminalPane {
     }
 
     fn finish_copy_search_result(&mut self, result: crate::search::SearchResult) {
+        if let Some(error) = result.error {
+            self.copy_mode.cancel_pending_search();
+            self.show_error("Copy search failed", error);
+            return;
+        }
         let Some(target) = self
             .copy_mode
             .finish_search(result.query_revision, result.matches)
@@ -1869,8 +2218,17 @@ impl TerminalPane {
         }
         let pattern = word_search_pattern(&word);
         let query_revision =
-            self.search_worker
-                .submit(generation, pattern, true, self.copy_search_cursor);
+            match self
+                .search_worker
+                .submit(generation, pattern, true, self.copy_search_cursor)
+            {
+                Ok(revision) => revision,
+                Err(error) => {
+                    self.copy_mode.cancel_pending_search();
+                    self.show_error("Search unavailable", error);
+                    return;
+                }
+            };
         self.copy_mode.begin_search(query_revision, forward, count);
         self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
     }
@@ -1907,11 +2265,11 @@ impl TerminalPane {
             ranges: &range,
             range_count: 1,
             style: SnapshotDecorationStyle {
-                foreground_rgb: 0x282828,
+                foreground_rgb: crate::colors::rgb(crate::colors::palette().background),
                 background_rgb: if self.copy_mode.visual_anchor.is_some() {
-                    0xd65d0e // Gruvbox neutral orange, matching the visual statusline.
+                    crate::colors::rgb(crate::colors::palette().accent)
                 } else {
-                    0xd79921 // Gruvbox neutral yellow, matching the normal statusline.
+                    crate::colors::rgb(crate::colors::palette().accent)
                 },
                 flags: 3,
             },
@@ -1931,8 +2289,8 @@ impl TerminalPane {
             ranges: selection_ranges.as_ptr(),
             range_count: selection_ranges.len(),
             style: SnapshotDecorationStyle {
-                foreground_rgb: 0xebdbb2,
-                background_rgb: 0x504945,
+                foreground_rgb: crate::colors::rgb(crate::colors::palette().selection_text),
+                background_rgb: crate::colors::rgb(crate::colors::palette().selection_background),
                 flags: 3,
             },
         });
@@ -1940,8 +2298,10 @@ impl TerminalPane {
             ranges: self.copy_mode.search_matches().as_ptr(),
             range_count: self.copy_mode.search_matches().len(),
             style: SnapshotDecorationStyle {
-                foreground_rgb: 0xebdbb2,
-                background_rgb: 0x665c54,
+                foreground_rgb: crate::colors::rgb(crate::colors::palette().search_match_text),
+                background_rgb: crate::colors::rgb(
+                    crate::colors::palette().search_match_background,
+                ),
                 flags: 3,
             },
         };
@@ -1956,20 +2316,13 @@ impl TerminalPane {
             ranges: yank_ranges.as_ptr(),
             range_count: yank_ranges.len(),
             style: SnapshotDecorationStyle {
-                foreground_rgb: 0x282828,
-                background_rgb: 0xd79921,
+                foreground_rgb: crate::colors::rgb(crate::colors::palette().yank_text),
+                background_rgb: crate::colors::rgb(crate::colors::palette().yank_background),
                 flags: 3,
             },
         });
-        let mut layers = Vec::with_capacity(4);
-        layers.push(caret_layer);
-        if let Some(layer) = selection_layer {
-            layers.push(layer);
-        }
-        if let Some(layer) = yank_layer {
-            layers.push(layer);
-        }
-        layers.push(matches_layer);
+        let layers =
+            copy_decoration_layers(caret_layer, selection_layer, yank_layer, matches_layer);
         unsafe {
             ghostty_ffi::ghostty_egui_host_snapshot_apply_decorations(
                 self.host,
@@ -2118,6 +2471,10 @@ impl TerminalPane {
                 &mut result,
             )
         } {
+            self.show_error(
+                "Copy failed",
+                "Unable to read the selected snapshot text".into(),
+            );
             return false;
         }
         let text = if result.text.is_null() {
@@ -2161,8 +2518,8 @@ impl TerminalPane {
             ranges: std::ptr::from_ref(range),
             range_count: 1,
             style: SnapshotDecorationStyle {
-                foreground_rgb: 0x282828,
-                background_rgb: 0xfabd2f,
+                foreground_rgb: crate::colors::rgb(crate::colors::palette().background),
+                background_rgb: crate::colors::rgb(crate::colors::palette().match_highlight),
                 flags: 3,
             },
         });
@@ -2170,8 +2527,10 @@ impl TerminalPane {
             ranges: self.search.matches.as_ptr(),
             range_count: self.search.matches.len(),
             style: SnapshotDecorationStyle {
-                foreground_rgb: 0xebdbb2,
-                background_rgb: 0x665c54,
+                foreground_rgb: crate::colors::rgb(crate::colors::palette().search_match_text),
+                background_rgb: crate::colors::rgb(
+                    crate::colors::palette().search_match_background,
+                ),
                 flags: 3,
             },
         };
@@ -2210,8 +2569,53 @@ impl TerminalPane {
     }
 }
 
+// The renderer uses the first matching decoration. Yank feedback must cover the
+// caret, even when the copied range contains only the caret's cell.
+fn copy_decoration_layers(
+    caret: SnapshotDecorationLayer,
+    selection: Option<SnapshotDecorationLayer>,
+    yank: Option<SnapshotDecorationLayer>,
+    matches: SnapshotDecorationLayer,
+) -> Vec<SnapshotDecorationLayer> {
+    let mut layers = Vec::with_capacity(4);
+    if let Some(layer) = yank {
+        layers.push(layer);
+    }
+    layers.push(caret);
+    if let Some(layer) = selection {
+        layers.push(layer);
+    }
+    layers.push(matches);
+    layers
+}
+
 #[cfg(test)]
 mod copy_shortcut_tests {
+    #[test]
+    fn single_cell_yank_takes_precedence_over_caret_and_restores_after_expiry() {
+        use super::*;
+        let range = SnapshotCellRange {
+            start: SnapshotCell { x: 0, y: 0 },
+            end: SnapshotCell { x: 0, y: 0 },
+        };
+        let layer = |color| SnapshotDecorationLayer {
+            ranges: &range,
+            range_count: 1,
+            style: SnapshotDecorationStyle {
+                foreground_rgb: 0,
+                background_rgb: color,
+                flags: 3,
+            },
+        };
+        let active = copy_decoration_layers(layer(1), Some(layer(2)), Some(layer(3)), layer(4));
+        assert_eq!(active[0].style.background_rgb, 3);
+        assert_eq!(active[1].style.background_rgb, 1);
+        assert_eq!(active[0].ranges, &range as *const _);
+        assert_eq!(active[0].range_count, 1);
+        let expired = copy_decoration_layers(layer(1), Some(layer(2)), None, layer(4));
+        assert_eq!(expired[0].style.background_rgb, 1);
+        assert_eq!(expired.len(), 3);
+    }
     #[test]
     fn scroll_shortcuts_accept_platform_command_alias_for_control() {
         use super::copy_scroll_direction;

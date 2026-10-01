@@ -31,58 +31,72 @@ pub(crate) struct TerminalPainter {
 }
 
 impl TerminalPainter {
-    pub(crate) fn new(gl: &glow::Context) -> Self {
+    pub(crate) fn new(gl: &glow::Context) -> Result<Self, crate::native_error::FatalError> {
+        use crate::native_error::{FatalError, FatalResult};
         unsafe {
-            let program = gl.create_program().expect("create terminal program");
-            let vertex = gl
-                .create_shader(glow::VERTEX_SHADER)
-                .expect("create vertex shader");
-            gl.shader_source(
-                vertex,
-                "#version 330\nconst vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));out vec2 uv;void main(){vec2 v=p[gl_VertexID];uv=vec2((v.x+1.0)*0.5,(1.0-v.y)*0.5);gl_Position=vec4(v,0,1);}",
-            );
-            gl.compile_shader(vertex);
-            assert!(
-                gl.get_shader_compile_status(vertex),
-                "{}",
-                gl.get_shader_info_log(vertex)
-            );
-            let fragment = gl
-                .create_shader(glow::FRAGMENT_SHADER)
-                .expect("create fragment shader");
-            gl.shader_source(
-                fragment,
-                "#version 330\nin vec2 uv;uniform sampler2D terminal_texture;out vec4 color;void main(){color=texture(terminal_texture,uv);}",
-            );
-            gl.compile_shader(fragment);
-            assert!(
-                gl.get_shader_compile_status(fragment),
-                "{}",
-                gl.get_shader_info_log(fragment)
-            );
-            gl.attach_shader(program, vertex);
-            gl.attach_shader(program, fragment);
-            gl.link_program(program);
-            assert!(
-                gl.get_program_link_status(program),
-                "{}",
-                gl.get_program_info_log(program)
-            );
-            gl.delete_shader(vertex);
-            gl.delete_shader(fragment);
-            let texture_uniform = gl.get_uniform_location(program, "terminal_texture");
-            Self {
-                program,
-                texture_uniform,
-                vertex_array: gl
+            let program = gl
+                .create_program()
+                .fatal("create the terminal shader program")?;
+            let mut shaders = Vec::new();
+            let result = (|| {
+                for (kind, source, create_step, compile_step) in [
+                    (
+                        glow::VERTEX_SHADER,
+                        "#version 330\nconst vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));out vec2 uv;void main(){vec2 v=p[gl_VertexID];uv=vec2((v.x+1.0)*0.5,(1.0-v.y)*0.5);gl_Position=vec4(v,0,1);}",
+                        "create the terminal vertex shader",
+                        "compile the terminal vertex shader",
+                    ),
+                    (
+                        glow::FRAGMENT_SHADER,
+                        "#version 330\nin vec2 uv;uniform sampler2D terminal_texture;out vec4 color;void main(){color=texture(terminal_texture,uv);}",
+                        "create the terminal fragment shader",
+                        "compile the terminal fragment shader",
+                    ),
+                ] {
+                    let shader = gl.create_shader(kind).fatal(create_step)?;
+                    shaders.push((shader, false));
+                    gl.shader_source(shader, source);
+                    gl.compile_shader(shader);
+                    if !gl.get_shader_compile_status(shader) {
+                        return Err(FatalError::new(
+                            compile_step,
+                            driver_log(gl.get_shader_info_log(shader)),
+                        ));
+                    }
+                    gl.attach_shader(program, shader);
+                    shaders.last_mut().unwrap().1 = true;
+                }
+                gl.link_program(program);
+                if !gl.get_program_link_status(program) {
+                    return Err(FatalError::new(
+                        "link the terminal shader program",
+                        driver_log(gl.get_program_info_log(program)),
+                    ));
+                }
+                let vertex_array = gl
                     .create_vertex_array()
-                    .expect("create terminal vertex array"),
-                current: None,
-                retired: Vec::new(),
+                    .fatal("create the terminal vertex array")?;
+                Ok(Self {
+                    program,
+                    texture_uniform: gl.get_uniform_location(program, "terminal_texture"),
+                    vertex_array,
+                    current: None,
+                    retired: Vec::new(),
+                })
+            })();
+            // Delete all temporary objects on both success and partial failure.
+            for (shader, attached) in shaders {
+                if attached {
+                    gl.detach_shader(program, shader);
+                }
+                gl.delete_shader(shader);
             }
+            if result.is_err() {
+                gl.delete_program(program);
+            }
+            result
         }
     }
-
     pub(crate) fn replace_frame(&mut self, frame: GlFrame) {
         let next = OwnedFrame {
             handle: frame.handle as usize,
@@ -165,5 +179,32 @@ impl TerminalPainter {
             gl.delete_program(self.program);
             gl.delete_vertex_array(self.vertex_array);
         }
+    }
+}
+
+fn driver_log(log: String) -> String {
+    if log.trim().is_empty() {
+        "The graphics driver reported failure without a diagnostic log.".into()
+    } else {
+        format!("Graphics driver log:\n{log}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shader_diagnostics_preserve_driver_log_and_explain_missing_log() {
+        let log = "0:2: error: unsupported instruction\nDriver details: test";
+        let error = crate::native_error::FatalError::new(
+            "compile the terminal fragment shader",
+            super::driver_log(log.into()),
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("compile the terminal fragment shader")
+        );
+        assert!(error.to_string().contains(log));
+        assert!(super::driver_log("\n  ".into()).contains("without a diagnostic log"));
     }
 }

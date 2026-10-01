@@ -1,3 +1,4 @@
+use crate::native_error::{FatalError, FatalResult};
 use crate::presentation::{Presentation, UiChanges};
 use crate::terminal::TerminalView;
 use egui_winit::winit;
@@ -12,13 +13,20 @@ pub(crate) fn run(
     args: Vec<CString>,
     pickers: crate::picker::config::Bindings,
     floating_padding: Option<crate::config::FloatingPadding>,
-) {
+    issues: Vec<String>,
+) -> Result<(), FatalError> {
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
         .build()
-        .expect("create event loop");
+        .fatal("create the application event loop")?;
     let proxy = event_loop.create_proxy();
-    let mut app = NativeApp::new(proxy, args, pickers, floating_padding);
-    event_loop.run_app(&mut app).expect("run event loop");
+    let mut app = NativeApp::new(proxy, args, pickers, floating_padding, issues);
+    let result = event_loop
+        .run_app(&mut app)
+        .fatal("run the application event loop");
+    match app.fatal_error.take() {
+        Some(error) => Err(error),
+        None => result,
+    }
 }
 
 struct ShellApp {
@@ -37,10 +45,11 @@ impl ShellApp {
         args: Vec<CString>,
         pickers: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
-    ) -> Self {
+        issues: Vec<String>,
+    ) -> Result<Self, FatalError> {
         let command_label = command_label(&args);
         let mut argv: Vec<*mut c_char> = args.iter().map(|arg| arg.as_ptr().cast_mut()).collect();
-        Self {
+        Ok(Self {
             terminal: TerminalView::new(
                 egui_ctx,
                 gl,
@@ -50,10 +59,11 @@ impl ShellApp {
                 command_label,
                 pickers,
                 floating_padding,
-            ),
+                issues,
+            )?,
             _args: args,
             _argv: argv,
-        }
+        })
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
@@ -136,10 +146,12 @@ pub(crate) enum UserEvent {
 }
 
 struct NativeApp {
+    fatal_error: Option<FatalError>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     args: Option<Vec<CString>>,
     pickers: Option<crate::picker::config::Bindings>,
     floating_padding: Option<crate::config::FloatingPadding>,
+    issues: Vec<String>,
     gl_window: Option<GlutinWindowContext>,
     gl: Option<Arc<glow::Context>>,
     egui: Option<egui_glow::EguiGlow>,
@@ -153,12 +165,15 @@ impl NativeApp {
         args: Vec<CString>,
         pickers: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
+        issues: Vec<String>,
     ) -> Self {
         Self {
+            fatal_error: None,
             proxy,
             args: Some(args),
             pickers: Some(pickers),
             floating_padding,
+            issues,
             gl_window: None,
             gl: None,
             egui: None,
@@ -168,6 +183,9 @@ impl NativeApp {
     }
 
     fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.fatal_error.is_some() {
+            return;
+        }
         let gl_window = self.gl_window.as_ref().expect("OpenGL window");
         let gl = self.gl.as_ref().expect("OpenGL context");
         let egui = self.egui.as_mut().expect("egui renderer");
@@ -196,7 +214,13 @@ impl NativeApp {
         let presented = !paced && self.presentation.ready(now);
         if presented {
             unsafe {
-                gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                let background = crate::colors::palette().background;
+                gl.clear_color(
+                    f32::from(background.r()) / 255.0,
+                    f32::from(background.g()) / 255.0,
+                    f32::from(background.b()) / 255.0,
+                    1.0,
+                );
                 gl.clear(glow::COLOR_BUFFER_BIT);
             }
             egui.paint(gl_window.window());
@@ -207,7 +231,14 @@ impl NativeApp {
             .cleanup_pending(shell.terminal.retired_pending(), Instant::now());
         if presented {
             let present_started = Instant::now();
-            gl_window.swap_buffers().expect("swap egui buffers");
+            if let Err(error) = gl_window
+                .swap_buffers()
+                .fatal("present the application frame (swap OpenGL buffers)")
+            {
+                self.fatal_error = Some(error);
+                event_loop.exit();
+                return;
+            }
             self.presentation.presented(present_started);
         }
     }
@@ -219,7 +250,17 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             return;
         }
 
-        let gl_window = unsafe { GlutinWindowContext::new(event_loop) };
+        if self.fatal_error.is_some() {
+            return;
+        }
+        let gl_window = match unsafe { GlutinWindowContext::new(event_loop) } {
+            Ok(window) => window,
+            Err(error) => {
+                self.fatal_error = Some(error);
+                event_loop.exit();
+                return;
+            }
+        };
         if let Some(refresh_millihertz) = gl_window
             .window()
             .current_monitor()
@@ -236,7 +277,8 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
                 gl_window.get_proc_address(&name)
             })
         });
-        let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
+        let mut egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
+        crate::colors::COLORS.set(&egui.egui_ctx, crate::colors::palette());
         egui.egui_ctx.add_plugin(UiChanges::default());
         let proxy = self.proxy.clone();
         egui.egui_ctx
@@ -247,14 +289,23 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             }
         });
 
-        let shell = ShellApp::new(
+        let shell = match ShellApp::new(
             &egui.egui_ctx,
             &gl,
             self.proxy.clone(),
             self.args.take().expect("application resumed twice"),
             self.pickers.take().expect("application resumed twice"),
             self.floating_padding,
-        );
+            std::mem::take(&mut self.issues),
+        ) {
+            Ok(shell) => shell,
+            Err(error) => {
+                egui.destroy();
+                self.fatal_error = Some(error);
+                event_loop.exit();
+                return;
+            }
+        };
         gl_window.window().set_visible(true);
         gl_window.window().request_redraw();
         self.gl_window = Some(gl_window);
@@ -270,6 +321,9 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         event: winit::event::WindowEvent,
     ) {
         use winit::event::WindowEvent;
+        if self.fatal_error.is_some() {
+            return;
+        }
         if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
             event_loop.exit();
             return;
@@ -302,6 +356,9 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
     }
 
     fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
+        if self.fatal_error.is_some() {
+            return;
+        }
         match event {
             UserEvent::GhosttyWake => {
                 if let Some(shell) = self.shell.as_mut() {
@@ -318,6 +375,9 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.fatal_error.is_some() {
+            return;
+        }
         let now = Instant::now();
         if self
             .presentation
@@ -368,12 +428,51 @@ struct GlutinWindowContext {
     surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
 }
 
+/// Cosmetic opt-in only: unsupported DWM attributes must not prevent startup.
+#[cfg(windows)]
+fn prefer_rounded_corners(hwnd: *mut std::ffi::c_void) {
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: *mut std::ffi::c_void,
+            attribute: u32,
+            value: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: u32 = 2;
+    const E_INVALIDARG: i32 = 0x80070057u32 as i32;
+    // DWM clips the entire client area, including our custom border. Leave
+    // maximized/snapped-window corner policy to Windows.
+    let preference = DWMWCP_ROUND;
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&preference as *const u32).cast(),
+            std::mem::size_of_val(&preference) as u32,
+        )
+    };
+    // Windows 10 does not recognize this attribute; retain its normal corners.
+    if result < 0 && result != E_INVALIDARG {
+        crate::error_log::warning(
+            "window.corners",
+            "Rounded window corners unavailable",
+            &format!(
+                "DwmSetWindowAttribute failed with HRESULT 0x{:08X}",
+                result as u32
+            ),
+        );
+    }
+}
+
 impl GlutinWindowContext {
-    unsafe fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> Self {
+    unsafe fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> Result<Self, FatalError> {
         use glutin::context::NotCurrentGlContext as _;
-        use glutin::display::{GetGlDisplay as _, GlDisplay as _};
+        use glutin::display::GlDisplay as _;
         use glutin::prelude::GlSurface as _;
-        use winit::raw_window_handle::HasWindowHandle as _;
+        use winit::raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
 
         let window_attributes = winit::window::WindowAttributes::default()
             .with_title("Ghostty — egui OpenGL sample")
@@ -385,18 +484,59 @@ impl GlutinWindowContext {
             .with_depth_size(0)
             .with_stencil_size(0)
             .with_transparency(false);
-        let display_builder = glutin_winit::DisplayBuilder::new()
-            .with_preference(gl_api_preference())
-            .with_window_attributes(Some(window_attributes.clone()));
-        let (window, config) = display_builder
-            .build(event_loop, template, |mut configs| {
-                configs.next().expect("no compatible OpenGL configuration")
-            })
-            .expect("create OpenGL display");
-        let display = config.display();
+        // WGL needs a native window to enumerate its full configuration set.
+        // Enumerate directly: DisplayBuilder's picker cannot return an error
+        // when the driver supplies no compatible configurations.
+        #[cfg(windows)]
+        let window = Some(
+            event_loop
+                .create_window(window_attributes.clone())
+                .fatal("create the OpenGL window")?,
+        );
+        #[cfg(not(windows))]
+        let window: Option<winit::window::Window> = None;
         let raw_window = window
             .as_ref()
-            .map(|window| window.window_handle().expect("window handle").as_raw());
+            .map(|window| {
+                window
+                    .window_handle()
+                    .fatal("get the window handle")
+                    .map(|handle| handle.as_raw())
+            })
+            .transpose()?;
+        #[cfg(windows)]
+        if let Some(winit::raw_window_handle::RawWindowHandle::Win32(handle)) = raw_window {
+            prefer_rounded_corners(handle.hwnd.get() as *mut std::ffi::c_void);
+        }
+        let raw_display = event_loop
+            .display_handle()
+            .fatal("get the display handle")?
+            .as_raw();
+        #[cfg(windows)]
+        let preference = glutin::display::DisplayApiPreference::WglThenEgl(raw_window);
+        #[cfg(target_os = "macos")]
+        let preference = glutin::display::DisplayApiPreference::Cgl;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let preference = glutin::display::DisplayApiPreference::EglThenGlx(Box::new(
+            winit::platform::x11::register_xlib_error_hook,
+        ));
+        let display = unsafe { glutin::display::Display::new(raw_display, preference) }
+            .fatal("create the OpenGL display")?;
+        #[cfg(windows)]
+        let template = if let Some(handle) = raw_window {
+            template.compatible_with_native_window(handle)
+        } else {
+            template
+        };
+        let config = unsafe { display.find_configs(template.build()) }
+            .fatal("enumerate OpenGL configurations")?
+            .next()
+            .ok_or_else(|| {
+                FatalError::new(
+                    "select an OpenGL configuration",
+                    "The graphics driver returned no compatible OpenGL configuration.",
+                )
+            })?;
         let attributes = glutin::context::ContextAttributesBuilder::new()
             .with_context_api(glutin::context::ContextApi::OpenGl(Some(
                 glutin::context::Version::new(4, 3),
@@ -405,40 +545,48 @@ impl GlutinWindowContext {
         let not_current = unsafe {
             display
                 .create_context(&config, &attributes)
-                .expect("create OpenGL 4.3 context")
+                .fatal("create the OpenGL 4.3 context")?
         };
-        let window = window.unwrap_or_else(|| {
-            glutin_winit::finalize_window(event_loop, window_attributes, &config)
-                .expect("create window")
-        });
+        let window = match window {
+            Some(window) => window,
+            None => glutin_winit::finalize_window(event_loop, window_attributes, &config)
+                .fatal("create the OpenGL window")?,
+        };
         let size = window.inner_size();
         let surface_attributes =
             glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
                 .build(
-                    window.window_handle().expect("window handle").as_raw(),
+                    window
+                        .window_handle()
+                        .fatal("get the window handle")?
+                        .as_raw(),
                     NonZeroU32::new(size.width).unwrap_or(NonZeroU32::MIN),
                     NonZeroU32::new(size.height).unwrap_or(NonZeroU32::MIN),
                 );
         let surface = unsafe {
             display
                 .create_window_surface(&config, &surface_attributes)
-                .expect("create OpenGL window surface")
+                .fatal("create the OpenGL window surface")?
         };
         let context = not_current
             .make_current(&surface)
-            .expect("make OpenGL current");
+            .fatal("make the OpenGL context current")?;
         if let Err(err) =
             surface.set_swap_interval(&context, glutin::surface::SwapInterval::DontWait)
         {
-            eprintln!("egui OpenGL swap interval could not be disabled: {err}");
+            crate::error_log::warning(
+                "graphics",
+                "Swap interval could not be disabled",
+                &err.to_string(),
+            );
         }
 
-        Self {
+        Ok(Self {
             window,
             context,
             display,
             surface,
-        }
+        })
     }
 
     fn window(&self) -> &winit::window::Window {
@@ -463,16 +611,4 @@ impl GlutinWindowContext {
         use glutin::display::GlDisplay as _;
         self.display.get_proc_address(name)
     }
-}
-
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-fn gl_api_preference() -> glutin_winit::ApiPreference {
-    // Ghostty's Unix OpenGL backend uses EGL. Prefer it on X11 as well as
-    // Wayland so the two renderer contexts can share texture objects.
-    glutin_winit::ApiPreference::PreferEgl
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-fn gl_api_preference() -> glutin_winit::ApiPreference {
-    glutin_winit::ApiPreference::FallbackEgl
 }

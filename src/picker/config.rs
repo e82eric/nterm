@@ -118,6 +118,30 @@ pub(crate) enum Definition {
         #[serde(default)]
         preview_visible: bool,
     },
+    Themes {
+        #[serde(default)]
+        position: Position,
+        #[serde(default)]
+        sort: Sort,
+        #[serde(default)]
+        initial_query: Option<String>,
+        #[serde(default)]
+        preview: Option<Preview>,
+        #[serde(default)]
+        preview_visible: bool,
+    },
+    ErrorLog {
+        #[serde(default)]
+        position: Position,
+        #[serde(default)]
+        sort: Sort,
+        #[serde(default)]
+        initial_query: Option<String>,
+        #[serde(default)]
+        preview: Option<Preview>,
+        #[serde(default)]
+        preview_visible: bool,
+    },
     Factory {
         #[serde(skip)]
         factory: Option<std::rc::Rc<crate::config::PickerFactory>>,
@@ -173,6 +197,8 @@ pub(crate) enum Definition {
         #[serde(default)]
         line_continuation: Option<String>,
         #[serde(default)]
+        success_exit_codes: Option<Vec<i32>>,
+        #[serde(default)]
         unique: Option<bool>,
         #[serde(default)]
         enter_action: Option<EnterAction>,
@@ -225,6 +251,8 @@ impl Definition {
             | Self::Items { preview, .. }
             | Self::Command { preview, .. }
             | Self::FileSystem { preview, .. }
+            | Self::ErrorLog { preview, .. }
+            | Self::Themes { preview, .. }
             | Self::CommandPalette { preview, .. } => {
                 if let Some(preview) = preview {
                     preview.set_command(value);
@@ -247,7 +275,10 @@ impl Definition {
             | Self::FileSystem { callback, .. }
             | Self::Command { callback, .. }
             | Self::Items { callback, .. } => *callback = Some(value),
-            Self::Factory { .. } | Self::CommandPalette { .. } => {}
+            Self::Factory { .. }
+            | Self::ErrorLog { .. }
+            | Self::Themes { .. }
+            | Self::CommandPalette { .. } => {}
         }
     }
 
@@ -278,7 +309,10 @@ impl Definition {
                 enter_action,
                 ..
             } => (callback.clone(), *enter_action),
-            Self::Factory { .. } | Self::CommandPalette { .. } => (None, None),
+            Self::Factory { .. }
+            | Self::ErrorLog { .. }
+            | Self::Themes { .. }
+            | Self::CommandPalette { .. } => (None, None),
         }
     }
 
@@ -289,7 +323,10 @@ impl Definition {
             | Self::FileSystem { callback, .. }
             | Self::Command { callback, .. }
             | Self::Items { callback, .. } => callback.as_ref(),
-            Self::Factory { .. } | Self::CommandPalette { .. } => None,
+            Self::Factory { .. }
+            | Self::ErrorLog { .. }
+            | Self::Themes { .. }
+            | Self::CommandPalette { .. } => None,
         }
     }
 }
@@ -354,6 +391,8 @@ pub(crate) struct Options {
 
 #[derive(Clone)]
 pub(crate) enum Source {
+    Themes,
+    ErrorLog,
     CommandPalette(Vec<crate::actions::Entry>),
     Scrollback { regex: Regex, unique: bool },
     FileSystem(FileOptions),
@@ -373,6 +412,7 @@ pub(crate) struct CommandOptions {
     pub(crate) cwd: Option<String>,
     pub(crate) line_continuation: Option<String>,
     pub(crate) unique: bool,
+    pub(crate) success_exit_codes: Option<Vec<i32>>,
 }
 
 #[derive(Clone)]
@@ -530,6 +570,8 @@ impl Bindings {
                 | Definition::Items { position, .. }
                 | Definition::Command { position, .. }
                 | Definition::FileSystem { position, .. }
+                | Definition::ErrorLog { position, .. }
+                | Definition::Themes { position, .. }
                 | Definition::CommandPalette { position, .. } => *position,
                 Definition::Factory { .. } => unreachable!(),
             };
@@ -538,6 +580,8 @@ impl Bindings {
                 | Definition::Scrollback { sort, .. }
                 | Definition::Items { sort, .. }
                 | Definition::FileSystem { sort, .. }
+                | Definition::ErrorLog { sort, .. }
+                | Definition::Themes { sort, .. }
                 | Definition::CommandPalette { sort, .. } => *sort,
                 Definition::Factory { .. } => unreachable!(),
             };
@@ -546,6 +590,8 @@ impl Bindings {
                 | Definition::Items { initial_query, .. }
                 | Definition::Command { initial_query, .. }
                 | Definition::FileSystem { initial_query, .. }
+                | Definition::ErrorLog { initial_query, .. }
+                | Definition::Themes { initial_query, .. }
                 | Definition::CommandPalette { initial_query, .. } => initial_query.clone(),
                 Definition::Factory { .. } => unreachable!(),
             };
@@ -554,6 +600,8 @@ impl Bindings {
                 | Definition::Items { preview, .. }
                 | Definition::Command { preview, .. }
                 | Definition::FileSystem { preview, .. }
+                | Definition::ErrorLog { preview, .. }
+                | Definition::Themes { preview, .. }
                 | Definition::CommandPalette { preview, .. } => preview.clone(),
                 Definition::Factory { .. } => unreachable!(),
             };
@@ -570,6 +618,12 @@ impl Bindings {
                 | Definition::FileSystem {
                     preview_visible, ..
                 }
+                | Definition::ErrorLog {
+                    preview_visible, ..
+                }
+                | Definition::Themes {
+                    preview_visible, ..
+                }
                 | Definition::CommandPalette {
                     preview_visible, ..
                 } => *preview_visible,
@@ -581,6 +635,26 @@ impl Bindings {
                     .map_err(|error| format!("pickers.{name}.preview: {error}"))?;
             }
             let mut options = match definition {
+                Definition::Themes { .. } => Options {
+                    position,
+                    sort,
+                    callback: None,
+                    source: Source::Themes,
+                    enter_action: EnterAction::Navigate,
+                    params: BTreeMap::new(),
+                    preview: None,
+                    preview_visible: false,
+                },
+                Definition::ErrorLog { .. } => Options {
+                    position,
+                    sort,
+                    callback: None,
+                    source: Source::ErrorLog,
+                    enter_action: EnterAction::Navigate,
+                    params: BTreeMap::new(),
+                    preview: None,
+                    preview_visible: false,
+                },
                 Definition::CommandPalette { .. } => Options {
                     position,
                     sort,
@@ -640,6 +714,7 @@ impl Bindings {
                     cwd,
                     line_continuation,
                     unique,
+                    success_exit_codes,
                     ..
                 } => {
                     if args.is_empty()
@@ -661,6 +736,13 @@ impl Bindings {
                             "pickers.{name}: Command only supports enter_action SendInput"
                         ));
                     }
+                    if success_exit_codes.as_ref().is_some_and(|codes| {
+                        codes.is_empty() || codes.len() > 16 || codes.iter().any(|code| *code < 0)
+                    }) {
+                        return Err(format!(
+                            "pickers.{name}.success_exit_codes must contain 1 to 16 nonnegative exit codes"
+                        ));
+                    }
                     Options {
                         position,
                         sort,
@@ -670,6 +752,7 @@ impl Bindings {
                             cwd,
                             line_continuation: line_continuation.filter(|value| !value.is_empty()),
                             unique: unique.unwrap_or(defaults.unique),
+                            success_exit_codes,
                         }),
                         enter_action: EnterAction::SendInput,
                         params: BTreeMap::new(),
@@ -830,6 +913,18 @@ impl Bindings {
             .map(|(name, action)| (name.as_str(), action.as_ref()))
     }
 
+    pub(crate) fn has_themes_picker(&self) -> bool {
+        self.definitions.values().any(|entry| {
+            matches!(entry, PickerEntry::Static(options) if matches!(options.source, Source::Themes))
+        })
+    }
+
+    pub(crate) fn has_error_log_picker(&self) -> bool {
+        self.definitions.values().any(|entry| {
+            matches!(entry, PickerEntry::Static(options) if matches!(options.source, Source::ErrorLog))
+        })
+    }
+
     pub(crate) fn palette_entries(&self) -> impl Iterator<Item = (&str, Option<String>)> {
         self.definitions
             .iter()
@@ -837,6 +932,7 @@ impl Bindings {
                 PickerEntry::Factory(..) => true,
                 PickerEntry::Static(options) => match &options.source {
                     Source::CommandPalette(_) => false,
+                    Source::Themes | Source::ErrorLog => true,
                     Source::Items(items) => !items.values.is_empty() || items.provider.is_some(),
                     Source::Command(command) => command.args.iter().all(|arg| {
                         arg.strip_prefix('{')
@@ -1224,6 +1320,53 @@ mod tests {
                 .map_err(|error| error.to_string())
                 .and_then(|keys| Bindings::compile(None, Some(keys)));
             assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn configured_special_pickers_replace_only_matching_palette_builtins() {
+        for themes in [false, true] {
+            for errors in [false, true] {
+                let mut definitions = serde_json::Map::new();
+                // Detection uses picker type, not its name or position.
+                if themes {
+                    definitions.insert(
+                        "appearance".into(),
+                        serde_json::json!({
+                            "type": "Themes", "position": "Cursor"
+                        }),
+                    );
+                }
+                if errors {
+                    definitions.insert(
+                        "diagnostics".into(),
+                        serde_json::json!({
+                            "type": "ErrorLog", "position": "Cursor"
+                        }),
+                    );
+                }
+                let bindings = Bindings::compile(
+                    Some(serde_json::from_value(definitions.into()).unwrap()),
+                    Some(Vec::new()),
+                )
+                .unwrap();
+                let entries = crate::actions::catalog(&bindings, false, false);
+                for (configured, builtin, name) in [
+                    (themes, AppAction::OpenThemePicker, "appearance"),
+                    (errors, AppAction::OpenErrorLog, "diagnostics"),
+                ] {
+                    assert_eq!(
+                        entries.iter().any(|entry| entry.action == builtin),
+                        !configured
+                    );
+                    assert_eq!(
+                        entries
+                            .iter()
+                            .any(|entry| { entry.action == AppAction::OpenPicker(name.into()) }),
+                        configured
+                    );
+                }
+            }
         }
     }
 

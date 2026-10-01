@@ -7,6 +7,8 @@ use pane::TerminalPane;
 
 pub(crate) struct TerminalView {
     main: TerminalPane,
+    messages: crate::messages::Messages,
+
     command_label: String,
     picker_bindings: crate::picker::config::Bindings,
     floating_padding: Option<crate::config::FloatingPadding>,
@@ -33,11 +35,14 @@ impl std::ops::DerefMut for FloatingTerminal {
 }
 
 impl FloatingTerminal {
-    fn new(parent: &TerminalView, gl: &glow::Context) -> Option<Self> {
-        Some(Self {
-            pane: parent.main.create_floating(gl)?,
+    fn new(
+        parent: &TerminalView,
+        gl: &glow::Context,
+    ) -> Result<Option<Self>, crate::native_error::FatalError> {
+        Ok(parent.main.create_floating(gl)?.map(|pane| Self {
+            pane,
             visible: true,
-        })
+        }))
     }
 
     fn destroy(&mut self, gl: &glow::Context) {
@@ -50,6 +55,9 @@ impl FloatingTerminal {
 }
 
 impl TerminalView {
+    pub(crate) fn apply_theme(&mut self, name: &str) -> Result<(), String> {
+        self.main.apply_theme(name)
+    }
     fn active_pane_ref(&self) -> &TerminalPane {
         if self.floating.as_ref().is_some_and(|pane| pane.visible) {
             &self.floating.as_ref().expect("visible floating pane").pane
@@ -67,15 +75,19 @@ impl TerminalView {
         command_label: String,
         picker_bindings: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
-    ) -> Self {
-        let main = TerminalPane::create(egui_ctx, gl, proxy, argc, argv);
-        Self {
+        mut issues: Vec<String>,
+    ) -> Result<Self, crate::native_error::FatalError> {
+        let main = TerminalPane::create(egui_ctx, gl, proxy, argc, argv)?;
+        issues.extend(main.take_config_issues());
+        Ok(Self {
+            messages: crate::messages::Messages::new(issues),
+
             main,
             command_label,
             picker_bindings,
             floating_padding,
             floating: None,
-        }
+        })
     }
 
     pub(crate) fn tick(&mut self) {
@@ -105,16 +117,44 @@ impl TerminalView {
         gl: &glow::Context,
     ) {
         match action {
+            AppAction::OpenThemePicker => {
+                let pane = if self.floating.as_ref().is_some_and(|pane| pane.visible) {
+                    &mut self.floating.as_mut().expect("floating action target").pane
+                } else {
+                    &mut self.main
+                };
+                pane.open_theme_picker(ctx);
+            }
+            AppAction::ApplyTheme(name) => match self.apply_theme(&name) {
+                Ok(()) => self.main.show_notice("Theme applied", name),
+                Err(error) => self.main.show_error("Theme could not be applied", error),
+            },
+            AppAction::ShowMessages => self.messages.open(),
+            AppAction::ShowErrorRecord(record) => self.messages.open_record(*record),
+            AppAction::OpenErrorLog => {
+                if let Some(floating) = self.floating.as_mut().filter(|pane| pane.visible) {
+                    floating.open_error_log(ctx);
+                } else {
+                    self.main.open_error_log(ctx);
+                }
+            }
             AppAction::NewWindow => {
                 if let Err(error) = crate::app::open_new_window() {
-                    eprintln!("could not open a new terminal window: {error}");
+                    self.main
+                        .show_error("Could not open a new terminal window", error.to_string());
                 }
             }
             AppAction::ToggleFloatingPane => {
                 if let Some(floating) = self.floating.as_mut() {
                     floating.visible = !floating.visible;
                 } else {
-                    self.floating = FloatingTerminal::new(self, gl);
+                    match FloatingTerminal::new(self, gl) {
+                        Ok(floating) => self.floating = floating,
+                        Err(error) => self.main.show_error(
+                            "Floating terminal could not be created",
+                            error.to_string(),
+                        ),
+                    }
                 }
             }
             AppAction::CloseFloatingPane => self.close_floating(gl),
@@ -185,13 +225,15 @@ impl TerminalView {
             .show(ui.ctx(), |floating_ui| {
                 floating_ui.set_min_size(content.size());
                 let painter = floating_ui.painter();
-                painter.rect_filled(content, 0.0, egui::Color32::from_black_alpha(90));
                 painter.rect_filled(
-                    rect.expand(3.0),
-                    3.0,
-                    egui::Color32::from_rgb(0x66, 0x5c, 0x54),
+                    content,
+                    0.0,
+                    crate::colors::palette()
+                        .background
+                        .gamma_multiply(90.0 / 255.0),
                 );
-                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(40, 40, 40));
+                painter.rect_filled(rect.expand(3.0), 3.0, crate::colors::palette().border);
+                painter.rect_filled(rect, 0.0, crate::colors::palette().background);
                 painter.add(egui::PaintCallback {
                     rect,
                     callback: floating.paint_callback(),
@@ -200,11 +242,13 @@ impl TerminalView {
         ui.ctx().move_to_top(layer_id);
     }
     pub(crate) fn update(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
+        self.messages.show(ui.ctx());
+        let messages_open = self.messages.is_open();
         let context = self.active_pane_ref().action_context();
         let (shortcut, shortcut_consumed) = ui.input_mut(|input| {
             self.picker_bindings
                 .consume_when(&mut input.events, |action, mods| {
-                    context.allows(action, mods)
+                    !messages_open && context.allows(action, mods)
                 })
         });
         let pane_shortcut = match shortcut {
@@ -271,13 +315,20 @@ impl TerminalView {
         } else {
             &mut self.main
         };
-        let input =
-            active_pane.handle_input(ui, active_bounds, &mut self.picker_bindings, has_floating);
+        let input = if messages_open {
+            pane::PaneInput {
+                keyboard_blocked: true,
+                suppress_forward: true,
+                action: None,
+            }
+        } else {
+            active_pane.handle_input(ui, active_bounds, &mut self.picker_bindings, has_floating)
+        };
         active_pane.forward_input(
             ui,
             active_bounds,
-            input.keyboard_blocked || shortcut_consumed,
-            input.suppress_forward || shortcut_consumed,
+            input.keyboard_blocked || shortcut_consumed || messages_open,
+            input.suppress_forward || shortcut_consumed || messages_open,
         );
         self.show_mode_status(ui, status_rect);
 
@@ -311,12 +362,15 @@ impl TerminalView {
         self.main.should_close()
     }
 
-    fn show_mode_status(&self, ui: &egui::Ui, rect: egui::Rect) {
+    fn show_mode_status(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+        let warning_right = rect.right() - 10.0;
+        // Paint the background before the clickable status indicator.
+        ui.painter()
+            .rect_filled(rect, 0.0, crate::colors::palette().panel_background);
+        let mut right_edge = self.messages.status(ui, rect).min(warning_right);
         let status = self.active_pane_ref().status(&self.command_label);
-        let background = egui::Color32::from_rgb(0x1d, 0x20, 0x21);
-        let foreground = egui::Color32::from_rgb(0xeb, 0xdb, 0xb2);
+        let foreground = crate::colors::palette().text;
         let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(rect, 0.0, background);
         let separator = status.separator;
         painter.line_segment(
             [
@@ -333,12 +387,11 @@ impl TerminalView {
             font.clone(),
             status.accent,
         );
-        let mut right_edge = rect.right() - 10.0;
         if let Some(floating) = &self.floating {
             let color = if floating.visible {
-                egui::Color32::from_rgb(250, 189, 47)
+                crate::colors::palette().warning
             } else {
-                egui::Color32::from_rgb(124, 111, 100)
+                crate::colors::palette().muted_text
             };
             let text = painter.layout_no_wrap(
                 "Floating Panes: 1".to_owned(),

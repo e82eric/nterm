@@ -50,7 +50,8 @@ Lua settings are loaded at startup from the first available location:
 
 Only one file is loaded. Missing default files preserve the existing configuration.
 An explicit missing file, unreadable file, or invalid configuration reports the
-filename and exits before opening a window, without falling back to another file.
+filename in Messages and starts with defaults for Lua settings, without falling
+back to another file. A persistent configuration indicator remains until restart.
 See `ghostty.lua` in this example for a starting configuration:
 
 ```powershell
@@ -71,7 +72,84 @@ the base; Lua overrides them, and explicit command-line options override Lua.
 The picker still imports Ghostty's resolved font and tracks its cell dimensions.
 Changes to Lua require restarting the app; live reload is not supported.
 
+The UI follows Ghostty's resolved theme colors. Optional `colors.ui` overrides
+take precedence for app chrome without changing terminal colors:
+
+```lua
+colors = {
+  theme = "Gruvbox Dark",
+  ui = { accent = "#fabd2f", panel_background = "#1d2021" },
+},
+theme_colors = {
+  ["Gruvbox Dark"] = { accent = "#fabd2f" },
+  ["Rose Pine"] = { accent = "#ebbcba" },
+},
+```
+
+Overrides accept `#RRGGBB` or `RRGGBB`. See [UI-COLORS.md](UI-COLORS.md) for all
+sixteen roles and derivation rules. Invalid overrides use configuration Messages.
+Colors are derived from the resolved Ghostty theme, then global `colors.ui`
+overrides are applied, followed by `theme_colors` overrides for that exact,
+case-sensitive theme name. This applies at startup and when selecting a theme;
+switching to another theme removes the previous theme's overrides. These
+overrides affect app chrome and UI decorations, not terminal ANSI colors.
+
+Use **Choose theme** in the command palette to search installed user and bundled
+Ghostty themes in the shared fuzzy picker. Arrow keys select an entry; Enter or clicking a theme applies it. Escape
+closes the picker without changing the theme. The choice updates the main and
+floating terminal panes and the shared UI palette for this session only. Explicit
+Lua UI overrides continue to take precedence; picker choices replace explicit
+native terminal colors for the session. To save a choice, set `colors.theme` in
+Lua and remove conflicting explicit native color settings, then restart. You can also bind the
+`OpenThemePicker` action in `keys`.
+
+To configure its placement, define a named theme picker instead:
+
+```lua
+pickers = {
+  themes = { type = "Themes", position = "Cursor", sort = "Score" },
+},
+keys = {
+  { key = "t", mods = "CTRL|SHIFT", picker = "themes" },
+},
+```
+
+Add these entries to the tables in your config. Named theme pickers also support
+`initial_query` and work in the main and floating panes. The built-in
+`OpenThemePicker` action keeps its centered placement.
+
 ## Lua actions and toasts
+
+Recoverable errors and fallback warnings are retained in a session history
+(200 records, 16 KiB details per record). Repeated failures aggregate. They also
+write to stderr and retain their existing toast or local picker/preview feedback.
+Choose **Error history** in the command palette and select an entry to view and
+copy its details. **Show messages** includes history alongside persistent
+configuration issues. Reopen the history picker to refresh its snapshot.
+
+You can bind `action = "OpenErrorLog"` or configure a named picker:
+
+```lua
+pickers = {
+  errors = { type = "ErrorLog", position = "Cursor" },
+},
+keys = {
+  { key = "h", mods = "CTRL|SHIFT", picker = "errors" },
+},
+```
+
+Merge these entries into your existing tables. History resets on restart.
+
+Search workers start on demand. A worker failure cancels the affected search;
+retrying starts a replacement. Command and preview errors include command/cwd,
+exit status, and bounded stderr. Command pickers accept exit 0 by default;
+ripgrep also accepts exit 1 for no matches. A command picker can specify
+`success_exit_codes = { 0, 1 }` to use another convention. Partial command
+results remain visible with an error indicating that they may be incomplete.
+Preview errors leave the picker usable; selecting another item retries naturally.
+
+Invalid startup arguments and unrecoverable UI/internal failures use the native
+fatal-error path. Rust callbacks catch panics before returning across the C API.
 
 Define named actions alongside `pickers` and reference them in `keys`. Actions
 also appear in the command palette with their configured label and shortcuts:

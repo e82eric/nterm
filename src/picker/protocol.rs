@@ -2,10 +2,17 @@ use serde::Deserialize;
 
 pub(crate) const MAX_PAYLOAD: usize = 1024 * 1024;
 
-pub(crate) fn new_token() -> String {
+pub(crate) fn new_token() -> Result<String, crate::native_error::FatalError> {
+    token_with_random(getrandom::fill)
+}
+
+fn token_with_random(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Result<String, crate::native_error::FatalError> {
+    use crate::native_error::FatalResult;
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("unable to generate terminal OSC token");
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    fill(&mut bytes).fatal("generate a secure terminal protocol token")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[derive(Deserialize)]
@@ -138,10 +145,21 @@ mod tests {
     }
     #[test]
     fn tokens_are_random_and_printable() {
-        let first = new_token();
+        let first = new_token().unwrap();
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_ne!(first, new_token());
+        assert_ne!(first, new_token().unwrap());
+    }
+    #[test]
+    fn randomness_failure_returns_error_without_a_fallback_token() {
+        let error = super::token_with_random(|bytes| {
+            bytes[0] = 42;
+            Err(getrandom::Error::UNSUPPORTED)
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("generate a secure terminal protocol token"));
+        assert!(message.contains(&getrandom::Error::UNSUPPORTED.to_string()));
     }
     #[test]
     fn parses_item_list_with_separate_display_and_insert_text() {

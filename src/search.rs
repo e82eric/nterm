@@ -79,13 +79,13 @@ impl SearchUi {
         let mut accept = false;
         let available_width = bounds.width();
         let search_width = (available_width - 24.0).max(1.0);
-        // Gruvbox dark: lift the search box one shade above the terminal background.
-        let fill = egui::Color32::from_rgb(0x3c, 0x38, 0x36); // dark1
-        let border = egui::Color32::from_rgb(0x66, 0x5c, 0x54); // dark3
-        let accent = egui::Color32::from_rgb(0xfa, 0xbd, 0x2f); // bright yellow
-        let text_color = egui::Color32::from_rgb(0xeb, 0xdb, 0xb2); // light1
-        let muted_text = egui::Color32::from_rgb(0xd5, 0xc4, 0xa1); // light2
-        let selection = egui::Color32::from_rgb(0x66, 0x5c, 0x54); // dark3
+        let palette = crate::colors::palette();
+        let fill = palette.panel_background;
+        let border = palette.border;
+        let accent = palette.accent;
+        let text_color = palette.text;
+        let muted_text = palette.muted_text;
+        let selection = palette.selection_background;
 
         let id = if interactive {
             "terminal-search"
@@ -111,7 +111,7 @@ impl SearchUi {
                     ui.set_width(search_width);
                     ui.visuals_mut().text_cursor.stroke = egui::Stroke::new(2.0, text_color);
                     ui.visuals_mut().selection.bg_fill = selection;
-                    ui.visuals_mut().selection.stroke.color = text_color;
+                    ui.visuals_mut().selection.stroke.color = palette.selection_text;
                     ui.horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
                         ui.add_sized(
@@ -276,43 +276,91 @@ pub(crate) struct SearchWorker {
     latest_query_revision: Arc<AtomicU64>,
     next_query_revision: u64,
     thread: Option<thread::JoinHandle<()>>,
+    ctx: egui::Context,
+    fault: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl SearchWorker {
     pub(crate) fn new(ctx: egui::Context) -> Self {
-        let (command_tx, command_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
-        let latest_query_revision = Arc::new(AtomicU64::new(0));
-        let worker_query_revision = Arc::clone(&latest_query_revision);
-        let thread = thread::Builder::new()
-            .name("ghostty-egui-search".to_owned())
-            .spawn(move || worker_loop(command_rx, result_tx, worker_query_revision, ctx))
-            .expect("start search worker");
+        let (commands, _) = mpsc::channel();
+        let (_, results) = mpsc::channel();
         Self {
-            commands: command_tx,
-            results: result_rx,
-            latest_query_revision,
+            commands,
+            results,
+            latest_query_revision: Arc::new(AtomicU64::new(0)),
             next_query_revision: 0,
-            thread: Some(thread),
+            thread: None,
+            ctx,
+            fault: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
+    fn ensure_started(&mut self) -> Result<(), String> {
+        let fault = self
+            .fault
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(error) = fault {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            return Err(format!("Search worker failed: {error}"));
+        }
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            return Ok(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|panic| crate::native_error::panic_detail(panic.as_ref()))?;
+        }
+        let (command_tx, command_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let revision = self.latest_query_revision.clone();
+        let ctx = self.ctx.clone();
+        let fault = self.fault.clone();
+        let thread = thread::Builder::new()
+            .name("ghostty-egui-search".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_loop(command_rx, result_tx, revision, ctx.clone())
+                }));
+                if let Err(panic) = result {
+                    *fault.lock().unwrap_or_else(|error| error.into_inner()) =
+                        Some(crate::native_error::panic_detail(panic.as_ref()));
+                    ctx.request_repaint();
+                }
+            })
+            .map_err(|error| format!("Unable to start search worker: {error}"))?;
+        self.commands = command_tx;
+        self.results = result_rx;
+        self.thread = Some(thread);
+        Ok(())
+    }
     pub(crate) fn submit(
         &mut self,
         snapshot_generation: u64,
         query: String,
         regex: bool,
         cursor: usize,
-    ) -> u64 {
+    ) -> Result<u64, String> {
+        self.ensure_started()?;
         let query_revision = self.advance_query_revision();
-        let _ = self.commands.send(SearchCommand::Search(SearchRequest {
-            snapshot_generation,
-            query_revision,
-            query,
-            regex,
-            cursor,
-        }));
-        query_revision
+        self.commands
+            .send(SearchCommand::Search(SearchRequest {
+                snapshot_generation,
+                query_revision,
+                query,
+                regex,
+                cursor,
+            }))
+            .map_err(|_| "Search worker stopped before receiving the request".to_owned())?;
+        Ok(query_revision)
     }
 
     pub(crate) fn cancel(&mut self) {
@@ -322,16 +370,58 @@ impl SearchWorker {
     /// Wait until the worker has stopped using the previous snapshot cursor.
     pub(crate) fn cancel_and_wait(&mut self) {
         self.cancel();
+        if self.thread.is_none() {
+            return;
+        }
         let (tx, rx) = mpsc::channel();
-        if self.commands.send(SearchCommand::Barrier(tx)).is_ok() {
-            let _ = rx.recv();
+        if self.commands.send(SearchCommand::Barrier(tx)).is_err() || rx.recv().is_err() {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            let fault = self
+                .fault
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            crate::error_log::error(
+                "search",
+                "Worker stopped while releasing snapshot",
+                fault
+                    .as_deref()
+                    .unwrap_or("Search command channel disconnected"),
+            );
         }
     }
 
-    pub(crate) fn take_latest_result(&self) -> Option<SearchResult> {
-        self.results.try_iter().last()
+    pub(crate) fn take_latest_result(&mut self) -> Result<Option<SearchResult>, String> {
+        let fault = self
+            .fault
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(error) = fault {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            return Err(format!("Search worker failed: {error}"));
+        }
+        if self.thread.is_none() {
+            return Ok(None);
+        }
+        let mut latest = None;
+        loop {
+            match self.results.try_recv() {
+                Ok(result) => latest = Some(result),
+                Err(mpsc::TryRecvError::Empty) => return Ok(latest),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(thread) = self.thread.take() {
+                        let _ = thread.join();
+                    }
+                    return Err("Search worker stopped unexpectedly; retry the search".into());
+                }
+            }
+        }
     }
-
     fn advance_query_revision(&mut self) -> u64 {
         self.next_query_revision = self.next_query_revision.wrapping_add(1);
         if self.next_query_revision == 0 {
@@ -399,6 +489,11 @@ fn worker_loop(
         if latest_query_revision.load(Ordering::Acquire) != query_revision {
             continue;
         }
+        if let Some(error) = &outcome.error {
+            if error.starts_with("Unable to") {
+                crate::error_log::error("search", "Snapshot scan failed", error);
+            }
+        }
         if results
             .send(SearchResult {
                 snapshot_generation: request.snapshot_generation,
@@ -439,7 +534,12 @@ fn find_search_matches_cancellable(
     };
     let mut scan = LineScan::new(matcher);
     if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_cursor_reset(cursor as *mut _) } {
-        return None;
+        return Some(SearchOutcome {
+            matches: Vec::new(),
+            error: Some(ghostty_ffi::native_error(
+                "Unable to reset search snapshot cursor",
+            )),
+        });
     }
     loop {
         if cancelled() {
@@ -451,7 +551,12 @@ fn find_search_matches_cancellable(
         } {
             0 => break,
             1 => {}
-            _ => return None,
+            _ => {
+                return Some(SearchOutcome {
+                    matches: Vec::new(),
+                    error: Some(ghostty_ffi::native_error("Unable to read search snapshot")),
+                });
+            }
         }
         let bytes = unsafe { std::slice::from_raw_parts(chunk.text, chunk.len) };
         let points = unsafe { std::slice::from_raw_parts(chunk.points, chunk.len) };
@@ -545,6 +650,31 @@ impl LineScan {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_restarts_on_next_request_after_disconnection() {
+        let mut worker = super::SearchWorker::new(egui::Context::default());
+        let first = worker.submit(1, String::new(), false, 0).unwrap();
+        worker
+            .commands
+            .send(super::SearchCommand::Shutdown)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !worker.thread.as_ref().unwrap().is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(worker.take_latest_result().is_err());
+        let second = worker.submit(2, String::new(), false, 0).unwrap();
+        assert!(second > first);
+        loop {
+            if let Some(result) = worker.take_latest_result().unwrap() {
+                assert_eq!(result.snapshot_generation, 2);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
     use super::{LineScan, SearchUi, find_search_matches_cancellable};
     use crate::ghostty_ffi::{SnapshotCell, SnapshotCellRange, SnapshotTextPoint};
     use regex::{Regex, RegexBuilder};

@@ -55,7 +55,7 @@ impl Toasts {
                         0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::proportional(20.0),
-                            color: crate::picker::style::TEXT,
+                            color: crate::colors::palette().text,
                             ..Default::default()
                         },
                     );
@@ -64,7 +64,7 @@ impl Toasts {
                         0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::proportional(18.0),
-                            color: crate::picker::style::TEXT,
+                            color: crate::colors::palette().text,
                             ..Default::default()
                         },
                     );
@@ -103,8 +103,8 @@ impl Toasts {
                 ui.set_clip_rect(bounds.intersect(ui.clip_rect()));
                 for galley in &galleys {
                     egui::Frame::new()
-                        .fill(crate::picker::style::BACKGROUND)
-                        .stroke(egui::Stroke::new(1.0, crate::picker::style::BORDER))
+                        .fill(crate::colors::palette().panel_background)
+                        .stroke(egui::Stroke::new(1.0, crate::colors::palette().border))
                         .corner_radius(8)
                         .inner_margin(12)
                         .show(ui, |ui| {
@@ -113,7 +113,7 @@ impl Toasts {
                             ui.painter().galley(
                                 rect.min,
                                 galley.clone(),
-                                crate::picker::style::TEXT,
+                                crate::colors::palette().text,
                             );
                         });
                     ui.add_space(8.0);

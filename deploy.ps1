@@ -10,6 +10,7 @@ Set-StrictMode -Version Latest
 
 $repository = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $source = Join-Path $repository 'zig-out\bin'
+$resourceSource = Join-Path $repository 'zig-out\share'
 $destinationPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
 
 if (-not $SkipBuild) {
@@ -36,8 +37,24 @@ foreach ($file in $files) {
 }
 
 New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
+$themeSource = Join-Path $resourceSource 'ghostty\themes'
+$terminfoSource = Join-Path $resourceSource 'terminfo\ghostty.terminfo'
+if (-not (Test-Path -LiteralPath $themeSource -PathType Container)) {
+    throw "Missing bundled themes: $themeSource. Build with -Demit-themes=true."
+}
+if (-not (Test-Path -LiteralPath $terminfoSource -PathType Leaf)) {
+    throw "Missing resource discovery sentinel: $terminfoSource. Build with -Demit-terminfo=true."
+}
 foreach ($file in $files) {
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $destinationPath $file) -Force
+}
+
+# Keep the share layout beside the executable so Ghostty's resource discovery
+# finds both its terminfo sentinel and the bundled themes.
+$resourceDestination = Join-Path $destinationPath 'share'
+New-Item -ItemType Directory -Path $resourceDestination -Force | Out-Null
+foreach ($directory in @('ghostty', 'terminfo')) {
+    Copy-Item -LiteralPath (Join-Path $resourceSource $directory) -Destination $resourceDestination -Recurse -Force
 }
 
 Write-Host "Deployed $($files -join ', ') to $destinationPath"

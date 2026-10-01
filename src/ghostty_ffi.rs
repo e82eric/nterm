@@ -1,7 +1,40 @@
 use std::ffi::{c_char, c_void};
 
+unsafe extern "C" {
+    fn ghostty_last_error() -> *const c_char;
+    pub(crate) fn ghostty_config_theme_directories(
+        userdata: *mut c_void,
+        callback: extern "C" fn(*mut c_void, *const c_char),
+    ) -> bool;
+    pub(crate) fn ghostty_egui_host_apply_theme(
+        host: *mut Host,
+        name: *const c_char,
+        error: *mut c_char,
+        capacity: usize,
+    ) -> bool;
+}
+
+pub(crate) fn native_error(operation: &str) -> String {
+    let cause = unsafe { ghostty_last_error() };
+    if cause.is_null() {
+        operation.into()
+    } else {
+        format!(
+            "{operation}: {}",
+            unsafe { std::ffi::CStr::from_ptr(cause) }.to_string_lossy()
+        )
+    }
+}
+
 #[repr(C)]
 pub(crate) struct Host(c_void);
+
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct FontVariation {
+    pub(crate) tag: u32,
+    pub(crate) value: f32,
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -9,6 +42,8 @@ pub(crate) struct FontData {
     pub(crate) data: *mut u8,
     pub(crate) len: usize,
     pub(crate) face_index: u32,
+    pub(crate) variation_count: u32,
+    pub(crate) variations: [FontVariation; 32],
 }
 
 #[repr(C)]
@@ -159,6 +194,8 @@ unsafe extern "C" {
         context: *mut c_void,
         scale: f64,
         osc_token: *const c_char,
+        error_buffer: *mut c_char,
+        error_capacity: usize,
     ) -> *mut Host;
     pub(crate) fn ghostty_egui_host_destroy(host: *mut Host);
     pub(crate) fn ghostty_egui_host_create_floating(
@@ -166,6 +203,8 @@ unsafe extern "C" {
         userdata: *mut c_void,
         scale: f64,
         osc_token: *const c_char,
+        error_buffer: *mut c_char,
+        error_capacity: usize,
     ) -> *mut Host;
     pub(crate) fn ghostty_egui_host_tick(host: *mut Host);
     pub(crate) fn ghostty_egui_host_resize(host: *mut Host, width: u32, height: u32, scale: f64);

@@ -1,9 +1,7 @@
 use crate::ghostty_ffi::{self, Host, SnapshotCellRange, SnapshotStyledRows};
 use crate::picker::config::Preview;
 use crate::picker::font::Typography;
-use crate::picker::style;
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -35,6 +33,8 @@ unsafe extern "C" {
         columns: u16,
         rows: u16,
         scroll_offset: usize,
+        default_foreground: u32,
+        default_background: u32,
         cells: *mut Cell,
         out_total_rows: *mut usize,
     ) -> bool;
@@ -136,14 +136,16 @@ fn command_output(
     revision: &AtomicU64,
     id: u64,
 ) -> Result<Vec<u8>, String> {
+    use super::process;
     if args.is_empty() {
         return Err("preview command requires an executable".into());
     }
+    let context = process::describe(args, cwd);
     let mut command = std::process::Command::new(&args[0]);
     command
         .args(&args[1..])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -152,38 +154,58 @@ fn command_output(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("preview: {error}"))?;
-    let mut stdout = child.stdout.take().ok_or("preview command has no stdout")?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .by_ref()
-            .take(MAX_BYTES as u64)
-            .read_to_end(&mut bytes)
-            .ok();
-        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
-        bytes
-    });
-    loop {
+    let mut child = process::ChildGuard(
+        command
+            .spawn()
+            .map_err(|error| format!("{context}\nUnable to start preview: {error}"))?,
+    );
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or("preview command has no stdout")?;
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or("preview command has no stderr")?;
+    let reader = process::reader("preview stdout reader", move || {
+        process::read_bounded(stdout, MAX_BYTES)
+            .map_err(|error| format!("Unable to read preview stdout: {error}"))
+    })?;
+    let stderr_reader = process::reader("preview stderr reader", move || {
+        process::read_bounded(stderr, process::STDERR_LIMIT)
+            .map_err(|error| format!("Unable to read preview stderr: {error}"))
+    })?;
+    let status = loop {
         if revision.load(Ordering::Acquire) != id {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+            let _ = process::join(reader, "preview stdout reader");
+            let _ = process::join(stderr_reader, "preview stderr reader");
             return Err("preview cancelled".into());
         }
-        match child.try_wait() {
-            Ok(Some(_)) => break,
+        match child.0.try_wait() {
+            Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(error) => return Err(format!("preview: {error}")),
+            Err(error) => return Err(format!("{context}\nUnable to wait for preview: {error}")),
         }
+    };
+    let stdout_result = process::join(reader, "preview stdout reader");
+    let stderr_result = process::join(stderr_reader, "preview stderr reader");
+    if revision.load(Ordering::Acquire) != id {
+        return Err("preview cancelled".into());
     }
-    reader
-        .join()
-        .map_err(|_| "preview reader stopped".to_owned())
+    let bytes = stdout_result.map_err(|error| format!("{context}\n{error}"))?;
+    let stderr = stderr_result.map_err(|error| format!("{context}\n{error}"))?;
+    if !status.success() && !(process::no_match_exit(&args[0]) && status.code() == Some(1)) {
+        return Err(format!(
+            "{context}\n{}",
+            process::status_error(status, &stderr)
+        ));
+    }
+    Ok(bytes)
 }
-
 fn parse(
     bytes: &[u8],
     columns: usize,
@@ -206,6 +228,8 @@ fn parse(
             columns as u16,
             rows as u16,
             scroll_offset,
+            crate::colors::rgb(crate::colors::palette().text),
+            crate::colors::rgb(crate::colors::palette().background),
             cells.as_mut_ptr(),
             &mut total_rows,
         )
@@ -339,6 +363,9 @@ impl PickerPreview {
                     }
                     Err(error) => {
                         self.cells.clear();
+                        if error != "preview cancelled" && error != "No scrollback match selected" {
+                            crate::error_log::error("picker preview", "Preview failed", &error);
+                        }
                         self.error = Some(error);
                     }
                 }
@@ -377,85 +404,107 @@ impl PickerPreview {
         let total_rows = self.total_rows;
         let scroll_offset = self.scroll_offset;
         self.workers.retain(|worker| !worker.is_finished());
-        self.workers.push(std::thread::spawn(move || {
-            let center_line = match &job {
-                PreviewJob::Command { center_line, .. } => *center_line,
-                _ => None,
-            };
-            let bytes = match job {
-                PreviewJob::Text(plain) => {
-                    // Escape control bytes so text previews cannot alter the VT state.
-                    Ok(plain
-                        .chars()
-                        .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
-                        .collect::<String>()
-                        .into_bytes())
-                }
-                PreviewJob::Ansi(text) => Ok(text.into_bytes()),
-                PreviewJob::Scrollback => match generation {
-                    Some(generation) if range.is_some() && rows > 0 => styled_rows(
-                        host,
-                        generation,
-                        first_row,
-                        (rows as u64).min(total_rows) as u32,
-                    ),
-                    _ => Err("No scrollback match selected".into()),
-                },
-                PreviewJob::Command { args, cwd, .. } => {
-                    command_output(&args, cwd.as_deref(), &revision, id)
-                }
-                PreviewJob::Empty => Ok(Vec::new()),
-                PreviewJob::Error(error) => Err(error),
-            };
-            if revision.load(Ordering::Acquire) != id {
-                return;
-            }
-            let (cells, total_preview_rows, cached_bytes, scroll_offset) = match bytes {
-                Ok(bytes) => {
-                    let bytes = bytes[..bytes.len().min(MAX_BYTES)].to_vec();
-                    let parsed = parse(
-                        &bytes,
-                        columns,
-                        rows,
-                        if scrollback { 0 } else { scroll_offset },
-                    );
-                    let parsed = parsed.and_then(|(cells, total_rows)| {
-                        let offset = center_line.map_or(scroll_offset, |line| {
-                            line.saturating_sub(rows / 2)
-                                .min(total_rows.saturating_sub(rows))
-                        });
-                        if !scrollback && offset != scroll_offset {
-                            parse(&bytes, columns, rows, offset)
-                                .map(|(cells, total_rows)| (cells, total_rows, offset))
-                        } else {
-                            Ok((cells, total_rows, offset))
-                        }
-                    });
-                    match parsed {
-                        Ok((cells, total_rows, offset)) => (
-                            Ok(cells),
-                            total_rows,
-                            if scrollback { None } else { Some(bytes) },
-                            offset,
-                        ),
-                        Err(error) => (Err(error), 0, None, scroll_offset),
+        let failure_sender = sender.clone();
+        let failure_revision = revision.clone();
+        let failure_ctx = ctx.clone();
+        if let Some(worker) = crate::worker::spawn(
+            "picker preview worker",
+            move || {
+                let center_line = match &job {
+                    PreviewJob::Command { center_line, .. } => *center_line,
+                    _ => None,
+                };
+                let bytes = match job {
+                    PreviewJob::Text(plain) => {
+                        // Escape control bytes so text previews cannot alter the VT state.
+                        Ok(plain
+                            .chars()
+                            .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
+                            .collect::<String>()
+                            .into_bytes())
                     }
+                    PreviewJob::Ansi(text) => Ok(text.into_bytes()),
+                    PreviewJob::Scrollback => match generation {
+                        Some(generation) if range.is_some() && rows > 0 => styled_rows(
+                            host,
+                            generation,
+                            first_row,
+                            (rows as u64).min(total_rows) as u32,
+                        ),
+                        _ => Err("No scrollback match selected".into()),
+                    },
+                    PreviewJob::Command { args, cwd, .. } => {
+                        command_output(&args, cwd.as_deref(), &revision, id)
+                    }
+                    PreviewJob::Empty => Ok(Vec::new()),
+                    PreviewJob::Error(error) => Err(error),
+                };
+                if revision.load(Ordering::Acquire) != id {
+                    return;
                 }
-                Err(error) => (Err(error), 0, None, scroll_offset),
-            };
-            if revision.load(Ordering::Acquire) == id {
-                let _ = sender.send(Update {
-                    revision: id,
-                    cells,
-                    columns,
-                    first_row,
-                    total_rows: total_preview_rows,
-                    bytes: cached_bytes,
-                    scroll_offset,
-                });
-                ctx.request_repaint();
-            }
-        }));
+                let (cells, total_preview_rows, cached_bytes, scroll_offset) = match bytes {
+                    Ok(bytes) => {
+                        let bytes = bytes[..bytes.len().min(MAX_BYTES)].to_vec();
+                        let parsed = parse(
+                            &bytes,
+                            columns,
+                            rows,
+                            if scrollback { 0 } else { scroll_offset },
+                        );
+                        let parsed = parsed.and_then(|(cells, total_rows)| {
+                            let offset = center_line.map_or(scroll_offset, |line| {
+                                line.saturating_sub(rows / 2)
+                                    .min(total_rows.saturating_sub(rows))
+                            });
+                            if !scrollback && offset != scroll_offset {
+                                parse(&bytes, columns, rows, offset)
+                                    .map(|(cells, total_rows)| (cells, total_rows, offset))
+                            } else {
+                                Ok((cells, total_rows, offset))
+                            }
+                        });
+                        match parsed {
+                            Ok((cells, total_rows, offset)) => (
+                                Ok(cells),
+                                total_rows,
+                                if scrollback { None } else { Some(bytes) },
+                                offset,
+                            ),
+                            Err(error) => (Err(error), 0, None, scroll_offset),
+                        }
+                    }
+                    Err(error) => (Err(error), 0, None, scroll_offset),
+                };
+                if revision.load(Ordering::Acquire) == id {
+                    let _ = sender.send(Update {
+                        revision: id,
+                        cells,
+                        columns,
+                        first_row,
+                        total_rows: total_preview_rows,
+                        bytes: cached_bytes,
+                        scroll_offset,
+                    });
+                    ctx.request_repaint();
+                }
+            },
+            move |error| {
+                if failure_revision.load(Ordering::Acquire) == id {
+                    let _ = failure_sender.send(Update {
+                        revision: id,
+                        cells: Err(error),
+                        columns,
+                        first_row,
+                        total_rows: 0,
+                        bytes: None,
+                        scroll_offset,
+                    });
+                    failure_ctx.request_repaint();
+                }
+            },
+        ) {
+            self.workers.push(worker);
+        }
     }
 
     fn apply_updates(&mut self) {
@@ -479,6 +528,9 @@ impl PickerPreview {
                 }
                 Err(error) => {
                     self.cells.clear();
+                    if error != "preview cancelled" && error != "No scrollback match selected" {
+                        crate::error_log::error("picker preview", "Preview failed", &error);
+                    }
                     self.error = Some(error);
                 }
             }
@@ -509,6 +561,9 @@ impl PickerPreview {
                 Ok((cells, _)) => self.cells = cells,
                 Err(error) => {
                     self.cells.clear();
+                    if error != "preview cancelled" && error != "No scrollback match selected" {
+                        crate::error_log::error("picker preview", "Preview failed", &error);
+                    }
                     self.error = Some(error);
                 }
             }
@@ -550,7 +605,7 @@ impl PickerPreview {
                         egui::Align2::LEFT_CENTER,
                         label,
                         typography.font.clone(),
-                        style::ERROR,
+                        crate::colors::palette().error,
                     );
                 }
                 continue;
@@ -572,7 +627,11 @@ impl PickerPreview {
                     match_contains(range, self.first_row + y as u64, x as u32)
                 });
                 if highlighted {
-                    painter.rect_filled(cell_rect, 0.0, style::SELECTION);
+                    painter.rect_filled(
+                        cell_rect,
+                        0.0,
+                        crate::colors::palette().selection_background,
+                    );
                 } else if cell.background != 0x282828 || cell.flags & 8 != 0 {
                     painter.rect_filled(cell_rect, 0.0, bg);
                 }
@@ -636,6 +695,20 @@ fn color(rgb: u32) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(windows)]
+    fn command_failure_retains_exit_status_and_stderr() {
+        let args = vec![
+            "cmd.exe".into(),
+            "/C".into(),
+            "echo preview diagnostic 1>&2 & exit /b 2".into(),
+        ];
+        let error = super::command_output(&args, None, &std::sync::atomic::AtomicU64::new(1), 1)
+            .unwrap_err();
+        assert!(error.contains("preview diagnostic"));
+        assert!(error.contains("cmd.exe"));
+        assert!(error.contains("exited"));
+    }
     use super::*;
 
     #[test]
@@ -801,7 +874,7 @@ mod tests {
         let lua = std::rc::Rc::new(mlua::Lua::new());
         let function = lua.load(r#"return function(item)
             return {
-                args={'cmd.exe', '/d', '/c', 'echo A&& echo B&& echo C&& echo D&& echo E&& echo F&& <nul set /p =G'},
+                args={'cmd.exe', '/d', '/c', 'echo A&& echo B&& echo C&& echo D&& echo E&& echo F&& <nul set /p =G & exit /b 0'},
                 center_line=tonumber(item.value),
             }
         end"#).eval::<mlua::Function>().unwrap();

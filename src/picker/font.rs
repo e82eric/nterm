@@ -29,14 +29,17 @@ impl PickerFont {
         let mut load = |bold, name: &str| {
             let mut data = ghostty_ffi::FontData::default();
             if !unsafe { ghostty_ffi::ghostty_egui_host_read_font(host, bold, &mut data) } {
-                eprintln!(
-                    "picker: terminal font cannot be exported; using egui monospace fallback"
+                crate::error_log::warning(
+                    "picker font",
+                    "Terminal font export failed",
+                    "Using egui monospace fallback",
                 );
                 return egui::FontFamily::Monospace;
             }
             let bytes = unsafe { std::slice::from_raw_parts(data.data, data.len) }.to_vec();
             let mut font = egui::FontData::from_owned(bytes);
             font.index = data.face_index;
+            font.tweak.coords = variation_coords(&data);
             unsafe { ghostty_ffi::ghostty_font_data_free(&mut data) };
             let family = egui::FontFamily::Name(name.into());
             definitions
@@ -85,9 +88,37 @@ impl PickerFont {
     }
 }
 
+fn variation_coords(data: &ghostty_ffi::FontData) -> egui::epaint::text::VariationCoords {
+    let mut coords = egui::epaint::text::VariationCoords::default();
+    for axis in data.variations.iter().take(data.variation_count as usize) {
+        coords.push(&axis.tag.to_be_bytes(), axis.value);
+    }
+    coords
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_design_coordinates_preserve_bold_and_other_axes() {
+        let mut data = ghostty_ffi::FontData::default();
+        assert!(variation_coords(&data).as_ref().is_empty());
+        data.variation_count = 2;
+        data.variations[0] = ghostty_ffi::FontVariation {
+            tag: u32::from_be_bytes(*b"wght"),
+            value: 700.0,
+        };
+        data.variations[1] = ghostty_ffi::FontVariation {
+            tag: u32::from_be_bytes(*b"wdth"),
+            value: 95.0,
+        };
+        let coords = variation_coords(&data);
+        assert_eq!(coords.as_ref()[0].0.to_be_bytes(), *b"wght");
+        assert_eq!(coords.as_ref()[0].1, 700.0);
+        assert_eq!(coords.as_ref()[1].0.to_be_bytes(), *b"wdth");
+        assert_eq!(coords.as_ref()[1].1, 95.0);
+    }
 
     #[test]
     fn sizing_tracks_cell_width_height_zoom_and_dpi() {
