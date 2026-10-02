@@ -11,6 +11,12 @@ zig build egui-sample -Doptimize=ReleaseFast
 .\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
 ```
 
+With `GHOSTTY_LOG=stderr`, lines containing `resize diagnostic` show the grid
+and cursor after reflow, Windows ConPTY notification, and cursor-position
+replies. Windows finishes reflow before notifying ConPTY so a resize-triggered
+cursor query receives coordinates from the updated terminal. These diagnostics
+contain coordinates only, not terminal text.
+
 Windows builds compile the bundled `xterm-ghostty` terminfo database using
 `tic` from Git for Windows or PATH. For another installation, pass
 `-Dterminfo-compiler="C:/path/to/tic.exe"`. The app sets `TERM`, `COLORTERM`,
@@ -23,8 +29,12 @@ To build and deploy the Windows sample to another directory:
 .\example\rust-egui-terminal\deploy.ps1 C:\Apps\GhosttyEgui
 ```
 
-The script copies `ghostty_egui.exe` and its required `ghostty.dll`. Use
-`-SkipBuild` to copy an existing build. It leaves any `ghostty.lua` in the
+The script copies `ghostty_egui.exe`, its required `ghostty.dll`, and the matched
+ConPTY `1.25.260710002-preview` DLL and console host. It downloads the pinned
+Microsoft NuGet package on first use and caches it under `.zig-cache/conpty`.
+Use `-SkipBuild` to copy an existing build; the pinned ConPTY components are
+still deployed. Close running instances before replacing their binaries.
+It leaves any `ghostty.lua` in the
 destination untouched; the app also checks the home directory for that file.
 
 On Linux, select the embedded runtime build explicitly:
