@@ -11,6 +11,41 @@ zig build egui-sample -Doptimize=ReleaseFast
 .\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
 ```
 
+Copy mode borrows the live terminal until its first guarded mutation. At that
+point it captures independently owned compressed history before applying the
+mutation. Search and text extraction decode one page into temporary storage;
+they do not expand the entire snapshot. Complete cursor-style-only output
+does not trigger capture because the insertion cursor is hidden in copy mode.
+The compressor retains native mappings, so Windows committed-memory counters
+can include those mappings even when their physical pages are discarded.
+
+For snapshot memory diagnostics, enable native logging before starting a new
+process:
+
+```powershell
+$env:GHOSTTY_LOG = 'stderr'
+Start-Process -FilePath .\zig-out\bin\ghostty_egui.exe `
+    -ArgumentList '--command=pwsh.exe' `
+    -RedirectStandardError snapshot-diagnostics.log
+```
+
+Use `Start-Process` to explicitly provide the Windows GUI application with a
+stderr handle. PowerShell's `2>` redirection can leave an empty file for this
+application. Startup `info:` lines should appear before entering copy mode.
+
+Lines containing `snapshot diagnostic` report borrowed-mode entry, the first
+capture trigger, and resident/compressed terminal
+page counts and bytes before and after text scans. An `owned` source means a
+snapshot was actually allocated. If only `live` resident bytes grow while
+compressed pages decrease, scanning is restoring compressed history.
+Complete cursor-style-only output is reported as `skipped_capture=cursor_style`;
+the frozen presentation hides the terminal cursor, so this needs no copy.
+The reported bytes measure terminal page storage, rather than total process
+memory. Inspecting the
+diagnostic metadata does not restore compressed pages. Clear `GHOSTTY_LOG` to
+disable logging. Rebuild with `zig build egui-sample -Doptimize=ReleaseFast` to update the DLL beside
+the executable; plain `zig build` updates the library output separately.
+
 With `GHOSTTY_LOG=stderr`, lines containing `resize diagnostic` show the grid
 and cursor after reflow, Windows ConPTY notification, and cursor-position
 replies. Windows finishes reflow before notifying ConPTY so a resize-triggered
