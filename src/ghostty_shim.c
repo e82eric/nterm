@@ -9,17 +9,24 @@
 #include <windows.h>
 #endif
 
+typedef struct GhosttyEguiHost GhosttyEguiHost;
 typedef struct {
+    ghostty_config_t base_config;
+    GhosttyEguiHost *hosts;
+} GhosttyEguiShared;
+
+struct GhosttyEguiHost {
     ghostty_app_t app;
     ghostty_surface_t surface;
-    bool owns_app;
-    ghostty_config_t base_config;
+    GhosttyEguiShared *shared;
+    GhosttyEguiHost *next;
+    bool focused;
     ghostty_platform_opengl_s platform;
 #ifdef _WIN32
     HWND window;
     WNDPROC previous_window_proc;
 #endif
-} GhosttyEguiHost;
+};
 
 #ifdef _WIN32
 static const wchar_t host_property[] = L"GhosttyEguiHost.QuickSelect";
@@ -39,7 +46,6 @@ static LRESULT CALLBACK host_window_proc(HWND window, UINT message, WPARAM wpara
 }
 #endif
 
-extern void ghostty_egui_wakeup(void *userdata);
 extern void ghostty_egui_frame_ready(void *userdata);
 extern void ghostty_egui_close(void *userdata);
 extern void ghostty_egui_protocol(void *userdata, const uint8_t *bytes, size_t len);
@@ -87,7 +93,8 @@ static void report_theme_colors(ghostty_config_t config, void *userdata) {
     ghostty_egui_theme_colors(userdata, &colors, name.ptr, name.len);
 }
 
-static void wake(void *userdata) { ghostty_egui_wakeup(userdata); }
+extern void ghostty_egui_app_wakeup(void);
+static void wake(void *userdata) { (void)userdata; ghostty_egui_app_wakeup(); }
 static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action_value) {
     if (target.tag != GHOSTTY_TARGET_SURFACE) return false;
 
@@ -215,7 +222,8 @@ GhosttyEguiHost *ghostty_egui_host_create(
     }
 
     ghostty_runtime_config_s runtime = {
-        .userdata = userdata,
+        // App wakeups use the process event loop, not a particular surface.
+        .userdata = NULL,
         .wakeup_cb = wake,
         .action_cb = action,
         .read_clipboard_cb = read_clipboard,
@@ -258,8 +266,17 @@ GhosttyEguiHost *ghostty_egui_host_create(
     }
     host->app = app;
     host->surface = surface;
-    host->owns_app = true;
-    host->base_config = base_config;
+    host->shared = calloc(1, sizeof(*host->shared));
+    if (!host->shared) {
+        startup_error(error_buffer, error_capacity, "allocate shared terminal application", strerror(errno));
+        ghostty_surface_free(surface);
+        ghostty_app_free(app);
+        ghostty_config_free(base_config);
+        free(host);
+        return NULL;
+    }
+    host->shared->base_config = base_config;
+    host->shared->hosts = host;
     host->platform = options.platform.opengl;
 #ifdef _WIN32
     if (SetPropW((HWND)window, host_property, host)) {
@@ -271,42 +288,58 @@ GhosttyEguiHost *ghostty_egui_host_create(
     return host;
 }
 
-GhosttyEguiHost *ghostty_egui_host_create_floating(
-    GhosttyEguiHost *parent, void *userdata, double scale, const char *osc_token,
+GhosttyEguiHost *ghostty_egui_host_create_child(
+    GhosttyEguiHost *parent, void *userdata, void *window, void *display, void *context,
+    double scale, const char *osc_token,
     char *error_buffer, size_t error_capacity
 ) {
     if (error_buffer && error_capacity) error_buffer[0] = '\0';
     if (!parent) {
-        startup_error(error_buffer, error_capacity, "create the floating terminal", "No parent terminal is available");
+        startup_error(error_buffer, error_capacity, "create an additional terminal", "No parent terminal is available");
         return NULL;
     }
     GhosttyEguiHost *host = calloc(1, sizeof(*host));
     if (!host) {
-        startup_error(error_buffer, error_capacity, "allocate the floating terminal host", strerror(errno));
+        startup_error(error_buffer, error_capacity, "allocate an additional terminal host", strerror(errno));
         return NULL;
     }
     ghostty_surface_config_s options = ghostty_surface_config_new();
     options.platform_tag = GHOSTTY_PLATFORM_OPENGL;
     options.platform.opengl = parent->platform;
+    if (window) {
+        options.platform.opengl.window = window;
+        options.platform.opengl.display = display;
+        options.platform.opengl.context = context;
+    }
     options.scale_factor = scale;
     options.userdata = userdata;
     ghostty_env_var_s token_env = { .key = "WEZTERM_OSC_TOKEN", .value = osc_token };
     options.env_vars = &token_env;
     options.env_var_count = 1;
     host->app = parent->app;
-    host->platform = parent->platform;
+    host->platform = options.platform.opengl;
     host->surface = ghostty_surface_new(host->app, &options);
     if (!host->surface) {
-        startup_error(error_buffer, error_capacity, "create the floating terminal surface", ghostty_last_init_error());
+        startup_error(error_buffer, error_capacity, "create an additional terminal surface", ghostty_last_init_error());
         free(host);
         return NULL;
     }
+    host->shared = parent->shared;
+    host->next = host->shared->hosts;
+    host->shared->hosts = host;
+#ifdef _WIN32
+    if (window && SetPropW((HWND)window, host_property, host)) {
+        host->previous_window_proc = (WNDPROC)SetWindowLongPtrW((HWND)window, GWLP_WNDPROC, (LONG_PTR)host_window_proc);
+        if (host->previous_window_proc) host->window = (HWND)window;
+        else RemovePropW((HWND)window, host_property);
+    }
+#endif
     return host;
 }
 
 bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, const char *family, float size, char *error, size_t capacity) {
-    if (!host || !host->base_config) return false;
-    ghostty_config_t candidate = ghostty_config_clone(host->base_config);
+    if (!host || !host->shared->base_config) return false;
+    ghostty_config_t candidate = ghostty_config_clone(host->shared->base_config);
     if (!candidate) {
         snprintf(error, capacity, "Unable to allocate theme configuration");
         return false;
@@ -329,7 +362,7 @@ bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, c
         if (inputs) ghostty_config_free(inputs);
         return false;
     }
-    // One app owns both the main and floating surfaces. The update propagates
+    // One app owns all window and floating surfaces. The update propagates
     // to existing surfaces and becomes the configuration for future surfaces.
     ghostty_app_update_config(host->app, candidate);
     if (ghostty_last_error()) {
@@ -338,9 +371,10 @@ bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, c
         if (inputs) ghostty_config_free(inputs);
         return false;
     }
-    report_theme_colors(candidate, ghostty_surface_userdata(host->surface));
-    ghostty_config_free(host->base_config);
-    host->base_config = inputs;
+    for (GhosttyEguiHost *item = host->shared->hosts; item; item = item->next)
+        report_theme_colors(candidate, ghostty_surface_userdata(item->surface));
+    ghostty_config_free(host->shared->base_config);
+    host->shared->base_config = inputs;
     ghostty_config_free(candidate);
     return true;
 }
@@ -350,7 +384,6 @@ bool ghostty_egui_host_apply_theme(GhosttyEguiHost *host, const char *name, char
 }
 
 void ghostty_egui_host_destroy(GhosttyEguiHost *host) {
-    if (host && host->base_config) ghostty_config_free(host->base_config);
     if (!host) return;
 #ifdef _WIN32
     if (host->window) {
@@ -360,7 +393,19 @@ void ghostty_egui_host_destroy(GhosttyEguiHost *host) {
     }
 #endif
     if (host->surface) ghostty_surface_free(host->surface);
-    if (host->owns_app && host->app) ghostty_app_free(host->app);
+    GhosttyEguiHost **link = &host->shared->hosts;
+    while (*link && *link != host) link = &(*link)->next;
+    if (*link) *link = host->next;
+    if (!host->shared->hosts) {
+        ghostty_app_free(host->app);
+        ghostty_config_free(host->shared->base_config);
+        free(host->shared);
+    } else {
+        bool focused = false;
+        for (GhosttyEguiHost *item = host->shared->hosts; item; item = item->next)
+            focused |= item->focused;
+        ghostty_app_set_focus(host->app, focused);
+    }
     free(host);
 }
 
@@ -381,7 +426,11 @@ void ghostty_egui_host_resize(GhosttyEguiHost *host, uint32_t width, uint32_t he
  runtime_error(host, "ghostty_egui_host_resize"); }
 void ghostty_egui_host_focus(GhosttyEguiHost *host, bool focused) {
     ghostty_clear_error();
-    ghostty_app_set_focus(host->app, focused);
+    host->focused = focused;
+    bool app_focused = false;
+    for (GhosttyEguiHost *item = host->shared->hosts; item; item = item->next)
+        app_focused |= item->focused;
+    ghostty_app_set_focus(host->app, app_focused);
     runtime_error(host, "set terminal app focus");
     ghostty_surface_set_focus(host->surface, focused);
  runtime_error(host, "ghostty_egui_host_focus"); }

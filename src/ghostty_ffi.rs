@@ -206,9 +206,12 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> *mut Host;
     pub(crate) fn ghostty_egui_host_destroy(host: *mut Host);
-    pub(crate) fn ghostty_egui_host_create_floating(
+    pub(crate) fn ghostty_egui_host_create_child(
         parent: *mut Host,
         userdata: *mut c_void,
+        window: *mut c_void,
+        display: *mut c_void,
+        context: *mut c_void,
         scale: f64,
         osc_token: *const c_char,
         error_buffer: *mut c_char,

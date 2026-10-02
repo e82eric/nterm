@@ -5,7 +5,6 @@ use egui_winit::winit;
 use glow::HasContext as _;
 use std::ffi::{CString, c_char, c_void};
 use std::num::NonZeroU32;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,6 +19,7 @@ pub(crate) fn run(
         .build()
         .fatal("create the application event loop")?;
     let proxy = event_loop.create_proxy();
+    let _ = APP_PROXY.set(proxy.clone());
     let mut app = NativeApp::new(
         proxy,
         args,
@@ -41,6 +41,10 @@ struct ShellApp {
     terminal: TerminalView,
     // Ghostty borrows argc/argv as process-global state, so retain both the
     // strings and pointer array until after the embedded app is destroyed.
+    _startup: std::rc::Rc<StartupArgs>,
+}
+
+struct StartupArgs {
     _args: Vec<CString>,
     _argv: Vec<*mut c_char>,
 }
@@ -50,6 +54,7 @@ impl ShellApp {
         egui_ctx: &egui::Context,
         gl: &glow::Context,
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+        window_id: winit::window::WindowId,
         args: Vec<CString>,
         pickers: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
@@ -63,6 +68,7 @@ impl ShellApp {
                 egui_ctx,
                 gl,
                 proxy,
+                window_id,
                 argv.len(),
                 argv.as_mut_ptr(),
                 command_label,
@@ -71,8 +77,10 @@ impl ShellApp {
                 issues,
                 reload_source,
             )?,
-            _args: args,
-            _argv: argv,
+            _startup: std::rc::Rc::new(StartupArgs {
+                _args: args,
+                _argv: argv,
+            }),
         })
     }
 
@@ -118,13 +126,6 @@ fn command_label(args: &[CString]) -> String {
     }
 }
 
-pub(crate) fn open_new_window() -> std::io::Result<()> {
-    Command::new(std::env::current_exe()?)
-        .args(std::env::args_os().skip(1))
-        .spawn()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod command_label_tests {
     use super::command_label;
@@ -148,26 +149,191 @@ mod command_label_tests {
     }
 }
 
+static APP_PROXY: std::sync::OnceLock<winit::event_loop::EventLoopProxy<UserEvent>> =
+    std::sync::OnceLock::new();
+static APP_WAKE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// The shared native app outlives any particular pane's callback userdata.
+#[unsafe(no_mangle)]
+extern "C" fn ghostty_egui_app_wakeup() {
+    crate::native_error::ffi_boundary("wake the shared terminal app", || {
+        if let Some(proxy) = APP_PROXY.get() {
+            if !APP_WAKE_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel)
+                && proxy.send_event(UserEvent::GhosttyWake).is_err()
+            {
+                APP_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+    });
+}
+
 #[derive(Debug)]
 pub(crate) enum UserEvent {
-    Repaint(Instant),
+    Repaint(winit::window::WindowId, Instant),
     GhosttyWake,
-    FrameReady,
+    FrameReady(winit::window::WindowId),
 }
 
 struct NativeApp {
     fatal_error: Option<FatalError>,
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-    args: Option<Vec<CString>>,
-    pickers: Option<crate::picker::config::Bindings>,
-    floating_padding: Option<crate::config::FloatingPadding>,
-    issues: Vec<String>,
-    reload_source: Option<crate::config::ReloadSource>,
-    gl_window: Option<GlutinWindowContext>,
-    gl: Option<Arc<glow::Context>>,
-    egui: Option<egui_glow::EguiGlow>,
+    startup: Option<(
+        Vec<CString>,
+        crate::picker::config::Bindings,
+        Option<crate::config::FloatingPadding>,
+        Vec<String>,
+        crate::config::ReloadSource,
+    )>,
+    windows: std::collections::HashMap<winit::window::WindowId, NativeWindow>,
+}
+
+struct NativeWindow {
+    // Destroy terminal/egui resources while this window's GL context is current.
+    gl_window: GlutinWindowContext,
+    gl: Arc<glow::Context>,
+    egui: egui_glow::EguiGlow,
     shell: Option<ShellApp>,
     presentation: Presentation,
+}
+
+impl NativeWindow {
+    fn new(
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    ) -> Result<Self, FatalError> {
+        let gl_window = unsafe { GlutinWindowContext::new(event_loop) }?;
+        let mut presentation = Presentation::default();
+        if let Some(rate) = gl_window
+            .window()
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+            .filter(|rate| *rate > 0)
+        {
+            presentation.interval =
+                std::time::Duration::from_nanos(1_000_000_000_000 / u64::from(rate));
+        }
+        let gl = Arc::new(unsafe {
+            glow::Context::from_loader_function(|name| {
+                gl_window.get_proc_address(&CString::new(name).expect("OpenGL symbol contains NUL"))
+            })
+        });
+        let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
+        crate::colors::COLORS.set(&egui.egui_ctx, crate::colors::palette());
+        egui.egui_ctx.add_plugin(UiChanges::default());
+        egui.egui_ctx
+            .global_style_mut(|style| style.animation_time = 0.0);
+        let id = gl_window.window().id();
+        egui.egui_ctx.set_request_repaint_callback(move |info| {
+            if let Some(deadline) = Instant::now().checked_add(info.delay) {
+                let _ = proxy.send_event(UserEvent::Repaint(id, deadline));
+            }
+        });
+        Ok(Self {
+            gl_window,
+            gl,
+            egui,
+            shell: None,
+            presentation,
+        })
+    }
+
+    fn show(&self) {
+        self.gl_window.window().set_visible(true);
+        self.gl_window.window().request_redraw();
+    }
+
+    fn redraw(&mut self) -> Result<(), FatalError> {
+        self.gl_window.make_current()?;
+        let shell = self.shell.as_mut().expect("terminal shell");
+        self.egui
+            .run(self.gl_window.window(), |ctx| shell.ui(ctx, &self.gl));
+        self.presentation.ui_dirty |= self
+            .egui
+            .egui_ctx
+            .with_plugin(|changes: &mut UiChanges| std::mem::take(&mut changes.changed))
+            .expect("UI change tracking registered");
+        let now = Instant::now();
+        let paced = self
+            .presentation
+            .present_deadline(now)
+            .is_some_and(|due| due > now);
+        if self.presentation.ready(now) {
+            self.presentation.frame_pending = shell.terminal.acquire_frames();
+        }
+        let presented = !paced && self.presentation.ready(now);
+        if presented {
+            unsafe {
+                let background = crate::colors::palette().background;
+                self.gl.clear_color(
+                    f32::from(background.r()) / 255.0,
+                    f32::from(background.g()) / 255.0,
+                    f32::from(background.b()) / 255.0,
+                    1.0,
+                );
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            self.egui.paint(self.gl_window.window());
+        } else {
+            shell.terminal.poll_retired(&self.gl);
+        }
+        self.presentation
+            .cleanup_pending(shell.terminal.retired_pending(), Instant::now());
+        if presented {
+            let started = Instant::now();
+            self.gl_window
+                .swap_buffers()
+                .fatal("present the application frame (swap OpenGL buffers)")?;
+            self.presentation.presented(started);
+        }
+        Ok(())
+    }
+
+    fn before_wait(&mut self, now: Instant) -> Result<Option<Instant>, FatalError> {
+        if self
+            .presentation
+            .cleanup_deadline
+            .is_some_and(|due| due <= now)
+        {
+            self.gl_window.make_current()?;
+            self.presentation.cleanup_deadline = None;
+            if let Some(shell) = &self.shell {
+                shell.terminal.poll_retired(&self.gl);
+                self.presentation
+                    .cleanup_pending(shell.terminal.retired_pending(), now);
+            }
+        }
+        let repaint_due = self
+            .presentation
+            .repaint_deadline
+            .is_some_and(|due| due <= now);
+        if repaint_due {
+            self.presentation.repaint_deadline = None;
+        }
+        if repaint_due || self.presentation.ready(now) {
+            self.gl_window.window().request_redraw();
+        }
+        Ok(self.presentation.next_deadline(now))
+    }
+}
+
+impl Drop for NativeWindow {
+    fn drop(&mut self) {
+        if let Err(error) = self.gl_window.make_current() {
+            crate::error_log::error(
+                "window.close",
+                "Could not activate graphics context",
+                &error.to_string(),
+            );
+            // Native renderer callbacks still reference the panes. Do not drop
+            // their userdata unless we can safely release the native resources.
+            crate::native_error::show(&error.to_string());
+            std::process::exit(1);
+        }
+        if let Some(shell) = &mut self.shell {
+            shell.destroy(&self.gl);
+        }
+        self.egui.destroy();
+    }
 }
 
 impl NativeApp {
@@ -182,158 +348,86 @@ impl NativeApp {
         Self {
             fatal_error: None,
             proxy,
-            args: Some(args),
-            pickers: Some(pickers),
-            floating_padding,
-            issues,
-            reload_source: Some(reload_source),
-            gl_window: None,
-            gl: None,
-            egui: None,
-            shell: None,
-            presentation: Presentation::default(),
+            startup: Some((args, pickers, floating_padding, issues, reload_source)),
+            windows: std::collections::HashMap::new(),
         }
     }
 
-    fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if self.fatal_error.is_some() {
-            return;
-        }
-        let gl_window = self.gl_window.as_ref().expect("OpenGL window");
-        let gl = self.gl.as_ref().expect("OpenGL context");
-        let egui = self.egui.as_mut().expect("egui renderer");
-        let shell = self.shell.as_mut().expect("terminal shell");
+    fn open_window(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        parent_id: winit::window::WindowId,
+    ) -> Result<(), FatalError> {
+        let Some(parent) = self.windows.get(&parent_id) else {
+            return Ok(());
+        };
+        let mut window = NativeWindow::new(event_loop, self.proxy.clone())?;
+        let parent_shell = parent.shell.as_ref().expect("parent terminal");
+        let terminal = parent_shell.terminal.new_window(
+            &window.egui.egui_ctx,
+            &window.gl,
+            window.gl_window.window().id(),
+        )?;
+        window.shell = Some(ShellApp {
+            terminal,
+            _startup: parent_shell._startup.clone(),
+        });
+        window.show();
+        self.windows.insert(window.gl_window.window().id(), window);
+        Ok(())
+    }
 
-        egui.run(gl_window.window(), |ctx| shell.ui(ctx, gl));
-        if shell.terminal.should_close() {
+    fn fail(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, error: FatalError) {
+        self.fatal_error = Some(error);
+        event_loop.exit();
+    }
+
+    fn close_window(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        id: winit::window::WindowId,
+    ) {
+        self.windows.remove(&id);
+        if self.windows.is_empty() {
             event_loop.exit();
-            return;
-        }
-
-        self.presentation.ui_dirty |= egui
-            .egui_ctx
-            .with_plugin(|changes: &mut UiChanges| std::mem::take(&mut changes.changed))
-            .expect("UI change tracking registered");
-        let now = Instant::now();
-        let paced = self
-            .presentation
-            .present_deadline(now)
-            .is_some_and(|due| due > now);
-        if self.presentation.ready(now) {
-            let new_frame = shell.terminal.acquire_frames();
-            // A queued notification may refer to a frame already acquired.
-            self.presentation.frame_pending = new_frame;
-        }
-        let presented = !paced && self.presentation.ready(now);
-        if presented {
-            unsafe {
-                let background = crate::colors::palette().background;
-                gl.clear_color(
-                    f32::from(background.r()) / 255.0,
-                    f32::from(background.g()) / 255.0,
-                    f32::from(background.b()) / 255.0,
-                    1.0,
-                );
-                gl.clear(glow::COLOR_BUFFER_BIT);
-            }
-            egui.paint(gl_window.window());
-        } else {
-            shell.terminal.poll_retired(gl);
-        }
-        self.presentation
-            .cleanup_pending(shell.terminal.retired_pending(), Instant::now());
-        if presented {
-            let present_started = Instant::now();
-            if let Err(error) = gl_window
-                .swap_buffers()
-                .fatal("present the application frame (swap OpenGL buffers)")
-            {
-                self.fatal_error = Some(error);
-                event_loop.exit();
-                return;
-            }
-            self.presentation.presented(present_started);
         }
     }
 }
 
 impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if self.gl_window.is_some() {
-            return;
-        }
-
         if self.fatal_error.is_some() {
             return;
         }
-        let gl_window = match unsafe { GlutinWindowContext::new(event_loop) } {
-            Ok(window) => window,
-            Err(error) => {
-                self.fatal_error = Some(error);
-                event_loop.exit();
-                return;
-            }
+        let Some((args, pickers, padding, issues, reload)) = self.startup.take() else {
+            return;
         };
-        if let Some(refresh_millihertz) = gl_window
-            .window()
-            .current_monitor()
-            .and_then(|monitor| monitor.refresh_rate_millihertz())
-            .filter(|rate| *rate > 0)
-        {
-            self.presentation.interval = std::time::Duration::from_nanos(
-                1_000_000_000_000_u64 / u64::from(refresh_millihertz),
-            );
+        let result = (|| {
+            let mut window = NativeWindow::new(event_loop, self.proxy.clone())?;
+            window.shell = Some(ShellApp::new(
+                &window.egui.egui_ctx,
+                &window.gl,
+                self.proxy.clone(),
+                window.gl_window.window().id(),
+                args,
+                pickers,
+                padding,
+                issues,
+                reload,
+            )?);
+            window.show();
+            self.windows.insert(window.gl_window.window().id(), window);
+            Ok::<_, FatalError>(())
+        })();
+        if let Err(error) = result {
+            self.fail(event_loop, error);
         }
-        let gl = Arc::new(unsafe {
-            glow::Context::from_loader_function(|name| {
-                let name = CString::new(name).expect("OpenGL symbol contains NUL");
-                gl_window.get_proc_address(&name)
-            })
-        });
-        let mut egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
-        crate::colors::COLORS.set(&egui.egui_ctx, crate::colors::palette());
-        egui.egui_ctx.add_plugin(UiChanges::default());
-        let proxy = self.proxy.clone();
-        egui.egui_ctx
-            .global_style_mut(|style| style.animation_time = 0.0);
-        egui.egui_ctx.set_request_repaint_callback(move |info| {
-            if let Some(deadline) = Instant::now().checked_add(info.delay) {
-                let _ = proxy.send_event(UserEvent::Repaint(deadline));
-            }
-        });
-
-        let shell = match ShellApp::new(
-            &egui.egui_ctx,
-            &gl,
-            self.proxy.clone(),
-            self.args.take().expect("application resumed twice"),
-            self.pickers.take().expect("application resumed twice"),
-            self.floating_padding,
-            std::mem::take(&mut self.issues),
-            self.reload_source
-                .take()
-                .expect("application resumed twice"),
-        ) {
-            Ok(shell) => shell,
-            Err(error) => {
-                egui.destroy();
-                self.fatal_error = Some(error);
-                event_loop.exit();
-                return;
-            }
-        };
-        gl_window.window().set_visible(true);
-        gl_window.window().request_redraw();
-        self.gl_window = Some(gl_window);
-        self.gl = Some(gl);
-        self.egui = Some(egui);
-        self.shell = Some(shell);
     }
 
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
-        _window_id: winit::window::WindowId,
+        id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
         use winit::event::WindowEvent;
@@ -341,33 +435,57 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             return;
         }
         if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
-            event_loop.exit();
+            self.close_window(event_loop, id);
             return;
         }
+        let Some(window) = self.windows.get_mut(&id) else {
+            return;
+        };
         if matches!(event, WindowEvent::RedrawRequested) {
-            self.redraw(event_loop);
+            if let Err(error) = window.redraw() {
+                self.fail(event_loop, error);
+                return;
+            }
+            let terminal = &mut window.shell.as_mut().expect("terminal shell").terminal;
+            if terminal.should_close() {
+                self.close_window(event_loop, id);
+                return;
+            }
+            if terminal.take_new_window_request() {
+                if let Err(error) = self.open_window(event_loop, id) {
+                    if let Some(parent) = self.windows.get_mut(&id) {
+                        parent
+                            .shell
+                            .as_mut()
+                            .expect("parent terminal")
+                            .terminal
+                            .window_error(error.to_string());
+                        parent.gl_window.window().request_redraw();
+                    }
+                }
+            }
             return;
         }
         if let WindowEvent::Resized(size) = event {
-            self.gl_window.as_ref().expect("OpenGL window").resize(size);
-            self.presentation.force = true;
+            if let Err(error) = window.gl_window.make_current() {
+                self.fail(event_loop, error);
+                return;
+            }
+            window.gl_window.resize(size);
+            window.presentation.force = true;
         }
         if matches!(
             event,
             WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Occluded(false)
         ) {
-            self.presentation.force = true;
+            window.presentation.force = true;
         }
-        let response = self.egui.as_mut().expect("egui renderer").on_window_event(
-            self.gl_window.as_ref().expect("OpenGL window").window(),
-            &event,
-        );
-        if response.repaint {
-            self.gl_window
-                .as_ref()
-                .expect("OpenGL window")
-                .window()
-                .request_redraw();
+        if window
+            .egui
+            .on_window_event(window.gl_window.window(), &event)
+            .repaint
+        {
+            window.gl_window.window().request_redraw();
         }
     }
 
@@ -377,15 +495,26 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         }
         match event {
             UserEvent::GhosttyWake => {
-                if let Some(shell) = self.shell.as_mut() {
-                    shell.terminal.tick();
+                APP_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
+                // All windows/panes share one app; a single tick drains its mailbox.
+                if let Some(window) = self.windows.values_mut().next() {
+                    window
+                        .shell
+                        .as_mut()
+                        .expect("terminal shell")
+                        .terminal
+                        .tick();
                 }
             }
-            UserEvent::FrameReady => {
-                self.presentation.frame_pending = true;
+            UserEvent::FrameReady(id) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.presentation.frame_pending = true;
+                }
             }
-            UserEvent::Repaint(deadline) => {
-                self.presentation.repaint_at(deadline);
+            UserEvent::Repaint(id, deadline) => {
+                if let Some(window) = self.windows.get_mut(&id) {
+                    window.presentation.repaint_at(deadline);
+                }
             }
         }
     }
@@ -395,45 +524,27 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             return;
         }
         let now = Instant::now();
-        if self
-            .presentation
-            .cleanup_deadline
-            .is_some_and(|due| due <= now)
-        {
-            self.presentation.cleanup_deadline = None;
-            if let (Some(shell), Some(gl)) = (&self.shell, &self.gl) {
-                // The UI context remains current on this thread. Cleanup does
-                // not run egui, paint, or swap buffers.
-                shell.terminal.poll_retired(gl);
-                self.presentation
-                    .cleanup_pending(shell.terminal.retired_pending(), now);
+        let mut deadline = None;
+        for window in self.windows.values_mut() {
+            match window.before_wait(now) {
+                Ok(Some(due)) => {
+                    deadline = Some(deadline.map_or(due, |old: Instant| old.min(due)));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.fail(event_loop, error);
+                    return;
+                }
             }
         }
-        let repaint_due = self
-            .presentation
-            .repaint_deadline
-            .is_some_and(|due| due <= now);
-        if repaint_due {
-            self.presentation.repaint_deadline = None;
-        }
-        if (repaint_due || self.presentation.ready(now))
-            && let Some(window) = &self.gl_window
-        {
-            window.window().request_redraw();
-        }
-        event_loop.set_control_flow(match self.presentation.next_deadline(now) {
-            Some(deadline) => winit::event_loop::ControlFlow::WaitUntil(deadline),
+        event_loop.set_control_flow(match deadline {
+            Some(due) => winit::event_loop::ControlFlow::WaitUntil(due),
             None => winit::event_loop::ControlFlow::Wait,
         });
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        if let (Some(shell), Some(gl)) = (self.shell.as_mut(), self.gl.as_ref()) {
-            shell.destroy(gl);
-        }
-        if let Some(egui) = self.egui.as_mut() {
-            egui.destroy();
-        }
+        self.windows.clear();
     }
 }
 
@@ -603,6 +714,13 @@ impl GlutinWindowContext {
             display,
             surface,
         })
+    }
+
+    fn make_current(&self) -> Result<(), FatalError> {
+        use glutin::context::PossiblyCurrentGlContext as _;
+        self.context
+            .make_current(&self.surface)
+            .fatal("activate the window OpenGL context")
     }
 
     fn window(&self) -> &winit::window::Window {

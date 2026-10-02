@@ -27,7 +27,7 @@ use std::time::Instant;
 struct WakeState {
     context: egui::Context,
     proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
-    wake_pending: AtomicBool,
+    window_id: egui_winit::winit::window::WindowId,
     frame_ready_pending: AtomicBool,
     close: AtomicBool,
     osc_token: String,
@@ -38,23 +38,14 @@ struct WakeState {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_wakeup(userdata: *mut c_void) {
-    crate::native_error::ffi_boundary("handle native callback ghostty_egui_wakeup", || {
-        let state = unsafe { &*(userdata.cast::<WakeState>()) };
-        if !state.wake_pending.swap(true, Ordering::AcqRel)
-            && state.proxy.send_event(UserEvent::GhosttyWake).is_err()
-        {
-            state.wake_pending.store(false, Ordering::Release);
-        }
-    });
-}
-
-#[unsafe(no_mangle)]
 extern "C" fn ghostty_egui_frame_ready(userdata: *mut c_void) {
     crate::native_error::ffi_boundary("handle native callback ghostty_egui_frame_ready", || {
         let state = unsafe { &*(userdata.cast::<WakeState>()) };
         if !state.frame_ready_pending.swap(true, Ordering::AcqRel)
-            && state.proxy.send_event(UserEvent::FrameReady).is_err()
+            && state
+                .proxy
+                .send_event(UserEvent::FrameReady(state.window_id))
+                .is_err()
         {
             state.frame_ready_pending.store(false, Ordering::Release);
         }
@@ -473,13 +464,14 @@ impl TerminalPane {
         egui_ctx: &egui::Context,
         gl: &glow::Context,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
+        window_id: egui_winit::winit::window::WindowId,
         argc: usize,
         argv: *mut *mut c_char,
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
             context: egui_ctx.clone(),
             proxy,
-            wake_pending: AtomicBool::new(false),
+            window_id,
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             osc_token: crate::picker::protocol::new_token()?,
@@ -521,10 +513,30 @@ impl TerminalPane {
         &self,
         gl: &glow::Context,
     ) -> Result<Option<Self>, crate::native_error::FatalError> {
+        self.create_child(&self.wake.context, gl, self.wake.window_id, false)
+            .map(Some)
+    }
+
+    pub(super) fn create_window(
+        &self,
+        ctx: &egui::Context,
+        gl: &glow::Context,
+        window_id: egui_winit::winit::window::WindowId,
+    ) -> Result<Self, crate::native_error::FatalError> {
+        self.create_child(ctx, gl, window_id, true)
+    }
+
+    fn create_child(
+        &self,
+        ctx: &egui::Context,
+        gl: &glow::Context,
+        window_id: egui_winit::winit::window::WindowId,
+        new_window: bool,
+    ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
-            context: self.wake.context.clone(),
+            context: ctx.clone(),
             proxy: self.wake.proxy.clone(),
-            wake_pending: AtomicBool::new(false),
+            window_id,
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             osc_token: crate::picker::protocol::new_token()?,
@@ -534,14 +546,22 @@ impl TerminalPane {
             clipboard_text: std::sync::Mutex::new(None),
         });
         let osc_token = std::ffi::CString::new(wake.osc_token.clone()).map_err(|error| {
-            crate::native_error::FatalError::new("create the floating terminal token", error)
+            crate::native_error::FatalError::new("create the additional terminal token", error)
         })?;
         let mut error_buffer = [0 as c_char; 2048];
         let host = unsafe {
-            ghostty_ffi::ghostty_egui_host_create_floating(
+            let native = current_native_context();
+            ghostty_ffi::ghostty_egui_host_create_child(
                 self.host,
                 (&mut *wake as *mut WakeState).cast(),
-                self.scale as f64,
+                if new_window {
+                    native.window
+                } else {
+                    std::ptr::null_mut()
+                },
+                native.display,
+                native.context,
+                ctx.pixels_per_point() as f64,
                 osc_token.as_ptr(),
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
@@ -551,15 +571,14 @@ impl TerminalPane {
             let detail =
                 unsafe { std::ffi::CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
             return Err(crate::native_error::FatalError::new(
-                "create the floating terminal",
+                "create the additional terminal",
                 detail,
             ));
         }
-        Self::new(host, wake, gl).map(Some)
+        Self::new(host, wake, gl)
     }
 
     pub(super) fn tick(&mut self) {
-        self.wake.wake_pending.store(false, Ordering::Release);
         unsafe { ghostty_ffi::ghostty_egui_host_tick(self.host) };
     }
 

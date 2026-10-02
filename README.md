@@ -11,6 +11,17 @@ zig build egui-sample -Doptimize=ReleaseFast
 .\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
 ```
 
+Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> to open another terminal in
+a new window within the same process. Each window has its own shell, terminal
+view, floating pane, and UI state. Windows share the native Ghostty app and its
+configuration; theme and font changes apply to all windows. Closing a window
+closes its terminals, and the app exits after the last window closes.
+
+On Windows, run `python example/rust-egui-terminal/tests/multiwindow_smoke.py`
+after building to check the shortcut, multiple windows in one process, floating
+panes, resizing, shell exit, and closing the original window before the others.
+The check briefly opens and focuses test windows, then closes them.
+
 Copy mode borrows the live terminal until its first guarded mutation. At that
 point it captures independently owned compressed history before applying the
 mutation. Search and text extraction decode one page into temporary storage;

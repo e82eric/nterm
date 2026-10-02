@@ -520,6 +520,7 @@ impl Default for Options {
     }
 }
 
+#[derive(Clone)]
 struct Binding {
     action: crate::actions::AppAction,
     key: egui::Key,
@@ -548,6 +549,7 @@ impl PickerEntry {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Bindings {
     pub(crate) builtin_pickers: BuiltinPickers,
     bindings: Vec<Binding>,

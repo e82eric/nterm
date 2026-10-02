@@ -14,6 +14,7 @@ pub(crate) struct TerminalView {
     picker_bindings: crate::picker::config::Bindings,
     floating_padding: Option<crate::config::FloatingPadding>,
     floating: Option<FloatingTerminal>,
+    new_window_requested: bool,
 }
 
 struct FloatingTerminal {
@@ -71,6 +72,7 @@ impl TerminalView {
         egui_ctx: &egui::Context,
         gl: &glow::Context,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
+        window_id: egui_winit::winit::window::WindowId,
         argc: usize,
         argv: *mut *mut c_char,
         command_label: String,
@@ -79,7 +81,7 @@ impl TerminalView {
         mut issues: Vec<String>,
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
-        let main = TerminalPane::create(egui_ctx, gl, proxy, argc, argv)?;
+        let main = TerminalPane::create(egui_ctx, gl, proxy, window_id, argc, argv)?;
         issues.extend(main.take_config_issues());
         Ok(Self {
             messages: crate::messages::Messages::new(issues),
@@ -90,7 +92,36 @@ impl TerminalView {
             picker_bindings,
             floating_padding,
             floating: None,
+            new_window_requested: false,
         })
+    }
+
+    pub(crate) fn new_window(
+        &self,
+        egui_ctx: &egui::Context,
+        gl: &glow::Context,
+        window_id: egui_winit::winit::window::WindowId,
+    ) -> Result<Self, crate::native_error::FatalError> {
+        let main = self.main.create_window(egui_ctx, gl, window_id)?;
+        Ok(Self {
+            messages: crate::messages::Messages::new(main.take_config_issues()),
+            main,
+            command_label: self.command_label.clone(),
+            reload_source: self.reload_source.clone(),
+            picker_bindings: self.picker_bindings.clone(),
+            floating_padding: self.floating_padding,
+            floating: None,
+            new_window_requested: false,
+        })
+    }
+
+    pub(crate) fn take_new_window_request(&mut self) -> bool {
+        std::mem::take(&mut self.new_window_requested)
+    }
+
+    pub(crate) fn window_error(&mut self, error: String) {
+        self.main
+            .show_error("Could not open terminal window", error);
     }
 
     pub(crate) fn tick(&mut self) {
@@ -174,10 +205,7 @@ impl TerminalView {
                 }
             }
             AppAction::NewWindow => {
-                if let Err(error) = crate::app::open_new_window() {
-                    self.main
-                        .show_error("Could not open terminal", error.to_string());
-                }
+                self.new_window_requested = true;
             }
             AppAction::ToggleFloatingPane => {
                 if let Some(floating) = self.floating.as_mut() {

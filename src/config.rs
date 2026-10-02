@@ -546,6 +546,7 @@ fn read_config(
     Ok(None)
 }
 
+#[derive(Clone)]
 pub(crate) struct ReloadSource {
     path: Option<PathBuf>,
     cli_theme: bool,
