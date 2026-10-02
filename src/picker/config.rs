@@ -19,6 +19,37 @@ pub(crate) enum Position {
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct BuiltinPresentation {
+    pub(crate) position: Option<Position>,
+    pub(crate) preview_visible: Option<bool>,
+    pub(crate) result_rows: Option<usize>,
+    pub(crate) preview_rows: Option<usize>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct BuiltinPickers {
+    pub(crate) line_break: BuiltinPresentation,
+}
+
+impl BuiltinPickers {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for (name, value, max) in [
+            ("result_rows", self.line_break.result_rows, 256),
+            ("preview_rows", self.line_break.preview_rows, 12),
+        ] {
+            if value.is_some_and(|value| value == 0 || value > max) {
+                return Err(format!(
+                    "builtin_pickers.line_break.{name} must be between 1 and {max}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
 pub(crate) enum Sort {
     #[serde(alias = "score")]
     Score,
@@ -55,7 +86,7 @@ pub(crate) enum Preview {
         #[serde(default)]
         cwd: Option<String>,
         #[serde(skip)]
-        command: Option<std::rc::Rc<crate::picker::action::PreviewCommand>>,
+        command: Option<std::rc::Rc<crate::lua_callbacks::PreviewCommand>>,
     },
 }
 
@@ -86,10 +117,7 @@ impl Preview {
         Ok(())
     }
 
-    pub(crate) fn set_command(
-        &mut self,
-        value: std::rc::Rc<crate::picker::action::PreviewCommand>,
-    ) {
+    pub(crate) fn set_command(&mut self, value: std::rc::Rc<crate::lua_callbacks::PreviewCommand>) {
         if let Self::Command { command, .. } = self {
             *command = Some(value);
         }
@@ -164,7 +192,7 @@ pub(crate) enum Definition {
         #[serde(default = "default_preview_visible")]
         preview_visible: bool,
         #[serde(skip)]
-        callback: Option<std::rc::Rc<crate::picker::action::Callback>>,
+        callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     },
     Items {
         #[serde(default)]
@@ -182,9 +210,9 @@ pub(crate) enum Definition {
         #[serde(default = "default_preview_visible")]
         preview_visible: bool,
         #[serde(skip)]
-        callback: Option<std::rc::Rc<crate::picker::action::Callback>>,
+        callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
         #[serde(skip)]
-        provider: Option<std::rc::Rc<crate::picker::action::ItemsProvider>>,
+        provider: Option<std::rc::Rc<crate::lua_callbacks::ItemsProvider>>,
     },
     Command {
         #[serde(default)]
@@ -209,7 +237,7 @@ pub(crate) enum Definition {
         #[serde(default = "default_preview_visible")]
         preview_visible: bool,
         #[serde(skip)]
-        callback: Option<std::rc::Rc<crate::picker::action::Callback>>,
+        callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     },
     FileSystem {
         #[serde(default)]
@@ -233,7 +261,7 @@ pub(crate) enum Definition {
         #[serde(default = "default_preview_visible")]
         preview_visible: bool,
         #[serde(skip)]
-        callback: Option<std::rc::Rc<crate::picker::action::Callback>>,
+        callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     },
 }
 
@@ -244,7 +272,7 @@ fn default_preview_visible() -> bool {
 impl Definition {
     pub(crate) fn set_preview_command(
         &mut self,
-        value: std::rc::Rc<crate::picker::action::PreviewCommand>,
+        value: std::rc::Rc<crate::lua_callbacks::PreviewCommand>,
     ) {
         match self {
             Self::Scrollback { preview, .. }
@@ -263,13 +291,13 @@ impl Definition {
     }
     pub(crate) fn set_items_provider(
         &mut self,
-        value: std::rc::Rc<crate::picker::action::ItemsProvider>,
+        value: std::rc::Rc<crate::lua_callbacks::ItemsProvider>,
     ) {
         if let Self::Items { provider, .. } = self {
             *provider = Some(value);
         }
     }
-    pub(crate) fn set_callback(&mut self, value: std::rc::Rc<crate::picker::action::Callback>) {
+    pub(crate) fn set_callback(&mut self, value: std::rc::Rc<crate::lua_callbacks::Callback>) {
         match self {
             Self::Scrollback { callback, .. }
             | Self::FileSystem { callback, .. }
@@ -285,7 +313,7 @@ impl Definition {
     fn acceptance(
         &self,
     ) -> (
-        Option<std::rc::Rc<crate::picker::action::Callback>>,
+        Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
         Option<EnterAction>,
     ) {
         match self {
@@ -317,7 +345,7 @@ impl Definition {
     }
 
     #[cfg(test)]
-    pub(crate) fn callback(&self) -> Option<&std::rc::Rc<crate::picker::action::Callback>> {
+    pub(crate) fn callback(&self) -> Option<&std::rc::Rc<crate::lua_callbacks::Callback>> {
         match self {
             Self::Scrollback { callback, .. }
             | Self::FileSystem { callback, .. }
@@ -345,6 +373,26 @@ pub(crate) enum BindingTarget {
     Picker(String),
 }
 
+pub(crate) const BUILTIN_NAMES: [&str; 4] = ["themes", "command_palette", "lines", "words"];
+
+pub(crate) fn builtin_defaults(name: &str) -> serde_json::Value {
+    match name {
+        "themes" => {
+            serde_json::json!({"type":"Themes", "position":"Cursor", "sort":"Score", "preview_visible":false})
+        }
+        "command_palette" => {
+            serde_json::json!({"type":"CommandPalette", "position":"Cursor", "preview_visible":false})
+        }
+        "lines" => {
+            serde_json::json!({"type":"Scrollback", "enter_action":"Navigate", "preview":{"type":"Scrollback", "rows":12}})
+        }
+        "words" => {
+            serde_json::json!({"type":"Scrollback", "regex":"\\S+", "enter_action":"SendInput", "unique":true, "preview_visible":false, "preview":{"type":"Scrollback", "rows":12}})
+        }
+        _ => unreachable!("validated builtin picker name"),
+    }
+}
+
 impl<'de> Deserialize<'de> for KeyBinding {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -354,18 +402,22 @@ impl<'de> Deserialize<'de> for KeyBinding {
             #[serde(default)]
             mods: String,
             picker: Option<String>,
+            builtin_picker: Option<String>,
             action: Option<String>,
         }
         let raw = RawBinding::deserialize(deserializer)?;
-        let target = match (raw.action, raw.picker) {
-            (Some(name), None) => BindingTarget::Action(
+        let target = match (raw.action, raw.picker, raw.builtin_picker) {
+            (Some(name), None, None) => BindingTarget::Action(
                 crate::actions::AppAction::from_name(&name)
                     .unwrap_or(crate::actions::AppAction::Lua(name)),
             ),
-            (None, Some(name)) => BindingTarget::Picker(name),
+            (None, Some(name), None) => BindingTarget::Picker(name),
+            (None, None, Some(name)) if BUILTIN_NAMES.contains(&name.as_str()) => {
+                BindingTarget::Picker(format!("builtin.{name}"))
+            }
             _ => {
                 return Err(serde::de::Error::custom(
-                    "key binding must specify exactly one of action or picker",
+                    "key binding must specify exactly one of action, picker, or a known builtin_picker",
                 ));
             }
         };
@@ -381,7 +433,7 @@ impl<'de> Deserialize<'de> for KeyBinding {
 pub(crate) struct Options {
     pub(crate) position: Position,
     pub(crate) sort: Sort,
-    pub(crate) callback: Option<std::rc::Rc<crate::picker::action::Callback>>,
+    pub(crate) callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     pub(crate) source: Source,
     pub(crate) enter_action: EnterAction,
     pub(crate) params: BTreeMap<String, String>,
@@ -403,7 +455,7 @@ pub(crate) enum Source {
 #[derive(Clone)]
 pub(crate) struct ItemsOptions {
     pub(crate) values: Vec<crate::picker::protocol::Item>,
-    pub(crate) provider: Option<std::rc::Rc<crate::picker::action::ItemsProvider>>,
+    pub(crate) provider: Option<std::rc::Rc<crate::lua_callbacks::ItemsProvider>>,
 }
 
 #[derive(Clone)]
@@ -497,6 +549,7 @@ impl PickerEntry {
 }
 
 pub(crate) struct Bindings {
+    pub(crate) builtin_pickers: BuiltinPickers,
     bindings: Vec<Binding>,
     definitions: BTreeMap<String, PickerEntry>,
     actions: BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
@@ -524,7 +577,7 @@ impl Bindings {
         defaults: PickerDefaults,
         actions: BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
     ) -> Result<Self, String> {
-        let definitions = definitions.unwrap_or_else(|| {
+        let mut definitions = definitions.unwrap_or_else(|| {
             BTreeMap::from([
                 (
                     "lines".into(),
@@ -552,6 +605,13 @@ impl Bindings {
                 ),
             ])
         });
+        for name in BUILTIN_NAMES {
+            definitions
+                .entry(format!("builtin.{name}"))
+                .or_insert_with(|| {
+                    serde_json::from_value(builtin_defaults(name)).expect("valid builtin defaults")
+                });
+        }
         let mut compiled = BTreeMap::new();
         for (name, definition) in definitions {
             if name.trim().is_empty() {
@@ -818,14 +878,21 @@ impl Bindings {
         }
         let keys = keys.unwrap_or_else(|| {
             let mut keys = crate::actions::default_bindings();
-            if compiled.contains_key("lines") {
+            {
                 keys.push(KeyBinding {
                     key: "f".into(),
                     mods: "CTRL|SHIFT".into(),
-                    target: BindingTarget::Picker("lines".into()),
+                    target: BindingTarget::Picker(
+                        if compiled.contains_key("lines") {
+                            "lines"
+                        } else {
+                            "builtin.lines"
+                        }
+                        .into(),
+                    ),
                 });
             }
-            if compiled.get("commands").is_some_and(|entry| {
+            let legacy_commands = compiled.get("commands").is_some_and(|entry| {
                 matches!(
                     entry,
                     PickerEntry::Static(Options {
@@ -833,11 +900,19 @@ impl Bindings {
                         ..
                     })
                 )
-            }) {
+            });
+            {
                 keys.push(KeyBinding {
                     key: "Space".into(),
                     mods: "CTRL|SHIFT".into(),
-                    target: BindingTarget::Picker("commands".into()),
+                    target: BindingTarget::Picker(
+                        if legacy_commands {
+                            "commands"
+                        } else {
+                            "builtin.command_palette"
+                        }
+                        .into(),
+                    ),
                 });
             }
             keys
@@ -896,7 +971,13 @@ impl Bindings {
             bindings,
             definitions: compiled,
             actions,
+            builtin_pickers: BuiltinPickers::default(),
         })
+    }
+
+    pub(crate) fn with_builtin_pickers(mut self, builtins: BuiltinPickers) -> Self {
+        self.builtin_pickers = builtins;
+        self
     }
 
     pub(crate) fn named(&self, name: &str) -> Option<PickerEntry> {
@@ -1357,7 +1438,7 @@ mod tests {
                 ] {
                     assert_eq!(
                         entries.iter().any(|entry| entry.action == builtin),
-                        !configured
+                        builtin != AppAction::OpenThemePicker && !configured
                     );
                     assert_eq!(
                         entries

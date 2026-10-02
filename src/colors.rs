@@ -19,6 +19,7 @@ pub(crate) struct UiOverrides {
     pub warning: Option<UiColor>,
     pub error: Option<UiColor>,
     pub match_highlight: Option<UiColor>,
+    pub picker_match_highlight: Option<UiColor>,
     pub search_match_background: Option<UiColor>,
     pub search_match_text: Option<UiColor>,
     pub yank_background: Option<UiColor>,
@@ -89,6 +90,9 @@ impl UiOverrides {
         }
         if let Some(color) = self.match_highlight {
             palette.match_highlight = color.0;
+        }
+        if let Some(color) = self.picker_match_highlight {
+            palette.picker_match_highlight = Some(color.0);
         }
         if let Some(color) = self.search_match_background {
             palette.search_match_background = color.0;
@@ -192,6 +196,7 @@ impl UiPalette {
             warning: readable(unpack(theme.ansi[3]), panel_background),
             error: readable(unpack(theme.ansi[1]), panel_background),
             match_highlight: readable(unpack(theme.ansi[3]), panel_background),
+            picker_match_highlight: None,
             search_match_background,
             search_match_text: readable(text, search_match_background),
             yank_background,
@@ -214,6 +219,7 @@ pub(crate) struct UiPalette {
     pub warning: Color32,
     pub error: Color32,
     pub match_highlight: Color32,
+    pub picker_match_highlight: Option<Color32>,
     pub search_match_background: Color32,
     pub search_match_text: Color32,
     pub yank_background: Color32,
@@ -234,6 +240,7 @@ impl UiPalette {
         warning: Color32::from_rgb(0xfa, 0xbd, 0x2f),
         error: Color32::from_rgb(0xfb, 0x49, 0x34),
         match_highlight: Color32::from_rgb(0xfb, 0x49, 0x34),
+        picker_match_highlight: None,
         search_match_background: Color32::from_rgb(0x67, 0x55, 0x2a),
         search_match_text: Color32::from_rgb(0xeb, 0xdb, 0xb2),
         yank_background: Color32::from_rgb(0xd3, 0x86, 0x9b),
@@ -248,6 +255,7 @@ impl Default for UiPalette {
 }
 
 pub(crate) struct ColorManager {
+    base: RwLock<(UiPalette, Option<String>)>,
     palette: RwLock<UiPalette>,
     overrides: RwLock<ColorOverrides>,
 }
@@ -268,6 +276,7 @@ impl ColorOverrides {
 }
 
 pub(crate) static COLORS: ColorManager = ColorManager {
+    base: RwLock::new((UiPalette::DEFAULT, None)),
     palette: RwLock::new(UiPalette::DEFAULT),
     overrides: RwLock::new(ColorOverrides {
         themes: std::collections::BTreeMap::new(),
@@ -284,6 +293,7 @@ pub(crate) static COLORS: ColorManager = ColorManager {
             warning: None,
             error: None,
             match_highlight: None,
+            picker_match_highlight: None,
             search_match_background: None,
             search_match_text: None,
             yank_background: None,
@@ -293,6 +303,15 @@ pub(crate) static COLORS: ColorManager = ColorManager {
 };
 
 impl ColorManager {
+    pub(crate) fn reload(&self, ctx: &egui::Context, overrides: ColorOverrides) {
+        self.configure(overrides);
+        let base = self.base.read().unwrap_or_else(|error| error.into_inner());
+        let overrides = self
+            .overrides
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        self.set(ctx, overrides.apply(base.0, base.1.as_deref()));
+    }
     pub(crate) fn configure(&self, overrides: ColorOverrides) {
         *self
             .overrides
@@ -301,6 +320,8 @@ impl ColorManager {
     }
 
     pub(crate) fn apply_theme(&self, ctx: &egui::Context, theme: &ThemeColors, name: Option<&str>) {
+        *self.base.write().unwrap_or_else(|error| error.into_inner()) =
+            (UiPalette::from_theme(theme), name.map(str::to_owned));
         let overrides = self
             .overrides
             .read()
@@ -433,6 +454,47 @@ mod tests {
         assert_eq!(selected.selection_background, base.selection_background);
     }
 
+    #[test]
+    fn picker_match_color_is_independent_and_inherits_when_omitted() {
+        let base = UiPalette::DEFAULT;
+        let overrides = ColorOverrides {
+            global: serde_json::from_str(
+                r##"{"match_highlight":"#fabd2f","picker_match_highlight":"#ffdd55"}"##,
+            )
+            .unwrap(),
+            themes: std::collections::BTreeMap::from([(
+                "Gruvbox Dark".into(),
+                serde_json::from_str(r##"{"picker_match_highlight":"#ffffff"}"##).unwrap(),
+            )]),
+        };
+        let selected = overrides.apply(base, Some("Gruvbox Dark"));
+        assert_eq!(rgb(selected.match_highlight), 0xfabd2f);
+        assert_eq!(rgb(selected.picker_match_highlight.unwrap()), 0xffffff);
+        assert_eq!(
+            rgb(overrides
+                .apply(base, Some("Other"))
+                .picker_match_highlight
+                .unwrap()),
+            0xffdd55
+        );
+        let legacy = serde_json::from_str::<UiOverrides>(r##"{"match_highlight":"#aabbcc"}"##)
+            .unwrap()
+            .apply(base);
+        assert!(legacy.picker_match_highlight.is_none());
+        assert_eq!(
+            rgb(legacy
+                .picker_match_highlight
+                .unwrap_or(legacy.match_highlight)),
+            0xaabbcc
+        );
+        assert!(
+            ColorOverrides::default()
+                .apply(base, None)
+                .picker_match_highlight
+                .is_none()
+        );
+    }
+
     fn theme(background: u32, foreground: u32) -> ThemeColors {
         ThemeColors {
             background,
@@ -460,6 +522,7 @@ mod tests {
             ]),
         };
         let manager = ColorManager {
+            base: RwLock::new((UiPalette::DEFAULT, None)),
             palette: RwLock::new(UiPalette::DEFAULT),
             overrides: RwLock::new(overrides),
         };
@@ -477,6 +540,11 @@ mod tests {
             assert_eq!(rgb(palette.warning), 0xabcdef);
             assert_eq!(rgb(palette.background), theme.background);
         }
+        manager.apply_theme(&context, &theme, Some("Gruvbox Dark"));
+        manager.reload(&context, ColorOverrides::default());
+        let palette = *manager.palette.read().unwrap();
+        assert_eq!(palette.accent, UiPalette::from_theme(&theme).accent);
+        assert_eq!(palette.warning, UiPalette::from_theme(&theme).warning);
     }
 
     #[test]

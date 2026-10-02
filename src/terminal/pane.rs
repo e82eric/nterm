@@ -200,38 +200,13 @@ extern "C" fn ghostty_egui_theme_colors(
 impl TerminalPane {
     pub(super) fn show_error(&mut self, title: &str, error: String) {
         crate::error_log::error("terminal", title, &error);
-        self.toasts.push(title.into(), error, 10000);
+        self.toasts.push_error(title.into(), error, 10000);
     }
 
     pub(super) fn show_notice(&mut self, title: &str, message: String) {
         self.toasts.push(title.into(), message, 3000);
     }
 
-    pub(super) fn open_theme_picker(&mut self, ctx: &egui::Context) {
-        let names = match crate::themes::installed_themes() {
-            Ok(names) if !names.is_empty() => names,
-            Ok(_) => {
-                self.show_error(
-                    "No themes found",
-                    "Check your Ghostty resources/themes directory".into(),
-                );
-                return;
-            }
-            Err(error) => {
-                self.show_error("Unable to list themes", error);
-                return;
-            }
-        };
-        let options = crate::themes::picker_options(names);
-        self.picker = Some(crate::picker::Picker::start(
-            self.host,
-            None,
-            false,
-            0,
-            ctx.clone(),
-            options,
-        ));
-    }
     pub(super) fn open_error_log(&mut self, ctx: &egui::Context) {
         let options = crate::error_log::picker_options();
         self.picker = Some(crate::picker::Picker::start(
@@ -262,6 +237,49 @@ impl TerminalPane {
                     .into_owned(),
             )
         }
+    }
+    pub(super) fn apply_settings(
+        &self,
+        config: &crate::config::ReloadedConfig,
+    ) -> Result<(), String> {
+        let theme = config
+            .theme
+            .as_deref()
+            .map(std::ffi::CString::new)
+            .transpose()
+            .map_err(|_| "Theme contains NUL")?;
+        let family = config
+            .font_family
+            .as_deref()
+            .map(std::ffi::CString::new)
+            .transpose()
+            .map_err(|_| "Font contains NUL")?;
+        let mut error = [0u8; 4096];
+        if unsafe {
+            ghostty_ffi::ghostty_egui_host_apply_settings(
+                self.host,
+                theme
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                family
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                config.font_size.unwrap_or(0.0),
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
+        } {
+            Ok(())
+        } else {
+            Err(
+                String::from_utf8_lossy(error.split(|byte| *byte == 0).next().unwrap_or_default())
+                    .into_owned(),
+            )
+        }
+    }
+
+    pub(super) fn refresh_picker_font(&mut self, ctx: &egui::Context) {
+        self.picker_font = crate::picker::font::PickerFont::new(ctx, self.host);
     }
     pub(super) fn take_config_issues(&self) -> Vec<String> {
         std::mem::take(&mut *self.wake.config_issues.lock().unwrap())
@@ -634,7 +652,8 @@ impl TerminalPane {
     ) -> PaneInput {
         let (picker_consumed, action) = self.handle_picker(ui, bounds, bindings, has_floating);
         let quick_consumed = !picker_consumed && self.handle_quick_select_keys(ui);
-        let copy_consumed = !picker_consumed && !quick_consumed && self.handle_copy_keys(ui);
+        let copy_consumed =
+            !picker_consumed && !quick_consumed && self.handle_copy_keys(ui, bindings);
         PaneInput {
             keyboard_blocked: picker_consumed
                 || quick_consumed
@@ -752,7 +771,7 @@ impl TerminalPane {
             let mut row = ghostty_ffi::LiveCursorLine::default();
             if !unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line(host, &mut row) } {
                 self.show_error(
-                    "Picker could not open",
+                    "Could not open picker",
                     "Unable to read live cursor line".into(),
                 );
                 return;
@@ -784,7 +803,7 @@ impl TerminalPane {
             }) {
             Ok(options) => options,
             Err(error) => {
-                self.show_error("Picker could not open", error);
+                self.show_error("Could not open picker", error);
                 return;
             }
         };
@@ -804,7 +823,7 @@ impl TerminalPane {
                     return;
                 }
                 Err(error) => {
-                    self.show_error("Unable to list themes", error);
+                    self.show_error("Could not load themes", error);
                     return;
                 }
             };
@@ -923,7 +942,7 @@ impl TerminalPane {
                 self.close_search();
                 self.close_copy_mode();
             }
-            self.toasts.push(
+            self.toasts.push_error(
                 "Terminal operation failed".into(),
                 format!("{operation}: {cause}"),
                 10000,
@@ -1017,12 +1036,12 @@ impl TerminalPane {
             Ok(commands) => {
                 for command in commands {
                     match command {
-                        crate::picker::action::Command::ShowToast {
+                        crate::lua_callbacks::Command::ShowToast {
                             title,
                             message,
                             duration_ms,
                         } => self.toasts.push(title, message, duration_ms),
-                        crate::picker::action::Command::Paste(text) => {
+                        crate::lua_callbacks::Command::Paste(text) => {
                             self.close_copy_mode();
                             unsafe {
                                 ghostty_ffi::ghostty_egui_host_text(
@@ -1032,11 +1051,11 @@ impl TerminalPane {
                                 );
                             }
                         }
-                        crate::picker::action::Command::SendText(text) => {
+                        crate::lua_callbacks::Command::SendText(text) => {
                             self.close_copy_mode();
                             Self::send_picker_text(self.host, &text);
                         }
-                        crate::picker::action::Command::ReplacePrompt {
+                        crate::lua_callbacks::Command::ReplacePrompt {
                             text,
                             before,
                             after,
@@ -1044,7 +1063,7 @@ impl TerminalPane {
                             self.close_copy_mode();
                             Self::replace_picker_prompt(self.host, &text, before, after);
                         }
-                        crate::picker::action::Command::Navigate(_) => {}
+                        crate::lua_callbacks::Command::Navigate(_) => {}
                     }
                 }
             }
@@ -1127,6 +1146,7 @@ impl TerminalPane {
         let typography = self.picker_font.typography(ui.ctx(), host);
         if let Some(picker) = self.picker.as_mut() {
             picker.typography = typography;
+            picker.builtin_pickers = bindings.builtin_pickers;
         }
         let action = self
             .picker
@@ -1196,12 +1216,12 @@ impl TerminalPane {
                         let mut sent = false;
                         for command in commands {
                             match command {
-                                crate::picker::action::Command::ShowToast {
+                                crate::lua_callbacks::Command::ShowToast {
                                     title,
                                     message,
                                     duration_ms,
                                 } => self.toasts.push(title, message, duration_ms),
-                                crate::picker::action::Command::Navigate(target) => {
+                                crate::lua_callbacks::Command::Navigate(target) => {
                                     if let Some(generation) =
                                         generation.filter(|g| self.copy_mode.generation == Some(*g))
                                     {
@@ -1210,11 +1230,11 @@ impl TerminalPane {
                                     } else {
                                         self.show_error(
                                             "Picker navigation failed",
-                                            "The snapshot is no longer active".into(),
+                                            "The saved terminal view has expired. Open the picker again.".into(),
                                         );
                                     }
                                 }
-                                crate::picker::action::Command::Paste(text) => {
+                                crate::lua_callbacks::Command::Paste(text) => {
                                     self.close_copy_mode();
                                     sent = true;
                                     unsafe {
@@ -1225,12 +1245,12 @@ impl TerminalPane {
                                         );
                                     }
                                 }
-                                crate::picker::action::Command::SendText(text) => {
+                                crate::lua_callbacks::Command::SendText(text) => {
                                     self.close_copy_mode();
                                     sent = true;
                                     Self::send_picker_text(self.host, &text);
                                 }
-                                crate::picker::action::Command::ReplacePrompt {
+                                crate::lua_callbacks::Command::ReplacePrompt {
                                     text,
                                     before,
                                     after,
@@ -1329,7 +1349,7 @@ impl TerminalPane {
             self.cancel_quick_select();
             self.show_error(
                 "Quick select failed",
-                "The terminal snapshot is no longer available".into(),
+                "The saved terminal view has expired. Open quick select again.".into(),
             );
             return false;
         }
@@ -1539,7 +1559,7 @@ impl TerminalPane {
         if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) } {
             self.show_error(
                 "Copy mode failed",
-                "Failed to create terminal snapshot".into(),
+                "Could not capture the terminal contents. Try again.".into(),
             );
             return;
         }
@@ -1559,7 +1579,7 @@ impl TerminalPane {
             unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
             self.show_error(
                 "Copy mode failed",
-                "Failed to initialize snapshot cursor".into(),
+                "Could not locate the cursor in the saved terminal view. Try again.".into(),
             );
             return;
         }
@@ -1591,7 +1611,7 @@ impl TerminalPane {
             self.close_search();
             self.show_error(
                 "Search navigation failed",
-                "The search snapshot is no longer available".into(),
+                "The saved search view has expired. Start a new search.".into(),
             );
             return;
         }
@@ -1654,7 +1674,11 @@ impl TerminalPane {
         }
     }
 
-    fn handle_copy_keys(&mut self, ui: &egui::Ui) -> bool {
+    fn handle_copy_keys(
+        &mut self,
+        ui: &egui::Ui,
+        bindings: &crate::picker::config::Bindings,
+    ) -> bool {
         let was_active = self.copy_mode.generation.is_some();
         let events = ui.input(|input| input.events.clone());
         self.copy_mode.begin_input_batch();
@@ -1665,6 +1689,31 @@ impl TerminalPane {
             let action = self.copy_mode.input(event);
             let generation = self.copy_mode.generation.expect("copy mode is active");
             let success = match action {
+                CopyAction::OpenLineSplit => {
+                    let mut view = SnapshotView::default();
+                    let picker = if unsafe {
+                        ghostty_ffi::ghostty_egui_host_snapshot_view(
+                            self.host, generation, &mut view,
+                        )
+                    } {
+                        crate::picker::Picker::start_line_split(
+                            self.host,
+                            generation,
+                            view,
+                            self.copy_mode.cursor.y,
+                            ui.ctx().clone(),
+                            bindings.builtin_pickers,
+                        )
+                    } else {
+                        Err("Unable to read the copy-mode snapshot".into())
+                    };
+                    match picker {
+                        Ok(picker) => self.picker = Some(picker),
+                        Err(error) => self.show_error("Could not split this line", error),
+                    }
+                    ui.ctx().request_repaint();
+                    break;
+                }
                 CopyAction::None => true,
                 CopyAction::Exit => {
                     self.close_copy_mode();
@@ -1818,7 +1867,7 @@ impl TerminalPane {
             self.close_copy_mode();
             self.show_error(
                 "Copy navigation failed",
-                "The snapshot or target could not be used".into(),
+                "This position is no longer available. Exit copy mode and try again.".into(),
             );
             return false;
         }
@@ -1827,7 +1876,7 @@ impl TerminalPane {
             self.close_copy_mode();
             self.show_error(
                 "Copy navigation failed",
-                "The snapshot or target could not be used".into(),
+                "This position is no longer available. Exit copy mode and try again.".into(),
             );
             return false;
         };
@@ -1835,7 +1884,7 @@ impl TerminalPane {
             self.close_copy_mode();
             self.show_error(
                 "Copy navigation failed",
-                "The snapshot or target could not be used".into(),
+                "This position is no longer available. Exit copy mode and try again.".into(),
             );
             return false;
         };
@@ -1847,7 +1896,7 @@ impl TerminalPane {
             self.close_copy_mode();
             self.show_error(
                 "Copy navigation failed",
-                "The snapshot or target could not be used".into(),
+                "This position is no longer available. Exit copy mode and try again.".into(),
             );
             return false;
         }
@@ -1866,7 +1915,7 @@ impl TerminalPane {
             self.close_copy_mode();
             self.show_error(
                 "Copy navigation failed",
-                "The snapshot or target could not be used".into(),
+                "This position is no longer available. Exit copy mode and try again.".into(),
             );
             return false;
         }
@@ -1874,7 +1923,7 @@ impl TerminalPane {
             self.close_copy_mode();
             self.show_error(
                 "Copy navigation failed",
-                "The snapshot or target could not be used".into(),
+                "This position is no longer available. Exit copy mode and try again.".into(),
             );
             return false;
         };
@@ -1887,7 +1936,7 @@ impl TerminalPane {
             self.close_copy_mode();
             self.show_error(
                 "Copy navigation failed",
-                "The snapshot or target could not be used".into(),
+                "This position is no longer available. Exit copy mode and try again.".into(),
             );
             return false;
         }
@@ -1911,7 +1960,7 @@ impl TerminalPane {
             self.close_copy_mode();
             self.show_error(
                 "Copy navigation failed",
-                "The snapshot or target could not be used".into(),
+                "This position is no longer available. Exit copy mode and try again.".into(),
             );
             false
         }
@@ -1975,7 +2024,7 @@ impl TerminalPane {
                 self.close_copy_mode();
                 self.show_error(
                     "Copy navigation failed",
-                    "The snapshot or target could not be used".into(),
+                    "This position is no longer available. Exit copy mode and try again.".into(),
                 );
                 false
             }
@@ -2473,7 +2522,7 @@ impl TerminalPane {
         } {
             self.show_error(
                 "Copy failed",
-                "Unable to read the selected snapshot text".into(),
+                "The selected text is no longer available. Select it again and retry.".into(),
             );
             return false;
         }

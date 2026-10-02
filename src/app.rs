@@ -14,12 +14,20 @@ pub(crate) fn run(
     pickers: crate::picker::config::Bindings,
     floating_padding: Option<crate::config::FloatingPadding>,
     issues: Vec<String>,
+    reload_source: crate::config::ReloadSource,
 ) -> Result<(), FatalError> {
     let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
         .build()
         .fatal("create the application event loop")?;
     let proxy = event_loop.create_proxy();
-    let mut app = NativeApp::new(proxy, args, pickers, floating_padding, issues);
+    let mut app = NativeApp::new(
+        proxy,
+        args,
+        pickers,
+        floating_padding,
+        issues,
+        reload_source,
+    );
     let result = event_loop
         .run_app(&mut app)
         .fatal("run the application event loop");
@@ -46,6 +54,7 @@ impl ShellApp {
         pickers: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
         issues: Vec<String>,
+        reload_source: crate::config::ReloadSource,
     ) -> Result<Self, FatalError> {
         let command_label = command_label(&args);
         let mut argv: Vec<*mut c_char> = args.iter().map(|arg| arg.as_ptr().cast_mut()).collect();
@@ -60,6 +69,7 @@ impl ShellApp {
                 pickers,
                 floating_padding,
                 issues,
+                reload_source,
             )?,
             _args: args,
             _argv: argv,
@@ -152,6 +162,7 @@ struct NativeApp {
     pickers: Option<crate::picker::config::Bindings>,
     floating_padding: Option<crate::config::FloatingPadding>,
     issues: Vec<String>,
+    reload_source: Option<crate::config::ReloadSource>,
     gl_window: Option<GlutinWindowContext>,
     gl: Option<Arc<glow::Context>>,
     egui: Option<egui_glow::EguiGlow>,
@@ -166,6 +177,7 @@ impl NativeApp {
         pickers: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
         issues: Vec<String>,
+        reload_source: crate::config::ReloadSource,
     ) -> Self {
         Self {
             fatal_error: None,
@@ -174,6 +186,7 @@ impl NativeApp {
             pickers: Some(pickers),
             floating_padding,
             issues,
+            reload_source: Some(reload_source),
             gl_window: None,
             gl: None,
             egui: None,
@@ -297,6 +310,9 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             self.pickers.take().expect("application resumed twice"),
             self.floating_padding,
             std::mem::take(&mut self.issues),
+            self.reload_source
+                .take()
+                .expect("application resumed twice"),
         ) {
             Ok(shell) => shell,
             Err(error) => {

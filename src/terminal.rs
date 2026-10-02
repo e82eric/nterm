@@ -10,6 +10,7 @@ pub(crate) struct TerminalView {
     messages: crate::messages::Messages,
 
     command_label: String,
+    reload_source: crate::config::ReloadSource,
     picker_bindings: crate::picker::config::Bindings,
     floating_padding: Option<crate::config::FloatingPadding>,
     floating: Option<FloatingTerminal>,
@@ -76,6 +77,7 @@ impl TerminalView {
         picker_bindings: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
         mut issues: Vec<String>,
+        reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
         let main = TerminalPane::create(egui_ctx, gl, proxy, argc, argv)?;
         issues.extend(main.take_config_issues());
@@ -84,6 +86,7 @@ impl TerminalView {
 
             main,
             command_label,
+            reload_source,
             picker_bindings,
             floating_padding,
             floating: None,
@@ -117,17 +120,49 @@ impl TerminalView {
         gl: &glow::Context,
     ) {
         match action {
+            AppAction::ReloadConfig => match self.reload_source.reload() {
+                Ok(config) => {
+                    if config.theme.is_some()
+                        || config.font_family.is_some()
+                        || config.font_size.is_some()
+                    {
+                        if let Err(error) = self.main.apply_settings(&config) {
+                            self.main
+                                .show_error("Could not reload configuration", error);
+                            return;
+                        }
+                    }
+                    if config.font_family.is_some() || config.font_size.is_some() {
+                        self.main.refresh_picker_font(ctx);
+                        if let Some(floating) = &mut self.floating {
+                            floating.refresh_picker_font(ctx);
+                        }
+                    }
+                    self.picker_bindings = config.bindings;
+                    self.floating_padding = config.padding;
+                    crate::colors::COLORS.reload(ctx, config.colors);
+                    self.main.show_notice("", "Configuration reloaded".into());
+                }
+                Err(error) => self
+                    .main
+                    .show_error("Could not reload configuration", error),
+            },
             AppAction::OpenThemePicker => {
+                let entry = self
+                    .picker_bindings
+                    .named("builtin.themes")
+                    .expect("builtin themes picker");
+                let has_floating = self.floating.is_some();
                 let pane = if self.floating.as_ref().is_some_and(|pane| pane.visible) {
                     &mut self.floating.as_mut().expect("floating action target").pane
                 } else {
                     &mut self.main
                 };
-                pane.open_theme_picker(ctx);
+                pane.open_picker(ctx, entry, None, &self.picker_bindings, has_floating);
             }
             AppAction::ApplyTheme(name) => match self.apply_theme(&name) {
                 Ok(()) => self.main.show_notice("Theme applied", name),
-                Err(error) => self.main.show_error("Theme could not be applied", error),
+                Err(error) => self.main.show_error("Could not apply theme", error),
             },
             AppAction::ShowMessages => self.messages.open(),
             AppAction::ShowErrorRecord(record) => self.messages.open_record(*record),
@@ -141,7 +176,7 @@ impl TerminalView {
             AppAction::NewWindow => {
                 if let Err(error) = crate::app::open_new_window() {
                     self.main
-                        .show_error("Could not open a new terminal window", error.to_string());
+                        .show_error("Could not open terminal", error.to_string());
                 }
             }
             AppAction::ToggleFloatingPane => {
@@ -150,10 +185,9 @@ impl TerminalView {
                 } else {
                     match FloatingTerminal::new(self, gl) {
                         Ok(floating) => self.floating = floating,
-                        Err(error) => self.main.show_error(
-                            "Floating terminal could not be created",
-                            error.to_string(),
-                        ),
+                        Err(error) => self
+                            .main
+                            .show_error("Could not open floating terminal", error.to_string()),
                     }
                 }
             }

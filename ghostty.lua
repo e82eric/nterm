@@ -8,37 +8,37 @@ return {
       action = function(app)
         local selection = app:get_selection_text()
         if selection == "" then
-          app:show_toast("Snippets", "No text is selected", 3000)
+          app:show_toast("Save snippet", "Select some text first.", 3000)
           return
         end
         local file, read_error = io.open(snippets_path, "rb")
         if not file then
-          app:show_toast("Snippets", "Unable to read snippets file: " .. tostring(read_error), 5000)
+          app:show_toast("Could not save snippet", "Unable to read snippets file: " .. tostring(read_error), 5000)
           return
         end
         local content = file:read("*a")
         file:close()
         local parsed, data = pcall(ghostty.json_parse, content)
         if not parsed or type(data) ~= "table" then
-          app:show_toast("Snippets", "Unable to parse snippets JSON: " .. tostring(data), 5000)
+          app:show_toast("Could not save snippet", "Unable to parse snippets JSON: " .. tostring(data), 5000)
           return
         end
         if type(data.snippets) ~= "table" then data.snippets = {} end
         table.insert(data.snippets, { input = selection })
         local encoded, json = pcall(ghostty.json_encode_pretty, data)
         if not encoded then
-          app:show_toast("Snippets", "Unable to encode snippets JSON: " .. tostring(json), 5000)
+          app:show_toast("Could not save snippet", "Unable to encode snippets JSON: " .. tostring(json), 5000)
           return
         end
         local output, open_error = io.open(snippets_path, "wb")
         if not output then
-          app:show_toast("Snippets", "Unable to save snippet: " .. tostring(open_error), 5000)
+          app:show_toast("Could not save snippet", "Unable to write snippets file: " .. tostring(open_error), 5000)
           return
         end
         local saved, save_error = output:write(json .. "\n")
         output:close()
         if not saved then
-          app:show_toast("Snippets", "Unable to save snippet: " .. tostring(save_error), 5000)
+          app:show_toast("Could not save snippet", "Unable to write snippets file: " .. tostring(save_error), 5000)
           return
         end
         app:show_toast("Snippet saved", selection, 2000)
@@ -59,6 +59,13 @@ return {
   -- floating = {
   --   padding = { top = 15, bottom = 15, left = 10, right = 10 }, -- Percent of terminal area.
   -- },
+  builtin_pickers = {
+    themes = { position = "Cursor", sort = "Score" },
+    command_palette = { position = "Cursor", preview_visible = false },
+    lines = {},
+    words = {},
+    line_break = { preview_visible = false },
+  },
   pickers = {
     CodexSuggestions = function(context)
       local cursor_row = context.line_before_cursor
@@ -102,22 +109,6 @@ return {
         end,
       }
     end,
-    commands = {
-      type = "CommandPalette",
-      position = "Cursor",
-      preview_visible = false,
-    },
-    lines = {
-      type = "Scrollback",
-      preview = { type = "Scrollback", rows = 12 },
-      -- Default regex extracts each nonblank logical line, trimming its padding.
-      enter_action = "Navigate",
-    },
-    words = {
-      type = "Scrollback",
-      regex = [[\S+]],
-      enter_action = "SendInput",
-    },
     files = {
       type = "FileSystem",
       -- preview = { type = "Command", args = { "bat.exe", "--color=always", "{item}" } },
@@ -167,9 +158,9 @@ return {
     { key = "ArrowUp", mods = "CTRL|SHIFT", action = "PreviousCommand" },
     { key = "ArrowDown", mods = "CTRL|SHIFT", action = "NextCommand" },
     -- On macOS you can also bind { key = "f", mods = "CMD", action = "OpenSearch" }.
-    { key = "Space", mods = "CTRL|SHIFT", picker = "commands" },
-    { key = "f", mods = "CTRL|SHIFT", picker = "lines" },
-    { key = "p", mods = "CTRL|SHIFT", picker = "words" },
+    { key = "Space", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
+    { key = "f", mods = "CTRL|SHIFT", builtin_picker = "lines" },
+    { key = "p", mods = "CTRL|SHIFT", builtin_picker = "words" },
     { key = "o", mods = "CTRL|SHIFT", picker = "files" },
     { key = "k", mods = "CTRL|SHIFT", picker = "CodexSuggestions" },
   },

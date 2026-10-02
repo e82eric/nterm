@@ -45,6 +45,17 @@ if (-not (Test-Path -LiteralPath $themeSource -PathType Container)) {
 if (-not (Test-Path -LiteralPath $terminfoSource -PathType Leaf)) {
     throw "Missing resource discovery sentinel: $terminfoSource. Build with -Demit-terminfo=true."
 }
+$compiledTerminfoPaths = @('terminfo\78\xterm-ghostty', 'terminfo\x\xterm-ghostty')
+$hasCompiledTerminfo = $false
+foreach ($relativePath in $compiledTerminfoPaths) {
+    if (Test-Path -LiteralPath (Join-Path $resourceSource $relativePath) -PathType Leaf) {
+        $hasCompiledTerminfo = $true
+        break
+    }
+}
+if (-not $hasCompiledTerminfo) {
+    throw "Missing compiled xterm-ghostty terminfo database. Rebuild with Git for Windows installed or pass -Dterminfo-compiler=<path to tic.exe>."
+}
 foreach ($file in $files) {
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $destinationPath $file) -Force
 }

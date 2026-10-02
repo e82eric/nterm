@@ -304,24 +304,29 @@ GhosttyEguiHost *ghostty_egui_host_create_floating(
     return host;
 }
 
-bool ghostty_egui_host_apply_theme(GhosttyEguiHost *host, const char *name, char *error, size_t capacity) {
-    if (!host || !host->base_config || !name) return false;
+bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, const char *family, float size, char *error, size_t capacity) {
+    if (!host || !host->base_config) return false;
     ghostty_config_t candidate = ghostty_config_clone(host->base_config);
     if (!candidate) {
         snprintf(error, capacity, "Unable to allocate theme configuration");
         return false;
     }
-    bool loaded = ghostty_config_set_theme(candidate, name);
+    bool loaded = (!name || ghostty_config_set_theme(candidate, name)) && ghostty_config_set_font(candidate, family, size);
+    // Keep the unfinalized inputs for later theme/font updates.
+    ghostty_config_t inputs = loaded ? ghostty_config_clone(candidate) : NULL;
+    if (loaded && !inputs) loaded = false;
     if (loaded) ghostty_config_finalize(candidate);
     if (loaded && ghostty_last_init_error()) {
         startup_error(error, capacity, "finalize the theme configuration", ghostty_last_init_error());
         ghostty_config_free(candidate);
+        if (inputs) ghostty_config_free(inputs);
         return false;
     }
     uint32_t count = ghostty_config_diagnostics_count(candidate);
     if (!loaded || count) {
         snprintf(error, capacity, "%s", count ? ghostty_config_get_diagnostic(candidate, 0).message : "Unable to load theme configuration");
         ghostty_config_free(candidate);
+        if (inputs) ghostty_config_free(inputs);
         return false;
     }
     // One app owns both the main and floating surfaces. The update propagates
@@ -330,11 +335,18 @@ bool ghostty_egui_host_apply_theme(GhosttyEguiHost *host, const char *name, char
     if (ghostty_last_error()) {
         startup_error(error, capacity, "apply the theme configuration", ghostty_last_error());
         ghostty_config_free(candidate);
+        if (inputs) ghostty_config_free(inputs);
         return false;
     }
     report_theme_colors(candidate, ghostty_surface_userdata(host->surface));
+    ghostty_config_free(host->base_config);
+    host->base_config = inputs;
     ghostty_config_free(candidate);
     return true;
+}
+
+bool ghostty_egui_host_apply_theme(GhosttyEguiHost *host, const char *name, char *error, size_t capacity) {
+    return ghostty_egui_host_apply_settings(host, name, NULL, 0, error, capacity);
 }
 
 void ghostty_egui_host_destroy(GhosttyEguiHost *host) {

@@ -1,6 +1,14 @@
 use std::ffi::{c_char, c_void};
 
 unsafe extern "C" {
+    pub(crate) fn ghostty_egui_host_apply_settings(
+        host: *mut Host,
+        name: *const c_char,
+        family: *const c_char,
+        size: f32,
+        error: *mut c_char,
+        capacity: usize,
+    ) -> bool;
     fn ghostty_last_error() -> *const c_char;
     pub(crate) fn ghostty_config_theme_directories(
         userdata: *mut c_void,

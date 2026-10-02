@@ -1984,6 +1984,7 @@ pub(crate) fn copy_jump_prefix(key: egui::Key, modifiers: egui::Modifiers) -> Op
 }
 
 pub(crate) enum CopyAction {
+    OpenLineSplit,
     None,
     Exit,
     ClearSearch {
@@ -2132,6 +2133,15 @@ impl CopyMode {
             return CopyAction::None;
         };
         let (key, modifiers) = (*key, *modifiers);
+        if key == egui::Key::B
+            && modifiers.ctrl
+            && !modifiers.shift
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+        {
+            self.clear_pending_for_navigation();
+            return CopyAction::OpenLineSplit;
+        }
         if is_copy_modifier_key(key) {
             return CopyAction::None;
         }
@@ -2460,6 +2470,51 @@ mod tests {
         ));
         assert!(mode.pending_yank.is_none());
         assert!(mode.pending_count.is_none());
+    }
+
+    #[test]
+    fn ctrl_b_opens_line_split_without_moving_cursor_or_leaking_pending_commands() {
+        let mut mode = super::CopyMode::default();
+        mode.cursor = crate::ghostty_ffi::SnapshotCell { x: 7, y: 42 };
+        mode.pending_count = Some(3);
+        mode.pending_g = true;
+        let key = |mods| egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: Some(egui::Key::B),
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        };
+        assert!(matches!(
+            mode.input(&key(egui::Modifiers::CTRL)),
+            super::CopyAction::OpenLineSplit
+        ));
+        assert_eq!(
+            mode.cursor,
+            crate::ghostty_ffi::SnapshotCell { x: 7, y: 42 }
+        );
+        // egui-winit sets the platform-neutral command bit alongside Ctrl on
+        // Windows/Linux. It is an alias, not an additional held modifier.
+        assert!(matches!(
+            mode.input(&key(egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            })),
+            super::CopyAction::OpenLineSplit
+        ));
+        assert!(mode.pending_count.is_none() && !mode.pending_g);
+        assert!(matches!(
+            mode.input(&key(egui::Modifiers::NONE)),
+            super::CopyAction::Motion {
+                motion: super::Motion::BackwardWord,
+                ..
+            }
+        ));
+        assert!(!matches!(
+            mode.input(&key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT)),
+            super::CopyAction::OpenLineSplit
+        ));
     }
 
     #[test]

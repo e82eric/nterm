@@ -14,6 +14,7 @@ pub(crate) struct PickerFactory {
     lua: std::rc::Rc<Lua>,
     key: mlua::RegistryKey,
     name: String,
+    builtin: Option<String>,
 }
 
 impl PickerFactory {
@@ -46,7 +47,11 @@ impl PickerFactory {
         let table: mlua::Table = function
             .call(argument)
             .map_err(|e| format!("pickers.{}: {e}", self.name))?;
-        let definition = parse_picker_table(&self.lua, &self.name, &table)?;
+        let definition = if let Some(name) = &self.builtin {
+            parse_builtin_table(&self.lua, name, &table)?
+        } else {
+            parse_picker_table(&self.lua, &self.name, &table)?
+        };
         if matches!(
             definition,
             crate::picker::config::Definition::Factory { .. }
@@ -117,7 +122,7 @@ fn parse_picker_table(
         definition
             .raw_set("action", mlua::Value::Nil)
             .map_err(|e| e.to_string())?;
-        callback = Some(std::rc::Rc::new(crate::picker::action::Callback {
+        callback = Some(std::rc::Rc::new(crate::lua_callbacks::Callback {
             lua: lua.clone(),
             key,
             name: name.into(),
@@ -141,7 +146,7 @@ fn parse_picker_table(
         definition
             .raw_set("items", mlua::Value::Nil)
             .map_err(|e| e.to_string())?;
-        provider = Some(std::rc::Rc::new(crate::picker::action::ItemsProvider {
+        provider = Some(std::rc::Rc::new(crate::lua_callbacks::ItemsProvider {
             lua: lua.clone(),
             key,
         }));
@@ -181,7 +186,7 @@ fn parse_picker_table(
             definition
                 .raw_set("preview", copy_preview)
                 .map_err(|e| e.to_string())?;
-            preview_command = Some(std::rc::Rc::new(crate::picker::action::PreviewCommand {
+            preview_command = Some(std::rc::Rc::new(crate::lua_callbacks::PreviewCommand {
                 lua: lua.clone(),
                 key,
                 name: name.into(),
@@ -203,6 +208,25 @@ fn parse_picker_table(
     Ok(parsed)
 }
 
+fn parse_builtin_table(
+    lua: &std::rc::Rc<Lua>,
+    name: &str,
+    overrides: &mlua::Table,
+) -> Result<crate::picker::config::Definition, String> {
+    let defaults = crate::picker::config::builtin_defaults(name);
+    let mlua::Value::Table(base) = lua.to_value(&defaults).map_err(|e| e.to_string())? else {
+        unreachable!("builtin defaults are a table")
+    };
+    for pair in overrides.clone().pairs::<String, mlua::Value>() {
+        let (field, value) = pair.map_err(|e| e.to_string())?;
+        if field == "type" || field == "regex" {
+            return Err(format!("builtin_pickers.{name}.{field} is built in"));
+        }
+        base.raw_set(field, value).map_err(|e| e.to_string())?;
+    }
+    parse_picker_table(lua, &format!("builtin.{name}"), &base)
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AppConfig {
@@ -212,6 +236,7 @@ struct AppConfig {
     theme_colors: std::collections::BTreeMap<String, crate::colors::UiOverrides>,
     floating: FloatingConfig,
     picker_defaults: crate::picker::config::PickerDefaults,
+    builtin_pickers: crate::picker::config::BuiltinPickers,
     pickers: Option<std::collections::BTreeMap<String, crate::picker::config::Definition>>,
     keys: Option<Vec<crate::picker::config::KeyBinding>>,
     #[serde(skip)]
@@ -355,7 +380,7 @@ impl AppConfig {
                         name.clone(),
                         std::rc::Rc::new(crate::actions::LuaAction {
                             label,
-                            callback: std::rc::Rc::new(crate::picker::action::Callback {
+                            callback: std::rc::Rc::new(crate::lua_callbacks::Callback {
                                 lua: lua.clone(),
                                 key,
                                 name,
@@ -384,19 +409,65 @@ impl AppConfig {
                                     lua: lua.clone(),
                                     key,
                                     name: name.clone(),
+                                    builtin: None,
                                 })),
                             }
                         }
                         _ => return Err(format!("pickers.{name} must be a table or function")),
                     };
+                    if name.starts_with("builtin.") {
+                        return Err("custom picker names cannot start with builtin.".into());
+                    }
                     definitions.insert(name, definition);
                 }
                 parsed_pickers = Some(definitions);
                 root.raw_set("pickers", mlua::Value::Nil)
                     .map_err(|e| e.to_string())?;
             }
+            if let Some(builtins) = root
+                .get::<_, Option<mlua::Table>>("builtin_pickers")
+                .map_err(|e| e.to_string())?
+            {
+                for pair in builtins.clone().pairs::<String, mlua::Value>() {
+                    let (name, value) = pair.map_err(|e| e.to_string())?;
+                    if name == "line_break" {
+                        continue;
+                    }
+                    if !crate::picker::config::BUILTIN_NAMES.contains(&name.as_str()) {
+                        return Err(format!("unknown builtin picker {name:?}"));
+                    }
+                    let definition = match value {
+                        mlua::Value::Table(table) => parse_builtin_table(&lua, &name, &table)?,
+                        mlua::Value::Function(function) => {
+                            let key = lua
+                                .create_registry_value(function)
+                                .map_err(|e| e.to_string())?;
+                            crate::picker::config::Definition::Factory {
+                                factory: Some(std::rc::Rc::new(PickerFactory {
+                                    lua: lua.clone(),
+                                    key,
+                                    name: format!("builtin.{name}"),
+                                    builtin: Some(name.clone()),
+                                })),
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "builtin_pickers.{name} must be a table or function"
+                            ));
+                        }
+                    };
+                    parsed_pickers
+                        .get_or_insert_with(Default::default)
+                        .insert(format!("builtin.{name}"), definition);
+                    builtins
+                        .raw_set(name, mlua::Value::Nil)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
         }
         let mut config: Self = lua.from_value(value).map_err(|error| error.to_string())?;
+        config.builtin_pickers.validate()?;
         config.pickers = parsed_pickers;
         config.actions = actions;
         Ok(config)
@@ -475,7 +546,71 @@ fn read_config(
     Ok(None)
 }
 
-pub(crate) fn prepare(
+pub(crate) struct ReloadSource {
+    path: Option<PathBuf>,
+    cli_theme: bool,
+    cli_font_family: bool,
+    cli_font_size: bool,
+}
+
+pub(crate) struct ReloadedConfig {
+    pub(crate) theme: Option<String>,
+    pub(crate) font_family: Option<String>,
+    pub(crate) font_size: Option<f32>,
+    pub(crate) bindings: crate::picker::config::Bindings,
+    pub(crate) padding: Option<FloatingPadding>,
+    pub(crate) colors: crate::colors::ColorOverrides,
+}
+
+impl ReloadSource {
+    pub(crate) fn reload(&self) -> Result<ReloadedConfig, String> {
+        let (path, source) = read_config(self.path.as_deref(), &default_paths(), |path| {
+            std::fs::read_to_string(path)
+        })?
+        .ok_or("No Lua configuration file found")?;
+        let load = || {
+            let config = AppConfig::parse(&source, &path)?;
+            config.ghostty_args()?;
+            Ok(ReloadedConfig {
+                font_family: if self.cli_font_family {
+                    None
+                } else {
+                    config.font.family
+                },
+                font_size: if self.cli_font_size {
+                    None
+                } else {
+                    config.font.size
+                },
+                theme: if self.cli_theme {
+                    None
+                } else {
+                    config.colors.theme
+                },
+                bindings: crate::picker::config::Bindings::compile_with_actions(
+                    config.pickers,
+                    config.keys,
+                    config.picker_defaults,
+                    config.actions,
+                )?
+                .with_builtin_pickers(config.builtin_pickers),
+                padding: config
+                    .floating
+                    .padding
+                    .map(FloatingPadding::validate)
+                    .transpose()?,
+                colors: crate::colors::ColorOverrides {
+                    global: config.colors.ui,
+                    themes: config.theme_colors,
+                },
+            })
+        };
+        load().map_err(|error: String| format!("{}: {error}", path.display()))
+    }
+}
+
+#[cfg(test)]
+fn prepare(
     args: Vec<String>,
     issues: &mut Vec<String>,
 ) -> Result<
@@ -484,6 +619,23 @@ pub(crate) fn prepare(
         crate::picker::config::Bindings,
         Option<FloatingPadding>,
         crate::colors::ColorOverrides,
+    ),
+    String,
+> {
+    prepare_with_reload(args, issues)
+        .map(|(args, bindings, padding, colors, _)| (args, bindings, padding, colors))
+}
+
+pub(crate) fn prepare_with_reload(
+    args: Vec<String>,
+    issues: &mut Vec<String>,
+) -> Result<
+    (
+        Vec<String>,
+        crate::picker::config::Bindings,
+        Option<FloatingPadding>,
+        crate::colors::ColorOverrides,
+        ReloadSource,
     ),
     String,
 > {
@@ -520,10 +672,12 @@ pub(crate) fn prepare(
     let mut pickers = crate::picker::config::Bindings::default();
     let mut floating_padding = None;
     let mut ui_colors = crate::colors::ColorOverrides::default();
+    let mut reload_path = explicit.clone();
     let loaded = (|| {
         if let Some((path, source)) = read_config(explicit.as_deref(), &default_paths(), |path| {
             std::fs::read_to_string(path)
         })? {
+            reload_path = Some(path.clone());
             let (options, bindings, padding, overrides) = AppConfig::parse(&source, &path)
                 .and_then(|config| {
                     Ok((
@@ -533,7 +687,8 @@ pub(crate) fn prepare(
                             config.keys,
                             config.picker_defaults,
                             config.actions,
-                        )?,
+                        )?
+                        .with_builtin_pickers(config.builtin_pickers),
                         config
                             .floating
                             .padding
@@ -570,8 +725,31 @@ pub(crate) fn prepare(
     {
         prepared.push("--font-family=".into());
     }
+    let cli_theme = remaining
+        .iter()
+        .take_while(|arg| *arg != "-e" && *arg != "--")
+        .any(|arg| arg == "--theme" || arg.starts_with("--theme="));
+    let cli_font_family = remaining
+        .iter()
+        .take_while(|arg| *arg != "-e" && *arg != "--")
+        .any(|arg| arg == "--font-family" || arg.starts_with("--font-family="));
+    let cli_font_size = remaining
+        .iter()
+        .take_while(|arg| *arg != "-e" && *arg != "--")
+        .any(|arg| arg == "--font-size" || arg.starts_with("--font-size="));
     prepared.extend(remaining);
-    Ok((prepared, pickers, floating_padding, ui_colors))
+    Ok((
+        prepared,
+        pickers,
+        floating_padding,
+        ui_colors,
+        ReloadSource {
+            path: reload_path,
+            cli_theme,
+            cli_font_family,
+            cli_font_size,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -586,6 +764,85 @@ fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reload_fonts_respect_cli_options_but_ignore_shell_arguments() {
+        let directory = std::env::temp_dir().join(format!(
+            "ghostty-reload-font-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("ghostty.lua");
+        std::fs::write(&path, "return {font={family='Consolas', size=19}}").unwrap();
+        for (tail, family, size) in [
+            (vec![], Some("Consolas"), Some(19.0)),
+            (vec!["--font-family=Other"], None, Some(19.0)),
+            (vec!["--font-size", "23"], Some("Consolas"), None),
+            (
+                vec!["-e", "echo", "--font-size=23", "--font-family=Other"],
+                Some("Consolas"),
+                Some(19.0),
+            ),
+        ] {
+            let mut args = vec!["ghostty".into(), format!("--lua-config={}", path.display())];
+            args.extend(tail.into_iter().map(str::to_owned));
+            let (_, _, _, _, reload) = super::prepare_with_reload(args, &mut Vec::new()).unwrap();
+            let loaded = reload.reload().unwrap();
+            assert_eq!(loaded.font_family.as_deref(), family);
+            assert_eq!(loaded.font_size, size);
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+    #[test]
+    fn reload_validates_before_replacing_config_and_keeps_old_callbacks_alive() {
+        let directory = std::env::temp_dir().join(format!(
+            "ghostty-reload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("ghostty.lua");
+        std::fs::write(
+            &path,
+            "return { actions = { Old = function(app) app:paste('old') end } }",
+        )
+        .unwrap();
+        let source = super::ReloadSource {
+            path: Some(path.clone()),
+            cli_theme: false,
+            cli_font_family: false,
+            cli_font_size: false,
+        };
+        let old = source.reload().unwrap();
+        std::fs::write(&path, "return { font = { size = -1 } }").unwrap();
+        assert!(source.reload().is_err());
+        std::fs::write(&path, "return { colors = {theme = 'Gruvbox Dark'}, actions = { New = function(app) app:paste('new') end }, keys = {{key='r', mods='CTRL|SHIFT', action='ReloadConfig'}} }").unwrap();
+        let new = source.reload().unwrap();
+        assert!(new.bindings.lua_action("Old").is_none());
+        assert!(new.bindings.lua_action("New").is_some());
+        assert_eq!(new.theme.as_deref(), Some("Gruvbox Dark"));
+        assert!(
+            matches!(&old.bindings.lua_action("Old").unwrap().callback.call_action(String::new()).unwrap()[0], crate::lua_callbacks::Command::Paste(text) if text == "old")
+        );
+        let entry = crate::actions::catalog(&new.bindings, false, false)
+            .into_iter()
+            .find(|entry| entry.action == crate::actions::AppAction::ReloadConfig)
+            .unwrap();
+        assert_eq!(entry.label, "Reload configuration");
+        assert_eq!(entry.shortcut.as_deref(), Some("Ctrl+Shift+R"));
+        assert!(entry.action.is_global());
+        std::fs::remove_file(&path).unwrap();
+        assert!(source.reload().is_err());
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
     #[test]
     fn theme_overrides_parse_and_validate_like_global_colors() {
         let config = parse(
@@ -704,7 +961,7 @@ mod tests {
             .call_action("selected text".into())
             .unwrap();
         assert!(
-            matches!(&commands[0], crate::picker::action::Command::ShowToast { title, message, duration_ms: 1500 } if title == "Saved" && message == "selected text")
+            matches!(&commands[0], crate::lua_callbacks::Command::ShowToast { title, message, duration_ms: 1500 } if title == "Saved" && message == "selected text")
         );
         assert_eq!(commands.len(), 1);
         for source in [
@@ -749,7 +1006,7 @@ mod tests {
             .call_action("echo café\nsecond line".into())
             .unwrap();
         assert!(
-            matches!(&commands[0], crate::picker::action::Command::ShowToast { title, .. } if title == "Snippet saved")
+            matches!(&commands[0], crate::lua_callbacks::Command::ShowToast { title, .. } if title == "Snippet saved")
         );
         assert_eq!(commands.len(), 1);
         let bytes = std::fs::read(&path).unwrap();
@@ -761,21 +1018,21 @@ mod tests {
         let commands = callback.call_action(String::new()).unwrap();
         assert_eq!(commands.len(), 1);
         assert!(
-            matches!(&commands[0], crate::picker::action::Command::ShowToast { message, .. } if message == "No text is selected")
+            matches!(&commands[0], crate::lua_callbacks::Command::ShowToast { title, message, .. } if title == "Save snippet" && message == "Select some text first.")
         );
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         std::fs::write(&path, "invalid JSON").unwrap();
         let commands = callback.call_action("keep selection".into()).unwrap();
         assert_eq!(commands.len(), 1);
         assert!(
-            matches!(&commands[0], crate::picker::action::Command::ShowToast { message, .. } if message.contains("Unable to parse"))
+            matches!(&commands[0], crate::lua_callbacks::Command::ShowToast { message, .. } if message.contains("Unable to parse"))
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "invalid JSON");
         std::fs::remove_file(&path).unwrap();
         let commands = callback.call_action("keep selection".into()).unwrap();
         assert_eq!(commands.len(), 1);
         assert!(
-            matches!(&commands[0], crate::picker::action::Command::ShowToast { message, .. } if message.contains("Unable to read"))
+            matches!(&commands[0], crate::lua_callbacks::Command::ShowToast { message, .. } if message.contains("Unable to read"))
         );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         std::fs::remove_dir(&directory).unwrap();
@@ -906,7 +1163,7 @@ mod tests {
             .callback()
             .unwrap();
         assert!(
-            matches!(&callback.call("file.txt", "file.txt", true, None, None, &Default::default()).unwrap()[0], crate::picker::action::Command::Paste(text) if text == "file.txt")
+            matches!(&callback.call("file.txt", "file.txt", true, None, None, &Default::default()).unwrap()[0], crate::lua_callbacks::Command::Paste(text) if text == "file.txt")
         );
         assert!(parse("return { pickers = { files = { action = 'invalid' } } }").is_err());
     }
@@ -925,10 +1182,10 @@ mod tests {
             .call("shown", "inserted", false, None, None, &params)
             .unwrap();
         assert!(
-            matches!(&commands[0], crate::picker::action::Command::SendText(text) if text == "\x08\x08\x1b[3~")
+            matches!(&commands[0], crate::lua_callbacks::Command::SendText(text) if text == "\x08\x08\x1b[3~")
         );
         assert!(
-            matches!(&commands[1], crate::picker::action::Command::Paste(text) if text == "inserted")
+            matches!(&commands[1], crate::lua_callbacks::Command::Paste(text) if text == "inserted")
         );
     }
 
@@ -977,7 +1234,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(&actions[0], crate::picker::action::Command::ReplacePrompt { text, before: 10, after: 0 } if text == "echo done")
+            matches!(&actions[0], crate::lua_callbacks::Command::ReplacePrompt { text, before: 10, after: 0 } if text == "echo done")
         );
         assert!(
             entry
@@ -1019,16 +1276,164 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(&commands[0], crate::picker::action::Command::SendText(text) if text == "\x08\x08\x1b[3~\x1b[3~")
+            matches!(&commands[0], crate::lua_callbacks::Command::SendText(text) if text == "\x08\x08\x1b[3~\x1b[3~")
         );
         assert!(
-            matches!(&commands[1], crate::picker::action::Command::SendText(text) if text == "nvim +42 'C:\\it''s here.txt'\r")
+            matches!(&commands[1], crate::lua_callbacks::Command::SendText(text) if text == "nvim +42 'C:\\it''s here.txt'\r")
         );
     }
     use super::*;
 
     fn parse(source: &str) -> Result<AppConfig, String> {
         AppConfig::parse(source, Path::new("test-config.lua"))
+    }
+
+    #[test]
+    fn builtin_picker_overrides_are_partial_and_validated() {
+        let config = parse("return { builtin_pickers = { line_break = { preview_visible = false, position = 'Center', result_rows = 5, preview_rows = 8 } } }").unwrap();
+        let settings = config.builtin_pickers.line_break;
+        assert_eq!(settings.preview_visible, Some(false));
+        assert_eq!(
+            settings.position,
+            Some(crate::picker::config::Position::Center)
+        );
+        assert_eq!(settings.result_rows, Some(5));
+        assert_eq!(settings.preview_rows, Some(8));
+        let partial =
+            parse("return { builtin_pickers = { line_break = { preview_visible = false } } }")
+                .unwrap();
+        assert!(partial.builtin_pickers.line_break.position.is_none());
+        assert!(
+            parse("return {}")
+                .unwrap()
+                .builtin_pickers
+                .line_break
+                .preview_visible
+                .is_none()
+        );
+        for source in [
+            "return { builtin_pickers = { unknown = {} } }",
+            "return { builtin_pickers = { line_break = { source = 'Items' } } }",
+            "return { builtin_pickers = { line_break = { result_rows = 0 } } }",
+            "return { builtin_pickers = { line_break = { preview_rows = 13 } } }",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn builtin_picker_defaults_overrides_factories_and_namespaces() {
+        let config = parse(r#"return {
+            builtin_pickers = {
+                themes = {position='Center'},
+                lines = {preview_visible=false},
+                words = function(context) return {initial_query=context.line_before_cursor, position='Cursor', action=function(app, item) app:replace_prompt(item.value, 2, 0) end} end,
+            },
+            pickers = {lines = {type='Items', items={{text='custom', value='custom'}}}},
+            keys = {{key='f', mods='CTRL', builtin_picker='lines'}, {key='p', builtin_picker='command_palette'}, {key='w', builtin_picker='words'}},
+        }"#).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+        let context = PickerContext {
+            line_before_cursor: "ab".into(),
+            ..Default::default()
+        };
+        let lines = bindings
+            .named("builtin.lines")
+            .unwrap()
+            .resolve(&context)
+            .unwrap();
+        assert!(!lines.preview_visible);
+        assert!(matches!(
+            lines.source,
+            crate::picker::config::Source::Scrollback { .. }
+        ));
+        assert!(matches!(
+            bindings
+                .named("lines")
+                .unwrap()
+                .resolve(&context)
+                .unwrap()
+                .source,
+            crate::picker::config::Source::Items(_)
+        ));
+        let words = bindings
+            .named("builtin.words")
+            .unwrap()
+            .resolve(&context)
+            .unwrap();
+        assert_eq!(words.params.get("query").map(String::as_str), Some("ab"));
+        assert!(words.callback.is_some());
+        assert!(matches!(
+            words.enter_action,
+            crate::picker::config::EnterAction::SendInput
+        ));
+        match words.source {
+            crate::picker::config::Source::Scrollback { regex, unique } => {
+                assert_eq!(regex.as_str(), r"\S+");
+                assert!(unique);
+            }
+            _ => panic!("word source"),
+        }
+        assert_eq!(
+            bindings
+                .named("builtin.themes")
+                .unwrap()
+                .resolve(&context)
+                .unwrap()
+                .position,
+            crate::picker::config::Position::Center
+        );
+        assert!(bindings.named("builtin.command_palette").is_some());
+        for source in [
+            "return {builtin_pickers={words={type='Items'}}}",
+            "return {builtin_pickers={words={regex='.*'}}}",
+            "return {pickers={['builtin.words']={}}}",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn config_file_compiles_and_resolves_builtin_pickers() {
+        // This also permits validating a migrated user config without launching
+        // the application or running command/item providers.
+        let source = match std::env::var_os("GHOSTTY_TEST_LUA_CONFIG") {
+            Some(path) => std::fs::read_to_string(path).unwrap(),
+            None => include_str!("../ghostty.lua").into(),
+        };
+        let config = parse(&source).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap()
+        .with_builtin_pickers(config.builtin_pickers);
+        let context = PickerContext {
+            line_before_cursor: "PS C:\\src> foo".into(),
+            ..Default::default()
+        };
+        for name in crate::picker::config::BUILTIN_NAMES {
+            bindings
+                .named(&format!("builtin.{name}"))
+                .unwrap()
+                .resolve(&context)
+                .unwrap();
+        }
+        assert!(
+            !bindings
+                .builtin_pickers
+                .line_break
+                .preview_visible
+                .unwrap_or(true)
+        );
     }
 
     #[test]
@@ -1716,7 +2121,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(&commands[0], crate::picker::action::Command::ReplacePrompt { text, before: 3, after: 0 } if text == "replacement")
+            matches!(&commands[0], crate::lua_callbacks::Command::ReplacePrompt { text, before: 3, after: 0 } if text == "replacement")
         );
     }
 

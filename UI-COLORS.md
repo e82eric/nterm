@@ -31,7 +31,7 @@ return {
 
 All sixteen roles in the table below accept `#RRGGBB` or `RRGGBB` strings. Omitted
 roles inherit derived values. Invalid strings/types or unknown roles reject the
-Lua configuration and appear in configuration Messages. Changes require restart.
+Lua configuration and appear in configuration Messages. Changes support manual config reload.
 Explicit overrides are applied exactly, without contrast correction.
 
 Background/text use resolved background/foreground. Panel, border, and muted
@@ -55,7 +55,8 @@ foreground because there is no individual terminal cell to resolve against.
 | success | Copied confirmation |
 | warning | Persistent configuration issue indicator |
 | error | Picker failures, invalid search, egui error text |
-| match_highlight | Picker matched characters, selected search match |
+| match_highlight | Selected search match; also the fallback for picker matched characters |
+| picker_match_highlight | Picker matched characters only; defaults to `match_highlight` when omitted |
 | search_match_background | Secondary search matches; defaults to ANSI yellow blended 30% into terminal background |
 | search_match_text | Text in secondary search matches; defaults to readable terminal foreground |
 | yank_background | Temporary copy-mode yank highlight background; defaults to theme ANSI magenta |

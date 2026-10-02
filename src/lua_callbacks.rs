@@ -1,3 +1,6 @@
+//! Lua callbacks and the queued Ghostty commands they produce.
+//! Shared by named actions, picker selections, item providers, and previews.
+
 use crate::ghostty_ffi::{SnapshotCell, SnapshotCellRange};
 use mlua::{Lua, LuaSerdeExt, RegistryKey, Table, UserData, UserDataMethods};
 use serde::Deserialize;
@@ -139,6 +142,30 @@ mod tests {
     }
 
     #[test]
+    fn toast_table_supports_optional_headers_and_rejects_invalid_options() {
+        let action = callback(
+            "return function(app) app:show_toast({message='Reloaded'}); app:show_toast({header='Reload failed', message='Invalid font size', duration_ms=5000}) end",
+        );
+        let commands = action.call_action(String::new()).unwrap();
+        assert!(
+            matches!(&commands[0], Command::ShowToast {title, message, duration_ms:2000} if title.is_empty() && message == "Reloaded")
+        );
+        assert!(
+            matches!(&commands[1], Command::ShowToast {title, message, duration_ms:5000} if title == "Reload failed" && message == "Invalid font size")
+        );
+        for args in [
+            "{message='x', duration_ms=0}",
+            "{message='x', duration_ms=60001}",
+            "{header='Missing message'}",
+            "{message='x', unexpected=true}",
+            "{message='x'}, 'extra'",
+        ] {
+            let action = callback(&format!("return function(app) app:show_toast({args}) end"));
+            assert!(action.call_action(String::new()).is_err(), "{args}");
+        }
+    }
+
+    #[test]
     fn closures_keep_state_and_queue_actions_in_order() {
         let callback = callback(
             "local count = 0; return function(app, item) count = count + 1; app:paste(item.path); app:send_text(tostring(count) .. '\\n') end",
@@ -268,22 +295,45 @@ impl UserData for App {
             }
             Ok(app.selection.clone())
         });
-        methods.add_method(
-            "show_toast",
-            |_, app, (title, message, duration): (String, String, Option<u64>)| {
-                let duration_ms = duration.unwrap_or(2000);
-                if !(1..=60000).contains(&duration_ms) {
+        methods.add_method("show_toast", |lua, app, args: mlua::MultiValue| {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ToastOptions {
+                #[serde(default)]
+                header: Option<String>,
+                message: String,
+                #[serde(default)]
+                duration_ms: Option<u64>,
+            }
+            let (title, message, duration) = if args.len() == 1
+                && matches!(args.iter().next(), Some(mlua::Value::Table(_)))
+            {
+                let options: ToastOptions = lua.from_value(args.into_iter().next().unwrap())?;
+                (
+                    options.header.unwrap_or_default(),
+                    options.message,
+                    options.duration_ms,
+                )
+            } else {
+                if !(2..=3).contains(&args.len()) {
                     return Err(mlua::Error::external(
-                        "toast duration must be between 1 and 60000 milliseconds",
+                        "show_toast expects an options table or title, message, optional duration",
                     ));
                 }
-                app.push(Command::ShowToast {
-                    title,
-                    message,
-                    duration_ms,
-                })
-            },
-        );
+                <(String, String, Option<u64>) as mlua::FromLuaMulti>::from_lua_multi(args, lua)?
+            };
+            let duration_ms = duration.unwrap_or(2000);
+            if !(1..=60000).contains(&duration_ms) {
+                return Err(mlua::Error::external(
+                    "toast duration must be between 1 and 60000 milliseconds",
+                ));
+            }
+            app.push(Command::ShowToast {
+                title,
+                message,
+                duration_ms,
+            })
+        });
         methods.add_method("paste", |_, app, text: String| {
             app.push(Command::Paste(text))
         });

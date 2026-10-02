@@ -2,6 +2,7 @@ use crate::picker::config::{BindingTarget, Bindings, KeyBinding};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppAction {
+    ReloadConfig,
     NewWindow,
     ShowMessages,
     OpenErrorLog,
@@ -23,6 +24,7 @@ pub(crate) enum AppAction {
 impl AppAction {
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         Some(match name {
+            "ReloadConfig" => Self::ReloadConfig,
             "NewWindow" => Self::NewWindow,
             "ShowMessages" => Self::ShowMessages,
             "OpenErrorLog" => Self::OpenErrorLog,
@@ -43,6 +45,7 @@ impl AppAction {
         matches!(
             self,
             Self::NewWindow
+                | Self::ReloadConfig
                 | Self::ShowMessages
                 | Self::OpenErrorLog
                 | Self::ShowErrorRecord(_)
@@ -151,6 +154,12 @@ pub(crate) struct Entry {
 pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
     for (id, label, action, available) in [
+        (
+            "config.reload",
+            "Reload configuration",
+            AppAction::ReloadConfig,
+            true,
+        ),
         ("window.new", "New window", AppAction::NewWindow, true),
         (
             "errors.open",
@@ -225,7 +234,12 @@ pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) ->
     }
     entries.extend(bindings.palette_entries().map(|(name, shortcut)| Entry {
         id: format!("picker.{name}"),
-        label: format!("Open picker: {name}"),
+        label: match name {
+            "builtin.themes" => "Choose theme".into(),
+            "builtin.lines" => "Pick scrollback line".into(),
+            "builtin.words" => "Pick scrollback word".into(),
+            _ => format!("Open picker: {name}"),
+        },
         shortcut,
         action: AppAction::OpenPicker(name.to_owned()),
     }));
@@ -240,7 +254,7 @@ pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) ->
 
 pub(crate) struct LuaAction {
     pub(crate) label: String,
-    pub(crate) callback: std::rc::Rc<crate::picker::action::Callback>,
+    pub(crate) callback: std::rc::Rc<crate::lua_callbacks::Callback>,
 }
 
 #[cfg(test)]

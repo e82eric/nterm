@@ -11,6 +11,12 @@ zig build egui-sample -Doptimize=ReleaseFast
 .\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
 ```
 
+Windows builds compile the bundled `xterm-ghostty` terminfo database using
+`tic` from Git for Windows or PATH. For another installation, pass
+`-Dterminfo-compiler="C:/path/to/tic.exe"`. The app sets `TERM`, `COLORTERM`,
+and an MSYS-compatible `TERMINFO` path for its shell, so Git's `less` can
+recognize the terminal without a PowerShell override.
+
 To build and deploy the Windows sample to another directory:
 
 ```powershell
@@ -70,7 +76,7 @@ are rejected. Rust evaluates Lua once, validates the settings, and translates th
 into Ghostty configuration arguments. Ghostty's normal configuration files remain
 the base; Lua overrides them, and explicit command-line options override Lua.
 The picker still imports Ghostty's resolved font and tracks its cell dimensions.
-Changes to Lua require restarting the app; live reload is not supported.
+Use the command palette's Reload configuration action to apply supported Lua settings.
 
 The UI follows Ghostty's resolved theme colors. Optional `colors.ui` overrides
 take precedence for app chrome without changing terminal colors:
@@ -93,6 +99,11 @@ overrides are applied, followed by `theme_colors` overrides for that exact,
 case-sensitive theme name. This applies at startup and when selecting a theme;
 switching to another theme removes the previous theme's overrides. These
 overrides affect app chrome and UI decorations, not terminal ANSI colors.
+
+Set `colors.ui.picker_match_highlight` to color the matched characters in picker
+results independently of the selected terminal search match (`match_highlight`).
+It accepts `#RRGGBB`, supports `theme_colors` and manual reload, and falls back to
+`match_highlight` when omitted.
 
 Use **Choose theme** in the command palette to search installed user and bundled
 Ghostty themes in the shared fuzzy picker. Arrow keys select an entry; Enter or clicking a theme applies it. Escape
@@ -119,6 +130,23 @@ Add these entries to the tables in your config. Named theme pickers also support
 `OpenThemePicker` action keeps its centered placement.
 
 ## Lua actions and toasts
+
+All Ghostty pickers now embed the shared `nfm-egui` control used by
+SimpleWindowManager. It owns result rows, query input, streaming search, structured
+headers, `/` completion, keybinding help, and preview drawing. Ghostty supplies
+its existing Lua sources/actions, owned scrollback cell ranges, preview documents,
+theme colors, and exported terminal fonts and cell metrics. Main and floating
+pane bounds determine compact sizing and placement; inactive pane pickers cannot
+consume input or steal focus. Existing picker definitions and OSC requests remain
+supported. Ctrl+P/Ctrl+Space toggle previews, Ctrl+Page Up/Down page previews,
+Ctrl+C copies the selected row, and Ctrl+Shift+/ opens keybinding help.
+
+Preview parsing uses NFM's `nfm-preview-vt` crate and the standalone VT library
+produced by this Ghostty build. Zig supplies its include/library paths; direct
+Cargo builds from this repository or the sample directory use `.cargo/config.toml`.
+Build the native libraries first with `zig build egui-sample`. Explicit
+`NFM_GHOSTTY_VT_INCLUDE_DIR`, `NFM_GHOSTTY_VT_LIB_DIR`, and
+`NFM_GHOSTTY_VT_LIB_NAME` environment variables can select another VT build.
 
 Recoverable errors and fallback warnings are retained in a session history
 (200 records, 16 KiB details per record). Repeated failures aggregate. They also
@@ -170,6 +198,21 @@ keys = {
 ```
 
 An action may also be defined directly as a function; its name becomes its label.
+Toasts also accept an options table with an optional header:
+
+```lua
+app:show_toast({ message = "Configuration reloaded", duration_ms = 2000 })
+app:show_toast({ header = "Reload failed", message = "Invalid font size", duration_ms = 5000 })
+```
+
+Omitting `header` creates a compact message-only toast. Headers use the theme's
+accent color above the body; built-in errors use the error color. Both use the
+terminal font at 14 px, with bold headers, additional line spacing, and a maximum
+text width of 420 px. Long notifications are truncated to fit the pane, up to
+seven lines; full built-in error details remain in error history. Repeating the
+same notification refreshes it instead of adding another card. The existing positional form continues
+to work, with its title displayed as the header; an empty title omits it.
+
 `get_selection_text()` returns the active pane's live selection or copy-mode
 visual selection, and returns an empty string if none exists. Toast duration is in milliseconds
 (default 2000, allowed range 1–60000). Toasts use the picker's `Cursor` placement
@@ -201,12 +244,53 @@ The default, `sort = "Source"`, preserves source order while filtering. Use
 `"Source"`. Source order means input order for Items and Command, catalog order
 for CommandPalette, newest-first for Scrollback, and scan order for FileSystem.
 
+## Splitting a scrollback result
+
+In a scrollback picker, **Ctrl+B** opens searchable pieces of the selected
+result's first physical row. **Alt+Left** returns to the original source and
+query; Escape closes the picker. Enter inserts the selected piece into the
+terminal, and Ctrl+C copies it. These shortcuts appear in picker help.
+
+In copy mode, **Ctrl+B** opens the same line-split picker for the copy cursor's
+current physical row. Escape returns to copy mode with the cursor preserved;
+Enter inserts the selected piece and exits copy mode. This entry point reuses
+the frozen copy-mode snapshot and does not scan the full scrollback.
+
+The shared `nfm-picker-sources::line_split` extractor prioritizes fixed-width
+table fields and quoted/bracketed values before whitespace tokens and path/URL
+components. It supports nested brackets, escaped and doubled quotes, and
+punctuation-trimmed alternatives. Table detection samples up to ten neighboring
+physical rows on either side and requires consistent gutters in at least three
+rows. One-cell gutters also require an aligned next field and varying occupied
+width of the preceding value; short detected fields such as `0` remain selectable.
+Payloads preserve grapheme cell ranges for preview highlights.
+Common PowerShell/debugger prompt prefixes are excluded by pattern; this adapter
+does not yet use semantic prompt ranges. Soft-wrapped rows are split individually.
+
 ## Command palette
 
 The command palette is a named picker with `type = "CommandPalette"`. The default
 configuration and sample bind it to **Ctrl+Shift+Space**. Type to filter actions,
 use the arrow keys to select one, and press Enter to run it. Escape closes the
 palette and preserves the terminal's current copy mode and cursor.
+
+Choose **Reload configuration** to reread the Lua configuration without restarting.
+Picker definitions, Lua actions, keybindings, UI colors, terminal and picker fonts, the configured theme, and
+floating-pane padding update after validation. A failed reload reports an error
+and keeps the previous configuration. Existing pickers retain their Lua callbacks
+until closed; subsequently opened pickers use the new definitions. Removing a UI
+color override restores the active theme's color. Explicit command-line theme
+settings retain precedence, as do command-line font family and size settings.
+Ghostty preserves a font size adjusted with its zoom actions until the size is reset.
+Omitted font settings retain their current values. Shell command and scrollback-limit changes
+require restarting the application. This action does not reload Ghostty's native
+configuration files or watch for file changes.
+
+The action is always listed, even without a shortcut. To bind it in Lua:
+
+```lua
+keys = { { key = "r", mods = "CTRL|SHIFT", action = "ReloadConfig" } }
+```
 
 Palette entries use NFM's structured store with aligned `Action` and `Shortcut`
 columns. Ordinary text uses fuzzy matching; structured queries can filter or sort
@@ -427,6 +511,55 @@ colors and text attributes and highlighting the match. The row count can be
 Set `preview_visible = false` on any picker definition to start with its
 preview hidden. The default is `true`. While the picker is open, Ctrl+P
 toggles the preview, and Ctrl+PageUp or Ctrl+PageDown scrolls it by half a page.
+
+Built-in picker presentation can be overridden separately from custom `pickers`:
+
+```lua
+builtin_pickers = {
+    themes = { position = "Cursor", sort = "Score" },
+    command_palette = { position = "Cursor", preview_visible = false },
+    lines = { preview_visible = true },
+    words = { preview_visible = false },
+    line_break = {
+        preview_visible = false,
+        -- position = "Center",
+        -- result_rows = 7,
+        -- preview_rows = 12,
+    },
+},
+```
+
+Bind these directly with `builtin_picker`, independently of custom picker names:
+
+```lua
+keys = {
+    { key = "f", mods = "CTRL|SHIFT", builtin_picker = "lines" },
+    { key = "p", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
+    { key = ".", mods = "CTRL|SHIFT", builtin_picker = "words" },
+}
+```
+
+Themes, command palette, lines, and words always exist, even when omitted from
+the config. Their overrides accept the corresponding picker options except
+`type` and `regex`, which are built in. The source defaults are Themes,
+CommandPalette, nonblank logical lines/Navigate, and unique `\S+` words/SendInput.
+Lines preview starts visible; words preview starts hidden. Theme and command
+palette pickers default to Cursor position with previews hidden. A built-in
+override may also be a function of the same cursor context as custom picker
+factories; its returned table is merged with defaults each time it opens.
+For example, a words factory can seed `initial_query` and install a callback
+to replace the word before the cursor. Existing custom `pickers` remain supported.
+`picker = "words"` references a custom picker, while `builtin_picker = "words"`
+references the built-in. Names beginning with `builtin.` are reserved; internal
+names such as `builtin.words` also identify built-ins in the command palette.
+
+These are partial overrides: omitted line break values use the defaults (Bottom,
+seven result rows, twelve preview rows, preview visible). `line_break` applies to
+Ctrl+B in copy mode and in scrollback pickers. Alt+Left restores the parent
+picker's position and preview state. Ctrl+P still toggles the line break preview.
+Result rows must be 1–256 and preview rows 1–12. Source and selection behavior
+remain built in; unknown picker names or fields are rejected. Manual config
+reload applies these settings to subsequent line break openings.
 Unmodified arrow and page keys continue to navigate the results.
 
 A picker may override `enter_action` with a Lua callback:
@@ -719,3 +852,25 @@ terminal.
 
 The native C Win32 sample remains available through
 `zig build win32-sample -Doptimize=ReleaseFast`.
+
+## Shared byte preview ownership
+
+Text and ANSI picker previews now use NFM's complete-document byte API.
+Scrollback previews use `nfm_egui::byte_preview::ByteSource::Paged`: NFM owns
+centering, half-page scrolling, parsing, clipping and selected-range highlights.
+Ghostty supplies only the requested styled snapshot rows at the original
+terminal width. A guarded `SnapshotPreview` lease drains active reads before
+Ghostty releases the frozen snapshot. Command/Lua previews resolve an owned
+command specification on the Lua UI thread. NFM's shared command executor runs
+it with concurrent bounded stdout/stderr reads and cancellation, then retains
+the output through the complete-document API. Ghostty owns no preview worker,
+ANSI parser, page cache or half-page scrolling state.
+
+Command picker candidates use `nfm_picker_sources::command`, backed by the same
+shared command executor in streaming mode. NFM handles pipe reads, newline and
+continuation records, deduplication, accepted values, cancellation, exit codes
+and incremental snapshot publication. Ghostty's `picker/command.rs` only
+resolves config/request parameters and connects repaint/error reporting.
+Completed records appear while the command is still running. Total candidate
+output is not subject to preview byte limits; individual physical lines and
+joined continuation records are limited to 4 MiB, and retained stderr to 16 KiB.

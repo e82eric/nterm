@@ -8,6 +8,7 @@ mod copy_mode;
 mod error_log;
 mod ghostty_ffi;
 mod input;
+mod lua_callbacks;
 mod messages;
 mod native_error;
 mod painter;
@@ -67,11 +68,11 @@ fn run() -> Result<(), native_error::FatalError> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (args, pickers, floating_padding, ui_colors) =
-        config::prepare(arguments, &mut issues).fatal("read startup arguments")?;
+    let (args, pickers, floating_padding, ui_colors, reload_source) =
+        config::prepare_with_reload(arguments, &mut issues).fatal("read startup arguments")?;
     let args = encode_args(args)?;
     crate::colors::COLORS.configure(ui_colors);
-    app::run(args, pickers, floating_padding, issues)
+    app::run(args, pickers, floating_padding, issues, reload_source)
 }
 
 #[cfg(test)]

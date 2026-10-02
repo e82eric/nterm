@@ -771,6 +771,7 @@ dependencies = [
  "glutin",
  "glutin-winit",
  "mlua",
+ "nfm-egui",
  "nfm-picker-sources",
  "nfm_file_system",
  "nfm_search_core",
@@ -778,6 +779,7 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1253,14 +1255,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "nfm-egui"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "egui",
+ "nfm-preview-command",
+ "nfm-preview-vt",
+ "nfm_search_core",
+]
+
+[[package]]
 name = "nfm-picker-sources"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "csv",
+ "nfm-preview-command",
  "nfm_search_core",
  "regex",
  "serde",
+]
+
+[[package]]
+name = "nfm-preview-command"
+version = "0.1.0"
+
+[[package]]
+name = "nfm-preview-vt"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -2318,6 +2343,12 @@ name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+
+[[package]]
+name = "unicode-width"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "uuid"

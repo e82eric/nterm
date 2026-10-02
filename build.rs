@@ -7,7 +7,6 @@ fn main() {
 
     cc::Build::new()
         .file("src/ghostty_shim.c")
-        .file("src/picker/preview_vt.c")
         .include(root.join("include"))
         .warnings(true)
         .compile("ghostty_egui_shim");
@@ -17,12 +16,10 @@ fn main() {
         root.join("zig-out/lib").display()
     );
     println!("cargo:rustc-link-lib=dylib=ghostty");
-    println!("cargo:rustc-link-lib=static=ghostty-vt-static");
     if cfg!(target_family = "unix") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
     }
     println!("cargo:rerun-if-changed=src/ghostty_shim.c");
-    println!("cargo:rerun-if-changed=src/picker/preview_vt.c");
     println!(
         "cargo:rerun-if-changed={}",
         root.join("include/ghostty.h").display()
