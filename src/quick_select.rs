@@ -1,7 +1,7 @@
-use crate::copy_mode::TextRow;
 use crate::ghostty_ffi::{
     SnapshotCell, SnapshotCellRange, SnapshotCellText, SnapshotDecorationStyle, SnapshotView,
 };
+use nfm_egui::copy_mode::TextRow;
 use regex::Regex;
 use std::sync::OnceLock;
 

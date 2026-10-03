@@ -88,6 +88,10 @@ and 412/892/1163 MiB for Vulkan. Lower resident RAM therefore does not imply
 lower commitment in every scenario. Results vary with driver, window size,
 terminal content, and configuration.
 
+Copy mode uses the shared `nfm-egui::copy_mode` engine. Ghostty supplies native
+terminal snapshots, rendering, search workers, clipboard operations, and
+terminal-specific actions such as hint yank and line splits.
+
 Copy mode borrows the live terminal until its first guarded mutation. At that
 point it captures independently owned compressed history before applying the
 mutation. Search and text extraction decode one page into temporary storage;
@@ -975,7 +979,7 @@ yet expand existing selections as Vim does.
 <kbd>yic</kbd>/<kbd>yac</kbd> copy a command's output or the prompt and output
 using prompt regexes over the frozen scrollback. The four patterns copied
 from the reference WezTerm configuration are hardcoded in
-`src/copy_mode.rs` for now, with Lua configuration planned for later.
+`nfm-egui/src/copy_mode.rs` for now, with Lua configuration planned for later.
 Like WezTerm, a command block ends immediately before the next matching
 prompt line. Text that resembles a prompt can create a false boundary.
 Every successful yank briefly highlights the copied cells for 250 ms; a new

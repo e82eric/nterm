@@ -1,14 +1,4 @@
 use crate::app::UserEvent;
-use crate::copy_mode::{
-    CopyAction, CopyMode, CopySelection, CopyTextObject, Jump, Motion, MotionEvaluation,
-    MotionResult, SCROLL_PADDING_ROWS, TextRow, ViewportPosition, VisualMode, WordObject,
-    YANK_HIGHLIGHT_DURATION, YankCommand, find_prompt_boundaries, word_search_pattern,
-};
-#[cfg(test)]
-use crate::copy_mode::{
-    copy_digit, copy_jump_prefix, copy_motion, copy_motion_with_prefix, copy_scroll_direction,
-    copy_text_object_key, copy_viewport_position_key, is_copy_modifier_key,
-};
 use crate::ghostty_ffi::{
     self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
     SnapshotDecorationStyle, SnapshotTextRow, SnapshotView, SnapshotViewportOptions,
@@ -18,6 +8,16 @@ use crate::input;
 use crate::painter::TerminalPainter;
 use crate::quick_select::{self, Purpose as QuickSelectPurpose, QuickSelect};
 use crate::search::{SearchUi, SearchWorker};
+use nfm_egui::copy_mode::{
+    CopyAction, CopyMode, CopySelection, CopyTextObject, Jump, Motion, MotionEvaluation,
+    MotionResult, SCROLL_PADDING_ROWS, TextRow, ViewportPosition, VisualMode, WordObject,
+    YANK_HIGHLIGHT_DURATION, YankCommand, find_prompt_boundaries, word_search_pattern,
+};
+#[cfg(test)]
+use nfm_egui::copy_mode::{
+    copy_digit, copy_jump_prefix, copy_motion, copy_motion_with_prefix, copy_scroll_direction,
+    copy_text_object_key, copy_viewport_position_key, is_copy_modifier_key,
+};
 use std::ffi::{c_char, c_void};
 use std::sync::{
     Arc,
@@ -2443,7 +2443,7 @@ impl TerminalPane {
                 top = top.min(max_top);
             }
         }
-        crate::copy_mode::rectangle_row_ranges(range, top, height)
+        nfm_egui::copy_mode::rectangle_row_ranges(range, top, height)
     }
 
     fn copy_text_object_selection(
@@ -2809,38 +2809,38 @@ mod copy_shortcut_tests {
         };
         assert!(matches!(
             copy_motion(egui::Key::H, shift),
-            Some(crate::copy_mode::Motion::ViewportTop)
+            Some(nfm_egui::copy_mode::Motion::ViewportTop)
         ));
         assert!(matches!(
             copy_motion(egui::Key::M, shift),
-            Some(crate::copy_mode::Motion::ViewportMiddle)
+            Some(nfm_egui::copy_mode::Motion::ViewportMiddle)
         ));
         assert!(matches!(
             copy_motion(egui::Key::L, shift),
-            Some(crate::copy_mode::Motion::ViewportBottom)
+            Some(nfm_egui::copy_mode::Motion::ViewportBottom)
         ));
         assert!(matches!(
             copy_motion(egui::Key::PageUp, egui::Modifiers::NONE),
-            Some(crate::copy_mode::Motion::PageUp)
+            Some(nfm_egui::copy_mode::Motion::PageUp)
         ));
         assert!(matches!(
             copy_motion(egui::Key::PageDown, egui::Modifiers::NONE),
-            Some(crate::copy_mode::Motion::PageDown)
+            Some(nfm_egui::copy_mode::Motion::PageDown)
         ));
         assert!(matches!(
             copy_motion(egui::Key::U, ctrl),
-            Some(crate::copy_mode::Motion::HalfPageUp)
+            Some(nfm_egui::copy_mode::Motion::HalfPageUp)
         ));
         assert!(matches!(
             copy_motion(egui::Key::D, ctrl),
-            Some(crate::copy_mode::Motion::HalfPageDown)
+            Some(nfm_egui::copy_mode::Motion::HalfPageDown)
         ));
         assert!(copy_motion(egui::Key::H, ctrl).is_none());
     }
 
     #[test]
     fn text_motion_keys_are_copy_mode_only() {
-        use crate::copy_mode::Motion;
+        use nfm_egui::copy_mode::Motion;
         let shift = egui::Modifiers {
             shift: true,
             ..Default::default()
@@ -2903,7 +2903,7 @@ mod copy_shortcut_tests {
 
     #[test]
     fn gg_prefix_moves_to_scrollback_top_and_other_keys_cancel_it() {
-        use crate::copy_mode::{CopyMode, Motion};
+        use nfm_egui::copy_mode::{CopyMode, Motion};
         let mut mode = CopyMode::default();
         assert_eq!(
             copy_motion_with_prefix(&mut mode, egui::Key::G, egui::Modifiers::NONE),
@@ -2928,7 +2928,7 @@ mod copy_shortcut_tests {
 
     #[test]
     fn next_copy_motions_and_digits_have_distinct_bindings() {
-        use crate::copy_mode::{CopyMode, Motion};
+        use nfm_egui::copy_mode::{CopyMode, Motion};
         let shift = egui::Modifiers {
             shift: true,
             ..Default::default()

@@ -7,7 +7,6 @@ mod actions;
 mod app;
 mod colors;
 mod config;
-mod copy_mode;
 mod error_log;
 mod ghostty_ffi;
 mod graphics;

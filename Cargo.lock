@@ -1441,6 +1441,9 @@ dependencies = [
  "nfm-preview-command",
  "nfm-preview-vt",
  "nfm_search_core",
+ "regex",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

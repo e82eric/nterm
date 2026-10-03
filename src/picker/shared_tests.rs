@@ -447,7 +447,7 @@ fn snapshot_byte_mapping_becomes_grapheme_cell_ranges() {
     let text = "界e\u{301}x ".to_owned();
     let columns = vec![0, 0, 0, 2, 2, 2, 3, 4];
     assert_eq!(text.len(), columns.len());
-    let row = crate::copy_mode::TextRow {
+    let row = nfm_egui::copy_mode::TextRow {
         text,
         columns,
         wraps_to_next: false,
@@ -472,7 +472,7 @@ fn final_line_split_grapheme_does_not_include_unoccupied_trailing_cells() {
             16,
         ),
     ] {
-        let row = crate::copy_mode::TextRow {
+        let row = nfm_egui::copy_mode::TextRow {
             text: text.into(),
             columns,
             wraps_to_next: false,
@@ -491,7 +491,7 @@ fn final_line_split_grapheme_does_not_include_unoccupied_trailing_cells() {
 #[test]
 fn line_split_word_before_distant_exported_whitespace_has_exact_range() {
     for suffix in [" ", "\n"] {
-        let row = crate::copy_mode::TextRow {
+        let row = nfm_egui::copy_mode::TextRow {
             text: format!("filename.txt{suffix}"),
             columns: (20..32).chain(std::iter::once(159)).collect(),
             wraps_to_next: false,

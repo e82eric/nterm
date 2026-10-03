@@ -1,6 +1,6 @@
 use super::{Items, command, config};
-use crate::copy_mode::TextRow;
 use crate::ghostty_ffi::{self, Host, SnapshotCell, SnapshotCellRange};
+use nfm_egui::copy_mode::TextRow;
 use nfm_picker_sources::structured::{
     StructuredSchema, StructuredStreamingSnapshot, StructuredStreamingStore,
 };

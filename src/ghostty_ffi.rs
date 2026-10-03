@@ -77,28 +77,31 @@ pub(crate) struct GlFrame {
     pub(crate) frame_generation: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SnapshotCell {
-    pub(crate) x: u32,
-    pub(crate) y: u64,
-}
+// Shared copy-mode types have a C layout matching the native snapshot ABI.
+pub(crate) use nfm_egui::copy_mode::{
+    CellPosition as SnapshotCell, CellRange as SnapshotCellRange, View as SnapshotView,
+};
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SnapshotView {
-    pub(crate) cursor: SnapshotCell,
-    pub(crate) viewport_top: u64,
-    pub(crate) total_rows: u64,
-    pub(crate) viewport_rows: u32,
-    pub(crate) columns: u32,
-}
+#[cfg(all(test, target_pointer_width = "64"))]
+mod copy_mode_abi_tests {
+    use super::{SnapshotCell, SnapshotCellRange, SnapshotView};
+    use std::mem::{align_of, offset_of, size_of};
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SnapshotCellRange {
-    pub(crate) start: SnapshotCell,
-    pub(crate) end: SnapshotCell,
+    #[test]
+    fn shared_copy_types_match_native_snapshot_layout() {
+        assert_eq!(size_of::<SnapshotCell>(), 16);
+        assert_eq!(align_of::<SnapshotCell>(), 8);
+        assert_eq!(offset_of!(SnapshotCell, x), 0);
+        assert_eq!(offset_of!(SnapshotCell, y), 8);
+        assert_eq!(size_of::<SnapshotCellRange>(), 32);
+        assert_eq!(offset_of!(SnapshotCellRange, end), 16);
+        assert_eq!(size_of::<SnapshotView>(), 40);
+        assert_eq!(offset_of!(SnapshotView, cursor), 0);
+        assert_eq!(offset_of!(SnapshotView, viewport_top), 16);
+        assert_eq!(offset_of!(SnapshotView, total_rows), 24);
+        assert_eq!(offset_of!(SnapshotView, viewport_rows), 32);
+        assert_eq!(offset_of!(SnapshotView, columns), 36);
+    }
 }
 
 #[repr(C)]

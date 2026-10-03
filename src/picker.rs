@@ -490,7 +490,7 @@ impl Drop for Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::copy_mode::TextRow;
+    use nfm_egui::copy_mode::TextRow;
     use nfm_search_core::{
         fuzzy_search_session::FuzzySearchSession, snapshot_store::SnapshotStore,
         store::PublishingStreamingItemStoreWithPayload,
