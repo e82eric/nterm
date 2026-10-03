@@ -3,15 +3,25 @@ use crate::presentation::Presentation;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[cfg_attr(feature = "vulkan", path = "app/vulkan_ui.rs")]
 mod shared_ui;
+#[cfg(feature = "vulkan")]
+mod vulkan_window;
+use crate::graphics as glow;
 use crate::terminal::TerminalView;
 use egui_winit::winit;
+#[cfg(not(feature = "vulkan"))]
 use glow::HasContext as _;
 use shared_ui::{SharedUi, WindowUi};
-use std::ffi::{CString, c_char, c_void};
+#[cfg(not(feature = "vulkan"))]
+use std::ffi::c_void;
+use std::ffi::{CString, c_char};
+#[cfg(not(feature = "vulkan"))]
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
+#[cfg(feature = "vulkan")]
+use vulkan_window::{GlutinWindowContext, GlutinWindowSurface};
 
 pub(crate) fn run(
     args: Vec<CString>,
@@ -254,6 +264,7 @@ impl NativeWindow {
         }
         let presented = !paced && self.presentation.ready(now);
         if presented {
+            #[cfg(not(feature = "vulkan"))]
             unsafe {
                 let background = crate::colors::palette().background;
                 self.gl.clear_color(
@@ -266,9 +277,9 @@ impl NativeWindow {
             }
             self.shared_ui
                 .borrow_mut()
-                .finish_output(output, Some(self.gl_window.window().inner_size().into()));
+                .finish_output(output, Some(self.gl_window.window().inner_size().into()))?;
         } else {
-            self.shared_ui.borrow_mut().finish_output(output, None);
+            self.shared_ui.borrow_mut().finish_output(output, None)?;
             shell.terminal.poll_retired(&self.gl);
         }
         self.presentation
@@ -568,6 +579,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
     }
 }
 
+#[cfg(not(feature = "vulkan"))]
 struct GlutinWindowContext {
     // Release the DC/surface before the hidden native window.
     surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
@@ -616,6 +628,7 @@ fn prefer_rounded_corners(hwnd: *mut std::ffi::c_void) {
     }
 }
 
+#[cfg(not(feature = "vulkan"))]
 impl GlutinWindowContext {
     unsafe fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> Result<Self, FatalError> {
         use glutin::context::NotCurrentGlContext as _;
@@ -753,12 +766,14 @@ impl GlutinWindowContext {
 }
 
 /// Every window has a drawable surface, all using the same UI GL context.
+#[cfg(not(feature = "vulkan"))]
 struct GlutinWindowSurface {
     surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
     window: winit::window::Window,
     graphics: Rc<GlutinWindowContext>,
 }
 
+#[cfg(not(feature = "vulkan"))]
 impl GlutinWindowSurface {
     unsafe fn new(
         event_loop: &winit::event_loop::ActiveEventLoop,

@@ -5,6 +5,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#ifdef GHOSTTY_EGUI_VULKAN
+#define GHOSTTY_EGUI_PLATFORM GHOSTTY_PLATFORM_WGPU
+#else
+#define GHOSTTY_EGUI_PLATFORM GHOSTTY_PLATFORM_OPENGL
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -239,7 +244,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
     ghostty_config_free(config);
 
     ghostty_surface_config_s options = ghostty_surface_config_new();
-    options.platform_tag = GHOSTTY_PLATFORM_OPENGL;
+    options.platform_tag = GHOSTTY_EGUI_PLATFORM;
     options.platform.opengl.window = window;
     options.platform.opengl.display = display;
     options.platform.opengl.context = context;
@@ -304,7 +309,7 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
         return NULL;
     }
     ghostty_surface_config_s options = ghostty_surface_config_new();
-    options.platform_tag = GHOSTTY_PLATFORM_OPENGL;
+    options.platform_tag = GHOSTTY_EGUI_PLATFORM;
     options.platform.opengl = parent->platform;
     if (window) {
         options.platform.opengl.window = window;
@@ -434,8 +439,13 @@ void ghostty_egui_host_focus(GhosttyEguiHost *host, bool focused) {
     runtime_error(host, "set terminal app focus");
     ghostty_surface_set_focus(host->surface, focused);
  runtime_error(host, "ghostty_egui_host_focus"); }
+#ifdef GHOSTTY_EGUI_VULKAN
+bool ghostty_egui_host_take_frame(GhosttyEguiHost *host, ghostty_gpu_frame_s *frame) {
+    bool succeeded = ghostty_surface_take_gpu_frame(host->surface, frame);
+#else
 bool ghostty_egui_host_take_frame(GhosttyEguiHost *host, ghostty_gl_frame_s *frame) {
     bool succeeded = ghostty_surface_take_gl_frame(host->surface, frame);
+#endif
     runtime_error(host, "acquire terminal frame");
     return succeeded;
 }

@@ -13,6 +13,7 @@ options = argparse.ArgumentParser(description=__doc__)
 options.add_argument('--memory-report', type=Path)
 options.add_argument('--shell', default='cmd.exe')
 options.add_argument('--executable', default='zig-out/bin/ghostty_egui.exe')
+options.add_argument('--terminal-arg', action='append', default=[])
 options = options.parse_args()
 memory_samples = {}
 
@@ -67,7 +68,13 @@ def sample_memory(label, expected_shells):
         raise c.WinError(c.get_last_error())
     try:
         time.sleep(2)
-        shells, threads = process_counts()
+        deadline = time.monotonic() + 10
+        while True:
+            assert process.poll() is None, f'App exited: {process.returncode}'
+            shells, threads = process_counts()
+            if shells == expected_shells or time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
         assert shells == expected_shells, f'{label}: expected {expected_shells} shells, got {shells}'
         samples = []
         for _ in range(5):
@@ -83,10 +90,17 @@ def sample_memory(label, expected_shells):
             time.sleep(0.1)
         memory_samples[label] = {name: statistics.median((sample[name] for sample in samples)) for name in samples[0]}
         memory_samples[label].update(shells=shells, threads=threads)
+        sizes = []
+        for hwnd in windows():
+            rect = w.RECT()
+            u.GetClientRect(hwnd, c.byref(rect))
+            sizes.append([rect.right, rect.bottom])
+        memory_samples[label]['window_sizes'] = sorted(sizes)
         print('MEMORY:', label, memory_samples[label], flush=True)
     finally:
         kernel.CloseHandle(handle)
 u = c.WinDLL('user32', use_last_error=True)
+u.SetProcessDPIAware()
 u.GetForegroundWindow.restype = w.HWND
 u.SetForegroundWindow.argtypes = [w.HWND]
 u.BringWindowToTop.argtypes = [w.HWND]
@@ -97,6 +111,7 @@ u.GetWindowTextW.argtypes = [w.HWND, w.LPWSTR, c.c_int]
 u.IsWindowVisible.argtypes = [w.HWND]
 u.ShowWindow.argtypes = [w.HWND, c.c_int]
 u.SetWindowPos.argtypes = [w.HWND, w.HWND, c.c_int, c.c_int, c.c_int, c.c_int, w.UINT]
+u.GetClientRect.argtypes = [w.HWND, c.POINTER(w.RECT)]
 u.keybd_event.argtypes = [w.BYTE, w.BYTE, w.DWORD, c.c_size_t]
 callback_type = c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
 u.EnumWindows.argtypes = [callback_type, w.LPARAM]
@@ -107,7 +122,7 @@ log = tempfile.TemporaryFile()
 startup = subprocess.STARTUPINFO()
 startup.dwFlags = subprocess.STARTF_USESHOWWINDOW
 startup.wShowWindow = 0
-process = subprocess.Popen([options.executable, '--command=' + options.shell], env=env, stderr=log, startupinfo=startup)
+process = subprocess.Popen([options.executable, '--command=' + options.shell, *options.terminal_arg], env=env, stderr=log, startupinfo=startup)
 
 def windows():
     result = []
@@ -124,8 +139,8 @@ def windows():
     u.EnumWindows(visit, 0)
     return result
 
-def wait_count(count):
-    deadline = time.monotonic() + 15
+def wait_count(count, timeout=15):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         assert process.poll() is None, f'App exited: {process.returncode}'
         found = windows()
@@ -168,14 +183,26 @@ def shortcut(hwnd, key):
     for vk in (key, 16, 17):
         u.keybd_event(vk, 0, 2, 0)
     time.sleep(0.5)
+
+def open_window(hwnd, count):
+    # A tiling manager can move focus again after SetForegroundWindow. Retry
+    # only while no window has opened, so a delayed shortcut cannot duplicate it.
+    for attempt in range(3):
+        shortcut(hwnd, ord('N'))
+        try:
+            return wait_count(count, 5)
+        except AssertionError:
+            assert process.poll() is None, f'App exited: {process.returncode}'
+            assert len(windows()) == count - 1, 'Unexpected window count during shortcut retry'
+            if attempt == 2:
+                raise
 try:
     first = wait_count(1)[0]
     sample_memory('one_window', 1)
     current = first
     for count in (2, 3, 4):
         prior = set(windows())
-        shortcut(current, ord('N'))
-        current = next(iter(set(wait_count(count)) - prior))
+        current = next(iter(set(open_window(current, count)) - prior))
         print(f'PASS: {count} windows in PID {process.pid}', flush=True)
     sample_memory('four_windows', 4)
     if options.memory_report:
@@ -191,8 +218,7 @@ try:
     remaining = wait_count(3)
     print('PASS: original window closed; secondary windows survive', flush=True)
     prior = set(remaining)
-    shortcut(remaining[0], ord('N'))
-    current = next(iter(set(wait_count(4)) - prior))
+    current = next(iter(set(open_window(remaining[0], 4)) - prior))
     print('PASS: surviving window creates another window', flush=True)
     for index, hwnd in enumerate(windows()):
         u.SetWindowPos(hwnd, 0, 50 + index * 40, 50 + index * 40, 750 + index * 50, 500 + index * 40, 4)
@@ -207,6 +233,10 @@ try:
     for hwnd in windows():
         u.PostMessageW(hwnd, 16, 0, 0)
     assert process.wait(timeout=15) == 0
+    log.seek(0)
+    diagnostics = log.read().decode('utf-8', errors='replace')
+    for failure in ('wgpu error:', 'Vulkan render step failed', 'Ghostty Vulkan dispatch failed'):
+        assert failure not in diagnostics, diagnostics[-16000:]
     print('PASS: last window closes process cleanly', flush=True)
     if options.memory_report:
         options.memory_report.parent.mkdir(parents=True, exist_ok=True)
@@ -226,4 +256,8 @@ finally:
             process.terminate()
     if previous:
         u.SetForegroundWindow(previous)
+    log.seek(0)
+    diagnostics = log.read().decode('utf-8', errors='replace')
+    if process.returncode != 0 or 'err' in diagnostics.lower() or 'panic' in diagnostics.lower():
+        print('APP DIAGNOSTICS:\n' + diagnostics[-16000:], flush=True)
     log.close()

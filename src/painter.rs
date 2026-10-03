@@ -208,3 +208,5 @@ mod tests {
         assert!(super::driver_log("\n  ".into()).contains("without a diagnostic log"));
     }
 }
+
+pub(crate) type PaintCallback = std::sync::Arc<egui_glow::CallbackFn>;

@@ -1,5 +1,8 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+// The package library carries build.rs's native shim link directives.
+extern crate ghostty_egui;
+
 mod actions;
 mod app;
 mod colors;
@@ -7,10 +10,12 @@ mod config;
 mod copy_mode;
 mod error_log;
 mod ghostty_ffi;
+mod graphics;
 mod input;
 mod lua_callbacks;
 mod messages;
 mod native_error;
+#[cfg_attr(feature = "vulkan", path = "painter_vulkan.rs")]
 mod painter;
 mod picker;
 mod presentation;

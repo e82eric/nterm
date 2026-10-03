@@ -13,6 +13,7 @@ use crate::ghostty_ffi::{
     self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
     SnapshotDecorationStyle, SnapshotTextRow, SnapshotView, SnapshotViewportOptions,
 };
+use crate::graphics as glow;
 use crate::input;
 use crate::painter::TerminalPainter;
 use crate::quick_select::{self, Purpose as QuickSelectPurpose, QuickSelect};
@@ -102,7 +103,7 @@ pub(super) struct TerminalPane {
     host: *mut Host,
     wake: Box<WakeState>,
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
-    paint_callback: Arc<egui_glow::CallbackFn>,
+    paint_callback: crate::painter::PaintCallback,
     size: [u32; 2],
     scale: f32,
     focused: bool,
@@ -290,9 +291,12 @@ impl TerminalPane {
         };
         let painter = Arc::new(egui::mutex::Mutex::new(painter));
         let callback_painter = Arc::clone(&painter);
+        #[cfg(not(feature = "vulkan"))]
         let paint_callback = Arc::new(egui_glow::CallbackFn::new(move |_info, glow_painter| {
             callback_painter.lock().paint(glow_painter.gl());
         }));
+        #[cfg(feature = "vulkan")]
+        let paint_callback = crate::painter::callback(callback_painter);
         let picker_font = crate::picker::font::PickerFont::new(&wake.context, host);
         let search_worker = SearchWorker::new(wake.context.clone());
         Ok(Self {
@@ -590,7 +594,7 @@ impl TerminalPane {
         self.wake.context.request_repaint();
     }
 
-    pub(super) fn paint_callback(&self) -> Arc<egui_glow::CallbackFn> {
+    pub(super) fn paint_callback(&self) -> crate::painter::PaintCallback {
         self.paint_callback.clone()
     }
 
@@ -2969,7 +2973,7 @@ struct NativeContext {
     context: *mut c_void,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(feature = "vulkan")))]
 fn current_native_context() -> NativeContext {
     unsafe extern "system" {
         fn wglGetCurrentContext() -> *mut c_void;
@@ -2985,7 +2989,10 @@ fn current_native_context() -> NativeContext {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "freebsd"),
+    not(feature = "vulkan")
+))]
 fn current_native_context() -> NativeContext {
     #[link(name = "EGL")]
     unsafe extern "C" {
@@ -2998,5 +3005,15 @@ fn current_native_context() -> NativeContext {
             display: eglGetCurrentDisplay(),
             context: eglGetCurrentContext(),
         }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn current_native_context() -> NativeContext {
+    let (window, context) = crate::graphics::native_context();
+    NativeContext {
+        window,
+        display: std::ptr::null_mut(),
+        context,
     }
 }

@@ -1,8 +1,7 @@
 # Rust egui terminal shell
 
-This example embeds one full Ghostty terminal in an egui shell. Ghostty keeps
-its OpenGL renderer and exports completed textures to egui without a CPU pixel
-copy. The native C Win32 sample remains the performance baseline.
+This example embeds Ghostty terminals in an egui shell. It supports OpenGL
+and Vulkan, exporting completed textures to egui without a CPU pixel copy.
 
 From the repository root:
 
@@ -11,25 +10,83 @@ zig build egui-sample -Doptimize=ReleaseFast
 .\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
 ```
 
+Build the Vulkan application with:
+
+```powershell
+zig build egui-sample -Drenderer=vulkan -Doptimize=ReleaseFast
+.\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
+```
+
+This selects both the Zig Vulkan renderer and Cargo's `vulkan` feature. The
+terminal workers and egui-wgpu share one Vulkan device and queue across all
+windows. Each window has its own swapchain; each terminal retains its own grid,
+atlases, and upload buffers. Text, cursors, cell backgrounds, Kitty images,
+background images, and ShaderToy custom shaders use Vulkan. Custom shaders
+compile to SPIR-V; completed terminal frames use GPU texture copies and a
+bounded reusable export pool. The Vulkan path creates no OpenGL contexts and
+does not fall back to another backend if Vulkan is unavailable.
+
+Windows is the tested platform. Linux uses the same wgpu Vulkan backend but
+has not been validated here. macOS requires a Vulkan implementation such as
+MoltenVK; this build does not automatically select Metal. The Vulkan backend
+currently serves the embedded egui application, rather than the GTK/macOS apps.
+Build again without `-Drenderer=vulkan` to restore the OpenGL application. Keep
+the executable and its matching `ghostty.dll` together when comparing builds.
+
+After a Windows build, run the offscreen Vulkan pixel checks with:
+
+```powershell
+$env:NFM_GHOSTTY_VT_INCLUDE_DIR = "$PWD/include"
+$env:NFM_GHOSTTY_VT_LIB_DIR = "$PWD/zig-out/lib"
+$env:NFM_GHOSTTY_VT_LIB_NAME = 'ghostty-vt-static'
+cargo test --manifest-path example/rust-egui-terminal/Cargo.toml --features vulkan --test vulkan_render --target-dir .zig-cache/egui-target -- --nocapture
+```
+
+These checks require a working Vulkan driver and fail if Vulkan is unavailable;
+they do not substitute a different graphics backend. They check packed cell
+layouts, background and glyph pixels, native image dispatch, and egui composition
+on the same device.
+
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> to open another terminal in
 a new window within the same process. Each window has its own shell, terminal
 view, floating pane, and UI state. Windows share the native Ghostty app and its
 configuration; theme and font changes apply to all windows. Closing a window
 closes its terminals, and the app exits after the last window closes.
 
-Windows also share one egui context, font atlas, GPU painter, and UI OpenGL
-context. The UI context switches between each window's drawing surface, while
+Windows also share one egui context, font atlas, and GPU painter. In the OpenGL
+build, the UI context switches between each window's drawing surface, while
 input, focus, DPI, and presentation timing remain per window. Ghostty's terminal
 rendering workers retain their own OpenGL contexts. A hidden graphics window
 keeps shared resources alive independently of whichever terminal window closes.
+The Vulkan build keeps its shared device alive without a hidden graphics window.
 
 On Windows, run `python example/rust-egui-terminal/tests/multiwindow_smoke.py`
 after building to check the shortcut, multiple windows in one process, floating
 panes, resizing, shell exit, and closing the original window before the others.
 The check briefly opens and focuses test windows, then closes them.
+For the Vulkan custom-shader regression, add
+`--terminal-arg=--custom-shader=C:/src/ghostty2/example/rust-egui-terminal/tests/vulkan_passthrough.glsl`
+(adjust the absolute repository path). This also covers MSVC DLL initialization
+needed by the native shader compiler.
 Add `--memory-report .zig-cache/shared-ui-memory.json` to record private working
 set, total working set, and private bytes for one window, four windows, and four
 windows with floating panes. Use `--executable <path>` to compare another build.
+
+On the development RTX 3060 machine, ReleaseFast builds with `cmd.exe` and no
+custom shaders measured the following private resident RAM (MiB). Both runs
+used 1901×1039 pixels for one window and 1901×513 pixels per window for four.
+
+| Scenario | OpenGL | Vulkan |
+| --- | ---: | ---: |
+| One window | 66.6 | 36.9 |
+| Four windows | 152.7 | 43.8 |
+| Four windows with floating panes | 255.6 | 52.4 |
+
+These are process working-set measurements, excluding child shells and GPU
+VRAM. Private committed memory was respectively 303/738/1239 MiB for OpenGL
+and 412/892/1163 MiB for Vulkan. Lower resident RAM therefore does not imply
+lower commitment in every scenario. Results vary with driver, window size,
+terminal content, and configuration.
 
 Copy mode borrows the live terminal until its first guarded mutation. At that
 point it captures independently owned compressed history before applying the
@@ -315,8 +372,8 @@ The model and CLI arguments are configured in the Lua factory.
 Picker factories receive `context.recent_lines`: up to ten recent nonblank terminal
 rows, in chronological order, read from at most the last 256 snapshot rows.
 Pickers use the original seven-row layout. All picker definitions accept `sort`.
-The default, `sort = "Source"`, preserves source order while filtering. Use
-`sort = "Score"` for fuzzy match ranking. `"SourceOrder"` remains an alias for
+The default, `sort = "Score"`, ranks results by fuzzy match score. Use
+`sort = "Source"` to preserve source order while filtering. `"SourceOrder"` remains an alias for
 `"Source"`. Source order means input order for Items and Command, catalog order
 for CommandPalette, newest-first for Scrollback, and scan order for FileSystem.
 

@@ -68,7 +68,10 @@ pub(crate) struct SurfaceSize {
 #[derive(Default)]
 pub(crate) struct GlFrame {
     pub(crate) handle: *mut c_void,
+    #[cfg(not(feature = "vulkan"))]
     pub(crate) texture: u32,
+    #[cfg(feature = "vulkan")]
+    pub(crate) texture: usize,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) frame_generation: u64,

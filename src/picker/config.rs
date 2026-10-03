@@ -51,9 +51,9 @@ impl BuiltinPickers {
 
 #[derive(Clone, Copy, Default, Deserialize)]
 pub(crate) enum Sort {
+    #[default]
     #[serde(alias = "score")]
     Score,
-    #[default]
     #[serde(rename = "Source", alias = "SourceOrder", alias = "source")]
     SourceOrder,
 }
@@ -1351,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn every_picker_accepts_sort_and_defaults_to_source_order() {
+    fn every_picker_accepts_sort_and_defaults_to_score() {
         for kind in [
             "CommandPalette",
             "Scrollback",
@@ -1383,7 +1383,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     matches!(options.sort, Sort::Score),
-                    sort == Some("Score"),
+                    sort.is_none() || sort == Some("Score"),
                     "{kind}: {sort:?}"
                 );
             }

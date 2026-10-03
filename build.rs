@@ -5,8 +5,11 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
 
-    cc::Build::new()
-        .file("src/ghostty_shim.c")
+    let mut shim = cc::Build::new();
+    if env::var_os("CARGO_FEATURE_VULKAN").is_some() {
+        shim.define("GHOSTTY_EGUI_VULKAN", None);
+    }
+    shim.file("src/ghostty_shim.c")
         .include(root.join("include"))
         .warnings(true)
         .compile("ghostty_egui_shim");

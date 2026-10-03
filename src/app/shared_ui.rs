@@ -68,13 +68,17 @@ impl SharedUi {
         self.graphics.make_current()?;
         let ids: Vec<_> = ids.into_iter().collect();
         let output = register_viewports(&self.ctx, &ids);
-        self.finish_output(output, None);
+        self.finish_output(output, None)?;
         Ok(())
     }
 
     /// Upload shared texture changes even when presentation is paced. Otherwise
     /// a second window could draw glyphs before their atlas updates are uploaded.
-    pub fn finish_output(&mut self, mut output: egui::FullOutput, dimensions: Option<[u32; 2]>) {
+    pub fn finish_output(
+        &mut self,
+        mut output: egui::FullOutput,
+        dimensions: Option<[u32; 2]>,
+    ) -> Result<(), FatalError> {
         for (id, deltas) in output.textures_delta.set.drain() {
             for delta in deltas {
                 self.painter.set_texture(id, &delta);
@@ -88,6 +92,7 @@ impl SharedUi {
         for id in output.textures_delta.free.drain() {
             self.painter.free_texture(id);
         }
+        Ok(())
     }
 }
 
