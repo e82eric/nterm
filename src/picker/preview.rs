@@ -71,9 +71,10 @@ pub(super) fn scrollback_provider(
     reader: Arc<SnapshotPreview>,
     total_rows: u64,
     columns: usize,
-) -> nfm_egui::byte_preview::BytePreviewProvider<super::source::Candidate> {
+) -> impl nfm_egui::PreviewProvider<super::source::Candidate> {
     use nfm_egui::byte_preview::{ByteDocument, ByteSource, CellPosition, Highlight};
-    nfm_egui::byte_preview::BytePreviewProvider::new(
+    let copy_reader = reader.clone();
+    let provider = nfm_egui::byte_preview::BytePreviewProvider::new(
         move |selection: &nfm_egui::Selection<super::source::Candidate>, _cancel| {
             let range = selection.item.range.ok_or("No scrollback match selected")?;
             let reader = reader.clone();
@@ -101,7 +102,231 @@ pub(super) fn scrollback_provider(
                 }),
             })
         },
-    )
+    );
+    ScrollbackProvider {
+        provider,
+        document: Arc::new(SnapshotCopyDocument {
+            reader: copy_reader,
+            total_rows,
+            columns,
+        }),
+        published: Default::default(),
+    }
+}
+
+struct ScrollbackProvider {
+    provider: nfm_egui::byte_preview::BytePreviewProvider<super::source::Candidate>,
+    document: Arc<SnapshotCopyDocument>,
+    published: std::sync::Mutex<Option<(u64, usize)>>,
+}
+impl nfm_egui::PreviewProvider<super::source::Candidate> for ScrollbackProvider {
+    fn preview(
+        &self,
+        request: nfm_egui::PreviewRequest<super::source::Candidate>,
+        cancel: nfm_egui::Cancellation,
+    ) -> Result<nfm_egui::Preview, String> {
+        self.preview_viewport(request, cancel)
+            .map(|page| page.document)
+    }
+    fn preview_viewport(
+        &self,
+        request: nfm_egui::PreviewRequest<super::source::Candidate>,
+        cancel: nfm_egui::Cancellation,
+    ) -> Result<nfm_egui::preview::PreviewViewport, String> {
+        let key = (request.document_version, request.selection.index);
+        let page = self.provider.preview_viewport(request, cancel)?;
+        *self.published.lock().map_err(|_| "preview poisoned")? = Some(key);
+        Ok(page)
+    }
+    fn page_step(&self, rows: usize) -> usize {
+        (rows / 2).max(1)
+    }
+    fn copy_document(
+        &self,
+        version: u64,
+        index: usize,
+    ) -> Result<Option<Arc<dyn nfm_egui::copy_document::CopyDocument>>, String> {
+        let current = *self.published.lock().map_err(|_| "preview poisoned")?;
+        if current != Some((version, index)) {
+            return Ok(None);
+        }
+        Ok(Some(self.document.clone()))
+    }
+}
+
+struct SnapshotCopyDocument {
+    reader: Arc<SnapshotPreview>,
+    total_rows: u64,
+    columns: usize,
+}
+impl SnapshotCopyDocument {
+    fn read<R>(&self, f: impl FnOnce(*mut Host, u64) -> Result<R, String>) -> Result<R, String> {
+        let open = self
+            .reader
+            .open
+            .lock()
+            .map_err(|_| "snapshot lease poisoned")?;
+        if !*open {
+            return Err("snapshot closed".into());
+        }
+        let generation = self.reader.generation.ok_or("snapshot missing")?;
+        f(self.reader.host as *mut Host, generation)
+    }
+}
+impl nfm_egui::copy_document::CopyDocument for SnapshotCopyDocument {
+    fn metadata(&self) -> Result<nfm_egui::copy_document::DocumentMetadata, String> {
+        self.read(|host, revision| {
+            let mut view = ghostty_ffi::SnapshotView::default();
+            if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, revision, &mut view) } {
+                return Err("snapshot expired".into());
+            }
+            Ok(nfm_egui::copy_document::DocumentMetadata {
+                revision,
+                total_rows: view.total_rows,
+                columns: view.columns,
+            })
+        })
+    }
+    fn text_row(&self, y: u64) -> Result<Option<nfm_egui::copy_document::DocumentRow>, String> {
+        use unicode_segmentation::UnicodeSegmentation;
+        use unicode_width::UnicodeWidthStr;
+        self.read(|host, generation| {
+            if y >= self.total_rows {
+                return Ok(None);
+            }
+            let mut row = ghostty_ffi::SnapshotTextRow::default();
+            if !unsafe {
+                ghostty_ffi::ghostty_egui_host_snapshot_text_row(host, generation, y, &mut row)
+            } {
+                return Err("snapshot row unavailable".into());
+            }
+            let (text, columns) = if row.len == 0 {
+                (String::new(), Vec::new())
+            } else {
+                unsafe {
+                    (
+                        String::from_utf8_lossy(std::slice::from_raw_parts(row.text, row.len))
+                            .into_owned(),
+                        std::slice::from_raw_parts(row.columns, row.len).to_vec(),
+                    )
+                }
+            };
+            let wraps_to_next = row.wraps_to_next;
+            unsafe { ghostty_ffi::ghostty_egui_host_snapshot_text_row_free(&mut row) };
+            let mut widths = vec![1; self.columns];
+            for (byte, glyph) in text.grapheme_indices(true) {
+                if let Some(&column) = columns.get(byte) {
+                    let x = column as usize;
+                    let width = glyph.width().max(1).min(2);
+                    if x < widths.len() {
+                        widths[x] = width as u8;
+                    }
+                    if width == 2 && x + 1 < widths.len() {
+                        widths[x + 1] = 0;
+                    }
+                }
+            }
+            Ok(Some(nfm_egui::copy_document::DocumentRow {
+                text: nfm_egui::copy_mode::TextRow {
+                    text,
+                    columns,
+                    wraps_to_next,
+                },
+                widths,
+            }))
+        })
+    }
+    fn resolve_cell(
+        &self,
+        requested: nfm_egui::copy_mode::CellPosition,
+        right: bool,
+    ) -> Result<nfm_egui::copy_mode::CellPosition, String> {
+        self.read(|host, generation| {
+            let mut actual = ghostty_ffi::SnapshotCell::default();
+            if unsafe {
+                ghostty_ffi::ghostty_egui_host_snapshot_resolve_cell(
+                    host,
+                    generation,
+                    requested,
+                    right,
+                    &mut actual,
+                )
+            } {
+                Ok(actual)
+            } else {
+                Err("snapshot position unavailable".into())
+            }
+        })
+    }
+    fn selection_text(
+        &self,
+        selection: &nfm_egui::copy_mode::CopySelection,
+    ) -> Result<String, String> {
+        self.read(|host, generation| {
+            let mut result = ghostty_ffi::SnapshotSelectionText::default();
+            if !unsafe {
+                ghostty_ffi::ghostty_egui_host_snapshot_selection_text(
+                    host,
+                    generation,
+                    selection.range,
+                    selection.trim,
+                    selection.rectangle,
+                    &mut result,
+                )
+            } {
+                return Err("snapshot selection unavailable".into());
+            }
+            let mut text = if result.len == 0 {
+                String::new()
+            } else {
+                unsafe {
+                    String::from_utf8_lossy(std::slice::from_raw_parts(result.text, result.len))
+                        .into_owned()
+                }
+            };
+            unsafe { ghostty_ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result) };
+            if selection.linewise {
+                text.push('\n');
+            }
+            Ok(text)
+        })
+    }
+    fn viewport(
+        &self,
+        top: u64,
+        rows: usize,
+        appearance: &nfm_egui::Appearance,
+    ) -> Result<nfm_egui::Preview, String> {
+        self.read(|host, generation| {
+            let bytes = styled_rows(host as usize, generation, top, rows as u32)?;
+            let mut normalized = Vec::with_capacity(bytes.len());
+            for (i, &byte) in bytes.iter().enumerate() {
+                if byte == b'\n' && (i == 0 || bytes[i - 1] != b'\r') {
+                    normalized.push(b'\r');
+                }
+                normalized.push(byte);
+            }
+            nfm_egui::preview::parse_ansi(
+                &normalized,
+                &nfm_egui::PreviewRequest {
+                    selection: nfm_egui::Selection {
+                        item: (),
+                        text: String::new(),
+                        index: 0,
+                        source_version: generation,
+                        snapshot: Arc::new(()),
+                    },
+                    document_version: generation,
+                    initial_page: false,
+                    columns: self.columns.try_into().map_err(|_| "snapshot too wide")?,
+                    rows: rows.try_into().map_err(|_| "too many rows")?,
+                    scroll_offset: 0,
+                    foreground: appearance.palette.text,
+                    background: appearance.palette.background,
+                },
+            )
+        })
+    }
 }
 
 /// Lua remains on its owning UI thread. Only owned command specifications are
@@ -192,6 +417,33 @@ impl CommandPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn closed_snapshot_copy_document_rejects_all_native_reads() {
+        use nfm_egui::copy_document::CopyDocument;
+        let reader = Arc::new(SnapshotPreview::new(std::ptr::null_mut(), Some(1)));
+        reader.close();
+        let doc = SnapshotCopyDocument {
+            reader,
+            total_rows: 10,
+            columns: 20,
+        };
+        assert!(doc.metadata().is_err());
+        assert!(doc.text_row(0).is_err());
+        assert!(doc.resolve_cell(Default::default(), false).is_err());
+        assert!(
+            doc.viewport(0, 4, &nfm_egui::Appearance::default())
+                .is_err()
+        );
+        assert!(
+            doc.selection_text(&nfm_egui::copy_mode::CopySelection {
+                range: Default::default(),
+                linewise: false,
+                trim: true,
+                rectangle: false,
+            })
+            .is_err()
+        );
+    }
     #[test]
     fn snapshot_lease_close_waits_for_active_reads_and_blocks_future_reads() {
         let reader = Arc::new(SnapshotPreview::new(std::ptr::null_mut(), None));

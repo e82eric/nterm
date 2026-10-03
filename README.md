@@ -92,6 +92,12 @@ Copy mode uses the shared `nfm-egui::copy_mode` engine. Ghostty supplies native
 terminal snapshots, rendering, search workers, clipboard operations, and
 terminal-specific actions such as hint yank and line splits.
 
+Scrollback picker previews also support Ctrl+W copy-mode focus. NFM reads the
+original Ghostty snapshot lazily through a host-backed document adapter, so
+motions, wide-cell resolution, search, and yanks can extend beyond the displayed
+page. Full-history preview search runs on a cancellable worker. The preview
+lease closes before its native terminal host is destroyed.
+
 Copy mode borrows the live terminal until its first guarded mutation. At that
 point it captures independently owned compressed history before applying the
 mutation. Search and text extraction decode one page into temporary storage;

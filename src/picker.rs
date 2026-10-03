@@ -209,6 +209,10 @@ impl Picker {
                 error: p.error,
                 accent: p.accent,
                 success: p.success,
+                search_match_background: Some(p.search_match_background),
+                search_match_text: Some(p.search_match_text),
+                yank_background: Some(p.yank_background),
+                yank_text: Some(p.yank_text),
             },
             typography: nfm_egui::Typography {
                 normal: self.typography.font.clone(),

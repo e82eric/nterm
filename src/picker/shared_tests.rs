@@ -4,6 +4,29 @@ use nfm_search_core::{
 };
 use std::time::{Duration, Instant};
 
+#[test]
+fn preview_appearance_receives_configured_copy_colors() {
+    let ctx = egui::Context::default();
+    let picker = items(&ctx);
+    let mut frame = ctx.run_ui(egui::RawInput::default(), |_| {});
+    frame.textures_delta.clear();
+    let appearance = picker.appearance(&ctx);
+    let palette = crate::colors::palette();
+    assert_eq!(
+        appearance.palette.search_match_background,
+        Some(palette.search_match_background)
+    );
+    assert_eq!(
+        appearance.palette.search_match_text,
+        Some(palette.search_match_text)
+    );
+    assert_eq!(
+        appearance.palette.yank_background,
+        Some(palette.yank_background)
+    );
+    assert_eq!(appearance.palette.yank_text, Some(palette.yank_text));
+}
+
 fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
     egui::Event::Key {
         key,
@@ -52,31 +75,51 @@ fn wait_selection(
 }
 
 #[cfg(windows)]
-fn wait_preview_text(
+fn wait_preview_rendered_text(
     ctx: &egui::Context,
     picker: &mut Picker,
     expected_first_line: &str,
 ) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let (_, commands) = frame(
-            ctx,
-            picker,
-            vec![key(
-                egui::Key::C,
-                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-            )],
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                picker.show(ui.ctx(), 24.0);
+            },
         );
-        for command in commands {
-            if let egui::OutputCommand::CopyText(text) = command {
-                if text
-                    .lines()
-                    .next()
-                    .is_some_and(|line| line.trim() == expected_first_line)
-                {
-                    return text;
+        output.textures_delta.clear();
+        let mut glyphs: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => {
+                    Some((text.pos.y, text.pos.x, text.galley.text().to_owned()))
                 }
+                _ => None,
+            })
+            .collect();
+        glyphs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let mut lines = Vec::<String>::new();
+        let mut row_y = f32::NEG_INFINITY;
+        for (y, _, text) in glyphs {
+            if (y - row_y).abs() > 1.0 {
+                lines.push(String::new());
+                row_y = y;
             }
+            lines.last_mut().unwrap().push_str(&text);
+        }
+        if lines
+            .first()
+            .is_some_and(|line| line.trim() == expected_first_line)
+        {
+            return lines.join("\n");
         }
         assert!(
             Instant::now() < deadline,
@@ -118,7 +161,7 @@ fn command_preview_runs_through_nfm_using_the_accepted_value_and_cwd() {
             ..Default::default()
         },
     );
-    let text = wait_preview_text(&ctx, &mut picker, "inserted");
+    let text = wait_preview_rendered_text(&ctx, &mut picker, "inserted");
     assert!(
         text.to_lowercase()
             .contains(&cwd.trim_end_matches(['/', '\\']).to_lowercase())
@@ -170,26 +213,26 @@ fn lua_command_preview_resolves_once_and_nfm_owns_centering_paging_and_selection
             ..Default::default()
         },
     );
-    wait_preview_text(&ctx, &mut picker, "row14");
+    wait_preview_rendered_text(&ctx, &mut picker, "row14");
     frame(
         &ctx,
         &mut picker,
         vec![key(egui::Key::PageUp, egui::Modifiers::CTRL)],
     );
-    wait_preview_text(&ctx, &mut picker, "row8");
+    wait_preview_rendered_text(&ctx, &mut picker, "row8");
     frame(
         &ctx,
         &mut picker,
         vec![key(egui::Key::PageDown, egui::Modifiers::CTRL)],
     );
-    wait_preview_text(&ctx, &mut picker, "row14");
+    wait_preview_rendered_text(&ctx, &mut picker, "row14");
     assert_eq!(lua.globals().get::<_, u32>("calls").unwrap(), 1);
     frame(
         &ctx,
         &mut picker,
         vec![key(egui::Key::N, egui::Modifiers::CTRL)],
     );
-    wait_preview_text(&ctx, &mut picker, "row0");
+    wait_preview_rendered_text(&ctx, &mut picker, "row0");
     assert_eq!(lua.globals().get::<_, u32>("calls").unwrap(), 2);
     frame(
         &ctx,
@@ -202,7 +245,7 @@ fn lua_command_preview_resolves_once_and_nfm_owns_centering_paging_and_selection
         &mut picker,
         vec![key(egui::Key::P, egui::Modifiers::CTRL)],
     );
-    wait_preview_text(&ctx, &mut picker, "row0");
+    wait_preview_rendered_text(&ctx, &mut picker, "row0");
     assert_eq!(lua.globals().get::<_, u32>("calls").unwrap(), 2);
 }
 fn items(ctx: &egui::Context) -> Picker {
@@ -272,6 +315,13 @@ fn complete_preview_uses_accepted_value_and_nfm_paging_and_copy() {
     wait_selection(&ctx, &mut picker);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        if !picker.shared.preview_focused() {
+            frame(
+                &ctx,
+                &mut picker,
+                vec![key(egui::Key::W, egui::Modifiers::CTRL)],
+            );
+        }
         let (_, commands) = frame(
             &ctx,
             &mut picker,
