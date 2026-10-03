@@ -26,34 +26,12 @@ if (-not $SkipBuild) {
     }
 }
 
-# Pin both ConPTY components to the preview with resize cursor synchronization.
-# Cache the package independently of build outputs, including with -SkipBuild.
-$conptyVersion = '1.25.260710002-preview'
-$conptyFileVersion = '1.25.2607.10002'
-$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-if ($architecture -notin @('x64', 'x86', 'arm64')) {
-    throw "Unsupported ConPTY architecture: $architecture"
-}
-$conptyCache = Join-Path $repository ".zig-cache\conpty\$conptyVersion"
-$conptyPackage = Join-Path $conptyCache 'package'
-$conptyDll = Join-Path $conptyPackage "runtimes\win-$architecture\native\conpty.dll"
-$conptyHost = Join-Path $conptyPackage "build\native\runtimes\$architecture\OpenConsole.exe"
-if (-not ((Test-Path -LiteralPath $conptyDll -PathType Leaf) -and
-          (Test-Path -LiteralPath $conptyHost -PathType Leaf))) {
-    New-Item -ItemType Directory -Path $conptyCache -Force | Out-Null
-    $archive = Join-Path $conptyCache 'package.zip'
-    $packageUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/$conptyVersion/microsoft.windows.console.conpty.$conptyVersion.nupkg"
-    Invoke-WebRequest -Uri $packageUrl -OutFile $archive
-    Expand-Archive -LiteralPath $archive -DestinationPath $conptyPackage -Force
-}
-foreach ($path in @($conptyDll, $conptyHost)) {
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "Missing ConPTY package component: $path"
-    }
-    if ((Get-Item -LiteralPath $path).VersionInfo.FileVersion -ne $conptyFileVersion) {
-        throw "Unexpected ConPTY component version: $path (expected $conptyFileVersion)"
-    }
-}
+# Use the same pinned ConPTY package as zig build, including with -SkipBuild.
+$conpty = & (Join-Path $PSScriptRoot 'conpty.ps1')
+$conptyVersion = $conpty.Version
+$architecture = $conpty.Architecture
+$conptyDll = $conpty.Dll
+$conptyHost = $conpty.Host
 
 # Ghostty loads conpty.dll and its matching OpenConsole.exe beside the app.
 $files = @('ghostty.dll', 'ghostty_egui.exe', 'conpty.dll', 'OpenConsole.exe')

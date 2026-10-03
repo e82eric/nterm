@@ -75,6 +75,17 @@ To build and deploy the Windows sample to another directory:
 .\example\rust-egui-terminal\deploy.ps1 C:\Apps\GhosttyEgui
 ```
 
+Windows `zig build`, `zig build egui-sample`, and `zig build win32-sample` also
+install the matched ConPTY DLL and console host into the build's `bin` directory
+(normally `zig-out/bin`). Run `zig build conpty` to install just those components.
+Build and deployment share the package pin in `conpty.ps1`.
+The script verifies pinned SHA-256 hashes for the downloaded or cached package
+before extraction, and for both extracted components before copying them.
+A mismatch stops installation. The helper also requires the .NET SDK and runs
+`dotnet nuget verify` before extraction or installation, requiring the pinned
+Microsoft signing certificate and valid package signatures. Updating ConPTY
+requires reviewing the version, hashes, and signing certificate together.
+
 The script copies `ghostty_egui.exe`, its required `ghostty.dll`, and the matched
 ConPTY `1.25.260710002-preview` DLL and console host. It downloads the pinned
 Microsoft NuGet package on first use and caches it under `.zig-cache/conpty`.
