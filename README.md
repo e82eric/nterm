@@ -17,6 +17,12 @@ view, floating pane, and UI state. Windows share the native Ghostty app and its
 configuration; theme and font changes apply to all windows. Closing a window
 closes its terminals, and the app exits after the last window closes.
 
+Windows also share one egui context, font atlas, GPU painter, and UI OpenGL
+context. The UI context switches between each window's drawing surface, while
+input, focus, DPI, and presentation timing remain per window. Ghostty's terminal
+rendering workers retain their own OpenGL contexts. A hidden graphics window
+keeps shared resources alive independently of whichever terminal window closes.
+
 On Windows, run `python example/rust-egui-terminal/tests/multiwindow_smoke.py`
 after building to check the shortcut, multiple windows in one process, floating
 panes, resizing, shell exit, and closing the original window before the others.
