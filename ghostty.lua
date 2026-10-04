@@ -2,6 +2,12 @@
 -- the executable. Only the first available file is loaded.
 local snippets_path = (os.getenv("USERPROFILE") or os.getenv("HOME")) .. "/.wtd/.wt.json"
 return {
+  -- Local picker IPC is opt-in. See PICKER-PIPE.md and Invoke-GhosttyPicker.ps1.
+  picker_pipe = {
+    enabled = false,
+    allow_stream = false,
+    named = {},
+  },
   actions = {
     SaveSnippet = {
       label = "Save selection as snippet",
@@ -151,6 +157,9 @@ return {
     -- An explicit keys table replaces all top-level action and picker defaults.
     { key = "n", mods = "CTRL|SHIFT", action = "NewWindow" },
     { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },
+    { key = "e", mods = "CTRL|ALT|SHIFT", action = "CreateFloatingPane" },
+    { key = "]", mods = "CTRL|ALT", action = "NextFloatingPane" },
+    { key = "[", mods = "CTRL|ALT", action = "PreviousFloatingPane" },
     { key = "w", mods = "CTRL|SHIFT", action = "CloseFloatingPane" },
     { key = "/", mods = "CTRL|SHIFT", action = "OpenSearch" },
     { key = "m", mods = "CTRL|SHIFT", action = "EnterCopyMode" },

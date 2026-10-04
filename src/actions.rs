@@ -9,6 +9,10 @@ pub(crate) enum AppAction {
     ShowErrorRecord(Box<crate::error_log::Record>),
     OpenThemePicker,
     ApplyTheme(String),
+    RestoreFloatingPane(u64),
+    CreateFloatingPane,
+    NextFloatingPane,
+    PreviousFloatingPane,
     ToggleFloatingPane,
     CloseFloatingPane,
     OpenPicker(String),
@@ -29,6 +33,9 @@ impl AppAction {
             "ShowMessages" => Self::ShowMessages,
             "OpenErrorLog" => Self::OpenErrorLog,
             "OpenThemePicker" => Self::OpenThemePicker,
+            "CreateFloatingPane" => Self::CreateFloatingPane,
+            "NextFloatingPane" => Self::NextFloatingPane,
+            "PreviousFloatingPane" => Self::PreviousFloatingPane,
             "ToggleFloatingPane" => Self::ToggleFloatingPane,
             "CloseFloatingPane" => Self::CloseFloatingPane,
             "OpenSearch" => Self::OpenSearch,
@@ -51,6 +58,10 @@ impl AppAction {
                 | Self::ShowErrorRecord(_)
                 | Self::OpenThemePicker
                 | Self::ApplyTheme(_)
+                | Self::RestoreFloatingPane(_)
+                | Self::CreateFloatingPane
+                | Self::NextFloatingPane
+                | Self::PreviousFloatingPane
                 | Self::ToggleFloatingPane
                 | Self::CloseFloatingPane
         )
@@ -101,6 +112,9 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     let mut keys = [
         ("n", "CTRL|SHIFT", "NewWindow"),
         ("e", "CTRL|SHIFT", "ToggleFloatingPane"),
+        ("e", "CTRL|ALT|SHIFT", "CreateFloatingPane"),
+        ("]", "CTRL|ALT", "NextFloatingPane"),
+        ("[", "CTRL|ALT", "PreviousFloatingPane"),
         ("w", "CTRL|SHIFT", "CloseFloatingPane"),
         ("/", "CTRL|SHIFT", "OpenSearch"),
         ("m", "CTRL|SHIFT", "EnterCopyMode"),
@@ -151,6 +165,30 @@ pub(crate) struct Entry {
     pub(crate) action: AppAction,
 }
 
+pub(crate) fn floating_pane_entry(id: u64, name: Option<&str>, title: &str, active: bool) -> Entry {
+    let label = name.filter(|name| !name.trim().is_empty()).unwrap_or(title);
+    // Titles may contain controls; keep each palette item on one display line.
+    let label: String = label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(256)
+        .collect();
+    let detail = if label.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", label.trim())
+    };
+    Entry {
+        id: format!("floating.restore.{id}"),
+        label: format!(
+            "Restore floating pane {id}{detail}{}",
+            if active { " (active)" } else { "" }
+        ),
+        shortcut: None,
+        action: AppAction::RestoreFloatingPane(id),
+    }
+}
+
 pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
     for (id, label, action, available) in [
@@ -184,6 +222,24 @@ pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) ->
             "Toggle floating pane",
             AppAction::ToggleFloatingPane,
             true,
+        ),
+        (
+            "floating.create",
+            "Create floating pane",
+            AppAction::CreateFloatingPane,
+            true,
+        ),
+        (
+            "floating.next",
+            "Next floating pane",
+            AppAction::NextFloatingPane,
+            has_floating,
+        ),
+        (
+            "floating.previous",
+            "Previous floating pane",
+            AppAction::PreviousFloatingPane,
+            has_floating,
         ),
         (
             "floating.close",
@@ -260,6 +316,26 @@ pub(crate) struct LuaAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn floating_entries_use_stable_ids_name_then_title_and_mark_active() {
+        let named = floating_pane_entry(7, Some("tools"), "PowerShell", true);
+        assert_eq!(named.id, "floating.restore.7");
+        assert_eq!(named.label, "Restore floating pane 7 — tools (active)");
+        assert_eq!(named.action, AppAction::RestoreFloatingPane(7));
+        assert_eq!(
+            floating_pane_entry(8, None, "nvim README.md", false).label,
+            "Restore floating pane 8 — nvim README.md"
+        );
+        assert_eq!(
+            floating_pane_entry(9, None, "", false).label,
+            "Restore floating pane 9"
+        );
+        assert!(
+            !floating_pane_entry(10, None, "title\nnext\tline", false)
+                .label
+                .contains('\n')
+        );
+    }
     #[test]
     fn catalog_lists_unbound_pickers_skips_request_sources_and_checks_state() {
         let definitions = serde_json::from_value(serde_json::json!({

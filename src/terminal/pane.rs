@@ -6,18 +6,18 @@ use crate::ghostty_ffi::{
 use crate::graphics as glow;
 use crate::input;
 use crate::painter::TerminalPainter;
-use crate::quick_select::{self, Purpose as QuickSelectPurpose, QuickSelect};
 use crate::search::{SearchUi, SearchWorker};
 use nfm_egui::copy_mode::{
     CopyAction, CopyMode, CopySelection, CopyTextObject, Jump, Motion, MotionEvaluation,
-    MotionResult, SCROLL_PADDING_ROWS, TextRow, ViewportPosition, VisualMode, WordObject,
-    YANK_HIGHLIGHT_DURATION, YankCommand, find_prompt_boundaries, word_search_pattern,
+    MotionResult, TextRow, ViewportPosition, VisualMode, WordObject, YANK_HIGHLIGHT_DURATION,
+    YankCommand, find_prompt_boundaries, word_search_pattern,
 };
 #[cfg(test)]
 use nfm_egui::copy_mode::{
     copy_digit, copy_jump_prefix, copy_motion, copy_motion_with_prefix, copy_scroll_direction,
     copy_text_object_key, copy_viewport_position_key, is_copy_modifier_key,
 };
+use nfm_egui::quick_select::{self, Purpose as QuickSelectPurpose, QuickSelect};
 use std::ffi::{c_char, c_void};
 use std::sync::{
     Arc,
@@ -26,16 +26,43 @@ use std::sync::{
 use std::time::Instant;
 
 struct WakeState {
+    #[cfg(windows)]
+    pipe: Option<crate::picker::pipe::Service>,
     context: egui::Context,
     proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
     window_id: egui_winit::winit::window::WindowId,
     frame_ready_pending: AtomicBool,
     close: AtomicBool,
-    osc_token: String,
-    protocol_request: std::sync::Mutex<Option<crate::picker::protocol::PickerRequest>>,
+    title: std::sync::Mutex<String>,
     clipboard_text: std::sync::Mutex<Option<String>>,
     config_issues: std::sync::Mutex<Vec<String>>,
     runtime_issues: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl WakeState {
+    fn picker_environment(&self) -> (std::ffi::CString, std::ffi::CString) {
+        #[cfg(windows)]
+        if let Some(pipe) = &self.pipe {
+            return (
+                std::ffi::CString::new(pipe.endpoint.clone()).unwrap(),
+                std::ffi::CString::new(pipe.token.clone()).unwrap(),
+            );
+        }
+        (std::ffi::CString::default(), std::ffi::CString::default())
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ghostty_egui_title(userdata: *mut c_void, title: *const c_char) {
+    crate::native_error::ffi_boundary("handle terminal title", || {
+        if userdata.is_null() || title.is_null() {
+            return;
+        }
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        *state.title.lock().unwrap() = unsafe { std::ffi::CStr::from_ptr(title) }
+            .to_string_lossy()
+            .into_owned();
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -59,26 +86,6 @@ extern "C" fn ghostty_egui_close(userdata: *mut c_void) {
         let state = unsafe { &*(userdata.cast::<WakeState>()) };
         state.close.store(true, Ordering::Release);
         state.context.request_repaint();
-    });
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_protocol(userdata: *mut c_void, bytes: *const u8, len: usize) {
-    crate::native_error::ffi_boundary("handle native callback ghostty_egui_protocol", || {
-        if bytes.is_null() || len > crate::picker::protocol::MAX_PAYLOAD {
-            return;
-        }
-        let state = unsafe { &*(userdata.cast::<WakeState>()) };
-        let payload = unsafe { std::slice::from_raw_parts(bytes, len) };
-        match crate::picker::protocol::parse(payload, &state.osc_token) {
-            Ok(request) => {
-                *state.protocol_request.lock().unwrap() = Some(request);
-                state.context.request_repaint();
-            }
-            Err(error) => {
-                crate::error_log::error("protocol", "Rejected terminal picker request", &error)
-            }
-        }
     });
 }
 
@@ -119,6 +126,8 @@ pub(super) struct TerminalPane {
     toasts: crate::toast::Toasts,
     copy_search_cursor: usize,
     prompt_boundaries: Option<(u64, Vec<u64>)>,
+    pub(super) floating_palette_entries: Vec<crate::actions::Entry>,
+    pub(super) pending_callback: Option<(crate::picker::Action, Option<u64>, bool)>,
 }
 
 #[unsafe(no_mangle)]
@@ -190,6 +199,14 @@ extern "C" fn ghostty_egui_theme_colors(
 }
 
 impl TerminalPane {
+    pub(super) fn mark_pipe_timing(&self, stage: &'static str) {
+        #[cfg(windows)]
+        if let Some(pipe) = &self.wake.pipe {
+            pipe.mark_active(stage);
+        }
+        #[cfg(not(windows))]
+        let _ = stage;
+    }
     pub(super) fn show_error(&mut self, title: &str, error: String) {
         crate::error_log::error("terminal", title, &error);
         self.toasts.push_error(title.into(), error, 10000);
@@ -291,12 +308,10 @@ impl TerminalPane {
         };
         let painter = Arc::new(egui::mutex::Mutex::new(painter));
         let callback_painter = Arc::clone(&painter);
-        #[cfg(not(feature = "vulkan"))]
+
         let paint_callback = Arc::new(egui_glow::CallbackFn::new(move |_info, glow_painter| {
             callback_painter.lock().paint(glow_painter.gl());
         }));
-        #[cfg(feature = "vulkan")]
-        let paint_callback = crate::painter::callback(callback_painter);
         let picker_font = crate::picker::font::PickerFont::new(&wake.context, host);
         let search_worker = SearchWorker::new(wake.context.clone());
         Ok(Self {
@@ -319,6 +334,8 @@ impl TerminalPane {
             toasts: crate::toast::Toasts::default(),
             copy_search_cursor: 0,
             prompt_boundaries: None,
+            floating_palette_entries: Vec::new(),
+            pending_callback: None,
         })
     }
 
@@ -338,6 +355,10 @@ impl TerminalPane {
 
     pub(super) fn destroy(&mut self, gl: &glow::Context) {
         self.picker = None;
+        #[cfg(windows)]
+        {
+            self.wake.pipe.take();
+        }
         self.cancel_quick_select();
         self.close_search();
         self.close_copy_mode();
@@ -393,6 +414,10 @@ impl TerminalPane {
             self.prepare_search_snapshot();
         }
         self.apply_search_result();
+        // The first live write turns a borrowed snapshot into an owned one.
+        // Native code invalidates decorations during that handoff even when
+        // the viewport has not scrolled or resized.
+        self.refresh_decorations();
         if self.quick_select.is_none()
             && self.picker.is_none()
             && let Some(generation) = self.copy_mode.generation
@@ -406,26 +431,28 @@ impl TerminalPane {
         }
     }
 
-    pub(super) fn refresh_decorations(&mut self, scrolled: bool, resized: bool) {
-        if (scrolled || resized)
-            && let Some(generation) = self.search.snapshot_generation
-            && unsafe {
+    pub(super) fn refresh_decorations(&mut self) {
+        let refresh = snapshot_decoration_refresh(
+            self.quick_select.as_ref().map(|quick| quick.generation),
+            self.search.snapshot_generation,
+            self.copy_mode.generation,
+            |generation| unsafe {
                 ghostty_ffi::ghostty_egui_host_snapshot_decorations_need_refresh(
                     self.host, generation,
                 )
+            },
+        );
+        match refresh {
+            Some(SnapshotDecorationOwner::QuickSelect(_)) => {
+                self.publish_quick_select();
             }
-        {
-            self.publish_search_matches(false);
-        }
-        if scrolled
-            && let Some(generation) = self.copy_mode.generation
-            && unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_decorations_need_refresh(
-                    self.host, generation,
-                )
+            Some(SnapshotDecorationOwner::Search(_)) => {
+                self.publish_search_matches(false);
             }
-        {
-            self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+            Some(SnapshotDecorationOwner::Copy(generation)) => {
+                self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+            }
+            None => {}
         }
     }
 
@@ -440,7 +467,9 @@ impl TerminalPane {
             return;
         }
         let scrolled = input::forward(self.host, self.size, ui, rect, self.scale, keyboard_blocked);
-        self.refresh_decorations(scrolled, false);
+        if scrolled {
+            self.refresh_decorations();
+        }
     }
 
     pub(super) fn drain_clipboard(&self, ctx: &egui::Context) {
@@ -461,6 +490,7 @@ pub(super) struct PaneStatus<'a> {
     pub(super) accent: egui::Color32,
     pub(super) separator: egui::Color32,
     pub(super) detail: Option<String>,
+    pub(super) pipe_status: Option<bool>,
 }
 
 impl TerminalPane {
@@ -473,19 +503,28 @@ impl TerminalPane {
         argv: *mut *mut c_char,
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
+            #[cfg(windows)]
+            pipe: Some(
+                crate::picker::pipe::Service::new(egui_ctx.clone()).map_err(|e| {
+                    crate::native_error::FatalError::new("create secure picker pipe", e)
+                })?,
+            ),
             context: egui_ctx.clone(),
             proxy,
             window_id,
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
-            osc_token: crate::picker::protocol::new_token()?,
-            protocol_request: std::sync::Mutex::new(None),
+            title: std::sync::Mutex::new(String::new()),
             config_issues: std::sync::Mutex::new(Vec::new()),
             runtime_issues: std::sync::Mutex::new(Vec::new()),
             clipboard_text: std::sync::Mutex::new(None),
         });
+        #[cfg(windows)]
+        if let Some(pipe) = &wake.pipe {
+            pipe.bind_window(wake.proxy.clone(), wake.window_id);
+        }
         let native = current_native_context();
-        let osc_token = std::ffi::CString::new(wake.osc_token.clone()).unwrap();
+        let (picker_endpoint, picker_token) = wake.picker_environment();
         let mut error_buffer = [0 as c_char; 2048];
         let host = unsafe {
             ghostty_ffi::ghostty_egui_host_create(
@@ -496,7 +535,8 @@ impl TerminalPane {
                 native.display,
                 native.context,
                 egui_ctx.pixels_per_point() as f64,
-                osc_token.as_ptr(),
+                picker_endpoint.as_ptr(),
+                picker_token.as_ptr(),
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
             )
@@ -516,9 +556,9 @@ impl TerminalPane {
     pub(super) fn create_floating(
         &self,
         gl: &glow::Context,
-    ) -> Result<Option<Self>, crate::native_error::FatalError> {
-        self.create_child(&self.wake.context, gl, self.wake.window_id, false)
-            .map(Some)
+        options: &super::floating::CreateOptions,
+    ) -> Result<Self, crate::native_error::FatalError> {
+        self.create_child(&self.wake.context, gl, self.wake.window_id, false, options)
     }
 
     pub(super) fn create_window(
@@ -527,7 +567,7 @@ impl TerminalPane {
         gl: &glow::Context,
         window_id: egui_winit::winit::window::WindowId,
     ) -> Result<Self, crate::native_error::FatalError> {
-        self.create_child(ctx, gl, window_id, true)
+        self.create_child(ctx, gl, window_id, true, &Default::default())
     }
 
     fn create_child(
@@ -536,23 +576,41 @@ impl TerminalPane {
         gl: &glow::Context,
         window_id: egui_winit::winit::window::WindowId,
         new_window: bool,
+        options: &super::floating::CreateOptions,
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
+            #[cfg(windows)]
+            pipe: Some(crate::picker::pipe::Service::new(ctx.clone()).map_err(|e| {
+                crate::native_error::FatalError::new("create secure picker pipe", e)
+            })?),
             context: ctx.clone(),
             proxy: self.wake.proxy.clone(),
             window_id,
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
-            osc_token: crate::picker::protocol::new_token()?,
-            protocol_request: std::sync::Mutex::new(None),
+            title: std::sync::Mutex::new(String::new()),
             config_issues: std::sync::Mutex::new(Vec::new()),
             runtime_issues: std::sync::Mutex::new(Vec::new()),
             clipboard_text: std::sync::Mutex::new(None),
         });
-        let osc_token = std::ffi::CString::new(wake.osc_token.clone()).map_err(|error| {
-            crate::native_error::FatalError::new("create the additional terminal token", error)
-        })?;
+        #[cfg(windows)]
+        if let Some(pipe) = &wake.pipe {
+            pipe.bind_window(wake.proxy.clone(), wake.window_id);
+        }
+        let (picker_endpoint, picker_token) = wake.picker_environment();
         let mut error_buffer = [0 as c_char; 2048];
+        let command = options
+            .command
+            .as_ref()
+            .map(|s| std::ffi::CString::new(s.as_str()))
+            .transpose()
+            .map_err(|e| crate::native_error::FatalError::new("floating pane command", e))?;
+        let cwd = options
+            .cwd
+            .as_ref()
+            .map(|s| std::ffi::CString::new(s.as_str()))
+            .transpose()
+            .map_err(|e| crate::native_error::FatalError::new("floating pane directory", e))?;
         let host = unsafe {
             let native = current_native_context();
             ghostty_ffi::ghostty_egui_host_create_child(
@@ -566,7 +624,10 @@ impl TerminalPane {
                 native.display,
                 native.context,
                 ctx.pixels_per_point() as f64,
-                osc_token.as_ptr(),
+                picker_endpoint.as_ptr(),
+                picker_token.as_ptr(),
+                command.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
             )
@@ -588,6 +649,10 @@ impl TerminalPane {
 
     pub(super) fn should_close(&self) -> bool {
         self.wake.close.load(Ordering::Acquire)
+    }
+
+    pub(super) fn title(&self) -> String {
+        self.wake.title.lock().unwrap().clone()
     }
 
     pub(super) fn request_repaint(&self) {
@@ -663,6 +728,20 @@ impl TerminalPane {
             accent,
             separator,
             detail,
+            pipe_status: {
+                #[cfg(windows)]
+                {
+                    self.wake
+                        .pipe
+                        .as_ref()
+                        .filter(|pipe| pipe.enabled())
+                        .map(|pipe| pipe.connected())
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            },
         }
     }
 
@@ -671,9 +750,10 @@ impl TerminalPane {
         ui: &egui::Ui,
         bounds: egui::Rect,
         bindings: &mut crate::picker::config::Bindings,
-        has_floating: bool,
     ) -> PaneInput {
-        let (picker_consumed, action) = self.handle_picker(ui, bounds, bindings, has_floating);
+        self.copy_mode
+            .set_scroll_padding(bindings.cursor_scroll_padding);
+        let (picker_consumed, action) = self.handle_picker(ui, bounds, bindings);
         let quick_consumed = !picker_consumed && self.handle_quick_select_keys(ui);
         let copy_consumed =
             !picker_consumed && !quick_consumed && self.handle_copy_keys(ui, bindings);
@@ -853,6 +933,7 @@ impl TerminalPane {
             options.source = crate::themes::picker_options(names).source;
         } else if let crate::picker::config::Source::CommandPalette(entries) = &mut options.source {
             *entries = crate::actions::catalog(bindings, has_floating, self.copying());
+            entries.extend(self.floating_palette_entries.iter().cloned());
             // A factory's source is only known after resolving it. Exclude
             // the current factory too, without evaluating other factories.
             if let crate::picker::config::PickerEntry::Factory(factory, _) = &entry {
@@ -1007,7 +1088,7 @@ impl TerminalPane {
         }
     }
 
-    fn selected_text(&self) -> String {
+    pub(super) fn selected_text(&self) -> String {
         let mut result = ghostty_ffi::SnapshotSelectionText::default();
         let copied = if let Some(generation) = self.copy_mode.generation {
             let Some(selection) = self
@@ -1050,12 +1131,12 @@ impl TerminalPane {
         text
     }
 
-    pub(super) fn execute_lua_action(
+    pub(super) fn finish_lua_action(
         &mut self,
-        action: &crate::actions::LuaAction,
+        result: Result<Vec<crate::lua_callbacks::Command>, String>,
         ctx: &egui::Context,
     ) {
-        match action.callback.call_action(self.selected_text()) {
+        match result {
             Ok(commands) => {
                 for command in commands {
                     match command {
@@ -1135,41 +1216,126 @@ impl TerminalPane {
         }
         ctx.request_repaint();
     }
+    #[cfg(windows)]
+    pub(super) fn handle_pipe_requests(
+        &mut self,
+        ctx: &egui::Context,
+        bindings: &crate::picker::config::Bindings,
+        has_floating: bool,
+        interactive: bool,
+    ) {
+        use crate::picker::pipe::{Event, Open};
+        if let Some(pipe) = &self.wake.pipe {
+            pipe.update(
+                &bindings.pipe_policy,
+                unsafe { ghostty_ffi::ghostty_egui_host_shell_pid(self.host) } as u32,
+                unsafe { ghostty_ffi::ghostty_egui_host_shell_creation_time(self.host) },
+            );
+        }
+        if self.picker.as_ref().is_some_and(|p| p.pipe_cancelled()) {
+            let picker = self.picker.take().unwrap();
+            let (generation, from_copy) = (picker.generation, picker.from_copy);
+            drop(picker);
+            self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
+        }
+        loop {
+            let event = self
+                .wake
+                .pipe
+                .as_ref()
+                .and_then(|pipe| pipe.events.try_recv().ok());
+            let Some(event) = event else {
+                break;
+            };
+            match event {
+                Event::Open { request, session } => {
+                    session.trace.mark("ui_dispatched", None);
+                    if session.cancelled.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if !interactive
+                        || self.picker.is_some()
+                        || self.search.active
+                        || self.quick_select.is_some()
+                    {
+                        session.finish("error",serde_json::json!({"code":"busy","message":"another overlay is active"}));
+                        continue;
+                    }
+                    if let Err(message) = bindings.pipe_policy.authorize(&request) {
+                        session.finish(
+                            "error",
+                            serde_json::json!({"code":"capability_denied","message":message}),
+                        );
+                        continue;
+                    }
+                    session.trace.mark("definition_resolution_started", None);
+                    let (entry, params) = match &request {
+                        Open::Named { name, params } => (
+                            bindings
+                                .named(name)
+                                .ok_or_else(|| "unknown named picker".to_owned()),
+                            Some(params.clone()),
+                        ),
+                        Open::Stream { options } => {
+                            (crate::picker::config::Bindings::pipe_stream(options), None)
+                        }
+                    };
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(message) => {
+                            session.finish(
+                                "error",
+                                serde_json::json!({"code":"invalid_definition","message":message}),
+                            );
+                            continue;
+                        }
+                    };
+                    let mut params = params.unwrap_or_default();
+                    params.insert("__ipc_request".into(), "1".into());
+                    session.trace.mark("definition_resolution_finished", None);
+                    let _timing_scope =
+                        crate::picker::diagnostics::Scope::enter(session.trace.clone());
+                    self.open_picker(ctx, entry, Some(params), bindings, has_floating);
+                    if let Some(picker) = &mut self.picker {
+                        picker.attach_pipe(
+                            ctx,
+                            session.clone(),
+                            match &request {
+                                Open::Stream { options } => Some(options),
+                                _ => None,
+                            },
+                        );
+                        picker.bind_pipe_search_wake(self.wake.proxy.clone(), self.wake.window_id);
+                        session.trace.mark("picker_created", None);
+                        session.reply(serde_json::json!({"type":"opened","request_id":session.id}));
+                    } else {
+                        session.finish("error",serde_json::json!({"code":"open_failed","message":"unable to open picker"}));
+                    }
+                }
+                other => {
+                    if let Some(picker) = &mut self.picker {
+                        picker.pipe_event(ctx, other);
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_picker(
         &mut self,
         ui: &egui::Ui,
         bounds: egui::Rect,
         bindings: &mut crate::picker::config::Bindings,
-        has_floating: bool,
     ) -> (bool, Option<crate::actions::AppAction>) {
         let was_active = self.picker.as_ref().is_some();
-        let modal_active = self.search.active || self.quick_select.is_some();
-        let mut shortcut = None;
-        let mut consumed = false;
-        let mut request_params = None;
-        let request = self.wake.protocol_request.lock().unwrap().take();
-        if let Some(request) = request {
-            consumed = true;
-            if !was_active && !modal_active {
-                if let Some(entry) = bindings.named(&request.name) {
-                    shortcut = Some(entry);
-                    request_params = Some(request.params);
-                } else {
-                    crate::error_log::error("protocol", "Unknown OSC picker", &request.name);
-                }
-            } else {
-                eprintln!("OSC picker request ignored while another overlay is active");
-            }
-        }
-        if let Some(entry) = shortcut.filter(|_| !was_active && !modal_active) {
-            self.open_picker(ui.ctx(), entry, request_params, bindings, has_floating);
-        }
+        let consumed = false;
         let active = self.picker.as_ref().is_some();
         let host = self.host;
         let typography = self.picker_font.typography(ui.ctx(), host);
         if let Some(picker) = self.picker.as_mut() {
             picker.typography = typography;
             picker.builtin_pickers = bindings.builtin_pickers;
+            picker.set_cursor_scroll_padding(bindings.cursor_scroll_padding);
         }
         let action = self
             .picker
@@ -1224,78 +1390,89 @@ impl TerminalPane {
                     ghostty_ffi::ghostty_egui_host_text(self.host, text.as_ptr().cast(), text.len())
                 };
             }
-            crate::picker::Action::Custom(callback, text, filesystem, range, value, params) => {
-                match callback.call_with_selection(
-                    &text,
-                    &value,
-                    filesystem,
-                    generation,
-                    range,
-                    &params,
-                    self.selected_text(),
-                ) {
-                    Ok(commands) => {
-                        let mut navigated = false;
-                        let mut sent = false;
-                        for command in commands {
-                            match command {
-                                crate::lua_callbacks::Command::ShowToast {
-                                    title,
-                                    message,
-                                    duration_ms,
-                                } => self.toasts.push(title, message, duration_ms),
-                                crate::lua_callbacks::Command::Navigate(target) => {
-                                    if let Some(generation) =
-                                        generation.filter(|g| self.copy_mode.generation == Some(*g))
-                                    {
-                                        self.accept_picker_cell(generation, target);
-                                        navigated = true;
-                                    } else {
-                                        self.show_error(
-                                            "Picker navigation failed",
-                                            "The saved terminal view has expired. Open the picker again.".into(),
-                                        );
-                                    }
-                                }
-                                crate::lua_callbacks::Command::Paste(text) => {
-                                    self.close_copy_mode();
-                                    sent = true;
-                                    unsafe {
-                                        ghostty_ffi::ghostty_egui_host_text(
-                                            self.host,
-                                            text.as_ptr().cast(),
-                                            text.len(),
-                                        );
-                                    }
-                                }
-                                crate::lua_callbacks::Command::SendText(text) => {
-                                    self.close_copy_mode();
-                                    sent = true;
-                                    Self::send_picker_text(self.host, &text);
-                                }
-                                crate::lua_callbacks::Command::ReplacePrompt {
-                                    text,
-                                    before,
-                                    after,
-                                } => {
-                                    self.close_copy_mode();
-                                    sent = true;
-                                    Self::replace_picker_prompt(self.host, &text, before, after);
-                                }
-                            }
-                        }
-                        if !sent && !navigated {
-                            restore_copy(self);
-                        }
-                    }
-                    Err(error) => {
-                        self.show_error("Picker action failed", error);
-                        restore_copy(self);
-                    }
-                }
+            action @ crate::picker::Action::Custom(..) => {
+                self.pending_callback = Some((action, generation, from_copy));
             }
         }
         None
+    }
+
+    pub(super) fn finish_picker_callback(
+        &mut self,
+        result: Result<Vec<crate::lua_callbacks::Command>, String>,
+        generation: Option<u64>,
+        from_copy: bool,
+    ) {
+        let restore_copy = |pane: &mut Self| {
+            if from_copy {
+                if let Some(generation) = generation {
+                    pane.publish_copy_decoration(generation, pane.copy_mode.cursor, false);
+                }
+            } else {
+                pane.close_copy_mode();
+            }
+        };
+        match result {
+            Ok(commands) => {
+                let mut navigated = false;
+                let mut sent = false;
+                for command in commands {
+                    match command {
+                        crate::lua_callbacks::Command::ShowToast {
+                            title,
+                            message,
+                            duration_ms,
+                        } => self.toasts.push(title, message, duration_ms),
+                        crate::lua_callbacks::Command::Navigate(target) => {
+                            if let Some(generation) =
+                                generation.filter(|g| self.copy_mode.generation == Some(*g))
+                            {
+                                self.accept_picker_cell(generation, target);
+                                navigated = true;
+                            } else {
+                                self.show_error(
+                                    "Picker navigation failed",
+                                    "The saved terminal view has expired. Open the picker again."
+                                        .into(),
+                                );
+                            }
+                        }
+                        crate::lua_callbacks::Command::Paste(text) => {
+                            self.close_copy_mode();
+                            sent = true;
+                            unsafe {
+                                ghostty_ffi::ghostty_egui_host_text(
+                                    self.host,
+                                    text.as_ptr().cast(),
+                                    text.len(),
+                                );
+                            }
+                        }
+                        crate::lua_callbacks::Command::SendText(text) => {
+                            self.close_copy_mode();
+                            sent = true;
+                            Self::send_picker_text(self.host, &text);
+                        }
+                        crate::lua_callbacks::Command::ReplacePrompt {
+                            text,
+                            before,
+                            after,
+                        } => {
+                            self.close_copy_mode();
+                            sent = true;
+                            Self::replace_picker_prompt(self.host, &text, before, after);
+                        }
+                    }
+                }
+                if !sent && !navigated {
+                    restore_copy(self);
+                }
+            }
+            Err(error) => {
+                self.show_error("Picker action failed", error);
+                restore_copy(self);
+            }
+        }
     }
 
     fn accept_picker_cell(&mut self, generation: u64, target: SnapshotCell) {
@@ -1398,7 +1575,27 @@ impl TerminalPane {
         let Some(quick) = &self.quick_select else {
             return false;
         };
-        let (ranges, text, style) = quick.decorations();
+        let palette = crate::colors::palette();
+        let ranges: Vec<_> = quick.visible_hints().map(|hint| hint.range).collect();
+        let text: Vec<_> = quick
+            .cell_text()
+            .into_iter()
+            .map(|hint| ghostty_ffi::SnapshotCellText {
+                cell: hint.cell,
+                codepoint: hint.codepoint,
+                style: SnapshotDecorationStyle {
+                    foreground_rgb: crate::colors::rgb(palette.accent),
+                    background_rgb: crate::colors::rgb(palette.background),
+                    flags: 3,
+                },
+                bold: true,
+            })
+            .collect();
+        let style = SnapshotDecorationStyle {
+            foreground_rgb: crate::colors::rgb(palette.selection_text),
+            background_rgb: crate::colors::rgb(palette.selection_background),
+            flags: 3,
+        };
         let layer = SnapshotDecorationLayer {
             ranges: ranges.as_ptr(),
             range_count: ranges.len(),
@@ -1521,6 +1718,63 @@ impl TerminalPane {
         self.next_search_open = self.next_search_open.wrapping_add(1);
         self.pending_search_snapshot = Some(self.next_search_open);
         self.wake.context.request_repaint();
+    }
+
+    fn open_copy_search(&mut self, backward: bool) {
+        let Some(generation) = self.copy_mode.generation else {
+            return;
+        };
+        self.search_worker.cancel_and_wait();
+        let cursor = if self.copy_search_cursor != 0 {
+            self.copy_search_cursor
+        } else {
+            (unsafe { ghostty_ffi::ghostty_egui_host_snapshot_cursor_new(self.host, generation) })
+                as usize
+        };
+        if cursor == 0 {
+            self.show_error(
+                "Search unavailable",
+                "Unable to create snapshot cursor".into(),
+            );
+            return;
+        }
+        self.copy_mode.cancel_pending_search();
+        let padding = self.copy_mode.scroll_padding();
+        let origin = std::mem::take(&mut self.copy_mode);
+        self.copy_mode.set_scroll_padding(padding);
+        self.copy_search_cursor = 0;
+        self.search = SearchUi {
+            active: true,
+            focus_requested: true,
+            snapshot_generation: Some(generation),
+            cursor,
+            copy_origin: Some(origin),
+            backward,
+            ..Default::default()
+        };
+        self.publish_search_matches(false);
+        self.queue_search();
+        self.wake.context.request_repaint();
+    }
+
+    fn cancel_search(&mut self) {
+        if self.search.copy_origin.is_some() {
+            self.search_worker.cancel_and_wait();
+            let mut search = std::mem::take(&mut self.search);
+            self.copy_mode = search.copy_origin.take().unwrap();
+            self.copy_search_cursor = search.cursor;
+            if let Some(generation) = self.copy_mode.generation {
+                self.apply_copy_target(
+                    generation,
+                    Motion::CharacterJump,
+                    self.copy_mode.cursor,
+                    false,
+                );
+            }
+            self.wake.context.request_repaint();
+        } else {
+            self.close_search();
+        }
     }
 
     fn prepare_search_snapshot(&mut self) {
@@ -1662,8 +1916,15 @@ impl TerminalPane {
         view.cursor = actual;
         self.copy_mode.start(generation, view);
         self.copy_search_cursor = search.cursor;
-        self.copy_mode
-            .adopt_search(search.query_revision, search.matches);
+        if search.copy_origin.is_some() {
+            self.copy_mode
+                .begin_search(search.query_revision, !search.backward, 1);
+            self.copy_mode
+                .finish_search(search.query_revision, search.matches);
+        } else {
+            self.copy_mode
+                .adopt_search(search.query_revision, search.matches);
+        }
         self.pending_search_snapshot = None;
         self.prompt_boundaries = None;
         self.wake.context.memory_mut(|memory| {
@@ -1690,7 +1951,9 @@ impl TerminalPane {
                 };
             }
             unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+            let padding = self.copy_mode.scroll_padding();
             self.copy_mode = CopyMode::default();
+            self.copy_mode.set_scroll_padding(padding);
             self.copy_search_cursor = 0;
             self.prompt_boundaries = None;
             self.wake.context.request_repaint();
@@ -1702,11 +1965,24 @@ impl TerminalPane {
         ui: &egui::Ui,
         bindings: &crate::picker::config::Bindings,
     ) -> bool {
+        if self.search.active {
+            return false;
+        }
         let was_active = self.copy_mode.generation.is_some();
         let events = ui.input(|input| input.events.clone());
         self.copy_mode.begin_input_batch();
-        for event in &events {
+        for (event_index, event) in events.iter().enumerate() {
             if self.copy_mode.generation.is_none() {
+                break;
+            }
+            if let egui::Event::Text(text) = event
+                && matches!(text.as_str(), "/" | "?")
+            {
+                self.open_copy_search(text == "?");
+                // The trigger belongs to copy mode, not the search query.
+                ui.ctx().input_mut(|input| {
+                    input.events.drain(..=event_index);
+                });
                 break;
             }
             let action = self.copy_mode.input(event);
@@ -1977,7 +2253,10 @@ impl TerminalPane {
         if let Some(actual) = self.resolve_copy_cell(generation, requested, snap_right)
             && self.publish_copy_decoration(generation, actual, true)
         {
-            self.copy_mode.moved(motion, actual);
+            let host = self.host;
+            self.copy_mode.moved_with_rows(motion, actual, |row| {
+                Self::read_snapshot_row_from(host, generation, row)
+            });
             true
         } else {
             self.close_copy_mode();
@@ -2317,7 +2596,7 @@ impl TerminalPane {
     fn publish_copy_decoration(&self, generation: u64, cell: SnapshotCell, reveal: bool) -> bool {
         let viewport = SnapshotViewportOptions {
             reveal: if reveal { &cell } else { std::ptr::null() },
-            padding_rows: SCROLL_PADDING_ROWS,
+            padding_rows: self.copy_mode.scroll_padding(),
             ..Default::default()
         };
         self.publish_copy_decoration_with_viewport(generation, cell, &viewport)
@@ -2338,11 +2617,11 @@ impl TerminalPane {
             range_count: 1,
             style: SnapshotDecorationStyle {
                 foreground_rgb: crate::colors::rgb(crate::colors::palette().background),
-                background_rgb: if self.copy_mode.visual_anchor.is_some() {
-                    crate::colors::rgb(crate::colors::palette().accent)
-                } else {
-                    crate::colors::rgb(crate::colors::palette().accent)
-                },
+                background_rgb: crate::colors::rgb(
+                    crate::colors::palette()
+                        .copy_cursor_background
+                        .unwrap_or(crate::colors::palette().accent),
+                ),
                 flags: 3,
             },
         };
@@ -2393,8 +2672,18 @@ impl TerminalPane {
                 flags: 3,
             },
         });
-        let layers =
+        let active_match = self.copy_mode.search_matches().iter().find(|range| {
+            (range.start.y, range.start.x) <= (cell.y, cell.x)
+                && (cell.y, cell.x) <= (range.end.y, range.end.x)
+        });
+        let mut layers =
             copy_decoration_layers(caret_layer, selection_layer, yank_layer, matches_layer);
+        if let Some(range) = active_match {
+            // Earlier layers win. Keep cursor/yank precedence, but color the
+            // whole active match before ordinary search matches.
+            let index = layers.len() - 1;
+            layers.insert(index, active_search_layer(range));
+        }
         unsafe {
             ghostty_ffi::ghostty_egui_host_snapshot_apply_decorations(
                 self.host,
@@ -2583,18 +2872,10 @@ impl TerminalPane {
             reveal: selected
                 .filter(|_| reveal_selected)
                 .map_or(std::ptr::null(), |range| &range.start),
-            padding_rows: SCROLL_PADDING_ROWS,
+            padding_rows: self.copy_mode.scroll_padding(),
             ..Default::default()
         };
-        let selected_layers = selected.map(|range| SnapshotDecorationLayer {
-            ranges: std::ptr::from_ref(range),
-            range_count: 1,
-            style: SnapshotDecorationStyle {
-                foreground_rgb: crate::colors::rgb(crate::colors::palette().background),
-                background_rgb: crate::colors::rgb(crate::colors::palette().match_highlight),
-                flags: 3,
-            },
-        });
+        let selected_layers = selected.map(active_search_layer);
         let matches_layer = SnapshotDecorationLayer {
             ranges: self.search.matches.as_ptr(),
             range_count: self.search.matches.len(),
@@ -2634,7 +2915,7 @@ impl TerminalPane {
             self.navigate_search(previous);
         }
         if action.close {
-            self.close_search();
+            self.cancel_search();
         } else if action.accept {
             self.accept_search();
         }
@@ -2643,6 +2924,19 @@ impl TerminalPane {
 
 // The renderer uses the first matching decoration. Yank feedback must cover the
 // caret, even when the copied range contains only the caret's cell.
+fn active_search_layer(range: &SnapshotCellRange) -> SnapshotDecorationLayer {
+    let palette = crate::colors::palette();
+    SnapshotDecorationLayer {
+        ranges: std::ptr::from_ref(range),
+        range_count: 1,
+        style: SnapshotDecorationStyle {
+            foreground_rgb: crate::colors::rgb(palette.background),
+            background_rgb: crate::colors::rgb(palette.match_highlight),
+            flags: 3,
+        },
+    }
+}
+
 fn copy_decoration_layers(
     caret: SnapshotDecorationLayer,
     selection: Option<SnapshotDecorationLayer>,
@@ -2661,8 +2955,97 @@ fn copy_decoration_layers(
     layers
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotDecorationOwner {
+    QuickSelect(u64),
+    Search(u64),
+    Copy(u64),
+}
+
+fn snapshot_decoration_refresh(
+    quick: Option<u64>,
+    search: Option<u64>,
+    copy: Option<u64>,
+    needs_refresh: impl FnOnce(u64) -> bool,
+) -> Option<SnapshotDecorationOwner> {
+    let owner = quick
+        .map(SnapshotDecorationOwner::QuickSelect)
+        .or_else(|| search.map(SnapshotDecorationOwner::Search))
+        .or_else(|| copy.map(SnapshotDecorationOwner::Copy))?;
+    let generation = match owner {
+        SnapshotDecorationOwner::QuickSelect(generation)
+        | SnapshotDecorationOwner::Search(generation)
+        | SnapshotDecorationOwner::Copy(generation) => generation,
+    };
+    needs_refresh(generation).then_some(owner)
+}
+
 #[cfg(test)]
 mod copy_shortcut_tests {
+    #[test]
+    fn quick_select_labels_refresh_after_live_snapshot_handoff_without_navigation() {
+        use super::*;
+        // Quick select also holds copy-mode state for the same snapshot. Once
+        // native code invalidates that snapshot's decorations, only hints own
+        // the refresh; a copy repaint would erase them.
+        assert_eq!(
+            snapshot_decoration_refresh(Some(7), None, Some(7), |_| false),
+            None
+        );
+        assert_eq!(
+            snapshot_decoration_refresh(Some(7), None, Some(7), |generation| generation == 7),
+            Some(SnapshotDecorationOwner::QuickSelect(7))
+        );
+        assert_eq!(
+            snapshot_decoration_refresh(Some(7), Some(6), Some(7), |generation| generation == 7),
+            Some(SnapshotDecorationOwner::QuickSelect(7))
+        );
+        assert_eq!(
+            snapshot_decoration_refresh(None, None, Some(7), |_| true),
+            Some(SnapshotDecorationOwner::Copy(7))
+        );
+    }
+
+    #[test]
+    fn unchanged_snapshot_does_not_republish_or_fall_through_to_other_modes() {
+        use super::*;
+        assert_eq!(
+            snapshot_decoration_refresh(Some(7), Some(6), Some(7), |generation| {
+                assert_eq!(generation, 7);
+                false
+            }),
+            None
+        );
+        assert_eq!(
+            snapshot_decoration_refresh(None, Some(7), Some(7), |_| true),
+            Some(SnapshotDecorationOwner::Search(7))
+        );
+        assert_eq!(
+            snapshot_decoration_refresh(None, None, None, |_| panic!("no active snapshot")),
+            None
+        );
+    }
+    #[test]
+    fn active_search_layer_uses_full_match_and_distinct_configured_color() {
+        use super::*;
+        let range = SnapshotCellRange {
+            start: SnapshotCell { x: 3, y: 2 },
+            end: SnapshotCell { x: 8, y: 3 },
+        };
+        let layer = active_search_layer(&range);
+        assert_eq!(layer.ranges, std::ptr::from_ref(&range));
+        assert_eq!(layer.range_count, 1);
+        assert_eq!(layer.style.flags, 3);
+        assert_eq!(
+            layer.style.background_rgb,
+            crate::colors::rgb(crate::colors::palette().match_highlight)
+        );
+        assert_eq!(
+            layer.style.foreground_rgb,
+            crate::colors::rgb(crate::colors::palette().background)
+        );
+    }
+
     #[test]
     fn single_cell_yank_takes_precedence_over_caret_and_restores_after_expiry() {
         use super::*;
@@ -2973,7 +3356,7 @@ struct NativeContext {
     context: *mut c_void,
 }
 
-#[cfg(all(target_os = "windows", not(feature = "vulkan")))]
+#[cfg(target_os = "windows")]
 fn current_native_context() -> NativeContext {
     unsafe extern "system" {
         fn wglGetCurrentContext() -> *mut c_void;
@@ -2989,10 +3372,7 @@ fn current_native_context() -> NativeContext {
     }
 }
 
-#[cfg(all(
-    any(target_os = "linux", target_os = "freebsd"),
-    not(feature = "vulkan")
-))]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn current_native_context() -> NativeContext {
     #[link(name = "EGL")]
     unsafe extern "C" {
@@ -3005,15 +3385,5 @@ fn current_native_context() -> NativeContext {
             display: eglGetCurrentDisplay(),
             context: eglGetCurrentContext(),
         }
-    }
-}
-
-#[cfg(feature = "vulkan")]
-fn current_native_context() -> NativeContext {
-    let (window, context) = crate::graphics::native_context();
-    NativeContext {
-        window,
-        display: std::ptr::null_mut(),
-        context,
     }
 }

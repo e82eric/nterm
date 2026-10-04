@@ -87,6 +87,10 @@ pub(crate) enum Preview {
         cwd: Option<String>,
         #[serde(skip)]
         command: Option<std::rc::Rc<crate::lua_callbacks::PreviewCommand>>,
+        #[serde(default)]
+        max_bytes: Option<usize>,
+        #[serde(default)]
+        max_scrollback_lines: Option<usize>,
     },
 }
 
@@ -101,7 +105,15 @@ impl Preview {
                 return Err("scrollback preview rows must be between 1 and 12".into());
             }
         }
-        if let Self::Command { args, cwd, command } = self {
+        if let Self::Command {
+            args,
+            cwd,
+            command,
+            max_bytes,
+            max_scrollback_lines,
+        } = self
+        {
+            validate_preview_limits(*max_bytes, *max_scrollback_lines)?;
             if command.is_some() && !args.is_empty() {
                 return Err("preview command cannot specify both args and command".into());
             }
@@ -128,6 +140,24 @@ impl Preview {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct PickerDefaults {
     pub(crate) unique: bool,
+    pub(crate) preview_max_bytes: Option<usize>,
+    pub(crate) preview_max_scrollback_lines: Option<usize>,
+}
+
+fn validate_preview_limits(bytes: Option<usize>, lines: Option<usize>) -> Result<(), String> {
+    if bytes.is_some_and(|value| value == 0 || value.checked_mul(2).is_none()) {
+        return Err("max_bytes must be positive and fit after newline normalization".into());
+    }
+    if lines == Some(0) {
+        return Err("max_scrollback_lines must be positive".into());
+    }
+    Ok(())
+}
+
+impl PickerDefaults {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        validate_preview_limits(self.preview_max_bytes, self.preview_max_scrollback_lines)
+    }
 }
 
 // Repeat the shared acceptance fields so each variant can reject unknown fields.
@@ -200,7 +230,7 @@ pub(crate) enum Definition {
         #[serde(default)]
         sort: Sort,
         #[serde(default)]
-        items: Vec<crate::picker::protocol::Item>,
+        items: Vec<crate::picker::wire::Item>,
         #[serde(default)]
         enter_action: Option<EnterAction>,
         #[serde(default)]
@@ -454,7 +484,7 @@ pub(crate) enum Source {
 
 #[derive(Clone)]
 pub(crate) struct ItemsOptions {
-    pub(crate) values: Vec<crate::picker::protocol::Item>,
+    pub(crate) values: Vec<crate::picker::wire::Item>,
     pub(crate) provider: Option<std::rc::Rc<crate::lua_callbacks::ItemsProvider>>,
 }
 
@@ -480,7 +510,7 @@ impl Options {
     pub(crate) fn with_request(mut self, params: BTreeMap<String, String>) -> Result<Self, String> {
         if let Source::Items(items) = &mut self.source {
             if params.contains_key("items") {
-                items.values = crate::picker::protocol::items(&params)?;
+                items.values = crate::picker::wire::items(&params)?;
                 items.provider = None;
             }
         }
@@ -551,13 +581,43 @@ impl PickerEntry {
 
 #[derive(Clone)]
 pub(crate) struct Bindings {
+    pub(crate) pipe_policy: super::pipe::Policy,
     pub(crate) builtin_pickers: BuiltinPickers,
+    pub(crate) cursor_scroll_padding: u32,
     bindings: Vec<Binding>,
     definitions: BTreeMap<String, PickerEntry>,
     actions: BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
 }
 
 impl Bindings {
+    pub(crate) fn with_pipe_policy(mut self, policy: super::pipe::Policy) -> Self {
+        self.pipe_policy = policy;
+        self
+    }
+    pub(crate) fn pipe_stream(options: &super::pipe::StreamOptions) -> Result<PickerEntry, String> {
+        let value = serde_json::json!({"type":"Items","items":[],"initial_query":options.initial_query,"preview_visible":options.preview_visible,"preview":options.preview});
+        if let Some(preview) = value.get("preview") {
+            if preview
+                .get("max_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|n| n > 10 * 1024 * 1024)
+                || preview
+                    .get("max_scrollback_lines")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|n| n > 8192)
+            {
+                return Err("IPC preview exceeds server limits".into());
+            }
+        }
+        let definition: Definition = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let compiled = Self::compile(
+            Some(BTreeMap::from([("ipc".into(), definition)])),
+            Some(Vec::new()),
+        )?;
+        compiled
+            .named("ipc")
+            .ok_or("invalid picker definition".into())
+    }
     pub(crate) fn compile(
         definitions: Option<BTreeMap<String, Definition>>,
         keys: Option<Vec<KeyBinding>>,
@@ -579,6 +639,7 @@ impl Bindings {
         defaults: PickerDefaults,
         actions: BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
     ) -> Result<Self, String> {
+        defaults.validate()?;
         let mut definitions = definitions.unwrap_or_else(|| {
             BTreeMap::from([
                 (
@@ -657,7 +718,7 @@ impl Bindings {
                 | Definition::CommandPalette { initial_query, .. } => initial_query.clone(),
                 Definition::Factory { .. } => unreachable!(),
             };
-            let preview = match &definition {
+            let mut preview = match &definition {
                 Definition::Scrollback { preview, .. }
                 | Definition::Items { preview, .. }
                 | Definition::Command { preview, .. }
@@ -691,6 +752,23 @@ impl Bindings {
                 } => *preview_visible,
                 Definition::Factory { .. } => unreachable!(),
             };
+            if let Some(Preview::Command {
+                max_bytes,
+                max_scrollback_lines,
+                ..
+            }) = &mut preview
+            {
+                *max_bytes = Some(
+                    max_bytes
+                        .or(defaults.preview_max_bytes)
+                        .unwrap_or(10 * 1024 * 1024),
+                );
+                *max_scrollback_lines = Some(
+                    max_scrollback_lines
+                        .or(defaults.preview_max_scrollback_lines)
+                        .unwrap_or(8192),
+                );
+            }
             if let Some(preview) = &preview {
                 preview
                     .validate()
@@ -751,7 +829,7 @@ impl Bindings {
                 Definition::Items {
                     items, provider, ..
                 } => {
-                    crate::picker::protocol::validate_items(&items)?;
+                    crate::picker::wire::validate_items(&items)?;
                     if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
                         return Err(format!(
                             "pickers.{name}: Items only supports enter_action SendInput"
@@ -785,13 +863,18 @@ impl Bindings {
                     {
                         return Err(format!("pickers.{name}.args requires an executable"));
                     }
-                    if args.iter().any(|arg| arg.contains('\0'))
-                        || cwd.as_ref().is_some_and(|value| value.contains('\0'))
-                        || line_continuation.as_ref().is_some_and(|value| {
-                            value.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n'))
-                        })
-                    {
-                        return Err(format!("pickers.{name}: command contains NUL"));
+                    if let Some(index) = args.iter().position(|arg| arg.contains('\0')) {
+                        return Err(format!("pickers.{name}.args[{index}] contains NUL"));
+                    }
+                    if cwd.as_ref().is_some_and(|value| value.contains('\0')) {
+                        return Err(format!("pickers.{name}.cwd contains NUL"));
+                    }
+                    if line_continuation.as_ref().is_some_and(|value| {
+                        value.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n'))
+                    }) {
+                        return Err(format!(
+                            "pickers.{name}.line_continuation cannot contain NUL or a newline; use a literal continuation marker"
+                        ));
                     }
                     if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
                         return Err(format!(
@@ -971,10 +1054,17 @@ impl Bindings {
         }
         Ok(Self {
             bindings,
+            pipe_policy: super::pipe::Policy::default(),
             definitions: compiled,
             actions,
             builtin_pickers: BuiltinPickers::default(),
+            cursor_scroll_padding: nfm_egui::copy_mode::SCROLL_PADDING_ROWS,
         })
+    }
+
+    pub(crate) fn with_cursor_scroll_padding(mut self, rows: u32) -> Self {
+        self.cursor_scroll_padding = rows;
+        self
     }
 
     pub(crate) fn with_builtin_pickers(mut self, builtins: BuiltinPickers) -> Self {

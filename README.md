@@ -1,7 +1,7 @@
 # Rust egui terminal shell
 
-This example embeds Ghostty terminals in an egui shell. It supports OpenGL
-and Vulkan, exporting completed textures to egui without a CPU pixel copy.
+This example embeds Ghostty terminals in an egui shell. It uses OpenGL,
+exporting completed textures to egui without a CPU pixel copy.
 
 From the repository root:
 
@@ -10,83 +10,25 @@ zig build egui-sample -Doptimize=ReleaseFast
 .\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
 ```
 
-Build the Vulkan application with:
-
-```powershell
-zig build egui-sample -Drenderer=vulkan -Doptimize=ReleaseFast
-.\zig-out\bin\ghostty_egui.exe --command=pwsh.exe
-```
-
-This selects both the Zig Vulkan renderer and Cargo's `vulkan` feature. The
-terminal workers and egui-wgpu share one Vulkan device and queue across all
-windows. Each window has its own swapchain; each terminal retains its own grid,
-atlases, and upload buffers. Text, cursors, cell backgrounds, Kitty images,
-background images, and ShaderToy custom shaders use Vulkan. Custom shaders
-compile to SPIR-V; completed terminal frames use GPU texture copies and a
-bounded reusable export pool. The Vulkan path creates no OpenGL contexts and
-does not fall back to another backend if Vulkan is unavailable.
-
-Windows is the tested platform. Linux uses the same wgpu Vulkan backend but
-has not been validated here. macOS requires a Vulkan implementation such as
-MoltenVK; this build does not automatically select Metal. The Vulkan backend
-currently serves the embedded egui application, rather than the GTK/macOS apps.
-Build again without `-Drenderer=vulkan` to restore the OpenGL application. Keep
-the executable and its matching `ghostty.dll` together when comparing builds.
-
-After a Windows build, run the offscreen Vulkan pixel checks with:
-
-```powershell
-$env:NFM_GHOSTTY_VT_INCLUDE_DIR = "$PWD/include"
-$env:NFM_GHOSTTY_VT_LIB_DIR = "$PWD/zig-out/lib"
-$env:NFM_GHOSTTY_VT_LIB_NAME = 'ghostty-vt-static'
-cargo test --manifest-path example/rust-egui-terminal/Cargo.toml --features vulkan --test vulkan_render --target-dir .zig-cache/egui-target -- --nocapture
-```
-
-These checks require a working Vulkan driver and fail if Vulkan is unavailable;
-they do not substitute a different graphics backend. They check packed cell
-layouts, background and glyph pixels, native image dispatch, and egui composition
-on the same device.
-
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> to open another terminal in
 a new window within the same process. Each window has its own shell, terminal
 view, floating pane, and UI state. Windows share the native Ghostty app and its
 configuration; theme and font changes apply to all windows. Closing a window
 closes its terminals, and the app exits after the last window closes.
 
-Windows also share one egui context, font atlas, and GPU painter. In the OpenGL
-build, the UI context switches between each window's drawing surface, while
+Windows also share one egui context, font atlas, and GPU painter. The UI
+context switches between each window's drawing surface, while
 input, focus, DPI, and presentation timing remain per window. Ghostty's terminal
 rendering workers retain their own OpenGL contexts. A hidden graphics window
 keeps shared resources alive independently of whichever terminal window closes.
-The Vulkan build keeps its shared device alive without a hidden graphics window.
 
 On Windows, run `python example/rust-egui-terminal/tests/multiwindow_smoke.py`
 after building to check the shortcut, multiple windows in one process, floating
 panes, resizing, shell exit, and closing the original window before the others.
 The check briefly opens and focuses test windows, then closes them.
-For the Vulkan custom-shader regression, add
-`--terminal-arg=--custom-shader=C:/src/ghostty2/example/rust-egui-terminal/tests/vulkan_passthrough.glsl`
-(adjust the absolute repository path). This also covers MSVC DLL initialization
-needed by the native shader compiler.
 Add `--memory-report .zig-cache/shared-ui-memory.json` to record private working
 set, total working set, and private bytes for one window, four windows, and four
 windows with floating panes. Use `--executable <path>` to compare another build.
-
-On the development RTX 3060 machine, ReleaseFast builds with `cmd.exe` and no
-custom shaders measured the following private resident RAM (MiB). Both runs
-used 1901×1039 pixels for one window and 1901×513 pixels per window for four.
-
-| Scenario | OpenGL | Vulkan |
-| --- | ---: | ---: |
-| One window | 66.6 | 36.9 |
-| Four windows | 152.7 | 43.8 |
-| Four windows with floating panes | 255.6 | 52.4 |
-
-These are process working-set measurements, excluding child shells and GPU
-VRAM. Private committed memory was respectively 303/738/1239 MiB for OpenGL
-and 412/892/1163 MiB for Vulkan. Lower resident RAM therefore does not imply
-lower commitment in every scenario. Results vary with driver, window size,
-terminal content, and configuration.
 
 Copy mode uses the shared `nfm-egui::copy_mode` engine. Ghostty supplies native
 terminal snapshots, rendering, search workers, clipboard operations, and
@@ -98,40 +40,12 @@ motions, wide-cell resolution, search, and yanks can extend beyond the displayed
 page. Full-history preview search runs on a cancellable worker. The preview
 lease closes before its native terminal host is destroyed.
 
-Copy mode borrows the live terminal until its first guarded mutation. At that
-point it captures independently owned compressed history before applying the
-mutation. Search and text extraction decode one page into temporary storage;
-they do not expand the entire snapshot. Complete cursor-style-only output
-does not trigger capture because the insertion cursor is hidden in copy mode.
-The compressor retains native mappings, so Windows committed-memory counters
-can include those mappings even when their physical pages are discarded.
-
-For snapshot memory diagnostics, enable native logging before starting a new
-process:
-
-```powershell
-$env:GHOSTTY_LOG = 'stderr'
-Start-Process -FilePath .\zig-out\bin\ghostty_egui.exe `
-    -ArgumentList '--command=pwsh.exe' `
-    -RedirectStandardError snapshot-diagnostics.log
-```
-
-Use `Start-Process` to explicitly provide the Windows GUI application with a
-stderr handle. PowerShell's `2>` redirection can leave an empty file for this
-application. Startup `info:` lines should appear before entering copy mode.
-
-Lines containing `snapshot diagnostic` report borrowed-mode entry, the first
-capture trigger, and resident/compressed terminal
-page counts and bytes before and after text scans. An `owned` source means a
-snapshot was actually allocated. If only `live` resident bytes grow while
-compressed pages decrease, scanning is restoring compressed history.
-Complete cursor-style-only output is reported as `skipped_capture=cursor_style`;
-the frozen presentation hides the terminal cursor, so this needs no copy.
-The reported bytes measure terminal page storage, rather than total process
-memory. Inspecting the
-diagnostic metadata does not restore compressed pages. Clear `GHOSTTY_LOG` to
-disable logging. Rebuild with `zig build egui-sample -Doptimize=ReleaseFast` to update the DLL beside
-the executable; plain `zig build` updates the library output separately.
+Copy mode captures an independently owned copy of the full terminal and
+scrollback when it opens. Search, copy, and quick select read this fixed copy
+while shell output continues updating the live terminal. Exiting removes the
+decorations and returns to the live terminal. Snapshot history remains resident;
+large histories require more memory and take longer to capture at mode entry.
+Upstream live scrollback compression remains available.
 
 With `GHOSTTY_LOG=stderr`, lines containing `resize diagnostic` show the grid
 and cursor after reflow, Windows ConPTY notification, and cursor-position
@@ -248,6 +162,10 @@ results independently of the selected terminal search match (`match_highlight`).
 It accepts `#RRGGBB`, supports `theme_colors` and manual reload, and falls back to
 `match_highlight` when omitted.
 
+Set `colors.ui.copy_cursor_background` to color the copy-mode cursor in the
+terminal and NFM preview independently of `accent` and the active search match.
+It also supports `theme_colors` overrides and falls back to `accent` when omitted.
+
 Use **Choose theme** in the command palette to search installed user and bundled
 Ghostty themes in the shared fuzzy picker. Arrow keys select an entry; Enter or clicking a theme applies it. Escape
 closes the picker without changing the theme. The choice updates the main and
@@ -272,6 +190,80 @@ Add these entries to the tables in your config. Named theme pickers also support
 `initial_query` and work in the main and floating panes. The built-in
 `OpenThemePicker` action keeps its centered placement.
 
+## Multiple floating panes
+
+The command palette includes a restore entry for each retained pane, including
+hidden panes. Entries always show its stable ID, followed by its explicit name
+or current terminal title, and mark the visible pane as active. Labels are
+captured when the palette opens; selecting an entry restores that pane by ID.
+If its shell exits while the palette is open, selection reports that the pane
+has closed.
+
+Each window retains its own floating panes, with one visible at a time. Hidden
+panes keep their shells running. The default shortcuts are:
+
+| Shortcut | Action |
+| --- | --- |
+| Ctrl+Shift+E | `ToggleFloatingPane` |
+| Ctrl+Alt+Shift+E | `CreateFloatingPane` |
+| Ctrl+Alt+] | `NextFloatingPane` |
+| Ctrl+Alt+[ | `PreviousFloatingPane` |
+| Ctrl+Shift+W | `CloseFloatingPane` |
+
+These action names can also be assigned in Lua `keys`. Toggle hides the visible
+pane or restores the last focused pane, creating one if none exist. Next and
+previous follow creation order, wrap around, and restore a hidden pane. With no
+panes, cycling does nothing. Closing the visible pane restores the most recently
+focused remaining pane; closing a hidden pane leaves the current visibility
+unchanged. A shell exiting removes its pane in the same way.
+
+Named actions and picker selection callbacks support:
+
+```lua
+actions = {
+  {
+    name = "ToolsPane",
+    action = function(app)
+      local pane = app:get_floating_pane("tools")
+      if pane then
+        app:restore_floating_pane(pane.id)
+      else
+        pane = app:create_floating_pane({
+          name = "tools", command = "pwsh.exe", cwd = "C:\\src",
+        })
+        app:show_toast("Floating pane", "Created " .. pane.name .. " (" .. pane.id .. ")")
+      end
+    end,
+  },
+},
+keys = {
+  { key = "t", mods = "CTRL|ALT", action = "ToolsPane" },
+},
+```
+
+`app:create_floating_pane(options)` returns `{id, name, visible, focused}` after
+native creation succeeds. All options are optional; omitted command and working
+directory use the normal terminal defaults. `command` is a Ghostty command
+string. Names must be nonempty and unique among this window's existing panes.
+IDs are stable, monotonically increasing within a window, and never reused.
+
+`app:get_floating_pane(id_or_name)` returns a description or `nil`; with no
+argument it returns the last focused floating pane. `app:get_floating_panes()`
+returns descriptions in creation order. Descriptions are snapshots; `focused`
+means the pane is the window's terminal input target, even if the OS window
+itself is unfocused.
+
+`app:restore_floating_pane(id_or_name)`, `app:toggle_floating_pane()`,
+`app:next_floating_pane()`, `app:previous_floating_pane()`, and
+`app:close_floating_pane(id_or_name)` change pane state immediately.
+Close without a target closes the last focused pane, including when hidden.
+Restore or explicit close of a missing pane raises a Lua error; lookup returns
+`nil`. Creation errors are synchronous and can be handled with `pcall`.
+Pane operations already performed remain in effect if a callback subsequently
+fails. Queued paste/send-text commands still apply to the originating pane and
+are discarded if that pane was closed by the callback. Retained app handles
+expire when their callback returns.
+
 ## Lua actions and toasts
 
 All Ghostty pickers now embed the shared `nfm-egui` control used by
@@ -280,7 +272,7 @@ headers, `/` completion, keybinding help, and preview drawing. Ghostty supplies
 its existing Lua sources/actions, owned scrollback cell ranges, preview documents,
 theme colors, and exported terminal fonts and cell metrics. Main and floating
 pane bounds determine compact sizing and placement; inactive pane pickers cannot
-consume input or steal focus. Existing picker definitions and OSC requests remain
+consume input or steal focus. Existing picker definitions and named pipe requests remain
 supported. Ctrl+P/Ctrl+Space toggle previews, Ctrl+Page Up/Down page previews,
 Ctrl+C copies the selected row, and Ctrl+Shift+/ opens keybinding help.
 
@@ -444,7 +436,7 @@ command navigation, and named picker actions. It displays configured picker
 shortcuts and includes pickers without a binding. Unavailable actions are omitted:
 closing a floating pane requires an existing pane, and entering or exiting copy
 mode depends on the target pane's state. Empty Items sources without a provider
-and Command sources requiring unresolved OSC parameters are omitted. Lua factories
+and Command sources requiring unresolved request parameters are omitted. Lua factories
 run only when their picker is selected.
 
 The palette uses the normal picker layout and opens within the active pane.
@@ -529,7 +521,7 @@ while copying; Escape retains its existing copy-mode behavior, including clearin
 pending motions, visual selection, and search before exiting.
 
 Picker names can also map to functions. The function runs when its keybinding or
-named OSC request opens the picker, and returns the same table as a static picker:
+named pipe request opens the picker, and returns the same table as a static picker:
 
 ```lua
 pickers = {
@@ -588,7 +580,7 @@ filters cannot both be true. Filesystem pickers only support `SendInput`, pastin
 the raw path without shell quoting or Enter. Regex extraction is scrollback-only.
 An optional preview can show the selected path's contents.
 
-`Items` takes its candidates from an OSC request's `params.items`, a JSON-encoded
+`Items` takes its candidates from a named pipe request's `params.items`, a JSON-encoded
 array of `{ "text": "display label", "value": "text to insert" }`, or from an
 `items = function() ... end` Lua provider. The provider runs each time the picker
 opens, so it can read a file that changes during the session. Lua has
@@ -598,7 +590,7 @@ Enter pastes the chosen value. Item lists are limited to 2,000 entries.
 
 `Command` runs the configured `args` array without a shell and streams stdout
 lines into the fuzzy picker. An argument consisting of `{pattern}` is replaced
-with the OSC request's `params.pattern`; other `{name}` arguments can use other
+with the named pipe request's `params.pattern`; other `{name}` arguments can use other
 request parameters. The request's `params.cwd` overrides optional configured
 `cwd`. The command stops when the picker closes. Without an `action` callback,
 Enter pastes the selected line. The sample `Ripgrep` picker shows how to use
@@ -617,7 +609,7 @@ escape sequences; `preview = { type = "Command", args = { "bat", "--color=always
 "{item}" } }` runs a process and renders its output. `{item}` in preview text,
 arguments, or optional `cwd` is replaced with the selected item's accepted value.
 Commands run without a shell and are cancelled when selection changes or the
-picker closes. Preview output is limited to 64 KiB and displayed in 12 terminal
+picker closes. Command preview output is limited to 10 MiB and displayed in 12 terminal
 rows. Ghostty's VT parser handles ANSI sequences in an isolated terminal; egui
 draws its text, colors, and basic styles using the picker's font.
 Instead of fixed `args`, a Command preview can use `command = function(item, params)`
@@ -625,6 +617,41 @@ to return `{ args = {...}, cwd = "..." }` for each selected item. Return `nil`
 to leave that item's preview blank. `item.value` is the selected value;
 filesystem items also provide `item.path` and `item.is_directory`. The callback
 runs when the selected item changes.
+
+Command preview limits can be configured globally:
+
+Set `cursor_scroll_padding = 2` in the top-level Lua table to control the rows
+kept above and below the cursor in terminal copy/search mode and picker previews.
+The default is two rows. Zero disables the margin; short viewports reduce it
+automatically. Configuration reload applies the value to existing panes and
+picker previews.
+
+```lua
+picker_defaults = {
+  preview_max_bytes = 10 * 1024 * 1024,
+  preview_max_scrollback_lines = 8192,
+},
+```
+
+Override either limit in a picker's preview table:
+
+```lua
+preview = {
+  type = "Command",
+  max_bytes = 20 * 1024 * 1024,
+  max_scrollback_lines = 16384,
+  command = function(item, params)
+    return { args = { "bat", "--color=always", "--paging=never", item.value } }
+  end,
+},
+```
+
+Both values must be positive integers. Omitted values inherit the picker defaults;
+the built-in defaults are 10 MiB and 8192 physical scrollback lines. `max_bytes`
+caps captured command output, not terminal grid memory. The parser's byte bound
+follows it, allowing additional bytes for CRLF normalization. Scrollback pruning
+occurs at native page boundaries and can remove early rows when the line limit
+is reached; choose enough lines to retain the context used by `center_line`.
 
 The returned command table may also include `center_line`, a zero-based line
 number in the command output. The initial preview centers that line, clamping
@@ -721,7 +748,7 @@ files = {
 `item.text` contains the candidate text. Filesystem items also have `item.path`.
 `item.value` contains the text to insert (the same as `item.text` for scrollback
 and filesystem items). An action callback receives `(app, item, params)`, where
-`params` contains the OSC request's string parameters, or an empty table for a
+`params` contains the named pipe request's string parameters, or an empty table for a
 keybinding.
 Scrollback items have `item.range.start` and `.end`, each with zero-based `x` and
 `y` cells, and `item.snapshot_generation`.
@@ -731,7 +758,7 @@ with line breaks translated to Enter keys. `app:navigate(item)` enters copy mode
 at a scrollback item's first cell. Paths are not automatically shell-quoted.
 `app:replace_prompt(text, before, after)` sends `after` Delete and `before`
 Backspace key events, then pastes `text`; use the command-line cursor and length
-from the shell's OSC request to replace text on both sides of the cursor.
+from the shell's named pipe request to replace text on both sides of the cursor.
 For PowerShell completions, the sample Lua callback uses `app:send_text` to send
 Backspace bytes and Delete escape sequences, then `app:paste(item.value)` to
 insert the completion without submitting the command.
@@ -747,37 +774,10 @@ that Cargo path on other machines. Filesystem pickers are currently Windows-only
 Linux support will use NFM when it becomes available. Filesystem scans do not
 capture or read terminal snapshots, and cancellation leaves existing copy mode intact.
 
-Shell commands can open a named picker using the local WezTerm OSC protocol:
-
-```text
-ESC ] 9001 ; StreamingPicker ; TOKEN ; {"name":"files"} ST
-```
-
-Each terminal receives a random `WEZTERM_OSC_TOKEN` environment variable.
-For example, define this function in PowerShell inside the terminal:
-
-```powershell
-function Show-TerminalPicker([string] $Name = 'files') {
-    $json = @{ name = $Name } | ConvertTo-Json -Compress
-    [Console]::Write("$([char]27)]9001;StreamingPicker;$env:WEZTERM_OSC_TOKEN;$json$([char]27)\")
-}
-Show-TerminalPicker files
-```
-
-Names refer to the Lua `pickers` table and do not require a keybinding. Only the
-`action` remains an alias for `name`. Requests can include a `params` object of
-string values. For example, `PowerShellCompletion` in the sample `ghostty.lua`
-uses `params.items` (JSON encoded), `params.replaceBefore`, and
-`params.replaceAfter` to display completions and replace text around the cursor.
-Filesystem pickers can use `params.roots`, a JSON-encoded array of paths, to
-override their configured roots for one request. `params.query` sets the initial
-fuzzy query, for example to start a history picker with the text already typed
-at the shell prompt. The OSC payload is limited to
-1 MiB. BEL and ST terminators are accepted. Invalid
-tokens are rejected. Requests are ignored while search, quick select, or another
-picker is active; copy mode may open a picker normally. Pending requests coalesce
-to the latest validated request. Child processes inherit the token; it does not
-restrict programs that already have access to the terminal's environment.
+Shells open allowlisted named pickers through the authenticated local named pipe.
+See [PICKER-PIPE.md](PICKER-PIPE.md) and `Invoke-GhosttyPicker.ps1` for setup,
+parameters, streamed items, results, and cancellation. Custom OSC picker requests
+are no longer supported.
 
 Keys accept egui names such as `f`, `Space`, and `ArrowUp`; modifiers are joined
 with `|` (`CTRL`, `SHIFT`, `ALT`; `CMD`/`SUPER` are macOS-only). Definitions and regexes are compiled
@@ -872,6 +872,11 @@ remaining letters stay yellow. Backspace removes
 a prefix character.
 Escape (or Alt+Space again) returns to the previous mode. Quick select reuses
 the existing copy snapshot and preserves its cursor and selection on cancel.
+The hint engine is shared with NFM. Alt+Space also enters Quick Select in a
+picker's preview from results or preview focus. Selecting a hint moves the
+preview copy cursor; cancellation restores the previous focus and viewport.
+Terminal Shift-to-paste remains a terminal action. Preview hints support
+PageUp/PageDown and Backspace with the same labels and word matching.
 In copy mode, <kbd>Shift</kbd>+<kbd>Y</kbd> shows the same hints for a linewise
 yank. Completing a hint copies the logical lines from the current cursor (or
 visual anchor) through the hinted word's line and stays in copy mode. Escape
@@ -1017,3 +1022,9 @@ resolves config/request parameters and connects repaint/error reporting.
 Completed records appear while the command is still running. Total candidate
 output is not subject to preview byte limits; individual physical lines and
 joined continuation records are limited to 4 MiB, and retained stderr to 16 KiB.
+
+
+Windows shells can invoke named Lua pickers, submit picker definitions, or stream
+items through an opt-in authenticated named pipe and receive a selection response.
+See [PICKER-PIPE.md](PICKER-PIPE.md) for the security policy, wire protocol, and
+[Invoke-GhosttyPicker.ps1](Invoke-GhosttyPicker.ps1) for the PowerShell client.

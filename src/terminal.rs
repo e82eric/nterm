@@ -3,6 +3,7 @@ use crate::app::UserEvent;
 use crate::graphics as glow;
 use std::ffi::c_char;
 
+pub(crate) mod floating;
 mod pane;
 use pane::TerminalPane;
 
@@ -14,13 +15,12 @@ pub(crate) struct TerminalView {
     reload_source: crate::config::ReloadSource,
     picker_bindings: crate::picker::config::Bindings,
     floating_padding: Option<crate::config::FloatingPadding>,
-    floating: Option<FloatingTerminal>,
+    floating: floating::Panes<FloatingTerminal>,
     new_window_requested: bool,
 }
 
 struct FloatingTerminal {
     pane: TerminalPane,
-    visible: bool,
 }
 
 impl std::ops::Deref for FloatingTerminal {
@@ -38,16 +38,6 @@ impl std::ops::DerefMut for FloatingTerminal {
 }
 
 impl FloatingTerminal {
-    fn new(
-        parent: &TerminalView,
-        gl: &glow::Context,
-    ) -> Result<Option<Self>, crate::native_error::FatalError> {
-        Ok(parent.main.create_floating(gl)?.map(|pane| Self {
-            pane,
-            visible: true,
-        }))
-    }
-
     fn destroy(&mut self, gl: &glow::Context) {
         self.pane.destroy(gl);
     }
@@ -62,8 +52,8 @@ impl TerminalView {
         self.main.apply_theme(name)
     }
     fn active_pane_ref(&self) -> &TerminalPane {
-        if self.floating.as_ref().is_some_and(|pane| pane.visible) {
-            &self.floating.as_ref().expect("visible floating pane").pane
+        if self.floating.visible().is_some() {
+            &self.floating.visible().expect("visible floating pane").pane
         } else {
             &self.main
         }
@@ -92,7 +82,7 @@ impl TerminalView {
             reload_source,
             picker_bindings,
             floating_padding,
-            floating: None,
+            floating: Default::default(),
             new_window_requested: false,
         })
     }
@@ -111,7 +101,7 @@ impl TerminalView {
             reload_source: self.reload_source.clone(),
             picker_bindings: self.picker_bindings.clone(),
             floating_padding: self.floating_padding,
-            floating: None,
+            floating: Default::default(),
             new_window_requested: false,
         })
     }
@@ -131,19 +121,119 @@ impl TerminalView {
 
     pub(crate) fn acquire_frames(&mut self) -> bool {
         let mut acquired = self.main.acquire_frame();
-        if let Some(floating) = &mut self.floating {
+        for floating in &mut self.floating.entries {
             acquired |= floating.acquire_frame();
         }
         acquired
     }
-
-    fn close_floating(&mut self, gl: &glow::Context) {
-        if let Some(mut floating) = self.floating.take() {
-            floating.destroy(gl);
-            self.main.request_repaint();
+    pub(crate) fn mark_pipe_timing(&self, stage: &'static str) {
+        self.main.mark_pipe_timing(stage);
+        for floating in &self.floating.entries {
+            floating.pane.mark_pipe_timing(stage);
         }
     }
 
+    fn pane_mut(&mut self, id: Option<u64>) -> Option<&mut TerminalPane> {
+        match id {
+            None => Some(&mut self.main),
+            Some(id) => self
+                .floating
+                .entries
+                .iter_mut()
+                .find(|p| p.id == id)
+                .map(|p| &mut p.value.pane),
+        }
+    }
+    fn run_picker_callback(&mut self, origin: Option<u64>, gl: &glow::Context) {
+        let Some(pane) = self.pane_mut(origin) else {
+            return;
+        };
+        let Some((action, generation, from_copy)) = pane.pending_callback.take() else {
+            return;
+        };
+        let selection = pane.selected_text();
+        if let crate::picker::Action::Custom(callback, text, filesystem, range, value, params) =
+            action
+        {
+            let result =
+                callback.with_floating(&mut |request| self.floating_request(request, gl), || {
+                    callback.call_with_selection(
+                        &text, &value, filesystem, generation, range, &params, selection,
+                    )
+                });
+            if let Some(pane) = self.pane_mut(origin) {
+                pane.finish_picker_callback(result, generation, from_copy);
+            }
+        }
+    }
+    fn floating_request(
+        &mut self,
+        request: floating::Request,
+        gl: &glow::Context,
+    ) -> Result<serde_json::Value, String> {
+        use floating::{CreateOptions, Request};
+        let target_id = |panes: &floating::Panes<FloatingTerminal>,
+                         target: Option<floating::Target>|
+         -> Result<Option<u64>, String> {
+            match target {
+                Some(target) => panes
+                    .resolve(&target)
+                    .map(Some)
+                    .ok_or_else(|| "floating pane does not exist".into()),
+                None => Ok(panes.last_id()),
+            }
+        };
+        let result = match request {
+            Request::Create(options) => {
+                self.floating.validate_create(&options)?;
+                let pane = self
+                    .main
+                    .create_floating(gl, &options)
+                    .map_err(|e| e.to_string())?;
+                let id = self
+                    .floating
+                    .insert(options.name, FloatingTerminal { pane });
+                serde_json::to_value(self.floating.description(id)).unwrap()
+            }
+            Request::Toggle => {
+                if self.floating.visible_id().is_some() {
+                    self.floating.hide();
+                } else if let Some(id) = self.floating.last_id() {
+                    self.floating.restore(id);
+                } else {
+                    return self.floating_request(Request::Create(CreateOptions::default()), gl);
+                }
+                serde_json::Value::Null
+            }
+            Request::Restore(target) => {
+                let id = target_id(&self.floating, Some(target))?.unwrap();
+                self.floating.restore(id);
+                serde_json::to_value(self.floating.description(id)).unwrap()
+            }
+            Request::Get(target) => {
+                let id = match target {
+                    Some(target) => self.floating.resolve(&target),
+                    None => self.floating.last_id(),
+                };
+                serde_json::to_value(id.and_then(|id| self.floating.description(id))).unwrap()
+            }
+            Request::List => serde_json::to_value(self.floating.descriptions()).unwrap(),
+            Request::Next | Request::Previous => {
+                self.floating.cycle(matches!(request, Request::Next));
+                serde_json::Value::Null
+            }
+            Request::Close(target) => {
+                if let Some(id) = target_id(&self.floating, target)? {
+                    if let Some(mut pane) = self.floating.remove(id) {
+                        pane.destroy(gl);
+                    }
+                }
+                serde_json::Value::Null
+            }
+        };
+        self.main.request_repaint();
+        Ok(result)
+    }
     fn execute_action(
         &mut self,
         action: AppAction,
@@ -166,7 +256,7 @@ impl TerminalView {
                     }
                     if config.font_family.is_some() || config.font_size.is_some() {
                         self.main.refresh_picker_font(ctx);
-                        if let Some(floating) = &mut self.floating {
+                        for floating in &mut self.floating.entries {
                             floating.refresh_picker_font(ctx);
                         }
                     }
@@ -184,9 +274,13 @@ impl TerminalView {
                     .picker_bindings
                     .named("builtin.themes")
                     .expect("builtin themes picker");
-                let has_floating = self.floating.is_some();
-                let pane = if self.floating.as_ref().is_some_and(|pane| pane.visible) {
-                    &mut self.floating.as_mut().expect("floating action target").pane
+                let has_floating = !self.floating.is_empty();
+                let pane = if self.floating.visible().is_some() {
+                    &mut self
+                        .floating
+                        .visible_mut()
+                        .expect("floating action target")
+                        .pane
                 } else {
                     &mut self.main
                 };
@@ -199,7 +293,7 @@ impl TerminalView {
             AppAction::ShowMessages => self.messages.open(),
             AppAction::ShowErrorRecord(record) => self.messages.open_record(*record),
             AppAction::OpenErrorLog => {
-                if let Some(floating) = self.floating.as_mut().filter(|pane| pane.visible) {
+                if let Some(floating) = self.floating.visible_mut() {
                     floating.open_error_log(ctx);
                 } else {
                     self.main.open_error_log(ctx);
@@ -208,21 +302,34 @@ impl TerminalView {
             AppAction::NewWindow => {
                 self.new_window_requested = true;
             }
-            AppAction::ToggleFloatingPane => {
-                if let Some(floating) = self.floating.as_mut() {
-                    floating.visible = !floating.visible;
+            AppAction::RestoreFloatingPane(id) => {
+                if self.floating.description(id).is_some() {
+                    self.floating.restore(id);
                 } else {
-                    match FloatingTerminal::new(self, gl) {
-                        Ok(floating) => self.floating = floating,
-                        Err(error) => self
-                            .main
-                            .show_error("Could not open floating terminal", error.to_string()),
-                    }
+                    self.main.show_notice(
+                        "Floating pane closed",
+                        format!("Pane {id} is no longer available"),
+                    );
                 }
             }
-            AppAction::CloseFloatingPane => self.close_floating(gl),
+            AppAction::CreateFloatingPane
+            | AppAction::ToggleFloatingPane
+            | AppAction::NextFloatingPane
+            | AppAction::PreviousFloatingPane
+            | AppAction::CloseFloatingPane => {
+                let request = match action {
+                    AppAction::CreateFloatingPane => floating::Request::Create(Default::default()),
+                    AppAction::ToggleFloatingPane => floating::Request::Toggle,
+                    AppAction::NextFloatingPane => floating::Request::Next,
+                    AppAction::PreviousFloatingPane => floating::Request::Previous,
+                    _ => floating::Request::Close(None),
+                };
+                if let Err(error) = self.floating_request(request, gl) {
+                    self.main.show_error("Floating pane action failed", error);
+                }
+            }
             _ => {
-                let has_floating = self.floating.is_some();
+                let has_floating = !self.floating.is_empty();
                 let lua_action = if let AppAction::Lua(name) = &action {
                     self.picker_bindings.lua_action(name)
                 } else {
@@ -233,20 +340,33 @@ impl TerminalView {
                 } else {
                     None
                 };
-                let pane = if floating_target {
-                    let Some(floating) = &mut self.floating else {
-                        return;
-                    };
-                    &mut floating.pane
+                let origin = if floating_target {
+                    self.floating.visible_id()
                 } else {
-                    &mut self.main
+                    None
                 };
                 if let Some(lua_action) = lua_action {
-                    pane.execute_lua_action(&lua_action, ctx);
-                } else if let Some(entry) = entry {
-                    pane.open_picker(ctx, entry, None, &self.picker_bindings, has_floating);
+                    let selection = self
+                        .pane_mut(origin)
+                        .map(|p| p.selected_text())
+                        .unwrap_or_default();
+                    let callback = lua_action.callback.clone();
+                    let result = callback
+                        .with_floating(&mut |request| self.floating_request(request, gl), || {
+                            callback.call_action(selection)
+                        });
+                    if let Some(pane) = self.pane_mut(origin) {
+                        pane.finish_lua_action(result, ctx);
+                    }
                 } else {
-                    pane.execute_action(&action, ctx);
+                    let bindings = self.picker_bindings.clone();
+                    if let Some(pane) = self.pane_mut(origin) {
+                        if let Some(entry) = entry {
+                            pane.open_picker(ctx, entry, None, &bindings, has_floating);
+                        } else {
+                            pane.execute_action(&action, ctx);
+                        }
+                    }
                 }
             }
         }
@@ -277,7 +397,7 @@ impl TerminalView {
     }
 
     fn show_floating(&self, ui: &egui::Ui, content: egui::Rect, rect: egui::Rect) {
-        let Some(floating) = self.floating.as_ref().filter(|pane| pane.visible) else {
+        let Some(floating) = self.floating.visible() else {
             return;
         };
         let layer_id = egui::LayerId::new(egui::Order::Middle, egui::Id::new("floating-terminal"));
@@ -305,6 +425,23 @@ impl TerminalView {
         ui.ctx().move_to_top(layer_id);
     }
     pub(crate) fn update(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
+        let entries: Vec<_> = self
+            .floating
+            .entries
+            .iter()
+            .map(|pane| {
+                crate::actions::floating_pane_entry(
+                    pane.id,
+                    pane.name.as_deref(),
+                    &pane.title(),
+                    self.floating.visible_id() == Some(pane.id),
+                )
+            })
+            .collect();
+        self.main.floating_palette_entries = entries.clone();
+        for pane in &mut self.floating.entries {
+            pane.floating_palette_entries = entries.clone();
+        }
         self.messages.show(ui.ctx());
         let messages_open = self.messages.is_open();
         let context = self.active_pane_ref().action_context();
@@ -321,15 +458,20 @@ impl TerminalView {
             }
             action => action,
         };
-        if self
+        let exited: Vec<_> = self
             .floating
-            .as_ref()
-            .is_some_and(|floating| floating.should_close())
-        {
-            self.close_floating(gl);
+            .entries
+            .iter()
+            .filter(|p| p.should_close())
+            .map(|p| p.id)
+            .collect();
+        for id in exited {
+            if let Some(mut pane) = self.floating.remove(id) {
+                pane.destroy(gl);
+            }
         }
         self.main.update_modes(ui.ctx());
-        if let Some(floating) = &mut self.floating {
+        for floating in &mut self.floating.entries {
             floating.update_modes(ui.ctx());
         }
 
@@ -343,14 +485,15 @@ impl TerminalView {
         );
         let status_rect = egui::Rect::from_min_max(rect.left_bottom(), available.max);
         let scale = ui.ctx().pixels_per_point();
-        let floating_active = self.floating.as_ref().is_some_and(|pane| pane.visible);
+        let floating_active = self.floating.visible().is_some();
         let window_focused = ui.input(|input| input.viewport().focused.unwrap_or(false));
         let resized = self.main.resize(rect, scale);
         self.main
             .set_active(ui.ctx(), !floating_active, window_focused);
         let floating_rect = Self::floating_rect(rect, self.floating_padding);
-        if let Some(floating) = &mut self.floating {
-            let visible = floating.visible;
+        let visible_id = self.floating.visible_id();
+        for floating in &mut self.floating.entries {
+            let visible = Some(floating.id) == visible_id;
             if visible {
                 floating.resize(floating_rect, scale);
             }
@@ -365,16 +508,52 @@ impl TerminalView {
         if floating_active {
             self.main.show_background_overlays(ui.ctx(), rect);
         }
-        self.main.refresh_decorations(false, resized);
+        if resized {
+            self.main.refresh_decorations();
+        }
         // Snapshot-based actions must observe the resized pane, just like
         // pane-local input handlers do.
         if let Some(action) = pane_shortcut {
             self.execute_action(action, floating_active, ui.ctx(), gl);
         }
+        // Lua actions can change the active pane synchronously.
+        let visible_id = self.floating.visible_id();
+        let floating_active = visible_id.is_some();
+        self.main
+            .set_active(ui.ctx(), !floating_active, window_focused);
+        for pane in &mut self.floating.entries {
+            let visible = Some(pane.id) == visible_id;
+            if visible {
+                pane.resize(floating_rect, scale);
+            }
+            pane.set_active(ui.ctx(), visible, window_focused);
+        }
         let active_bounds = if floating_active { floating_rect } else { rect };
-        let has_floating = self.floating.is_some();
+        let has_floating = !self.floating.is_empty();
+        #[cfg(windows)]
+        {
+            self.main.handle_pipe_requests(
+                ui.ctx(),
+                &self.picker_bindings,
+                has_floating,
+                !floating_active && !messages_open,
+            );
+            for floating in &mut self.floating.entries {
+                let interactive = Some(floating.id) == visible_id && !messages_open;
+                floating.pane.handle_pipe_requests(
+                    ui.ctx(),
+                    &self.picker_bindings,
+                    has_floating,
+                    interactive,
+                );
+            }
+        }
         let active_pane = if floating_active {
-            &mut self.floating.as_mut().expect("visible floating pane").pane
+            &mut self
+                .floating
+                .visible_mut()
+                .expect("visible floating pane")
+                .pane
         } else {
             &mut self.main
         };
@@ -385,7 +564,7 @@ impl TerminalView {
                 action: None,
             }
         } else {
-            active_pane.handle_input(ui, active_bounds, &mut self.picker_bindings, has_floating)
+            active_pane.handle_input(ui, active_bounds, &mut self.picker_bindings)
         };
         active_pane.forward_input(
             ui,
@@ -397,18 +576,19 @@ impl TerminalView {
 
         self.show_floating(ui, rect, floating_rect);
         if floating_active {
-            if let Some(floating) = &mut self.floating {
+            if let Some(floating) = self.floating.visible_mut() {
                 floating.show_search_overlay(ui.ctx(), floating_rect);
             }
         } else {
             self.main.show_search_overlay(ui.ctx(), rect);
         }
 
+        self.run_picker_callback(visible_id, gl);
         if let Some(action) = input.action {
             self.execute_action(action, floating_active, ui.ctx(), gl);
         }
         self.main.drain_clipboard(ui.ctx());
-        if let Some(floating) = &self.floating {
+        for floating in &self.floating.entries {
             floating.drain_clipboard(ui.ctx());
         }
 
@@ -416,7 +596,7 @@ impl TerminalView {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.main.show_toasts(ui.ctx(), rect);
-        if let Some(floating) = self.floating.as_mut().filter(|pane| pane.visible) {
+        if let Some(floating) = self.floating.visible_mut() {
             floating.show_toasts(ui.ctx(), floating_rect);
         }
     }
@@ -450,14 +630,24 @@ impl TerminalView {
             font.clone(),
             status.accent,
         );
-        if let Some(floating) = &self.floating {
-            let color = if floating.visible {
+        if !self.floating.is_empty() {
+            let color = if self.floating.visible_id().is_some() {
                 crate::colors::palette().warning
             } else {
                 crate::colors::palette().muted_text
             };
             let text = painter.layout_no_wrap(
-                "Floating Panes: 1".to_owned(),
+                format!(
+                    "Floating Panes: {}{}",
+                    self.floating.entries.len(),
+                    self.floating
+                        .visible()
+                        .map(|p| format!(
+                            " [{}]",
+                            p.name.clone().unwrap_or_else(|| p.id.to_string())
+                        ))
+                        .unwrap_or_default()
+                ),
                 egui::FontId::monospace(13.0),
                 color,
             );
@@ -468,6 +658,41 @@ impl TerminalView {
                 color,
             );
             right_edge = left - 12.0;
+        }
+        if let Some(connected) = status.pipe_status {
+            let palette = crate::colors::palette();
+            let color = if connected {
+                palette.accent
+            } else {
+                palette.muted_text
+            };
+            let left = right_edge - 26.0;
+            if left > label_rect.right() + 8.0 {
+                let icon = egui::Rect::from_center_size(
+                    egui::pos2(left + 13.0, rect.center().y + 1.0),
+                    egui::vec2(26.0, 18.0),
+                );
+                let point = |x, y| icon.left_top() + egui::vec2(x, y);
+                let stroke = egui::Stroke::new(1.5, color);
+                // Two opposing arrows indicate bidirectional picker IPC.
+                painter.line_segment([point(2.0, 6.0), point(24.0, 6.0)], stroke);
+                painter.add(egui::Shape::line(
+                    vec![point(20.0, 3.0), point(24.0, 6.0), point(20.0, 9.0)],
+                    stroke,
+                ));
+                painter.line_segment([point(2.0, 12.0), point(24.0, 12.0)], stroke);
+                painter.add(egui::Shape::line(
+                    vec![point(6.0, 9.0), point(2.0, 12.0), point(6.0, 15.0)],
+                    stroke,
+                ));
+                ui.interact(icon, ui.id().with("pipe_status"), egui::Sense::hover())
+                    .on_hover_text(if connected {
+                        "Picker pipe: client connected"
+                    } else {
+                        "Picker pipe: no client connected"
+                    });
+                right_edge = left - 12.0;
+            }
         }
         if let Some(detail) = status.detail {
             let text = painter.layout_no_wrap(detail, font, foreground);
@@ -483,7 +708,7 @@ impl TerminalView {
     }
     pub(crate) fn poll_retired(&self, gl: &glow::Context) {
         self.main.poll_retired(gl);
-        if let Some(floating) = &self.floating {
+        for floating in &self.floating.entries {
             floating.poll_retired(gl);
         }
     }
@@ -492,12 +717,15 @@ impl TerminalView {
         self.main.retired_pending()
             || self
                 .floating
-                .as_ref()
-                .is_some_and(|floating| floating.retired_pending())
+                .entries
+                .iter()
+                .any(|floating| floating.retired_pending())
     }
 
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
-        self.close_floating(gl);
+        for mut floating in self.floating.entries.drain(..) {
+            floating.destroy(gl);
+        }
         self.main.destroy(gl);
     }
 }

@@ -3,25 +3,20 @@ use crate::presentation::Presentation;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-#[cfg_attr(feature = "vulkan", path = "app/vulkan_ui.rs")]
 mod shared_ui;
-#[cfg(feature = "vulkan")]
-mod vulkan_window;
 use crate::graphics as glow;
 use crate::terminal::TerminalView;
 use egui_winit::winit;
-#[cfg(not(feature = "vulkan"))]
+
 use glow::HasContext as _;
 use shared_ui::{SharedUi, WindowUi};
-#[cfg(not(feature = "vulkan"))]
+
 use std::ffi::c_void;
 use std::ffi::{CString, c_char};
-#[cfg(not(feature = "vulkan"))]
+
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
-#[cfg(feature = "vulkan")]
-use vulkan_window::{GlutinWindowContext, GlutinWindowSurface};
 
 pub(crate) fn run(
     args: Vec<CString>,
@@ -187,6 +182,11 @@ pub(crate) enum UserEvent {
     Repaint(Instant),
     GhosttyWake,
     FrameReady(winit::window::WindowId),
+    PickerWake {
+        window_id: winit::window::WindowId,
+        trace: Arc<crate::picker::diagnostics::Trace>,
+        search: bool,
+    },
 }
 
 struct NativeApp {
@@ -248,8 +248,14 @@ impl NativeWindow {
     }
 
     fn redraw(&mut self) -> Result<(), FatalError> {
+        self.shell
+            .as_ref()
+            .expect("terminal shell")
+            .terminal
+            .mark_pipe_timing("redraw_started");
         self.gl_window.make_current()?;
         let shell = self.shell.as_mut().expect("terminal shell");
+        shell.terminal.mark_pipe_timing("ui_frame_started");
         let (output, changed) = self
             .egui
             .run(self.gl_window.window(), |ui| shell.ui(ui, &self.gl));
@@ -264,7 +270,6 @@ impl NativeWindow {
         }
         let presented = !paced && self.presentation.ready(now);
         if presented {
-            #[cfg(not(feature = "vulkan"))]
             unsafe {
                 let background = crate::colors::palette().background;
                 self.gl.clear_color(
@@ -524,6 +529,24 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             return;
         }
         match event {
+            UserEvent::PickerWake {
+                window_id,
+                trace,
+                search,
+            } => {
+                trace.mark(
+                    if search {
+                        "search_wake_handled"
+                    } else {
+                        "pipe_wake_handled"
+                    },
+                    None,
+                );
+                if let Some(window) = self.windows.get_mut(&window_id) {
+                    // Service queued work immediately; only GPU presentation is paced.
+                    window.gl_window.window().request_redraw();
+                }
+            }
             UserEvent::GhosttyWake => {
                 APP_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
                 // All windows/panes share one app; a single tick drains its mailbox.
@@ -579,7 +602,6 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
     }
 }
 
-#[cfg(not(feature = "vulkan"))]
 struct GlutinWindowContext {
     // Release the DC/surface before the hidden native window.
     surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
@@ -628,7 +650,6 @@ fn prefer_rounded_corners(hwnd: *mut std::ffi::c_void) {
     }
 }
 
-#[cfg(not(feature = "vulkan"))]
 impl GlutinWindowContext {
     unsafe fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> Result<Self, FatalError> {
         use glutin::context::NotCurrentGlContext as _;
@@ -766,14 +787,13 @@ impl GlutinWindowContext {
 }
 
 /// Every window has a drawable surface, all using the same UI GL context.
-#[cfg(not(feature = "vulkan"))]
+
 struct GlutinWindowSurface {
     surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
     window: winit::window::Window,
     graphics: Rc<GlutinWindowContext>,
 }
 
-#[cfg(not(feature = "vulkan"))]
 impl GlutinWindowSurface {
     unsafe fn new(
         event_loop: &winit::event_loop::ActiveEventLoop,

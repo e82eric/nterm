@@ -67,6 +67,10 @@ pub(crate) fn start(
         }
     };
     let mut spec = CommandSpec::new(program);
+    let trace = super::diagnostics::current();
+    if let Some(trace) = &trace {
+        spec.observer = Some(super::diagnostics::command_observer(trace.clone(), None));
+    }
     spec.arguments = args;
     spec.working_directory = cwd.map(std::path::PathBuf::from);
     spec.output_limit = 16 * 1024;
@@ -76,6 +80,11 @@ pub(crate) fn start(
     if let Some(codes) = options.success_exit_codes {
         source.success_exit_codes = codes;
     }
+    let ipc = params.contains_key("__ipc_request");
+    let budget_store = store.clone();
+    let budget_cancel = cancelled.clone();
+    let budget_error = error.clone();
+    let usage = Mutex::new((0usize, 0usize));
     let sink = CommandSink {
         store,
         payload: SnapshotCellRange::default(),
@@ -84,7 +93,43 @@ pub(crate) fn start(
     };
     let control = CommandControl {
         cancelled,
-        changed: Arc::new(move || ctx.request_repaint()),
+        changed: Arc::new(move || {
+            if let Some(trace) = &trace {
+                use nfm_search_core::store::ItemsSource;
+                if budget_store
+                    .snapshot()
+                    .is_some_and(|snapshot| snapshot.len() > 0)
+                {
+                    trace.mark("command_first_items_published", None);
+                }
+            }
+            if ipc {
+                use nfm_search_core::store::ItemsSource;
+                if let Some(snapshot) = budget_store.snapshot() {
+                    let mut usage = usage.lock().unwrap();
+                    let mut stack = [0u8; 1024];
+                    let mut heap = Vec::new();
+                    for index in usage.0..snapshot.len() {
+                        // Include the separate continuation value and metadata
+                        // conservatively in the retained-storage budget.
+                        usage.1 = usage.1.saturating_add(
+                            snapshot
+                                .get_string(index, &mut stack, &mut heap)
+                                .len()
+                                .saturating_mul(2)
+                                + 128,
+                        );
+                    }
+                    usage.0 = snapshot.len();
+                    if usage.0 > super::pipe::MAX_ITEMS || usage.1 > super::pipe::MAX_STORAGE {
+                        *budget_error.lock().unwrap() =
+                            Some("IPC command output exceeds server limits".into());
+                        budget_cancel.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }),
         failed: Arc::new(|message| {
             crate::error_log::error("picker command", "Command failed", message)
         }),

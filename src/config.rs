@@ -237,6 +237,8 @@ struct AppConfig {
     floating: FloatingConfig,
     picker_defaults: crate::picker::config::PickerDefaults,
     builtin_pickers: crate::picker::config::BuiltinPickers,
+    cursor_scroll_padding: Option<u32>,
+    picker_pipe: crate::picker::pipe::Policy,
     pickers: Option<std::collections::BTreeMap<String, crate::picker::config::Definition>>,
     keys: Option<Vec<crate::picker::config::KeyBinding>>,
     #[serde(skip)]
@@ -468,6 +470,7 @@ impl AppConfig {
         }
         let mut config: Self = lua.from_value(value).map_err(|error| error.to_string())?;
         config.builtin_pickers.validate()?;
+        config.picker_defaults.validate()?;
         config.pickers = parsed_pickers;
         config.actions = actions;
         Ok(config)
@@ -594,7 +597,13 @@ impl ReloadSource {
                     config.picker_defaults,
                     config.actions,
                 )?
-                .with_builtin_pickers(config.builtin_pickers),
+                .with_builtin_pickers(config.builtin_pickers)
+                .with_pipe_policy(config.picker_pipe)
+                .with_cursor_scroll_padding(
+                    config
+                        .cursor_scroll_padding
+                        .unwrap_or(nfm_egui::copy_mode::SCROLL_PADDING_ROWS),
+                ),
                 padding: config
                     .floating
                     .padding
@@ -689,7 +698,13 @@ pub(crate) fn prepare_with_reload(
                             config.picker_defaults,
                             config.actions,
                         )?
-                        .with_builtin_pickers(config.builtin_pickers),
+                        .with_builtin_pickers(config.builtin_pickers)
+                        .with_pipe_policy(config.picker_pipe)
+                        .with_cursor_scroll_padding(
+                            config
+                                .cursor_scroll_padding
+                                .unwrap_or(nfm_egui::copy_mode::SCROLL_PADDING_ROWS),
+                        ),
                         config
                             .floating
                             .padding
@@ -1416,7 +1431,13 @@ mod tests {
             config.actions,
         )
         .unwrap()
-        .with_builtin_pickers(config.builtin_pickers);
+        .with_builtin_pickers(config.builtin_pickers)
+        .with_pipe_policy(config.picker_pipe)
+        .with_cursor_scroll_padding(
+            config
+                .cursor_scroll_padding
+                .unwrap_or(nfm_egui::copy_mode::SCROLL_PADDING_ROWS),
+        );
         let context = PickerContext {
             line_before_cursor: "PS C:\\src> foo".into(),
             ..Default::default()
@@ -1437,6 +1458,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sample_config_includes_multiple_floating_pane_shortcuts() {
+        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+        for action in [
+            crate::actions::AppAction::CreateFloatingPane,
+            crate::actions::AppAction::NextFloatingPane,
+            crate::actions::AppAction::PreviousFloatingPane,
+        ] {
+            assert!(
+                bindings.shortcut_for(&action).is_some(),
+                "missing {action:?}"
+            );
+        }
+    }
     #[test]
     fn named_pickers_compile_and_reject_bad_bindings_and_regexes() {
         let example = parse(include_str!("../ghostty.lua")).unwrap();
@@ -1564,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn ripgrep_osc_request_resolves_to_command_picker() {
+    fn ripgrep_pipe_parameters_resolve_to_command_picker() {
         let config = parse(include_str!("../ghostty.lua")).unwrap();
         let bindings = crate::picker::config::Bindings::compile_with_actions(
             config.pickers,
@@ -1573,14 +1615,16 @@ mod tests {
             config.actions,
         )
         .unwrap();
-        let payload = br#"StreamingPicker;secret;{"name":"Ripgrep","params":{"pattern":"ghostty","cwd":"C:\\src\\ghostty2","cursor":"0","length":"0"}}"#;
-        let request = crate::picker::protocol::parse(payload, "secret").unwrap();
+        let request: crate::picker::pipe::Open = serde_json::from_str(r#"{"kind":"named","name":"Ripgrep","params":{"pattern":"ghostty","cwd":"C:\\src\\ghostty2","cursor":"0","length":"0"}}"#).unwrap();
+        let crate::picker::pipe::Open::Named { name, params } = request else {
+            panic!("expected named picker")
+        };
         let options = bindings
-            .named(&request.name)
+            .named(&name)
             .unwrap()
             .resolve(&PickerContext::default())
             .unwrap()
-            .with_request(request.params)
+            .with_request(params)
             .unwrap();
         assert!(matches!(
             options.source,
@@ -1590,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_osc_request_overrides_configured_roots() {
+    fn filesystem_pipe_parameters_override_configured_roots() {
         let config = parse(
             r#"return { pickers = { files = { type = 'FileSystem', roots = { [[C:\default]] } } } }"#,
         )
@@ -1602,14 +1646,19 @@ mod tests {
             config.actions,
         )
         .unwrap();
-        let payload = br#"StreamingPicker;secret;{"name":"files","params":{"roots":"[\"G:\\\\src\",\"C:\\\\src\"]"}}"#;
-        let request = crate::picker::protocol::parse(payload, "secret").unwrap();
+        let request: crate::picker::pipe::Open = serde_json::from_str(
+            r#"{"kind":"named","name":"files","params":{"roots":"[\"G:\\\\src\",\"C:\\\\src\"]"}}"#,
+        )
+        .unwrap();
+        let crate::picker::pipe::Open::Named { name, params } = request else {
+            panic!("expected named picker")
+        };
         let options = bindings
-            .named(&request.name)
+            .named(&name)
             .unwrap()
             .resolve(&PickerContext::default())
             .unwrap()
-            .with_request(request.params)
+            .with_request(params)
             .unwrap();
         let crate::picker::config::Source::FileSystem(files) = options.source else {
             panic!("expected filesystem picker");
@@ -1734,6 +1783,101 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn cursor_scroll_padding_accepts_overrides_and_rejects_invalid_values() {
+        assert_eq!(parse("return {}").unwrap().cursor_scroll_padding, None);
+        assert_eq!(
+            crate::picker::config::Bindings::default().cursor_scroll_padding,
+            2
+        );
+        for value in [0, 2, 5] {
+            let config = parse(&format!("return {{ cursor_scroll_padding={value} }}")).unwrap();
+            let bindings = crate::picker::config::Bindings::default()
+                .with_cursor_scroll_padding(config.cursor_scroll_padding.unwrap());
+            assert_eq!(bindings.cursor_scroll_padding, value);
+        }
+        for value in ["-1", "1.5", "'two'", "4294967296"] {
+            assert!(parse(&format!("return {{ cursor_scroll_padding={value} }}")).is_err());
+        }
+    }
+
+    #[test]
+    fn picker_pipe_permissions_are_opt_in_and_strict() {
+        assert!(!parse("return {}").unwrap().picker_pipe.enabled);
+        let config =
+            parse("return { picker_pipe={enabled=true,allow_stream=true,named={'files'}} }")
+                .unwrap();
+        assert!(config.picker_pipe.enabled);
+        assert!(config.picker_pipe.allow_stream);
+        assert!(parse("return { picker_pipe={allow_definitions=true} }").is_err());
+        assert_eq!(config.picker_pipe.named, vec!["files"]);
+        assert!(parse("return { picker_pipe={enabled=true,unknown=true} }").is_err());
+    }
+
+    #[test]
+    fn preview_limits_inherit_defaults_and_allow_static_and_factory_overrides() {
+        for factory in [false, true] {
+            for (fields, expected) in [
+                ("", (123456, 456)),
+                (",max_bytes=98765", (98765, 456)),
+                (",max_scrollback_lines=789", (123456, 789)),
+            ] {
+                let definition = format!(
+                    "{{type='Items',items={{{{text='one',value='one'}}}},preview={{type='Command',args={{'bat'}}{fields}}}}}"
+                );
+                let definition = if factory {
+                    format!("function(context) return {definition} end")
+                } else {
+                    definition
+                };
+                let config = parse(&format!("return {{picker_defaults={{preview_max_bytes=123456,preview_max_scrollback_lines=456}},pickers={{x={definition}}}}}")).unwrap();
+                let bindings = crate::picker::config::Bindings::compile_with_defaults(
+                    config.pickers,
+                    config.keys,
+                    config.picker_defaults,
+                )
+                .unwrap();
+                let options = bindings
+                    .named("x")
+                    .unwrap()
+                    .resolve(&PickerContext::default())
+                    .unwrap();
+                let Some(crate::picker::config::Preview::Command {
+                    max_bytes,
+                    max_scrollback_lines,
+                    ..
+                }) = options.preview
+                else {
+                    panic!("missing command preview")
+                };
+                assert_eq!(
+                    (max_bytes.unwrap(), max_scrollback_lines.unwrap()),
+                    expected
+                );
+            }
+        }
+        for field in ["preview_max_bytes", "preview_max_scrollback_lines"] {
+            assert!(parse(&format!("return {{ picker_defaults={{ {field}=0 }} }}")).is_err());
+        }
+        for field in ["max_bytes", "max_scrollback_lines"] {
+            for value in ["0", "-1", "1.5"] {
+                let config = parse(&format!(
+                    "return {{pickers={{x={{type='Items',preview={{type='Command',args={{'bat'}},{field}={value}}}}}}}}}"
+                ));
+                if let Ok(config) = config {
+                    assert!(
+                        crate::picker::config::Bindings::compile_with_defaults(
+                            config.pickers,
+                            config.keys,
+                            config.picker_defaults
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

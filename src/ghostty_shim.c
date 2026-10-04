@@ -5,11 +5,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-#ifdef GHOSTTY_EGUI_VULKAN
-#define GHOSTTY_EGUI_PLATFORM GHOSTTY_PLATFORM_WGPU
-#else
-#define GHOSTTY_EGUI_PLATFORM GHOSTTY_PLATFORM_OPENGL
-#endif
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -53,7 +48,6 @@ static LRESULT CALLBACK host_window_proc(HWND window, UINT message, WPARAM wpara
 
 extern void ghostty_egui_frame_ready(void *userdata);
 extern void ghostty_egui_close(void *userdata);
-extern void ghostty_egui_protocol(void *userdata, const uint8_t *bytes, size_t len);
 extern void ghostty_egui_write_clipboard(void *userdata, const uint8_t *bytes, size_t len);
 extern void ghostty_egui_config_issue(void *userdata, const char *message);
 extern void ghostty_egui_runtime_issue(void *userdata, const char *operation, const char *cause);
@@ -98,6 +92,7 @@ static void report_theme_colors(ghostty_config_t config, void *userdata) {
     ghostty_egui_theme_colors(userdata, &colors, name.ptr, name.len);
 }
 
+extern void ghostty_egui_title(void *userdata, const char *title);
 extern void ghostty_egui_app_wakeup(void);
 static void wake(void *userdata) { (void)userdata; ghostty_egui_app_wakeup(); }
 static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action_value) {
@@ -105,8 +100,8 @@ static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s 
 
     void *userdata = ghostty_surface_userdata(target.target.surface);
     switch (action_value.tag) {
-    case GHOSTTY_ACTION_APPLICATION_PROTOCOL:
-        ghostty_egui_protocol(userdata, action_value.action.application_protocol.bytes, action_value.action.application_protocol.len);
+    case GHOSTTY_ACTION_SET_TITLE:
+        ghostty_egui_title(userdata, action_value.action.set_title.title);
         return true;
     case GHOSTTY_ACTION_RENDER:
         ghostty_egui_frame_ready(userdata);
@@ -176,7 +171,8 @@ GhosttyEguiHost *ghostty_egui_host_create(
     void *display,
     void *context,
     double scale,
-    const char *osc_token,
+    const char *picker_endpoint,
+    const char *picker_token,
     char *error_buffer,
     size_t error_capacity
 ) {
@@ -244,15 +240,18 @@ GhosttyEguiHost *ghostty_egui_host_create(
     ghostty_config_free(config);
 
     ghostty_surface_config_s options = ghostty_surface_config_new();
-    options.platform_tag = GHOSTTY_EGUI_PLATFORM;
+    options.platform_tag = GHOSTTY_PLATFORM_OPENGL;
     options.platform.opengl.window = window;
     options.platform.opengl.display = display;
     options.platform.opengl.context = context;
     options.scale_factor = scale;
     options.userdata = userdata;
-    ghostty_env_var_s token_env = { .key = "WEZTERM_OSC_TOKEN", .value = osc_token };
-    options.env_vars = &token_env;
-    options.env_var_count = 1;
+    ghostty_env_var_s token_env[] = {
+        { .key = "GHOSTTY_PICKER_ENDPOINT", .value = picker_endpoint },
+        { .key = "GHOSTTY_PICKER_TOKEN", .value = picker_token },
+    };
+    options.env_vars = token_env;
+    options.env_var_count = 2;
     ghostty_surface_t surface = ghostty_surface_new(app, &options);
     if (!surface) {
         startup_error(error_buffer, error_capacity, "create the main terminal surface", ghostty_last_init_error());
@@ -295,7 +294,9 @@ GhosttyEguiHost *ghostty_egui_host_create(
 
 GhosttyEguiHost *ghostty_egui_host_create_child(
     GhosttyEguiHost *parent, void *userdata, void *window, void *display, void *context,
-    double scale, const char *osc_token,
+    double scale,
+    const char *picker_endpoint, const char *picker_token,
+    const char *command, const char *cwd,
     char *error_buffer, size_t error_capacity
 ) {
     if (error_buffer && error_capacity) error_buffer[0] = '\0';
@@ -309,7 +310,7 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
         return NULL;
     }
     ghostty_surface_config_s options = ghostty_surface_config_new();
-    options.platform_tag = GHOSTTY_EGUI_PLATFORM;
+    options.platform_tag = GHOSTTY_PLATFORM_OPENGL;
     options.platform.opengl = parent->platform;
     if (window) {
         options.platform.opengl.window = window;
@@ -318,9 +319,14 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
     }
     options.scale_factor = scale;
     options.userdata = userdata;
-    ghostty_env_var_s token_env = { .key = "WEZTERM_OSC_TOKEN", .value = osc_token };
-    options.env_vars = &token_env;
-    options.env_var_count = 1;
+    options.command = command;
+    options.working_directory = cwd;
+    ghostty_env_var_s token_env[] = {
+        { .key = "GHOSTTY_PICKER_ENDPOINT", .value = picker_endpoint },
+        { .key = "GHOSTTY_PICKER_TOKEN", .value = picker_token },
+    };
+    options.env_vars = token_env;
+    options.env_var_count = 2;
     host->app = parent->app;
     host->platform = options.platform.opengl;
     host->surface = ghostty_surface_new(host->app, &options);
@@ -439,13 +445,8 @@ void ghostty_egui_host_focus(GhosttyEguiHost *host, bool focused) {
     runtime_error(host, "set terminal app focus");
     ghostty_surface_set_focus(host->surface, focused);
  runtime_error(host, "ghostty_egui_host_focus"); }
-#ifdef GHOSTTY_EGUI_VULKAN
-bool ghostty_egui_host_take_frame(GhosttyEguiHost *host, ghostty_gpu_frame_s *frame) {
-    bool succeeded = ghostty_surface_take_gpu_frame(host->surface, frame);
-#else
 bool ghostty_egui_host_take_frame(GhosttyEguiHost *host, ghostty_gl_frame_s *frame) {
     bool succeeded = ghostty_surface_take_gl_frame(host->surface, frame);
-#endif
     runtime_error(host, "acquire terminal frame");
     return succeeded;
 }
@@ -593,3 +594,6 @@ void ghostty_egui_host_mouse_scroll(GhosttyEguiHost *host, double x, double y, i
     ghostty_clear_error();
     ghostty_surface_mouse_scroll(host->surface, x, y, mods);
  runtime_error(host, "ghostty_egui_host_mouse_scroll"); }
+
+uint64_t ghostty_egui_host_shell_pid(GhosttyEguiHost *host) { return ghostty_surface_shell_pid(host->surface); }
+uint64_t ghostty_egui_host_shell_creation_time(GhosttyEguiHost *host) { return ghostty_surface_shell_creation_time(host->surface); }

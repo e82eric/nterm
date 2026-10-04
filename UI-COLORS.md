@@ -29,7 +29,7 @@ return {
 }
 ```
 
-All sixteen roles in the table below accept `#RRGGBB` or `RRGGBB` strings. Omitted
+All color roles accept `#RRGGBB` or `RRGGBB` strings. Omitted
 roles inherit derived values. Invalid strings/types or unknown roles reject the
 Lua configuration and appear in configuration Messages. Changes support manual config reload.
 Explicit overrides are applied exactly, without contrast correction.
@@ -52,6 +52,7 @@ foreground because there is no individual terminal cell to resolve against.
 | selection_background | Selected rows, editable text selections, snapshot selections |
 | selection_text | Text on selection backgrounds |
 | accent | Active status, caret, picker indicator, quick-select hint |
+| copy_cursor_background | Copy-mode cursor fill in the terminal and NFM preview; defaults to accent |
 | success | Copied confirmation |
 | warning | Persistent configuration issue indicator |
 | error | Picker failures, invalid search, egui error text |
@@ -74,7 +75,7 @@ theme_colors = {
 The manager applies theme-derived colors, global overrides, then theme-specific
 overrides. The same precedence applies at startup and after theme selection;
 overrides from the previous theme do not carry over. Keys are case-sensitive,
-and each table accepts the same sixteen roles and RGB formats as `colors.ui`.
+and each table accepts the same roles and RGB formats as `colors.ui`.
 Configuration changes require restarting the app.
 
 Fallback defaults use the existing Gruvbox-like colors. Similar per-component shades have

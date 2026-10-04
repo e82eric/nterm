@@ -68,10 +68,7 @@ pub(crate) struct SurfaceSize {
 #[derive(Default)]
 pub(crate) struct GlFrame {
     pub(crate) handle: *mut c_void,
-    #[cfg(not(feature = "vulkan"))]
     pub(crate) texture: u32,
-    #[cfg(feature = "vulkan")]
-    pub(crate) texture: usize,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) frame_generation: u64,
@@ -207,7 +204,8 @@ unsafe extern "C" {
         display: *mut c_void,
         context: *mut c_void,
         scale: f64,
-        osc_token: *const c_char,
+        picker_endpoint: *const c_char,
+        picker_token: *const c_char,
         error_buffer: *mut c_char,
         error_capacity: usize,
     ) -> *mut Host;
@@ -219,11 +217,16 @@ unsafe extern "C" {
         display: *mut c_void,
         context: *mut c_void,
         scale: f64,
-        osc_token: *const c_char,
+        picker_endpoint: *const c_char,
+        picker_token: *const c_char,
+        command: *const c_char,
+        cwd: *const c_char,
         error_buffer: *mut c_char,
         error_capacity: usize,
     ) -> *mut Host;
     pub(crate) fn ghostty_egui_host_tick(host: *mut Host);
+    pub(crate) fn ghostty_egui_host_shell_pid(host: *mut Host) -> u64;
+    pub(crate) fn ghostty_egui_host_shell_creation_time(host: *mut Host) -> u64;
     pub(crate) fn ghostty_egui_host_resize(host: *mut Host, width: u32, height: u32, scale: f64);
     pub(crate) fn ghostty_egui_host_focus(host: *mut Host, focused: bool);
     pub(crate) fn ghostty_egui_host_take_frame(host: *mut Host, frame: *mut GlFrame) -> bool;

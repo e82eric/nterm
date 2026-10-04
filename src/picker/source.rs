@@ -62,6 +62,15 @@ pub(super) enum PickerSource {
 }
 
 impl PickerSource {
+    pub(super) fn begin_pipe_stream(
+        &mut self,
+    ) -> PublishingStreamingItemStoreWithPayload<SnapshotCellRange> {
+        let Self::Items { runtime, .. } = self else {
+            panic!("pipe stream requires Items source");
+        };
+        runtime.store = Arc::new(SnapshotStore::new_append_only());
+        PublishingStreamingItemStoreWithPayload::new(runtime.store.clone())
+    }
     pub(super) fn split_line(
         host: *mut Host,
         generation: u64,

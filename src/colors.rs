@@ -15,6 +15,7 @@ pub(crate) struct UiOverrides {
     pub selection_background: Option<UiColor>,
     pub selection_text: Option<UiColor>,
     pub accent: Option<UiColor>,
+    pub copy_cursor_background: Option<UiColor>,
     pub success: Option<UiColor>,
     pub warning: Option<UiColor>,
     pub error: Option<UiColor>,
@@ -90,6 +91,9 @@ impl UiOverrides {
         }
         if let Some(color) = self.match_highlight {
             palette.match_highlight = color.0;
+        }
+        if let Some(color) = self.copy_cursor_background {
+            palette.copy_cursor_background = Some(color.0);
         }
         if let Some(color) = self.picker_match_highlight {
             palette.picker_match_highlight = Some(color.0);
@@ -197,6 +201,7 @@ impl UiPalette {
             error: readable(unpack(theme.ansi[1]), panel_background),
             match_highlight: readable(unpack(theme.ansi[3]), panel_background),
             picker_match_highlight: None,
+            copy_cursor_background: None,
             search_match_background,
             search_match_text: readable(text, search_match_background),
             yank_background,
@@ -215,6 +220,7 @@ pub(crate) struct UiPalette {
     pub selection_background: Color32,
     pub selection_text: Color32,
     pub accent: Color32,
+    pub copy_cursor_background: Option<Color32>,
     pub success: Color32,
     pub warning: Color32,
     pub error: Color32,
@@ -236,6 +242,7 @@ impl UiPalette {
         selection_background: Color32::from_rgb(0x3d, 0x39, 0x37),
         selection_text: Color32::from_rgb(0xeb, 0xdb, 0xb2),
         accent: Color32::from_rgb(0xfa, 0xbd, 0x2f),
+        copy_cursor_background: None,
         success: Color32::from_rgb(0xb8, 0xbb, 0x26),
         warning: Color32::from_rgb(0xfa, 0xbd, 0x2f),
         error: Color32::from_rgb(0xfb, 0x49, 0x34),
@@ -289,6 +296,7 @@ pub(crate) static COLORS: ColorManager = ColorManager {
             selection_background: None,
             selection_text: None,
             accent: None,
+            copy_cursor_background: None,
             success: None,
             warning: None,
             error: None,
@@ -391,6 +399,23 @@ fn visuals(p: UiPalette) -> egui::Visuals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_cursor_color_is_independent_and_inherits_accent_when_omitted() {
+        let base = UiPalette::DEFAULT;
+        let overrides: UiOverrides =
+            serde_json::from_str(r##"{"accent":"#fabd2f","copy_cursor_background":"#83a598"}"##)
+                .unwrap();
+        let configured = overrides.apply(base);
+        assert_eq!(rgb(configured.copy_cursor_background.unwrap()), 0x83a598);
+        assert_eq!(rgb(configured.accent), 0xfabd2f);
+        assert_eq!(configured.match_highlight, base.match_highlight);
+        let fallback = UiOverrides::default().apply(base);
+        assert_eq!(
+            fallback.copy_cursor_background.unwrap_or(fallback.accent),
+            base.accent
+        );
+    }
 
     #[test]
     fn secondary_search_colors_are_independent_of_picker_selection() {

@@ -4,6 +4,130 @@ use nfm_search_core::{
 };
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+#[test]
+fn pipe_timing_trace_covers_command_first_results_and_current_preview_frame() {
+    let ctx = egui::Context::default();
+    let trace = diagnostics::Trace::new("timing-correlation".into(), Instant::now());
+    let scope = diagnostics::Scope::enter(trace.clone());
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::Command(config::CommandOptions {
+                args: vec![
+                    "cmd.exe".into(),
+                    "/d".into(),
+                    "/c".into(),
+                    "echo timing-item".into(),
+                ],
+                cwd: None,
+                line_continuation: None,
+                unique: false,
+                success_exit_codes: None,
+            }),
+            preview: Some(config::Preview::Command {
+                args: vec![
+                    "cmd.exe".into(),
+                    "/d".into(),
+                    "/c".into(),
+                    "echo preview-timing".into(),
+                ],
+                cwd: None,
+                command: None,
+                max_bytes: None,
+                max_scrollback_lines: None,
+            }),
+            preview_visible: true,
+            ..Default::default()
+        },
+    );
+    drop(scope);
+    let (session, _rx) = pipe::Session::with_trace("timing-correlation".into(), trace.clone());
+    picker.attach_pipe(&ctx, session, None);
+    wait_preview_rendered_text(&ctx, &mut picker, "preview-timing");
+    // Attaching after worker completion still wakes the host with existing results.
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    picker
+        .shared
+        .set_search_wake_callback(Arc::new(move |timings| {
+            wake_tx.send(timings).unwrap();
+        }));
+    let timings = wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(timings.started.unwrap() <= timings.first_snapshot_ready.unwrap());
+    assert!(timings.first_snapshot_ready.unwrap() <= timings.first_matches_ready.unwrap());
+    assert!(timings.first_matches_ready.unwrap() <= timings.first_matches_taken.unwrap());
+    let snapshot = trace.snapshot();
+    let events = snapshot["events"].as_array().unwrap();
+    for stage in [
+        "command_spawn_started",
+        "command_spawned",
+        "command_first_stdout",
+        "command_first_items_published",
+        "picker_frame_built",
+        "first_results_frame_built",
+        "search_started",
+        "search_snapshot_ready",
+        "search_matches_ready",
+        "search_matches_taken",
+        "preview_requested",
+        "preview_spawned",
+        "preview_first_stdout",
+        "preview_process_finished",
+        "preview_document_ready",
+        "preview_frame_built",
+    ] {
+        assert!(
+            events.iter().any(|event| event["stage"] == stage),
+            "missing {stage}: {snapshot}"
+        );
+    }
+    assert_eq!(snapshot["request_id"], "timing-correlation");
+    assert!(
+        snapshot["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|span| span["name"] == "preview_prepare_to_frame")
+    );
+}
+
+#[test]
+fn pipe_stream_publishes_before_end_and_returns_value_without_pasting() {
+    let ctx = egui::Context::default();
+    let mut picker = items(&ctx);
+    let (session, rx) = pipe::Session::new("stream-test".into());
+    picker.attach_pipe(&ctx, session.clone(), Some(&pipe::StreamOptions::default()));
+    picker.pipe_event(
+        &ctx,
+        pipe::Event::Items {
+            sequence: 0,
+            items: vec![pipe::Item {
+                id: "original".into(),
+                text: "streamed item".into(),
+                value: serde_json::json!({"path":"selected-value"}),
+            }],
+            session: session.clone(),
+        },
+    );
+    assert_eq!(rx.try_recv().unwrap()["type"], "ack");
+    wait_selection(&ctx, &mut picker);
+    let (action, output) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert!(matches!(action, Some(Action::Cancel)));
+    assert!(output.is_empty());
+    let result = rx.try_recv().unwrap();
+    assert_eq!(result["status"], "accepted");
+    assert_eq!(result["selected"][0]["id"], "original");
+    assert_eq!(result["selected"][0]["value"]["path"], "selected-value");
+}
+
 #[test]
 fn preview_appearance_receives_configured_copy_colors() {
     let ctx = egui::Context::default();
@@ -12,6 +136,14 @@ fn preview_appearance_receives_configured_copy_colors() {
     frame.textures_delta.clear();
     let appearance = picker.appearance(&ctx);
     let palette = crate::colors::palette();
+    assert_eq!(
+        appearance.palette.search_active_background,
+        Some(palette.match_highlight)
+    );
+    assert_eq!(
+        appearance.palette.search_active_text,
+        Some(palette.background)
+    );
     assert_eq!(
         appearance.palette.search_match_background,
         Some(palette.search_match_background)
@@ -142,13 +274,15 @@ fn command_preview_runs_through_nfm_using_the_accepted_value_and_cwd() {
         ctx.clone(),
         config::Options {
             source: config::Source::Items(config::ItemsOptions {
-                values: vec![protocol::Item {
+                values: vec![wire::Item {
                     text: "display".into(),
                     value: "inserted".into(),
                 }],
                 provider: None,
             }),
             preview: Some(config::Preview::Command {
+                max_bytes: None,
+                max_scrollback_lines: None,
                 args: vec![
                     "cmd.exe".into(),
                     "/d".into(),
@@ -192,11 +326,11 @@ fn lua_command_preview_resolves_once_and_nfm_owns_centering_paging_and_selection
         config::Options {
             source: config::Source::Items(config::ItemsOptions {
                 values: vec![
-                    protocol::Item {
+                    wire::Item {
                         text: "first".into(),
                         value: "20".into(),
                     },
-                    protocol::Item {
+                    wire::Item {
                         text: "second".into(),
                         value: "1".into(),
                     },
@@ -204,6 +338,8 @@ fn lua_command_preview_resolves_once_and_nfm_owns_centering_paging_and_selection
                 provider: None,
             }),
             preview: Some(config::Preview::Command {
+                max_bytes: None,
+                max_scrollback_lines: None,
                 args: Vec::new(),
                 cwd: None,
                 command: Some(command),
@@ -257,7 +393,7 @@ fn items(ctx: &egui::Context) -> Picker {
         ctx.clone(),
         config::Options {
             source: config::Source::Items(config::ItemsOptions {
-                values: vec![protocol::Item {
+                values: vec![wire::Item {
                     text: "café shown".into(),
                     value: "inserted value".into(),
                 }],
@@ -296,7 +432,7 @@ fn complete_preview_uses_accepted_value_and_nfm_paging_and_copy() {
         ctx.clone(),
         config::Options {
             source: config::Source::Items(config::ItemsOptions {
-                values: vec![protocol::Item {
+                values: vec![wire::Item {
                     text: "display".into(),
                     value: "inserted".into(),
                 }],
@@ -334,7 +470,85 @@ fn complete_preview_uses_accepted_value_and_nfm_paging_and_copy() {
         assert!(Instant::now() < deadline, "NFM preview was not copied");
         std::thread::sleep(Duration::from_millis(2));
     }
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Space, egui::Modifiers::ALT)],
+    );
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+    );
+    assert!(picker.shared.preview_focused());
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::W, egui::Modifiers::CTRL)],
+    );
+    assert!(!picker.shared.preview_focused());
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Space, egui::Modifiers::ALT)],
+    );
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+    );
+    assert!(!picker.shared.preview_focused());
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Space, egui::Modifiers::ALT)],
+    );
+    let (action, _) = frame(&ctx, &mut picker, vec![egui::Event::Text("a".into())]);
+    assert!(action.is_none());
+    assert!(picker.shared.preview_focused());
+    let (_, commands) = frame(
+        &ctx,
+        &mut picker,
+        vec![
+            key(egui::Key::Y, egui::Modifiers::NONE),
+            key(egui::Key::Y, egui::Modifiers::NONE),
+        ],
+    );
+    assert!(commands.contains(&egui::OutputCommand::CopyText("second\n".into())));
 }
+#[test]
+fn floating_palette_selection_returns_id_instead_of_display_label() {
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::CommandPalette(vec![
+                crate::actions::floating_pane_entry(7, Some("tools"), "PowerShell", false),
+                crate::actions::floating_pane_entry(12, None, "nvim", true),
+            ]),
+            params: [("query".into(), "tools".into())].into(),
+            ..Default::default()
+        },
+    );
+    let selected = wait_selection(&ctx, &mut picker);
+    assert!(selected.text.contains("tools"));
+    let (action, _) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert!(matches!(
+        action,
+        Some(Action::Execute(
+            crate::actions::AppAction::RestoreFloatingPane(7)
+        ))
+    ));
+}
+
 #[test]
 fn structured_command_palette_returns_typed_action() {
     let ctx = egui::Context::default();
@@ -655,7 +869,7 @@ fn preview_toggle_and_help_use_shared_control() {
         ctx.clone(),
         config::Options {
             source: config::Source::Items(config::ItemsOptions {
-                values: vec![protocol::Item {
+                values: vec![wire::Item {
                     text: "one".into(),
                     value: "one".into(),
                 }],

@@ -235,8 +235,7 @@ try:
     assert process.wait(timeout=15) == 0
     log.seek(0)
     diagnostics = log.read().decode('utf-8', errors='replace')
-    for failure in ('wgpu error:', 'Vulkan render step failed', 'Ghostty Vulkan dispatch failed'):
-        assert failure not in diagnostics, diagnostics[-16000:]
+    assert 'OpenGL error' not in diagnostics, diagnostics[-16000:]
     print('PASS: last window closes process cleanly', flush=True)
     if options.memory_report:
         options.memory_report.parent.mkdir(parents=True, exist_ok=True)

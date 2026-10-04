@@ -1,12 +1,14 @@
 pub(crate) mod command;
 pub(crate) mod config;
+pub(crate) mod diagnostics;
 pub(crate) mod files;
 pub(crate) mod font;
+pub(crate) mod pipe;
 pub(crate) mod preview;
-pub(crate) mod protocol;
 #[cfg(test)]
 mod shared_tests;
 mod source;
+pub(crate) mod wire;
 
 use crate::ghostty_ffi::{self, Host, SnapshotCell, SnapshotCellRange};
 use nfm_search_core::search::SearchResult;
@@ -46,6 +48,10 @@ pub(crate) struct Picker {
     #[cfg(test)]
     session_id: u64,
     error: Arc<std::sync::Mutex<Option<String>>>,
+    pipe_session: Option<Arc<pipe::Session>>,
+    pipe_items: Vec<pipe::Item>,
+    pipe_publisher:
+        Option<nfm_search_core::store::PublishingStreamingItemStoreWithPayload<SnapshotCellRange>>,
 }
 
 pub(crate) enum Action {
@@ -63,6 +69,94 @@ pub(crate) enum Action {
     SendInput(String),
 }
 impl Picker {
+    pub(crate) fn attach_pipe(
+        &mut self,
+        ctx: &egui::Context,
+        session: Arc<pipe::Session>,
+        stream: Option<&pipe::StreamOptions>,
+    ) {
+        self.pipe_session = Some(session.clone());
+        if let Some(options) = stream {
+            self.pipe_publisher = Some(self.source.begin_pipe_stream());
+            self.shared
+                .replace_source(ctx, self.source.provider(), &options.initial_query);
+            self.result_rows = options.result_rows.unwrap_or(7);
+            self.preview_rows = options.preview_rows.unwrap_or(14);
+            self.shared.set_presentation(
+                self.result_rows,
+                self.preview_rows,
+                options.preview_visible,
+            );
+        }
+        self.shared
+            .set_search_wake_callback(Arc::new(move |timings| {
+                if !session.done() {
+                    diagnostics::record_search(&session.trace, &timings);
+                }
+            }));
+    }
+    pub(crate) fn bind_pipe_search_wake(
+        &self,
+        proxy: egui_winit::winit::event_loop::EventLoopProxy<crate::app::UserEvent>,
+        window_id: egui_winit::winit::window::WindowId,
+    ) {
+        let Some(session) = self.pipe_session.clone() else {
+            return;
+        };
+        self.shared
+            .set_search_wake_callback(Arc::new(move |timings| {
+                if session.done() {
+                    return;
+                }
+                diagnostics::record_search(&session.trace, &timings);
+                if timings.first_matches_ready.is_some() {
+                    session.trace.mark("search_wake_queued", None);
+                    let _ = proxy.send_event(crate::app::UserEvent::PickerWake {
+                        window_id,
+                        trace: session.trace.clone(),
+                        search: true,
+                    });
+                }
+            }));
+    }
+    pub(crate) fn pipe_event(&mut self, ctx: &egui::Context, event: pipe::Event) {
+        let Some(session) = &self.pipe_session else {
+            return;
+        };
+        match event {
+            pipe::Event::Items {
+                sequence,
+                items,
+                session: sender,
+            } if Arc::ptr_eq(session, &sender) && !sender.done() => {
+                if let Some(publisher) = &mut self.pipe_publisher {
+                    for item in items {
+                        publisher.add_item(item.text.as_bytes(), SnapshotCellRange::default());
+                        self.pipe_items.push(item);
+                    }
+                    publisher.publish();
+                    sender.trace.mark("first_items_published", None);
+                    sender.reply(serde_json::json!({"type":"ack","request_id":sender.id,"sequence":sequence}));
+                    ctx.request_repaint();
+                }
+            }
+            pipe::Event::End { session: sender }
+                if Arc::ptr_eq(session, &sender) && !sender.done() =>
+            {
+                if let Some(publisher) = &mut self.pipe_publisher {
+                    publisher.complete();
+                }
+                sender.reply(serde_json::json!({"type":"input_complete","request_id":sender.id}));
+                ctx.request_repaint();
+            }
+            _ => {}
+        }
+    }
+    pub(crate) fn pipe_cancelled(&self) -> bool {
+        self.pipe_session
+            .as_ref()
+            .is_some_and(|s| s.cancelled.load(Ordering::Acquire))
+    }
     pub(crate) fn is_command_palette(&self) -> bool {
         self.source.is_command_palette()
     }
@@ -169,6 +263,9 @@ impl Picker {
             _ => None,
         };
         Self {
+            pipe_session: None,
+            pipe_items: Vec::new(),
+            pipe_publisher: None,
             shared,
             cursor_row: None,
             position: options.position,
@@ -195,6 +292,10 @@ impl Picker {
             error,
         }
     }
+    pub(crate) fn set_cursor_scroll_padding(&mut self, rows: u32) {
+        self.shared.set_cursor_scroll_padding(rows);
+    }
+
     fn appearance(&self, ctx: &egui::Context) -> nfm_egui::Appearance {
         let p = crate::colors::palette();
         nfm_egui::Appearance {
@@ -208,9 +309,12 @@ impl Picker {
                 divider: p.border,
                 error: p.error,
                 accent: p.accent,
+                copy_cursor_background: p.copy_cursor_background,
                 success: p.success,
                 search_match_background: Some(p.search_match_background),
                 search_match_text: Some(p.search_match_text),
+                search_active_background: Some(p.match_highlight),
+                search_active_text: Some(p.background),
                 yank_background: Some(p.yank_background),
                 yank_text: Some(p.yank_text),
             },
@@ -270,6 +374,15 @@ impl Picker {
         bounds: egui::Rect,
         interactive: bool,
     ) -> Option<Action> {
+        if let Some(session) = &self.pipe_session {
+            if let Some(message) = self.error.lock().unwrap().clone() {
+                session.finish(
+                    "error",
+                    serde_json::json!({"code":"source_failed","message":message}),
+                );
+                return Some(Action::Cancel);
+            }
+        }
         let appearance = self.appearance(ctx);
         if interactive && !self.shared.keybinding_help_visible() && self.source.is_scrollback() {
             if self.split_parent.is_some()
@@ -293,6 +406,7 @@ impl Picker {
                 self.shared
                     .set_keybinding_help(vec![("Ctrl+B".into(), "Split selected line".into())]);
             } else if !self.line_split
+                && self.pipe_session.is_none()
                 && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::B))
             {
                 if let Some(selection) = self.shared.selection() {
@@ -329,9 +443,24 @@ impl Picker {
             });
         }
         self.shared.set_error(self.error.lock().unwrap().clone());
+        if let Some(session) = &self.pipe_session {
+            session.trace.mark("picker_frame_started", None);
+        }
         let output = self
             .shared
             .show(ctx, self.placement(bounds), &appearance, !interactive);
+        if let Some(session) = &self.pipe_session {
+            diagnostics::record_search(&session.trace, &self.shared.search_timings());
+            session.trace.mark("picker_frame_built", None);
+            if output.matched > 0 && !self.shared.keybinding_help_visible() {
+                session.trace.mark("first_results_frame_built", None);
+            }
+            if output.preview_rendered {
+                if let Some(preview) = &self.command_preview {
+                    preview.rendered(&session.trace, output.preview_selection);
+                }
+            }
+        }
         // An accepted event owns its searched snapshot even after the control closes.
         let selection = match &output.event {
             Some(nfm_egui::PickerEvent::Accepted(selection))
@@ -341,11 +470,22 @@ impl Picker {
         if let Some(preview) = &mut self.command_preview {
             if output.preview_rect.is_some() && !self.shared.is_closed() {
                 if let Some(selection) = &selection {
-                    let value = self.source.accepted_value(&SearchResult {
-                        node_index: selection.item.node_index,
-                        score: 0,
-                        path: selection.text.clone(),
-                    });
+                    let value = self
+                        .pipe_items
+                        .get(selection.item.node_index)
+                        .map(|item| {
+                            item.value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| item.value.to_string())
+                        })
+                        .unwrap_or_else(|| {
+                            self.source.accepted_value(&SearchResult {
+                                node_index: selection.item.node_index,
+                                score: 0,
+                                path: selection.text.clone(),
+                            })
+                        });
                     preview.prepare(
                         ctx,
                         &mut self.shared,
@@ -353,6 +493,9 @@ impl Picker {
                         &value,
                         self.source.is_filesystem(),
                         &self.request_params,
+                        self.pipe_session
+                            .as_ref()
+                            .map(|session| session.trace.clone()),
                     );
                 }
             }
@@ -369,6 +512,27 @@ impl Picker {
         }
     }
     fn accept(&self, selection: nfm_egui::Selection<source::Candidate>) -> Option<Action> {
+        if let Some(session) = &self.pipe_session {
+            let index = selection.item.node_index;
+            let value = self
+                .pipe_items
+                .get(index)
+                .map(|item| item.value.clone())
+                .unwrap_or_else(|| {
+                    serde_json::Value::String(self.source.accepted_value(&SearchResult {
+                        node_index: index,
+                        score: 0,
+                        path: selection.text.clone(),
+                    }))
+                });
+            let id = self
+                .pipe_items
+                .get(index)
+                .map(|item| item.id.clone())
+                .unwrap_or_else(|| index.to_string());
+            session.finish("accepted",serde_json::json!({"selected":[{"id":id,"text":selection.text,"value":value}],"query":self.shared.query()}));
+            return Some(Action::Cancel);
+        }
         let result = SearchResult {
             node_index: selection.item.node_index,
             score: 0,
@@ -485,6 +649,9 @@ impl Picker {
 
 impl Drop for Picker {
     fn drop(&mut self) {
+        if let Some(session) = &self.pipe_session {
+            session.finish("cancelled", serde_json::json!({"reason":"picker_closed"}));
+        }
         if let Some(reader) = &self.snapshot_preview {
             reader.close();
         }

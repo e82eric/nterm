@@ -1,5 +1,5 @@
 use crate::ghostty_ffi::{self, SnapshotCell, SnapshotCellRange, SnapshotTextChunk};
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -9,6 +9,8 @@ use std::thread;
 
 #[derive(Default)]
 pub(crate) struct SearchUi {
+    pub(crate) copy_origin: Option<nfm_egui::copy_mode::CopyMode>,
+    pub(crate) backward: bool,
     pub(crate) active: bool,
     pub(crate) query: String,
     pub(crate) regex: bool,
@@ -27,6 +29,16 @@ impl SearchUi {
     pub(crate) fn apply_result(&mut self, matches: Vec<SnapshotCellRange>, error: Option<String>) {
         self.matches = matches;
         self.selected = (!self.matches.is_empty()).then_some(0);
+        if let Some(origin) = &self.copy_origin {
+            let target = nfm_egui::copy_mode::next_match_cell(
+                &self.matches,
+                origin.cursor,
+                !self.backward,
+                1,
+            );
+            self.selected = target
+                .and_then(|target| self.matches.iter().position(|range| range.start == target));
+        }
         self.error = error;
         self.waiting = false;
     }
@@ -117,7 +129,7 @@ impl SearchUi {
                         ui.add_sized(
                             [16.0, 24.0],
                             egui::Label::new(
-                                egui::RichText::new("/")
+                                egui::RichText::new(if self.backward { "?" } else { "/" })
                                     .font(egui::FontId::monospace(16.0))
                                     .color(accent),
                             ),
@@ -518,12 +530,7 @@ fn find_search_matches_cancellable(
     if query.is_empty() {
         return Some(SearchOutcome::default());
     }
-    let pattern = if regex {
-        query.to_owned()
-    } else {
-        regex::escape(query)
-    };
-    let matcher = match RegexBuilder::new(&pattern).case_insensitive(!regex).build() {
+    let matcher = match nfm_egui::copy_mode::search_regex(query, regex) {
         Ok(matcher) => matcher,
         Err(error) => {
             return Some(SearchOutcome {
@@ -678,6 +685,29 @@ mod tests {
     use super::{LineScan, SearchUi, find_search_matches_cancellable};
     use crate::ghostty_ffi::{SnapshotCell, SnapshotCellRange, SnapshotTextPoint};
     use regex::{Regex, RegexBuilder};
+
+    #[test]
+    fn copy_search_selects_relative_to_cursor_in_both_directions() {
+        let matches: Vec<_> = [2, 8, 14]
+            .into_iter()
+            .map(|x| SnapshotCellRange {
+                start: SnapshotCell { x, y: 10 },
+                end: SnapshotCell { x: x + 1, y: 10 },
+            })
+            .collect();
+        let mut origin = nfm_egui::copy_mode::CopyMode::default();
+        origin.cursor = SnapshotCell { x: 8, y: 10 };
+        let mut search = SearchUi {
+            active: true,
+            copy_origin: Some(origin),
+            ..Default::default()
+        };
+        search.apply_result(matches.clone(), None);
+        assert_eq!(search.copy_target(), Some(SnapshotCell { x: 14, y: 10 }));
+        search.backward = true;
+        search.apply_result(matches, None);
+        assert_eq!(search.copy_target(), Some(SnapshotCell { x: 2, y: 10 }));
+    }
 
     #[test]
     fn copy_target_uses_selected_start_and_rejects_pending_or_invalid_results() {

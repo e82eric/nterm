@@ -80,17 +80,17 @@ impl PreviewCommand {
 }
 
 impl ItemsProvider {
-    pub(crate) fn read(&self) -> Result<Vec<crate::picker::protocol::Item>, String> {
+    pub(crate) fn read(&self) -> Result<Vec<crate::picker::wire::Item>, String> {
         let function: mlua::Function = self
             .lua
             .registry_value(&self.key)
             .map_err(|error| error.to_string())?;
         let value: mlua::Value = function.call(()).map_err(|error| error.to_string())?;
-        let items: Vec<crate::picker::protocol::Item> = self
+        let items: Vec<crate::picker::wire::Item> = self
             .lua
             .from_value(value)
             .map_err(|error| error.to_string())?;
-        crate::picker::protocol::validate_items(&items)?;
+        crate::picker::wire::validate_items(&items)?;
         Ok(items)
     }
 }
@@ -111,6 +111,126 @@ mod tests {
         }
     }
 
+    #[test]
+    fn floating_api_returns_live_ids_supports_names_and_expires_with_action() {
+        use crate::terminal::floating::{Panes, Request, Target};
+        let mut panes = Panes::default();
+        let callback = callback(
+            r#"local saved; return function(app)
+            if saved then saved:get_floating_panes(); return end
+            saved=app
+            assert(app:get_floating_pane('missing') == nil)
+            local a=app:create_floating_pane({name='tools',command='pwsh.exe',cwd='C:\\src'})
+            local b=app:create_floating_pane()
+            assert(a.id == 1 and a.name == 'tools' and a.visible and a.focused)
+            assert(b.id == 2)
+            assert(#app:get_floating_panes() == 2)
+            assert(app:get_floating_pane('tools').id == a.id)
+            app:restore_floating_pane(a.id)
+            assert(app:get_floating_pane().id == a.id)
+            app:toggle_floating_pane()
+            assert(not app:get_floating_pane().visible)
+            app:toggle_floating_pane()
+            app:next_floating_pane()
+            assert(app:get_floating_pane().id == b.id)
+            app:previous_floating_pane()
+            app:close_floating_pane('tools')
+            assert(app:get_floating_pane('tools') == nil)
+            assert(app:get_floating_pane().id == b.id)
+            app:close_floating_pane()
+            assert(#app:get_floating_panes() == 0)
+        end"#,
+        );
+        let mut dispatch = |request| {
+            let result = match request {
+                Request::Create(options) => {
+                    panes.validate_create(&options)?;
+                    let id = panes.insert(options.name, ());
+                    serde_json::to_value(panes.description(id)).unwrap()
+                }
+                Request::Get(target) => {
+                    let id = target.as_ref().and_then(|t| panes.resolve(t)).or_else(|| {
+                        if target.is_none() {
+                            panes.last_id()
+                        } else {
+                            None
+                        }
+                    });
+                    serde_json::to_value(id.and_then(|id| panes.description(id))).unwrap()
+                }
+                Request::List => serde_json::to_value(panes.descriptions()).unwrap(),
+                Request::Restore(target) => {
+                    let id = panes.resolve(&target).ok_or("missing pane")?;
+                    panes.restore(id);
+                    serde_json::Value::Null
+                }
+                Request::Toggle => {
+                    if panes.visible_id().is_some() {
+                        panes.hide();
+                    } else if let Some(id) = panes.last_id() {
+                        panes.restore(id);
+                    }
+                    serde_json::Value::Null
+                }
+                Request::Next | Request::Previous => {
+                    panes.cycle(matches!(request, Request::Next));
+                    serde_json::Value::Null
+                }
+                Request::Close(target) => {
+                    let id = target
+                        .as_ref()
+                        .and_then(|t| panes.resolve(t))
+                        .or_else(|| panes.last_id());
+                    if let Some(id) = id {
+                        panes.remove(id);
+                    }
+                    serde_json::Value::Null
+                }
+            };
+            Ok(result)
+        };
+        assert!(
+            callback
+                .with_floating(&mut dispatch, || callback.call_action(String::new()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            callback
+                .with_floating(&mut dispatch, || callback.call_action(String::new()))
+                .unwrap_err()
+                .contains("already returned")
+        );
+        assert!(panes.resolve(&Target::Id(1)).is_none());
+    }
+    #[test]
+    fn floating_creation_errors_are_synchronous_and_options_are_strict() {
+        let failing = callback(
+            "return function(app) local ok,err=pcall(function() app:create_floating_pane({name='bad'}) end); assert(not ok and string.find(tostring(err),'spawn failed')); app:show_toast('Error handled','yes') end",
+        );
+        let commands = failing
+            .with_floating(&mut |_| Err("spawn failed".into()), || {
+                failing.call_action(String::new())
+            })
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        for options in [
+            "{unexpected=true}",
+            "{name=''}",
+            "{cwd=''}",
+            "{command=''}",
+            "{name='a' .. string.char(0)}",
+        ] {
+            let c = callback(&format!(
+                "return function(app) app:create_floating_pane({options}) end"
+            ));
+            assert!(
+                c.with_floating(&mut |_| panic!("invalid options reached host"), || c
+                    .call_action(String::new()))
+                    .is_err()
+            );
+        }
+    }
     #[test]
     fn named_action_handles_expire_and_toasts_validate_duration() {
         let callback = callback(
@@ -289,6 +409,51 @@ struct App {
 }
 impl UserData for App {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+        use crate::terminal::floating::{CreateOptions, Request, Target};
+        methods.add_method(
+            "create_floating_pane",
+            |lua, app, options: Option<mlua::Value>| {
+                let options: CreateOptions = match options {
+                    Some(options) => lua.from_value(options)?,
+                    None => Default::default(),
+                };
+                options.validate().map_err(mlua::Error::external)?;
+                app.floating(lua, Request::Create(options))
+            },
+        );
+        methods.add_method("toggle_floating_pane", |lua, app, ()| {
+            app.floating(lua, Request::Toggle)
+        });
+        methods.add_method("restore_floating_pane", |lua, app, target: mlua::Value| {
+            app.floating(lua, Request::Restore(lua.from_value::<Target>(target)?))
+        });
+        methods.add_method(
+            "get_floating_pane",
+            |lua, app, target: Option<mlua::Value>| {
+                app.floating(
+                    lua,
+                    Request::Get(target.map(|v| lua.from_value::<Target>(v)).transpose()?),
+                )
+            },
+        );
+        methods.add_method("get_floating_panes", |lua, app, ()| {
+            app.floating(lua, Request::List)
+        });
+        methods.add_method("next_floating_pane", |lua, app, ()| {
+            app.floating(lua, Request::Next)
+        });
+        methods.add_method("previous_floating_pane", |lua, app, ()| {
+            app.floating(lua, Request::Previous)
+        });
+        methods.add_method(
+            "close_floating_pane",
+            |lua, app, target: Option<mlua::Value>| {
+                app.floating(
+                    lua,
+                    Request::Close(target.map(|v| lua.from_value::<Target>(v)).transpose()?),
+                )
+            },
+        );
         methods.add_method("get_selection_text", |_, app, ()| {
             if !app.active.get() {
                 return Err(mlua::Error::external("action has already returned"));
@@ -371,6 +536,17 @@ impl UserData for App {
     }
 }
 impl App {
+    fn floating<'lua>(
+        &self,
+        lua: &'lua Lua,
+        request: crate::terminal::floating::Request,
+    ) -> mlua::Result<mlua::Value<'lua>> {
+        if !self.active.get() {
+            return Err(mlua::Error::external("action has already returned"));
+        }
+        let handler: mlua::Function = lua.named_registry_value("ghostty.floating_handler")?;
+        handler.call(lua.to_value(&request)?)
+    }
     fn push(&self, command: Command) -> mlua::Result<()> {
         if !self.active.get() {
             return Err(mlua::Error::external("action has already returned"));
@@ -384,6 +560,34 @@ impl App {
     }
 }
 impl Callback {
+    pub(crate) fn with_floating<R>(
+        &self,
+        handler: &mut impl FnMut(
+            crate::terminal::floating::Request,
+        ) -> Result<serde_json::Value, String>,
+        call: impl FnOnce() -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.lua
+            .scope(|scope| {
+                let function = scope.create_function_mut(|lua, value: mlua::Value| {
+                    let request = lua.from_value(value)?;
+                    let response = handler(request).map_err(mlua::Error::external)?;
+                    // Missing panes are Lua nil, not the JSON null sentinel.
+                    if response.is_null() {
+                        Ok(mlua::Value::Nil)
+                    } else {
+                        lua.to_value(&response)
+                    }
+                })?;
+                self.lua
+                    .set_named_registry_value("ghostty.floating_handler", function)?;
+                let result = call().map_err(mlua::Error::external);
+                self.lua
+                    .unset_named_registry_value("ghostty.floating_handler")?;
+                result
+            })
+            .map_err(|e| e.to_string())
+    }
     pub(crate) fn call_action(&self, selection: String) -> Result<Vec<Command>, String> {
         let commands = Rc::new(RefCell::new(Vec::new()));
         let active = Rc::new(Cell::new(true));
