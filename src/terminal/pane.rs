@@ -8,14 +8,13 @@ use crate::input;
 use crate::painter::TerminalPainter;
 use crate::search::{SearchUi, SearchWorker};
 use nfm_egui::copy_mode::{
-    CopyAction, CopyMode, CopySelection, CopyTextObject, Jump, Motion, MotionEvaluation,
-    MotionResult, TextRow, ViewportPosition, VisualMode, WordObject, YANK_HIGHLIGHT_DURATION,
-    YankCommand, find_prompt_boundaries, word_search_pattern,
+    CopyAction, CopyMode, CopySelection, CopyTextObject, Motion, TextRow, VisualMode, YankCommand,
+    find_prompt_boundaries,
 };
 #[cfg(test)]
 use nfm_egui::copy_mode::{
-    copy_digit, copy_jump_prefix, copy_motion, copy_motion_with_prefix, copy_scroll_direction,
-    copy_text_object_key, copy_viewport_position_key, is_copy_modifier_key,
+    ViewportPosition, copy_digit, copy_jump_prefix, copy_motion, copy_motion_with_prefix,
+    copy_scroll_direction, copy_text_object_key, copy_viewport_position_key, is_copy_modifier_key,
 };
 use nfm_egui::quick_select::{self, Purpose as QuickSelectPurpose, QuickSelect};
 use std::ffi::{c_char, c_void};
@@ -24,6 +23,75 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Instant;
+
+/// Synchronous copy-controller access; the pane keeps the snapshot alive for
+/// this input call. Native pointers are never sent to an asynchronous worker.
+struct SnapshotNavigationDocument<'a> {
+    host: *mut Host,
+    generation: u64,
+    rows: u64,
+    boundaries: Option<&'a [u64]>,
+}
+impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDocument<'_> {
+    fn text_row(&self, row: u64) -> Result<Option<TextRow>, String> {
+        if row >= self.rows {
+            return Ok(None);
+        }
+        TerminalPane::read_snapshot_row_from(self.host, self.generation, row)
+            .map(Some)
+            .ok_or_else(|| "Unable to read copy-mode snapshot row".into())
+    }
+    fn resolve_cell(&self, cell: SnapshotCell, right: bool) -> Result<SnapshotCell, String> {
+        let mut actual = SnapshotCell::default();
+        if unsafe {
+            ghostty_ffi::ghostty_egui_host_snapshot_resolve_cell(
+                self.host,
+                self.generation,
+                cell,
+                right,
+                &mut actual,
+            )
+        } {
+            Ok(actual)
+        } else {
+            Err("Unable to resolve copy-mode snapshot cell".into())
+        }
+    }
+    fn selection_text(&self, selection: &CopySelection) -> Result<String, String> {
+        let mut result = ghostty_ffi::SnapshotSelectionText::default();
+        if !unsafe {
+            ghostty_ffi::ghostty_egui_host_snapshot_selection_text(
+                self.host,
+                self.generation,
+                selection.range,
+                selection.trim,
+                selection.rectangle,
+                &mut result,
+            )
+        } {
+            return Err("The selected text is no longer available".into());
+        }
+        let text = if result.text.is_null() {
+            Err("Unable to read selected text".into())
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(result.text, result.len) };
+            std::str::from_utf8(bytes)
+                .map(str::to_owned)
+                .map_err(|error| error.to_string())
+        };
+        unsafe { ghostty_ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result) };
+        let mut text = text?;
+        if selection.linewise {
+            text.push('\n');
+        }
+        Ok(text)
+    }
+    fn prompt_boundaries(&self, _rows: u64) -> Result<Vec<u64>, String> {
+        self.boundaries
+            .map(|rows| rows.to_vec())
+            .ok_or_else(|| "Command boundaries unavailable".into())
+    }
+}
 
 struct WakeState {
     #[cfg(windows)]
@@ -797,11 +865,11 @@ impl TerminalPane {
                         self.quick_select.as_ref().map(|quick| quick.purpose),
                         Some(QuickSelectPurpose::YankLines { .. })
                     ) {
-                        self.yank_quick_select_lines(ui.ctx(), cell);
+                        self.complete_quick_select(ui.ctx(), cell);
                     } else if shifted {
                         self.paste_quick_select(cell);
                     } else {
-                        self.accept_quick_select(cell);
+                        self.complete_quick_select(ui.ctx(), cell);
                     }
                     break;
                 }
@@ -1626,34 +1694,31 @@ impl TerminalPane {
         self.wake.context.request_repaint();
     }
 
-    fn accept_quick_select(&mut self, target: SnapshotCell) {
+    fn complete_quick_select(&mut self, ctx: &egui::Context, target: SnapshotCell) {
         let Some(quick) = self.quick_select.take() else {
             return;
         };
-        self.copy_mode.clear_pending_for_navigation();
-        self.apply_copy_target(quick.generation, Motion::CharacterJump, target, false);
-        self.wake.context.request_repaint();
-    }
-
-    fn yank_quick_select_lines(&mut self, ctx: &egui::Context, target: SnapshotCell) {
-        let Some(quick) = self.quick_select.take() else {
+        let mut view = SnapshotView::default();
+        if !unsafe {
+            ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, quick.generation, &mut view)
+        } {
+            self.copy_controller_error("Quick-select snapshot expired".into());
             return;
-        };
-        let QuickSelectPurpose::YankLines { origin } = quick.purpose else {
-            return;
-        };
-        let range = self
-            .copy_mode
-            .linewise_range_between(origin, target, |row| {
-                self.read_snapshot_row(quick.generation, row)
-            });
-        if let Some(range) = range
-            && self.yank_range(ctx, quick.generation, range, true, true)
-        {
-            self.copy_mode.visual_anchor = None;
         }
-        self.publish_copy_decoration(quick.generation, self.copy_mode.cursor, false);
-        self.wake.context.request_repaint();
+        let document = SnapshotNavigationDocument {
+            host: self.host,
+            generation: quick.generation,
+            rows: view.total_rows,
+            boundaries: None,
+        };
+        match nfm_egui::copy_controller::CopyController::new(&mut self.copy_mode, &document, view)
+            .select_quick(quick.purpose, target)
+        {
+            Ok(update) => {
+                self.apply_copy_update(update, quick.generation, ctx, None);
+            }
+            Err(error) => self.copy_controller_error(error),
+        }
     }
 
     fn paste_quick_select(&mut self, target: SnapshotCell) {
@@ -1975,20 +2040,151 @@ impl TerminalPane {
             if self.copy_mode.generation.is_none() {
                 break;
             }
-            if let egui::Event::Text(text) = event
-                && matches!(text.as_str(), "/" | "?")
-            {
-                self.open_copy_search(text == "?");
-                // The trigger belongs to copy mode, not the search query.
-                ui.ctx().input_mut(|input| {
-                    input.events.drain(..=event_index);
-                });
-                break;
-            }
             let action = self.copy_mode.input(event);
             let generation = self.copy_mode.generation.expect("copy mode is active");
-            let success = match action {
-                CopyAction::OpenLineSplit => {
+            let mut view = SnapshotView::default();
+            if !unsafe {
+                ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
+            } {
+                self.copy_controller_error("The copy-mode snapshot is no longer available".into());
+                break;
+            }
+            if matches!(
+                &action,
+                CopyAction::SelectObject {
+                    kind: CopyTextObject::Command,
+                    ..
+                } | CopyAction::Yank(YankCommand::Object {
+                    kind: CopyTextObject::Command,
+                    ..
+                })
+            ) && !self.ensure_prompt_boundaries(generation)
+            {
+                self.copy_controller_error("Unable to read command boundaries".into());
+                break;
+            }
+            let document = SnapshotNavigationDocument {
+                host: self.host,
+                generation,
+                rows: view.total_rows,
+                boundaries: self
+                    .prompt_boundaries
+                    .as_ref()
+                    .map(|(_, rows)| rows.as_slice()),
+            };
+            let update = match nfm_egui::copy_controller::CopyController::new(
+                &mut self.copy_mode,
+                &document,
+                view,
+            )
+            .execute(action)
+            {
+                Ok(update) => update,
+                Err(error) => {
+                    self.copy_controller_error(error);
+                    break;
+                }
+            };
+            let begins_search = update.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    nfm_egui::copy_controller::CopyEffect::BeginSearch { .. }
+                )
+            });
+            let success = self.apply_copy_update(update, generation, ui.ctx(), Some(bindings));
+            if begins_search {
+                // Egui may emit a key and its text together. Neither trigger
+                // belongs in the newly opened search prompt.
+                let mut consumed = event_index + 1;
+                if matches!(event, egui::Event::Key { .. })
+                    && matches!(events.get(consumed), Some(egui::Event::Text(text)) if text == "/" || text == "?")
+                {
+                    consumed += 1;
+                }
+                ui.ctx().input_mut(|input| {
+                    input.events.drain(..consumed);
+                });
+            }
+            if !success {
+                break;
+            }
+        }
+        was_active || self.copy_mode.generation.is_some()
+    }
+
+    fn copy_controller_error(&mut self, error: String) {
+        self.close_copy_mode();
+        self.show_error("Copy navigation failed", error);
+    }
+
+    fn apply_copy_update(
+        &mut self,
+        update: nfm_egui::copy_controller::CopyUpdate,
+        generation: u64,
+        ctx: &egui::Context,
+        bindings: Option<&crate::picker::config::Bindings>,
+    ) -> bool {
+        if update.changed {
+            let viewport = SnapshotViewportOptions {
+                top_row: update
+                    .viewport_top
+                    .as_ref()
+                    .map_or(std::ptr::null(), |top| top),
+                padding_rows: self.copy_mode.scroll_padding(),
+                ..Default::default()
+            };
+            if !self.publish_copy_decoration_with_viewport(
+                generation,
+                self.copy_mode.cursor,
+                &viewport,
+            ) {
+                self.copy_controller_error("Unable to publish copy-mode viewport".into());
+                return false;
+            }
+            ctx.request_repaint();
+        }
+        if let Some(delay) = update.repaint_after {
+            ctx.request_repaint_after(delay);
+        }
+        for effect in update.effects {
+            use nfm_egui::copy_controller::CopyEffect;
+            match effect {
+                CopyEffect::BeginSearch { forward } => {
+                    self.open_copy_search(!forward);
+                    return false;
+                }
+                CopyEffect::Exit => {
+                    self.close_copy_mode();
+                    return false;
+                }
+                CopyEffect::CopyText { text, .. } => ctx.copy_text(text),
+                CopyEffect::Search {
+                    pattern,
+                    forward,
+                    count,
+                    regex,
+                } => {
+                    self.submit_copy_search(pattern, forward, count, regex);
+                }
+                CopyEffect::ClearSearch { cancel_pending } => {
+                    if cancel_pending {
+                        self.search_worker.cancel();
+                    }
+                }
+                CopyEffect::QuickSelect { origin } => {
+                    self.open_quick_select();
+                    if let Some(quick) = &mut self.quick_select {
+                        quick.purpose = QuickSelectPurpose::YankLines { origin };
+                    }
+                }
+                CopyEffect::OpenLineSplit { cursor } => {
+                    let Some(bindings) = bindings else {
+                        self.show_error(
+                            "Could not split this line",
+                            "Picker bindings unavailable".into(),
+                        );
+                        return false;
+                    };
                     let mut view = SnapshotView::default();
                     let picker = if unsafe {
                         ghostty_ffi::ghostty_egui_host_snapshot_view(
@@ -1999,8 +2195,8 @@ impl TerminalPane {
                             self.host,
                             generation,
                             view,
-                            self.copy_mode.cursor.y,
-                            ui.ctx().clone(),
+                            cursor.y,
+                            ctx.clone(),
                             bindings.builtin_pickers,
                         )
                     } else {
@@ -2010,236 +2206,11 @@ impl TerminalPane {
                         Ok(picker) => self.picker = Some(picker),
                         Err(error) => self.show_error("Could not split this line", error),
                     }
-                    ui.ctx().request_repaint();
-                    break;
-                }
-                CopyAction::None => true,
-                CopyAction::Exit => {
-                    self.close_copy_mode();
-                    break;
-                }
-                CopyAction::ClearSearch { cancel_pending } => {
-                    if cancel_pending {
-                        self.search_worker.cancel();
-                    }
-                    self.publish_copy_decoration(generation, self.copy_mode.cursor, false)
-                }
-                CopyAction::Redraw | CopyAction::ToggleVisual => {
-                    self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
-                    true
-                }
-                CopyAction::Position(position) => self.position_copy_viewport(position),
-                CopyAction::SelectObject {
-                    object,
-                    kind,
-                    count,
-                } => {
-                    if let Some(selection) =
-                        self.copy_text_object_selection(generation, count, object, kind)
-                    {
-                        self.select_copy_visual_object(generation, selection.range, selection.trim)
-                    } else {
-                        true
-                    }
-                }
-                CopyAction::SwapEndpoint => self.apply_copy_target(
-                    generation,
-                    Motion::CharacterJump,
-                    self.copy_mode.cursor,
-                    false,
-                ),
-                CopyAction::Scroll { down, count } => self.scroll_copy_viewport(down, count),
-                CopyAction::HintYank { origin } => {
-                    self.open_quick_select();
-                    if let Some(quick) = &mut self.quick_select {
-                        quick.purpose = QuickSelectPurpose::YankLines { origin };
-                    }
-                    true
-                }
-                CopyAction::YankVisual => {
-                    if self.yank_visual(ui.ctx()) {
-                        self.copy_mode.visual_anchor = None;
-                        self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
-                    }
-                    true
-                }
-                CopyAction::Yank(command) => self.execute_copy_yank(ui.ctx(), generation, command),
-                CopyAction::Jump {
-                    jump,
-                    repeat,
-                    count,
-                } => self.perform_copy_jump(&jump, repeat, count),
-                CopyAction::SearchWord { forward, count } => {
-                    self.search_copy_word(forward, count);
-                    true
-                }
-                CopyAction::NavigateSearch { reverse, count } => {
-                    self.navigate_copy_search(reverse, count);
-                    true
-                }
-                CopyAction::Motion {
-                    motion,
-                    count,
-                    explicit_count,
-                } => self.perform_copy_motion(motion, count, explicit_count),
-            };
-            if !success {
-                break;
-            }
-        }
-        was_active || self.copy_mode.generation.is_some()
-    }
-
-    fn execute_copy_yank(
-        &mut self,
-        ctx: &egui::Context,
-        generation: u64,
-        command: YankCommand,
-    ) -> bool {
-        let (range, linewise, trim) = match command {
-            YankCommand::Lines(count) => (
-                self.copy_mode
-                    .yank_lines_range(count, |row| self.read_snapshot_row(generation, row)),
-                true,
-                true,
-            ),
-            YankCommand::RowEnd(count) => (
-                self.copy_mode
-                    .yank_to_row_end_range(count, |row| self.read_snapshot_row(generation, row)),
-                false,
-                true,
-            ),
-            YankCommand::Object {
-                object,
-                kind,
-                count,
-            } => self
-                .copy_text_object_selection(generation, count, object, kind)
-                .map_or((None, false, true), |selection| {
-                    (Some(selection.range), selection.linewise, selection.trim)
-                }),
-            YankCommand::Motion {
-                motion,
-                count,
-                explicit_count,
-            } => {
-                let target = self
-                    .copy_motion_target(generation, motion, count, explicit_count)
-                    .and_then(|target| {
-                        self.copy_mode.yank_motion_range(target, |row| {
-                            self.read_snapshot_row(generation, row)
-                        })
-                    });
-                match target {
-                    Some((range, linewise)) => (Some(range), linewise, true),
-                    None => (None, false, true),
+                    ctx.request_repaint();
+                    return false;
                 }
             }
-            YankCommand::Jump { jump, count } => {
-                let target = self
-                    .copy_jump_target(generation, &jump, count)
-                    .and_then(|cell| {
-                        self.copy_mode
-                            .yank_motion_range(Motion::CharacterJump.result(cell), |row| {
-                                self.read_snapshot_row(generation, row)
-                            })
-                    });
-                match target {
-                    Some((range, linewise)) => (Some(range), linewise, true),
-                    None => (None, false, true),
-                }
-            }
-        };
-        if let Some(range) = range
-            && self.yank_range(ctx, generation, range, linewise, trim)
-        {
-            self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
         }
-        true
-    }
-    fn scroll_copy_viewport(&mut self, down: bool, count: u32) -> bool {
-        let generation = self.copy_mode.generation.expect("copy mode is active");
-        let mut view = SnapshotView::default();
-        if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
-        } {
-            self.close_copy_mode();
-            self.show_error(
-                "Copy navigation failed",
-                "This position is no longer available. Exit copy mode and try again.".into(),
-            );
-            return false;
-        }
-        let Some((top, requested)) = self.copy_mode.scrolled_viewport_target(down, count, view)
-        else {
-            self.close_copy_mode();
-            self.show_error(
-                "Copy navigation failed",
-                "This position is no longer available. Exit copy mode and try again.".into(),
-            );
-            return false;
-        };
-        let Some(actual) = self.resolve_copy_cell(generation, requested, false) else {
-            self.close_copy_mode();
-            self.show_error(
-                "Copy navigation failed",
-                "This position is no longer available. Exit copy mode and try again.".into(),
-            );
-            return false;
-        };
-        let viewport = SnapshotViewportOptions {
-            top_row: &top,
-            ..Default::default()
-        };
-        if !self.publish_copy_decoration_with_viewport(generation, actual, &viewport) {
-            self.close_copy_mode();
-            self.show_error(
-                "Copy navigation failed",
-                "This position is no longer available. Exit copy mode and try again.".into(),
-            );
-            return false;
-        }
-        self.copy_mode
-            .moved(if down { Motion::Down } else { Motion::Up }, actual);
-        self.wake.context.request_repaint();
-        true
-    }
-
-    fn position_copy_viewport(&mut self, position: ViewportPosition) -> bool {
-        let generation = self.copy_mode.generation.expect("copy mode is active");
-        let mut view = SnapshotView::default();
-        if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
-        } {
-            self.close_copy_mode();
-            self.show_error(
-                "Copy navigation failed",
-                "This position is no longer available. Exit copy mode and try again.".into(),
-            );
-            return false;
-        }
-        let Some(top) = self.copy_mode.positioned_viewport_top(position, view) else {
-            self.close_copy_mode();
-            self.show_error(
-                "Copy navigation failed",
-                "This position is no longer available. Exit copy mode and try again.".into(),
-            );
-            return false;
-        };
-        let viewport = SnapshotViewportOptions {
-            top_row: &top,
-            ..Default::default()
-        };
-        if !self.publish_copy_decoration_with_viewport(generation, self.copy_mode.cursor, &viewport)
-        {
-            self.close_copy_mode();
-            self.show_error(
-                "Copy navigation failed",
-                "This position is no longer available. Exit copy mode and try again.".into(),
-            );
-            return false;
-        }
-        self.wake.context.request_repaint();
         true
     }
 
@@ -2285,91 +2256,6 @@ impl TerminalPane {
             )
         }
         .then_some(actual)
-    }
-
-    fn evaluate_copy_motion(
-        &self,
-        generation: u64,
-        motion: Motion,
-        count: u32,
-        explicit_count: bool,
-    ) -> MotionEvaluation {
-        let view = if motion.needs_view() {
-            let mut view = SnapshotView::default();
-            if !unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
-            } {
-                return MotionEvaluation::InvalidSnapshot;
-            }
-            Some(view)
-        } else {
-            None
-        };
-        self.copy_mode.evaluate_motion(
-            motion,
-            count,
-            explicit_count,
-            view,
-            |row| self.read_snapshot_row(generation, row),
-            |cell, right| self.resolve_copy_cell(generation, cell, right),
-        )
-    }
-
-    fn perform_copy_motion(&mut self, motion: Motion, count: u32, explicit_count: bool) -> bool {
-        let generation = self.copy_mode.generation.expect("copy mode is active");
-        match self.evaluate_copy_motion(generation, motion, count, explicit_count) {
-            MotionEvaluation::NoMovement => true,
-            MotionEvaluation::Complete(result) | MotionEvaluation::Partial(result) => {
-                self.apply_copy_target(generation, motion, result.target, false)
-            }
-            MotionEvaluation::InvalidSnapshot => {
-                self.close_copy_mode();
-                self.show_error(
-                    "Copy navigation failed",
-                    "This position is no longer available. Exit copy mode and try again.".into(),
-                );
-                false
-            }
-        }
-    }
-
-    fn copy_motion_target(
-        &self,
-        generation: u64,
-        motion: Motion,
-        count: u32,
-        explicit_count: bool,
-    ) -> Option<MotionResult> {
-        match self.evaluate_copy_motion(generation, motion, count, explicit_count) {
-            MotionEvaluation::Complete(result) => Some(result),
-            // A failed counted operator must not yank an incomplete range.
-            _ => None,
-        }
-    }
-
-    fn perform_copy_jump(&mut self, jump: &Jump, repeat: bool, count: u32) -> bool {
-        let generation = self.copy_mode.generation.expect("copy mode is active");
-        let mut working = self.copy_mode.clone();
-        for index in 0..count {
-            let Some(cell) = working.jump_target(jump, repeat || index > 0, |row| {
-                self.read_snapshot_row(generation, row)
-            }) else {
-                return true;
-            };
-            working.moved(Motion::CharacterJump, cell);
-        }
-        self.apply_copy_target(generation, Motion::CharacterJump, working.cursor, false)
-    }
-
-    fn copy_jump_target(&self, generation: u64, jump: &Jump, count: u32) -> Option<SnapshotCell> {
-        let mut working = self.copy_mode.clone();
-        for index in 0..count {
-            let cell = working.jump_target(jump, index > 0, |row| {
-                self.read_snapshot_row(generation, row)
-            })?;
-            working.moved(Motion::CharacterJump, cell);
-        }
-        Some(working.cursor)
     }
 
     fn recent_picker_lines(&self) -> Vec<String> {
@@ -2529,18 +2415,33 @@ impl TerminalPane {
             self.show_error("Copy search failed", error);
             return;
         }
-        let Some(target) = self
-            .copy_mode
-            .finish_search(result.query_revision, result.matches)
-        else {
+        let mut view = SnapshotView::default();
+        if !unsafe {
+            ghostty_ffi::ghostty_egui_host_snapshot_view(
+                self.host,
+                result.snapshot_generation,
+                &mut view,
+            )
+        } {
+            self.copy_controller_error("Copy-search snapshot expired".into());
             return;
+        }
+        let document = SnapshotNavigationDocument {
+            host: self.host,
+            generation: result.snapshot_generation,
+            rows: view.total_rows,
+            boundaries: None,
         };
-        self.apply_copy_target(
-            result.snapshot_generation,
-            Motion::CharacterJump,
-            target,
-            false,
-        );
+        let update =
+            nfm_egui::copy_controller::CopyController::new(&mut self.copy_mode, &document, view)
+                .finish_search(result.query_revision, result.matches, None);
+        match update {
+            Ok(update) => {
+                let ctx = self.wake.context.clone();
+                self.apply_copy_update(update, result.snapshot_generation, &ctx, None);
+            }
+            Err(error) => self.copy_controller_error(error),
+        }
     }
 
     fn navigate_search(&mut self, previous: bool) {
@@ -2548,14 +2449,8 @@ impl TerminalPane {
         self.publish_search_matches(true);
     }
 
-    fn search_copy_word(&mut self, forward: bool, count: u32) {
+    fn submit_copy_search(&mut self, pattern: String, forward: bool, count: u32, regex: bool) {
         let Some(generation) = self.copy_mode.generation else {
-            return;
-        };
-        let Some(word) = self
-            .copy_mode
-            .word_under_cursor(|row| self.read_snapshot_row(generation, row))
-        else {
             return;
         };
         if self.copy_search_cursor == 0 {
@@ -2567,11 +2462,10 @@ impl TerminalPane {
             }
             self.copy_search_cursor = cursor as usize;
         }
-        let pattern = word_search_pattern(&word);
         let query_revision =
             match self
                 .search_worker
-                .submit(generation, pattern, true, self.copy_search_cursor)
+                .submit(generation, pattern, regex, self.copy_search_cursor)
             {
                 Ok(revision) => revision,
                 Err(error) => {
@@ -2582,15 +2476,6 @@ impl TerminalPane {
             };
         self.copy_mode.begin_search(query_revision, forward, count);
         self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
-    }
-
-    fn navigate_copy_search(&mut self, reverse: bool, count: u32) {
-        let Some(generation) = self.copy_mode.generation else {
-            return;
-        };
-        if let Some(target) = self.copy_mode.navigate_search(reverse, count) {
-            self.apply_copy_target(generation, Motion::CharacterJump, target, false);
-        }
     }
 
     fn publish_copy_decoration(&self, generation: u64, cell: SnapshotCell, reveal: bool) -> bool {
@@ -2733,134 +2618,6 @@ impl TerminalPane {
             }
         }
         nfm_egui::copy_mode::rectangle_row_ranges(range, top, height)
-    }
-
-    fn copy_text_object_selection(
-        &mut self,
-        generation: u64,
-        count: u32,
-        object: WordObject,
-        kind: CopyTextObject,
-    ) -> Option<CopySelection> {
-        if matches!(kind, CopyTextObject::Command) && !self.ensure_prompt_boundaries(generation) {
-            return None;
-        }
-        let boundaries = self
-            .prompt_boundaries
-            .as_ref()
-            .map_or(&[][..], |(_, rows)| rows.as_slice());
-        self.copy_mode
-            .text_object_selection(count, object, kind, boundaries, |row| {
-                self.read_snapshot_row(generation, row)
-            })
-    }
-
-    fn select_copy_visual_object(
-        &mut self,
-        generation: u64,
-        range: SnapshotCellRange,
-        trim: bool,
-    ) -> bool {
-        let Some(start) = self.resolve_copy_cell(generation, range.start, false) else {
-            self.close_copy_mode();
-            return false;
-        };
-        let Some(end) = self.resolve_copy_cell(generation, range.end, false) else {
-            self.close_copy_mode();
-            return false;
-        };
-        self.copy_mode
-            .select_visual_object(SnapshotCellRange { start, end }, trim);
-        if !self.publish_copy_decoration(generation, end, true) {
-            self.close_copy_mode();
-            return false;
-        }
-        self.wake.context.request_repaint();
-        true
-    }
-
-    fn yank_visual(&mut self, ctx: &egui::Context) -> bool {
-        let Some(generation) = self.copy_mode.generation else {
-            return false;
-        };
-        let Some(selection) = self
-            .copy_mode
-            .visual_selection_to(self.copy_mode.cursor, |row| {
-                self.read_snapshot_row(generation, row)
-            })
-        else {
-            return false;
-        };
-        self.yank_selection(
-            ctx,
-            generation,
-            selection.range,
-            selection.linewise,
-            selection.trim,
-            selection.rectangle,
-        )
-    }
-
-    fn yank_range(
-        &mut self,
-        ctx: &egui::Context,
-        generation: u64,
-        range: SnapshotCellRange,
-        linewise: bool,
-        trim: bool,
-    ) -> bool {
-        self.yank_selection(ctx, generation, range, linewise, trim, false)
-    }
-
-    fn yank_selection(
-        &mut self,
-        ctx: &egui::Context,
-        generation: u64,
-        range: SnapshotCellRange,
-        linewise: bool,
-        trim: bool,
-        rectangle: bool,
-    ) -> bool {
-        let mut result = ghostty_ffi::SnapshotSelectionText::default();
-        if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_selection_text(
-                self.host,
-                generation,
-                range,
-                trim,
-                rectangle,
-                &mut result,
-            )
-        } {
-            self.show_error(
-                "Copy failed",
-                "The selected text is no longer available. Select it again and retry.".into(),
-            );
-            return false;
-        }
-        let text = if result.text.is_null() {
-            None
-        } else {
-            let bytes = unsafe { std::slice::from_raw_parts(result.text, result.len) };
-            std::str::from_utf8(bytes).ok().map(str::to_owned)
-        };
-        unsafe { ghostty_ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result) };
-        if let Some(mut text) = text {
-            if linewise {
-                text.push('\n');
-            }
-            ctx.copy_text(text);
-            if rectangle {
-                self.copy_mode
-                    .highlight_rectangle_yank(range, Instant::now());
-            } else {
-                self.copy_mode.highlight_yank(range, Instant::now());
-            }
-            ctx.request_repaint_after(YANK_HIGHLIGHT_DURATION);
-            true
-        } else {
-            false
-        }
     }
 
     fn publish_search_matches(&self, reveal_selected: bool) {
