@@ -109,6 +109,7 @@ pub(super) fn scrollback_provider(
             reader: copy_reader,
             total_rows,
             columns,
+            highlight: None,
         }),
         published: Default::default(),
     }
@@ -117,7 +118,7 @@ pub(super) fn scrollback_provider(
 struct ScrollbackProvider {
     provider: nfm_egui::byte_preview::BytePreviewProvider<super::source::Candidate>,
     document: Arc<SnapshotCopyDocument>,
-    published: std::sync::Mutex<Option<(u64, usize)>>,
+    published: std::sync::Mutex<Option<((u64, usize), ghostty_ffi::SnapshotCellRange)>>,
 }
 impl nfm_egui::PreviewProvider<super::source::Candidate> for ScrollbackProvider {
     fn preview(
@@ -134,8 +135,13 @@ impl nfm_egui::PreviewProvider<super::source::Candidate> for ScrollbackProvider 
         cancel: nfm_egui::Cancellation,
     ) -> Result<nfm_egui::preview::PreviewViewport, String> {
         let key = (request.document_version, request.selection.index);
+        let range = request
+            .selection
+            .item
+            .range
+            .ok_or("No scrollback match selected")?;
         let page = self.provider.preview_viewport(request, cancel)?;
-        *self.published.lock().map_err(|_| "preview poisoned")? = Some(key);
+        *self.published.lock().map_err(|_| "preview poisoned")? = Some((key, range));
         Ok(page)
     }
     fn page_step(&self, rows: usize) -> usize {
@@ -147,10 +153,20 @@ impl nfm_egui::PreviewProvider<super::source::Candidate> for ScrollbackProvider 
         index: usize,
     ) -> Result<Option<Arc<dyn nfm_egui::copy_document::CopyDocument>>, String> {
         let current = *self.published.lock().map_err(|_| "preview poisoned")?;
-        if current != Some((version, index)) {
+        let Some((key, range)) = current else {
+            return Ok(None);
+        };
+        if key != (version, index) {
             return Ok(None);
         }
-        Ok(Some(self.document.clone()))
+        // Each selection owns its decoration so an older viewport cannot pick
+        // up a newer selection while its preview is still being replaced.
+        Ok(Some(Arc::new(SnapshotCopyDocument {
+            reader: self.document.reader.clone(),
+            total_rows: self.document.total_rows,
+            columns: self.document.columns,
+            highlight: Some(range),
+        })))
     }
 }
 
@@ -158,6 +174,7 @@ struct SnapshotCopyDocument {
     reader: Arc<SnapshotPreview>,
     total_rows: u64,
     columns: usize,
+    highlight: Option<ghostty_ffi::SnapshotCellRange>,
 }
 impl SnapshotCopyDocument {
     fn read<R>(&self, f: impl FnOnce(*mut Host, u64) -> Result<R, String>) -> Result<R, String> {
@@ -306,7 +323,7 @@ impl nfm_egui::copy_document::CopyDocument for SnapshotCopyDocument {
                 }
                 normalized.push(byte);
             }
-            nfm_egui::preview::parse_ansi(
+            let mut preview = nfm_egui::preview::parse_ansi(
                 &normalized,
                 &nfm_egui::PreviewRequest {
                     selection: nfm_egui::Selection {
@@ -324,8 +341,45 @@ impl nfm_egui::copy_document::CopyDocument for SnapshotCopyDocument {
                     foreground: appearance.palette.text,
                     background: appearance.palette.background,
                 },
-            )
+            )?;
+            if let Some(range) = self.highlight {
+                highlight_scrollback(
+                    &mut preview,
+                    top,
+                    range,
+                    appearance.palette.selection_background,
+                );
+            }
+            Ok(preview)
         })
+    }
+}
+
+fn highlight_scrollback(
+    preview: &mut nfm_egui::Preview,
+    top: u64,
+    range: ghostty_ffi::SnapshotCellRange,
+    background: egui::Color32,
+) {
+    if let nfm_egui::Preview::Grid { columns, cells, .. } = preview {
+        if *columns == 0 {
+            return;
+        }
+        for (index, cell) in cells.iter_mut().enumerate() {
+            let coordinate = (
+                top.saturating_add((index / *columns) as u64),
+                (index % *columns) as u32,
+            );
+            if coordinate >= (range.start.y, range.start.x)
+                && coordinate <= (range.end.y, range.end.x)
+            {
+                if cell.inverse {
+                    std::mem::swap(&mut cell.foreground, &mut cell.background);
+                    cell.inverse = false;
+                }
+                cell.background = background;
+            }
+        }
     }
 }
 
@@ -513,6 +567,36 @@ impl nfm_egui::PreviewProvider<super::source::Candidate> for MeasuredPreview {
 mod tests {
     use super::*;
     #[test]
+    fn selected_match_highlight_survives_repaint_and_scrolling() {
+        use nfm_egui::copy_mode::CellPosition;
+        let range = ghostty_ffi::SnapshotCellRange {
+            start: CellPosition { x: 2, y: 10 },
+            end: CellPosition { x: 1, y: 11 },
+        };
+        let background = egui::Color32::YELLOW;
+        for top in [9, 10, 11, 12] {
+            // Host-backed viewports are rebuilt from ANSI on every repaint.
+            for _ in 0..2 {
+                let mut preview = nfm_egui::Preview::Grid {
+                    columns: 4,
+                    cells: vec![Default::default(); 12],
+                    total_rows: 20,
+                };
+                highlight_scrollback(&mut preview, top, range, background);
+                let nfm_egui::Preview::Grid { cells, .. } = preview else {
+                    unreachable!()
+                };
+                for (index, cell) in cells.iter().enumerate() {
+                    let coordinate = (top + (index / 4) as u64, (index % 4) as u32);
+                    assert_eq!(
+                        cell.background == background,
+                        coordinate >= (10, 2) && coordinate <= (11, 1)
+                    );
+                }
+            }
+        }
+    }
+    #[test]
     fn closed_snapshot_copy_document_rejects_all_native_reads() {
         use nfm_egui::copy_document::CopyDocument;
         let reader = Arc::new(SnapshotPreview::new(std::ptr::null_mut(), Some(1)));
@@ -521,6 +605,7 @@ mod tests {
             reader,
             total_rows: 10,
             columns: 20,
+            highlight: None,
         };
         assert!(doc.metadata().is_err());
         assert!(doc.text_row(0).is_err());
