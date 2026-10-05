@@ -1,11 +1,9 @@
 use crate::ghostty_ffi::{self, SnapshotCell, SnapshotCellRange, SnapshotTextChunk};
+pub(crate) use nfm_egui::search_service::SearchResult;
+use nfm_egui::search_service::{SearchDocument, SearchService, SearchTicket};
+#[cfg(test)]
 use regex::Regex;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-    mpsc,
-};
-use std::thread;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub(crate) struct SearchUi {
@@ -28,32 +26,21 @@ pub(crate) struct SearchUi {
 impl SearchUi {
     pub(crate) fn apply_result(&mut self, matches: Vec<SnapshotCellRange>, error: Option<String>) {
         self.matches = matches;
-        self.selected = (!self.matches.is_empty()).then_some(0);
-        if let Some(origin) = &self.copy_origin {
-            let target = nfm_egui::copy_mode::next_match_cell(
-                &self.matches,
-                origin.cursor,
-                !self.backward,
-                1,
-            );
-            self.selected = target
-                .and_then(|target| self.matches.iter().position(|range| range.start == target));
-        }
+        self.selected = nfm_egui::document_search::initial_match_index(
+            &self.matches,
+            self.copy_origin.as_ref().map(|origin| origin.cursor),
+            !self.backward,
+        );
         self.error = error;
         self.waiting = false;
     }
 
     pub(crate) fn navigate(&mut self, previous: bool) {
-        let count = self.matches.len();
-        if count == 0 {
-            return;
-        }
-        self.selected = Some(match self.selected {
-            Some(selected) if previous => (selected + count - 1) % count,
-            Some(selected) => (selected + 1) % count,
-            None if previous => count - 1,
-            None => 0,
-        });
+        self.selected = nfm_egui::document_search::navigate_match_index(
+            self.selected,
+            self.matches.len(),
+            previous,
+        );
     }
 
     pub(crate) fn selected_range(&self) -> Option<&SnapshotCellRange> {
@@ -138,7 +125,7 @@ impl SearchUi {
                         let match_label = if pending {
                             "…".to_owned()
                         } else if self.error.is_some() {
-                            "INVALID REGEX".to_owned()
+                            "SEARCH ERROR".to_owned()
                         } else {
                             self.match_label()
                         };
@@ -261,345 +248,145 @@ pub(crate) struct SearchUiAction {
     pub(crate) close: bool,
     pub(crate) accept: bool,
 }
-pub(crate) struct SearchResult {
-    pub(crate) snapshot_generation: u64,
-    pub(crate) query_revision: u64,
-    pub(crate) matches: Vec<SnapshotCellRange>,
-    pub(crate) error: Option<String>,
+/// Ghostty owns the native cursor; this guarded lease is invalidated before
+/// the pane frees it. All scheduling, cancellation and feedback live in NFM.
+struct SnapshotSearchDocument {
+    id: usize,
+    cursor: Mutex<usize>,
 }
-
-struct SearchRequest {
-    snapshot_generation: u64,
-    query_revision: u64,
-    query: String,
-    regex: bool,
-    cursor: usize,
-}
-
-enum SearchCommand {
-    Search(SearchRequest),
-    Barrier(mpsc::Sender<()>),
-    Shutdown,
-}
-
-pub(crate) struct SearchWorker {
-    commands: mpsc::Sender<SearchCommand>,
-    results: mpsc::Receiver<SearchResult>,
-    latest_query_revision: Arc<AtomicU64>,
-    next_query_revision: u64,
-    thread: Option<thread::JoinHandle<()>>,
-    ctx: egui::Context,
-    fault: Arc<std::sync::Mutex<Option<String>>>,
-}
-
-impl SearchWorker {
-    pub(crate) fn new(ctx: egui::Context) -> Self {
-        let (commands, _) = mpsc::channel();
-        let (_, results) = mpsc::channel();
-        Self {
-            commands,
-            results,
-            latest_query_revision: Arc::new(AtomicU64::new(0)),
-            next_query_revision: 0,
-            thread: None,
-            ctx,
-            fault: Arc::new(std::sync::Mutex::new(None)),
+impl SearchDocument for SnapshotSearchDocument {
+    fn visit_text(
+        &self,
+        visitor: &mut dyn FnMut(&[u8], &[SnapshotCell], bool) -> Result<(), String>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let cursor = self
+            .cursor
+            .lock()
+            .map_err(|_| "Search cursor lease failed")?;
+        if *cursor == 0 {
+            return Err("Search snapshot lease has closed".into());
+        }
+        if cancelled() {
+            return Err("Search cancelled".into());
+        }
+        if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_cursor_reset(*cursor as *mut _) } {
+            return Err(ghostty_ffi::native_error(
+                "Unable to reset search snapshot cursor",
+            ));
+        }
+        loop {
+            if cancelled() {
+                return Err("Search cancelled".into());
+            }
+            let mut chunk = SnapshotTextChunk::default();
+            match unsafe {
+                ghostty_ffi::ghostty_egui_host_snapshot_cursor_next(*cursor as *mut _, &mut chunk)
+            } {
+                0 => return Ok(()),
+                1 => {}
+                _ => return Err(ghostty_ffi::native_error("Unable to read search snapshot")),
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(chunk.text, chunk.len) };
+            let points = unsafe { std::slice::from_raw_parts(chunk.points, chunk.len) };
+            let positions = points
+                .iter()
+                .map(|point| {
+                    point
+                        .y
+                        .checked_sub(u32::from(chunk.start_y))
+                        .and_then(|offset| chunk.row_base.checked_add(u64::from(offset)))
+                        .map(|y| SnapshotCell {
+                            x: u32::from(point.x),
+                            y,
+                        })
+                        .ok_or("Invalid snapshot search coordinate")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            visitor(bytes, &positions, false)?;
         }
     }
-
-    fn ensure_started(&mut self) -> Result<(), String> {
-        let fault = self
-            .fault
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(error) = fault {
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-            return Err(format!("Search worker failed: {error}"));
+}
+pub(crate) struct SnapshotSearchAdapter {
+    service: SearchService,
+    document: Option<Arc<SnapshotSearchDocument>>,
+    ticket: Option<SearchTicket>,
+}
+impl SnapshotSearchAdapter {
+    pub(crate) fn new(ctx: egui::Context) -> Self {
+        Self {
+            service: SearchService::new(move || ctx.request_repaint()),
+            document: None,
+            ticket: None,
         }
-        if self
-            .thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
-        {
-            return Ok(());
-        }
-        if let Some(thread) = self.thread.take() {
-            thread
-                .join()
-                .map_err(|panic| crate::native_error::panic_detail(panic.as_ref()))?;
-        }
-        let (command_tx, command_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
-        let revision = self.latest_query_revision.clone();
-        let ctx = self.ctx.clone();
-        let fault = self.fault.clone();
-        let thread = thread::Builder::new()
-            .name("ghostty-egui-search".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    worker_loop(command_rx, result_tx, revision, ctx.clone())
-                }));
-                if let Err(panic) = result {
-                    *fault.lock().unwrap_or_else(|error| error.into_inner()) =
-                        Some(crate::native_error::panic_detail(panic.as_ref()));
-                    ctx.request_repaint();
-                }
-            })
-            .map_err(|error| format!("Unable to start search worker: {error}"))?;
-        self.commands = command_tx;
-        self.results = result_rx;
-        self.thread = Some(thread);
-        Ok(())
     }
     pub(crate) fn submit(
         &mut self,
-        snapshot_generation: u64,
+        generation: u64,
         query: String,
         regex: bool,
         cursor: usize,
     ) -> Result<u64, String> {
-        self.ensure_started()?;
-        let query_revision = self.advance_query_revision();
-        self.commands
-            .send(SearchCommand::Search(SearchRequest {
-                snapshot_generation,
-                query_revision,
-                query,
-                regex,
-                cursor,
-            }))
-            .map_err(|_| "Search worker stopped before receiving the request".to_owned())?;
-        Ok(query_revision)
+        if self.document.as_ref().is_none_or(|doc| doc.id != cursor) {
+            self.cancel_and_wait();
+            self.document = Some(Arc::new(SnapshotSearchDocument {
+                id: cursor,
+                cursor: Mutex::new(cursor),
+            }));
+        }
+        let ticket = self.service.submit(
+            generation,
+            self.document.as_ref().unwrap().clone(),
+            query,
+            regex,
+        )?;
+        let revision = ticket.query_revision;
+        self.ticket = Some(ticket);
+        Ok(revision)
     }
-
     pub(crate) fn cancel(&mut self) {
-        self.advance_query_revision();
+        self.ticket = None;
+        self.service.cancel();
     }
-
-    /// Wait until the worker has stopped using the previous snapshot cursor.
     pub(crate) fn cancel_and_wait(&mut self) {
-        self.cancel();
-        if self.thread.is_none() {
-            return;
+        self.ticket = None;
+        if let Err(error) = self.service.cancel_and_wait() {
+            crate::error_log::error("search", "Worker stopped while releasing snapshot", &error);
         }
-        let (tx, rx) = mpsc::channel();
-        if self.commands.send(SearchCommand::Barrier(tx)).is_err() || rx.recv().is_err() {
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-            let fault = self
-                .fault
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            crate::error_log::error(
-                "search",
-                "Worker stopped while releasing snapshot",
-                fault
-                    .as_deref()
-                    .unwrap_or("Search command channel disconnected"),
-            );
+        if let Some(document) = self.document.take() {
+            *document.cursor.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         }
     }
-
     pub(crate) fn take_latest_result(&mut self) -> Result<Option<SearchResult>, String> {
-        let fault = self
-            .fault
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(error) = fault {
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-            return Err(format!("Search worker failed: {error}"));
-        }
-        if self.thread.is_none() {
-            return Ok(None);
-        }
-        let mut latest = None;
-        loop {
-            match self.results.try_recv() {
-                Ok(result) => latest = Some(result),
-                Err(mpsc::TryRecvError::Empty) => return Ok(latest),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if let Some(thread) = self.thread.take() {
-                        let _ = thread.join();
-                    }
-                    return Err("Search worker stopped unexpectedly; retry the search".into());
-                }
-            }
-        }
-    }
-    fn advance_query_revision(&mut self) -> u64 {
-        self.next_query_revision = self.next_query_revision.wrapping_add(1);
-        if self.next_query_revision == 0 {
-            self.next_query_revision = 1;
-        }
-        self.latest_query_revision
-            .store(self.next_query_revision, Ordering::Release);
-        self.next_query_revision
-    }
-}
-
-impl Drop for SearchWorker {
-    fn drop(&mut self) {
-        self.cancel();
-        let _ = self.commands.send(SearchCommand::Shutdown);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn worker_loop(
-    commands: mpsc::Receiver<SearchCommand>,
-    results: mpsc::Sender<SearchResult>,
-    latest_query_revision: Arc<AtomicU64>,
-    ctx: egui::Context,
-) {
-    'requests: while let Ok(command) = commands.recv() {
-        let mut request = match command {
-            SearchCommand::Search(request) => request,
-            SearchCommand::Barrier(done) => {
-                let _ = done.send(());
-                continue;
-            }
-            SearchCommand::Shutdown => return,
-        };
-
-        // Collapse queued edits before starting work. A query revision check
-        // inside the byte scan also abandons an in-progress search after a
-        // newer edit.
-        loop {
-            match commands.try_recv() {
-                Ok(SearchCommand::Search(newer)) => request = newer,
-                Ok(SearchCommand::Barrier(done)) => {
-                    let _ = done.send(());
-                    continue 'requests;
-                }
-                Ok(SearchCommand::Shutdown) => return,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return,
-            }
-        }
-
-        let query_revision = request.query_revision;
-        if latest_query_revision.load(Ordering::Acquire) != query_revision {
-            continue;
-        }
-        let Some(outcome) =
-            find_search_matches_cancellable(request.cursor, &request.query, request.regex, || {
-                latest_query_revision.load(Ordering::Acquire) != query_revision
-            })
-        else {
-            continue;
-        };
-        if latest_query_revision.load(Ordering::Acquire) != query_revision {
-            continue;
-        }
-        if let Some(error) = &outcome.error {
-            if error.starts_with("Unable to") {
-                crate::error_log::error("search", "Snapshot scan failed", error);
-            }
-        }
-        if results
-            .send(SearchResult {
-                snapshot_generation: request.snapshot_generation,
-                query_revision,
-                matches: outcome.matches,
-                error: outcome.error,
-            })
-            .is_err()
+        let result = self.service.take_latest_result()?;
+        if let Some(error) = result
+            .as_ref()
+            .and_then(|result| result.error.as_ref())
+            .filter(|error| error.starts_with("Unable to"))
         {
-            return;
+            crate::error_log::error("search", "Snapshot scan failed", error);
         }
-        ctx.request_repaint();
+        Ok(result)
+    }
+}
+impl Drop for SnapshotSearchAdapter {
+    fn drop(&mut self) {
+        self.cancel_and_wait();
     }
 }
 
-fn find_search_matches_cancellable(
-    cursor: usize,
-    query: &str,
-    regex: bool,
-    cancelled: impl Fn() -> bool,
-) -> Option<SearchOutcome> {
-    if query.is_empty() {
-        return Some(SearchOutcome::default());
-    }
-    let matcher = match nfm_egui::copy_mode::search_regex(query, regex) {
-        Ok(matcher) => matcher,
-        Err(error) => {
-            return Some(SearchOutcome {
-                matches: Vec::new(),
-                error: Some(error.to_string()),
-            });
-        }
-    };
-    let mut scan = LineScan::new(matcher);
-    if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_cursor_reset(cursor as *mut _) } {
-        return Some(SearchOutcome {
-            matches: Vec::new(),
-            error: Some(ghostty_ffi::native_error(
-                "Unable to reset search snapshot cursor",
-            )),
-        });
-    }
-    loop {
-        if cancelled() {
-            return None;
-        }
-        let mut chunk = SnapshotTextChunk::default();
-        match unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_cursor_next(cursor as *mut _, &mut chunk)
-        } {
-            0 => break,
-            1 => {}
-            _ => {
-                return Some(SearchOutcome {
-                    matches: Vec::new(),
-                    error: Some(ghostty_ffi::native_error("Unable to read search snapshot")),
-                });
-            }
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(chunk.text, chunk.len) };
-        let points = unsafe { std::slice::from_raw_parts(chunk.points, chunk.len) };
-        scan.feed(bytes, points, chunk.row_base, chunk.start_y, &cancelled)?;
-    }
-    scan.finish(&cancelled)?;
-    scan.matches.reverse();
-    Some(SearchOutcome {
-        matches: scan.matches,
-        error: None,
-    })
-}
-
-#[derive(Default)]
-struct SearchOutcome {
-    matches: Vec<SnapshotCellRange>,
-    error: Option<String>,
-}
-
+// Coordinate conversion regression harness for the shared scanner.
+#[cfg(test)]
 struct LineScan {
-    matcher: Regex,
-    line: Vec<u8>,
-    cells: Vec<SnapshotCell>,
-    matches: Vec<SnapshotCellRange>,
+    scan: nfm_egui::document_search::LineScanner,
 }
-
+#[cfg(test)]
 impl LineScan {
     fn new(matcher: Regex) -> Self {
         Self {
-            matcher,
-            line: Vec::new(),
-            cells: Vec::new(),
-            matches: Vec::new(),
+            scan: nfm_egui::document_search::LineScanner::new(matcher),
         }
     }
-
     fn feed(
         &mut self,
         chunk: &[u8],
@@ -607,82 +394,35 @@ impl LineScan {
         row_base: u64,
         start_y: u16,
         cancelled: &impl Fn() -> bool,
-    ) -> Option<()> {
-        if chunk.len() != points.len() {
-            return None;
-        }
-        for (i, (&byte, point)) in chunk.iter().zip(points).enumerate() {
-            if i & 0xfff == 0 && cancelled() {
-                return None;
-            }
-            if byte == b'\n' {
-                self.finish_line(cancelled)?;
-                continue;
-            }
-            self.line.push(byte);
-            self.cells.push(SnapshotCell {
-                x: u32::from(point.x),
-                y: row_base + u64::from(point.y.checked_sub(u32::from(start_y))?),
-            });
-        }
-        Some(())
+    ) -> Result<(), nfm_egui::document_search::SearchError> {
+        let positions = points
+            .iter()
+            .map(|point| {
+                point
+                    .y
+                    .checked_sub(u32::from(start_y))
+                    .and_then(|offset| row_base.checked_add(u64::from(offset)))
+                    .map(|y| SnapshotCell {
+                        x: u32::from(point.x),
+                        y,
+                    })
+                    .ok_or(nfm_egui::document_search::SearchError::InvalidDocument)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.scan.feed(chunk, positions, cancelled)
     }
-
-    fn finish(&mut self, cancelled: &impl Fn() -> bool) -> Option<()> {
-        self.finish_line(cancelled)
-    }
-
-    fn finish_line(&mut self, cancelled: &impl Fn() -> bool) -> Option<()> {
-        if cancelled() {
-            return None;
-        }
-        let line = std::str::from_utf8(&self.line).ok()?;
-        for found in self.matcher.find_iter(line) {
-            if cancelled() {
-                return None;
-            }
-            if found.is_empty() {
-                continue;
-            }
-            self.matches.push(SnapshotCellRange {
-                start: *self.cells.get(found.start())?,
-                end: *self.cells.get(found.end() - 1)?,
-            });
-        }
-        self.line.clear();
-        self.cells.clear();
-        Some(())
+    #[cfg(test)]
+    fn finish(
+        &mut self,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(), nfm_egui::document_search::SearchError> {
+        self.scan.finish_line(cancelled)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn worker_restarts_on_next_request_after_disconnection() {
-        let mut worker = super::SearchWorker::new(egui::Context::default());
-        let first = worker.submit(1, String::new(), false, 0).unwrap();
-        worker
-            .commands
-            .send(super::SearchCommand::Shutdown)
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !worker.thread.as_ref().unwrap().is_finished() {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(worker.take_latest_result().is_err());
-        let second = worker.submit(2, String::new(), false, 0).unwrap();
-        assert!(second > first);
-        loop {
-            if let Some(result) = worker.take_latest_result().unwrap() {
-                assert_eq!(result.snapshot_generation, 2);
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
-    use super::{LineScan, SearchUi, find_search_matches_cancellable};
+    use super::{LineScan, SearchUi};
     use crate::ghostty_ffi::{SnapshotCell, SnapshotCellRange, SnapshotTextPoint};
     use regex::{Regex, RegexBuilder};
 
@@ -756,7 +496,7 @@ mod tests {
         feed(&mut scan, "x and 界x", 1);
         scan.finish(&|| false).unwrap();
         assert_eq!(
-            scan.matches,
+            scan.scan.matches(),
             vec![
                 SnapshotCellRange {
                     start: SnapshotCell { x: 1, y: 0 },
@@ -779,9 +519,9 @@ mod tests {
         let mut scan = LineScan::new(matcher);
         feed(&mut scan, "ÉaéA", 0);
         scan.finish(&|| false).unwrap();
-        assert_eq!(scan.matches.len(), 2);
-        assert_eq!(scan.matches[0].start.x, 0);
-        assert_eq!(scan.matches[1].start.x, 3);
+        assert_eq!(scan.scan.matches().len(), 2);
+        assert_eq!(scan.scan.matches()[0].start.x, 0);
+        assert_eq!(scan.scan.matches()[1].start.x, 3);
     }
 
     #[test]
@@ -799,7 +539,7 @@ mod tests {
         scan.feed(&[0x95, 0x8c], &second, 0, 0, &|| false).unwrap();
         scan.finish(&|| false).unwrap();
         assert_eq!(
-            scan.matches,
+            scan.scan.matches(),
             vec![SnapshotCellRange {
                 start: SnapshotCell { x: 1, y: 0 },
                 end: SnapshotCell { x: 1, y: 0 },
@@ -813,9 +553,9 @@ mod tests {
         feed(&mut scan, "a1b\na", 0);
         feed(&mut scan, "2b\na3\nb", 1);
         scan.finish(&|| false).unwrap();
-        assert_eq!(scan.matches.len(), 2);
-        assert_eq!(scan.matches[0].start, SnapshotCell { x: 0, y: 0 });
-        assert_eq!(scan.matches[1].end, SnapshotCell { x: 1, y: 1 });
+        assert_eq!(scan.scan.matches().len(), 2);
+        assert_eq!(scan.scan.matches()[0].start, SnapshotCell { x: 0, y: 0 });
+        assert_eq!(scan.scan.matches()[1].end, SnapshotCell { x: 1, y: 1 });
     }
 
     #[test]
@@ -827,8 +567,8 @@ mod tests {
         let mut scan = LineScan::new(matcher);
         feed(&mut scan, "a-b A.B", 0);
         scan.finish(&|| false).unwrap();
-        assert_eq!(scan.matches.len(), 1);
-        assert_eq!(scan.matches[0].start.x, 4);
+        assert_eq!(scan.scan.matches().len(), 1);
+        assert_eq!(scan.scan.matches()[0].start.x, 4);
     }
 
     #[test]
@@ -836,14 +576,24 @@ mod tests {
         let mut scan = LineScan::new(Regex::new(r"^|b").unwrap());
         feed(&mut scan, "abc", 0);
         scan.finish(&|| false).unwrap();
-        assert_eq!(scan.matches.len(), 1);
-        assert_eq!(scan.matches[0].start.x, 1);
+        assert_eq!(scan.scan.matches().len(), 1);
+        assert_eq!(scan.scan.matches()[0].start.x, 1);
     }
 
     #[test]
     fn invalid_regex_returns_an_error_without_accessing_the_cursor() {
-        let outcome = find_search_matches_cancellable(0, "(", true, || false).unwrap();
-        assert!(outcome.matches.is_empty());
-        assert!(outcome.error.is_some());
+        let document = super::SnapshotSearchDocument {
+            id: 0,
+            cursor: std::sync::Mutex::new(0),
+        };
+        let error = nfm_egui::search_service::search_document(
+            &document,
+            "(",
+            true,
+            Default::default(),
+            &|| false,
+        )
+        .unwrap_err();
+        assert!(error.contains("regex"));
     }
 }

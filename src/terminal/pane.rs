@@ -6,7 +6,7 @@ use crate::ghostty_ffi::{
 use crate::graphics as glow;
 use crate::input;
 use crate::painter::TerminalPainter;
-use crate::search::{SearchUi, SearchWorker};
+use crate::search::{SearchUi, SnapshotSearchAdapter};
 use nfm_egui::copy_mode::{
     CopyAction, CopyMode, CopySelection, CopyTextObject, Motion, TextRow, VisualMode, YankCommand,
     find_prompt_boundaries,
@@ -186,7 +186,7 @@ pub(super) struct TerminalPane {
     search: SearchUi,
     pending_search_snapshot: Option<u64>,
     next_search_open: u64,
-    search_worker: SearchWorker,
+    search_worker: SnapshotSearchAdapter,
     copy_mode: CopyMode,
     quick_select: Option<QuickSelect>,
     picker: Option<crate::picker::Picker>,
@@ -381,7 +381,7 @@ impl TerminalPane {
             callback_painter.lock().paint(glow_painter.gl());
         }));
         let picker_font = crate::picker::font::PickerFont::new(&wake.context, host);
-        let search_worker = SearchWorker::new(wake.context.clone());
+        let search_worker = SnapshotSearchAdapter::new(wake.context.clone());
         Ok(Self {
             host,
             wake,
@@ -2390,14 +2390,14 @@ impl TerminalPane {
                 return;
             }
         };
-        if self.copy_mode.generation == Some(result.snapshot_generation)
+        if self.copy_mode.generation == Some(result.document_revision)
             && self.copy_mode.search_accepts_result(result.query_revision)
         {
             self.finish_copy_search_result(result);
             return;
         }
         if !self.search.active
-            || self.search.snapshot_generation != Some(result.snapshot_generation)
+            || self.search.snapshot_generation != Some(result.document_revision)
             || self.search.query_revision != result.query_revision
         {
             return;
@@ -2419,7 +2419,7 @@ impl TerminalPane {
         if !unsafe {
             ghostty_ffi::ghostty_egui_host_snapshot_view(
                 self.host,
-                result.snapshot_generation,
+                result.document_revision,
                 &mut view,
             )
         } {
@@ -2428,7 +2428,7 @@ impl TerminalPane {
         }
         let document = SnapshotNavigationDocument {
             host: self.host,
-            generation: result.snapshot_generation,
+            generation: result.document_revision,
             rows: view.total_rows,
             boundaries: None,
         };
@@ -2438,7 +2438,7 @@ impl TerminalPane {
         match update {
             Ok(update) => {
                 let ctx = self.wake.context.clone();
-                self.apply_copy_update(update, result.snapshot_generation, &ctx, None);
+                self.apply_copy_update(update, result.document_revision, &ctx, None);
             }
             Err(error) => self.copy_controller_error(error),
         }
