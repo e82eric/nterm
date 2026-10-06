@@ -61,6 +61,7 @@ pub(crate) fn picker_options(names: Vec<String>) -> crate::picker::config::Optio
         position: Position::Center,
         sort: Sort::Score,
         callback: None,
+        keys: Vec::new(),
         source: Source::CommandPalette(
             names
                 .into_iter()

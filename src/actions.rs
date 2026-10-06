@@ -82,11 +82,7 @@ impl ActionContext {
         if self.palette {
             return false;
         }
-        if (self.picker || self.search || self.quick_select)
-            && !mods.ctrl
-            && !mods.alt
-            && !mods.mac_cmd
-        {
+        if (self.picker || self.search || self.quick_select) && !mods.ctrl && !mods.alt {
             return false;
         }
         if action.is_global() {
@@ -109,7 +105,7 @@ impl ActionContext {
 }
 
 pub(crate) fn default_bindings() -> Vec<KeyBinding> {
-    let mut keys = [
+    let keys = [
         ("n", "CTRL|SHIFT", "NewWindow"),
         ("e", "CTRL|SHIFT", "ToggleFloatingPane"),
         ("e", "CTRL|ALT|SHIFT", "CreateFloatingPane"),
@@ -124,18 +120,14 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     ]
     .into_iter()
     .map(|(key, mods, action)| KeyBinding {
-        key: key.into(),
-        mods: mods.into(),
-        target: BindingTarget::Action(AppAction::from_name(action).expect("known default action")),
+        trigger: crate::config::keybindings::BindingTrigger::Key(
+            crate::config::keybindings::parse_key(key).expect("known default key"),
+        ),
+        description: String::new(),
+        mods: crate::config::keybindings::parse_modifiers(mods).expect("known default modifiers"),
+        action: BindingTarget::Action(AppAction::from_name(action).expect("known default action")),
     })
     .collect::<Vec<_>>();
-    if cfg!(target_os = "macos") {
-        keys.push(KeyBinding {
-            key: "f".into(),
-            mods: "CMD".into(),
-            target: BindingTarget::Action(AppAction::OpenSearch),
-        });
-    }
     keys
 }
 
@@ -149,9 +141,6 @@ pub(crate) fn shortcut_label(key: egui::Key, mods: egui::Modifiers) -> String {
     }
     if mods.alt {
         parts.push("Alt".to_owned());
-    }
-    if mods.mac_cmd {
-        parts.push("Cmd".to_owned());
     }
     parts.push(key.name().to_owned());
     parts.join("+")

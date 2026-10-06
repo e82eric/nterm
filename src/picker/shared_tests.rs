@@ -616,10 +616,120 @@ fn lua_callback_retains_display_value_and_request_parameters() {
         panic!("callback was not retained");
     };
     assert!(std::rc::Rc::ptr_eq(&actual, &callback));
+    assert!(picker.shared.is_closed());
     assert_eq!(text, "café shown");
     assert_eq!(value, "inserted value");
     assert!(!filesystem && range.is_none());
     assert_eq!(params["fixture"], "kept");
+}
+
+#[test]
+fn picker_local_lua_key_receives_selection_without_closing() {
+    let ctx = egui::Context::default();
+    let mut picker = items(&ctx);
+    let lua = std::rc::Rc::new(mlua::Lua::new());
+    let callback = std::rc::Rc::new(crate::lua_callbacks::Callback {
+        key: lua
+            .create_registry_value(
+                lua.load("return function(app,item) app:close_picker(); app:paste(item.value) end")
+                    .eval::<mlua::Function>()
+                    .unwrap(),
+            )
+            .unwrap(),
+        lua,
+        name: "key fixture".into(),
+    });
+    picker.keys.push(config::PickerKey {
+        description: "Paste selected item".into(),
+        trigger: config::BindingTrigger::Key(egui::Key::Enter),
+        mods: egui::Modifiers::CTRL,
+        action: callback,
+    });
+    wait_selection(&ctx, &mut picker);
+    let (action, _) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Enter, egui::Modifiers::CTRL)],
+    );
+    let Some(Action::Custom(callback, text, filesystem, range, value, params)) = action else {
+        panic!("missing callback");
+    };
+    assert!(!picker.shared.is_closed());
+    let commands = callback
+        .call_with_selection(
+            &text,
+            &value,
+            filesystem,
+            None,
+            range,
+            &params,
+            String::new(),
+        )
+        .unwrap();
+    assert!(
+        matches!(&commands[..], [crate::lua_callbacks::Command::ClosePicker, crate::lua_callbacks::Command::Paste(text)] if text == "inserted value")
+    );
+    let (action, _) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert!(matches!(action, Some(Action::SendInput(value)) if value == "inserted value"));
+}
+
+#[test]
+fn picker_local_key_cannot_use_selection_after_query_edit() {
+    let ctx = egui::Context::default();
+    let mut picker = items(&ctx);
+    let lua = std::rc::Rc::new(mlua::Lua::new());
+    picker.keys.push(config::PickerKey {
+        description: "Stale fixture".into(),
+        trigger: config::BindingTrigger::Key(egui::Key::Enter),
+        mods: egui::Modifiers::CTRL,
+        action: std::rc::Rc::new(crate::lua_callbacks::Callback {
+            key: lua
+                .create_registry_value(
+                    lua.load("return function() error('stale') end")
+                        .eval::<mlua::Function>()
+                        .unwrap(),
+                )
+                .unwrap(),
+            lua,
+            name: "stale fixture".into(),
+        }),
+    });
+    wait_selection(&ctx, &mut picker);
+    let (action, _) = frame(
+        &ctx,
+        &mut picker,
+        vec![
+            egui::Event::Text("no match".into()),
+            key(egui::Key::Enter, egui::Modifiers::CTRL),
+        ],
+    );
+    assert!(action.is_none());
+    assert!(!picker.shared.is_closed());
+}
+
+#[test]
+fn picker_enter_override_replaces_default_acceptance() {
+    let ctx = egui::Context::default();
+    let mut picker = items(&ctx);
+    let lua = std::rc::Rc::new(mlua::Lua::new());
+    let table = lua
+        .load("return {{key='Enter', action=function(app,item) app:paste(item.value) end}}")
+        .eval::<mlua::Table>()
+        .unwrap();
+    picker.keys =
+        crate::config::keybindings::parse_picker_keys(&lua, "fixture", Some(table)).unwrap();
+    wait_selection(&ctx, &mut picker);
+    let (action, _) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert!(matches!(action, Some(Action::Custom(..))));
+    assert!(!picker.shared.is_closed());
 }
 
 #[test]
@@ -856,7 +966,9 @@ fn scrollback_selection_retains_owned_cell_range_across_publication() {
     assert_eq!(selection.item.range, Some(range));
     publisher.add_item(b"later", SnapshotCellRange::default());
     publisher.complete();
-    assert!(matches!(picker.accept(selection), Some(Action::Accept(cell)) if cell == range.start));
+    assert!(
+        matches!(picker.accept(selection), Some(Action::Navigate(cell)) if cell == range.start)
+    );
 }
 #[test]
 fn preview_toggle_and_help_use_shared_control() {
@@ -1038,4 +1150,66 @@ fn filesystem_picker_accepts_path_without_terminal_snapshot() {
     drop(picker);
     std::fs::remove_file(file).unwrap();
     std::fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn picker_double_click_override_receives_item_and_stays_open() {
+    for overridden in [false, true] {
+        let ctx = egui::Context::default();
+        let mut picker = items(&ctx);
+        if overridden {
+            let lua = std::rc::Rc::new(mlua::Lua::new());
+            picker.keys.push(config::PickerKey {
+                trigger: config::BindingTrigger::DoubleClick, mods: egui::Modifiers::NONE, description: "Paste clicked item".into(),
+                action: std::rc::Rc::new(crate::lua_callbacks::Callback {
+                    key: lua.create_registry_value(lua.load("return function(app,item) app:close_picker(); app:paste(item.value) end").eval::<mlua::Function>().unwrap()).unwrap(),
+                    lua, name: "double click fixture".into(),
+                }),
+            });
+        }
+        wait_selection(&ctx, &mut picker);
+        frame(&ctx, &mut picker, vec![]);
+        let row = egui::Id::new(("ghostty-picker", picker.session_id)).with(("row", 0usize));
+        let pos = ctx.read_response(row).expect("result row").rect.center();
+        frame(&ctx, &mut picker, vec![egui::Event::PointerMoved(pos)]);
+        let mut accepted = None;
+        for _ in 0..2 {
+            frame(
+                &ctx,
+                &mut picker,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            let (action, _) = frame(
+                &ctx,
+                &mut picker,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            if action.is_some() {
+                accepted = action;
+            }
+        }
+        if overridden {
+            let Some(Action::Custom(_, text, _, _, value, _)) = accepted else {
+                panic!("missing clicked item");
+            };
+            assert_eq!(text, "café shown");
+            assert_eq!(value, "inserted value");
+            assert!(!picker.shared.is_closed());
+        } else {
+            assert!(
+                matches!(accepted, Some(Action::SendInput(value)) if value == "inserted value")
+            );
+            assert!(picker.shared.is_closed());
+        }
+    }
 }

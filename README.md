@@ -3,6 +3,27 @@
 This example embeds Ghostty terminals in an egui shell. It uses OpenGL,
 exporting completed textures to egui without a CPU pixel copy.
 
+## Features
+
+- **[Vim Copy Mode](#vim-copy-mode):** Press Ctrl+Shift+M to browse a frozen copy of
+  terminal output with Vim-style motions, search, and character, line, or block
+  selections. Press `v`, move to select text, then press `y` to copy it to the
+  clipboard. Escape clears an active selection or search before exiting.
+- **Search and quick select:** Search scrollback with literal or regex queries,
+  filter lines in a fuzzy picker, or jump to words using keyboard hints.
+- **[Pickers](#pickers):** Use built-ins or configure custom sources and previews
+  in Lua; open named pickers or stream candidates from the shell.
+- **Multiple windows:** Press Ctrl+Shift+N to open an independent terminal window
+  in the same process, sharing configuration, fonts, and theme settings.
+- **[Floating panes](#multiple-floating-panes):** Create, name, hide, restore,
+  and cycle through additional shells within a window.
+- **[Command palette](#command-palette):** Find application actions and pickers
+  from one searchable menu.
+- **[Lua customization](#lua-actions-and-toasts):** Configure keybindings,
+  pickers, actions, fonts, themes, and UI colors.
+
+## Getting started
+
 From the repository root:
 
 ```powershell
@@ -30,9 +51,30 @@ Add `--memory-report .zig-cache/shared-ui-memory.json` to record private working
 set, total working set, and private bytes for one window, four windows, and four
 windows with floating panes. Use `--executable <path>` to compare another build.
 
+To copy terminal output with the keyboard, press **Ctrl+Shift+M** to enter
+[Vim Copy Mode](#vim-copy-mode). Move with the arrow keys, press `v` to start selecting,
+move to extend the selection, and press `y` to copy it to the system clipboard.
+Press Escape to return to the live terminal; if a selection or search is active,
+Escape clears it first, so another press may be needed. The section below covers
+all entry points, motions, selections, searches, and yank commands.
+
 Copy mode uses the shared `nfm-egui::copy_mode` engine. Ghostty supplies native
-terminal snapshots, rendering, search workers, clipboard operations, and
+terminal snapshots, rendering, clipboard operations, and
 terminal-specific actions such as hint yank and line splits.
+
+Terminal and preview search share NFM's `document_search` logical-line scanner,
+pattern compiler, and match navigation. Literal matching ignores case; regex
+matching honors case unless inline flags override it. Soft wraps remain part of
+the same logical line, and UTF-8 matches retain their display-cell coordinates.
+Both paths limit a logical line to 4 MiB and search results to 200,000 matches;
+exceeding either bound reports a search error. NFM's `SearchSession` handles
+copy-mode query revisions and navigation queued while a search is pending.
+NFM's `SearchService` owns the reusable worker, superseded-query cancellation,
+stale-result filtering, completion notifications, and worker recovery. Ghostty
+supplies a guarded snapshot cursor through `SearchDocument::visit_text`, using
+chunked reads rather than one native call per row, and retains terminal search
+UI and snapshot lifetime management. Cancellation waits for the worker to release
+the document before Ghostty invalidates the cursor lease and frees the cursor.
 
 Scrollback picker previews also support Ctrl+W copy-mode focus. NFM reads the
 original Ghostty snapshot lazily through a host-backed document adapter, so
@@ -467,6 +509,101 @@ Palette pickers are excluded from the catalog. Selection always dispatches the
 catalog's typed action; `enter_action` and custom Lua `action` are unsupported.
 The separate top-level `command_palette` setting has been removed.
 
+## Pickers
+
+Pickers provide a fuzzy query, selectable results, and optional previews inside
+the active terminal pane. Type to filter; arrows, Ctrl+N/P, and Page Up/Down
+move through results. Enter accepts and Escape cancels. Ctrl+P or Ctrl+Space
+toggles the preview, Ctrl+Page Up/Down scrolls it, Ctrl+W focuses its copy mode,
+and Ctrl+Shift+/ opens picker keybinding help.
+
+### Built-in pickers
+
+The four named built-ins are always available. With the default keybindings,
+use the shortcuts below; theme selection is also available in the command palette.
+
+| Built-in name | Purpose and acceptance behavior | Default presentation / shortcut |
+| --- | --- | --- |
+| `lines` | Nonblank logical scrollback lines; Enter enters Vim Copy Mode at the selected line. | Bottom, scrollback preview visible; Ctrl+Shift+F. |
+| `words` | Unique whitespace-delimited scrollback words (`\S+`); Enter pastes the word without submitting it. | Bottom, preview hidden; Ctrl+Shift+P. |
+| `themes` | Installed user and bundled Ghostty themes; Enter applies the selected theme for the session. | Cursor, score sorting, preview hidden; choose **Choose theme** in the palette. |
+| `command_palette` | Application actions and configured pickers; Enter dispatches the selected action. | Cursor, preview hidden; Ctrl+Shift+Space. |
+
+The line-split picker is a contextual built-in: Ctrl+B opens it for the selected
+scrollback result or Vim Copy Mode cursor row. Its `line_break` settings control
+presentation; it is not one of the four named `builtin_picker` binding targets.
+See [Splitting a scrollback result](#splitting-a-scrollback-result) for its actions.
+Error history and Messages are also available through the command palette;
+[Lua actions and toasts](#lua-actions-and-toasts) explains their configuration.
+
+Built-in picker presentation can be overridden separately from custom `pickers`:
+
+```lua
+builtin_pickers = {
+    themes = { position = "Cursor", sort = "Score" },
+    command_palette = { position = "Cursor", preview_visible = false },
+    lines = { preview_visible = true },
+    words = { preview_visible = false },
+    line_break = {
+        preview_visible = false,
+        -- position = "Center",
+        -- result_rows = 7,
+        -- preview_rows = 12,
+    },
+},
+```
+
+Bind these directly with `builtin_picker`, independently of custom picker names:
+
+```lua
+keys = {
+    { key = "f", mods = "CTRL|SHIFT", builtin_picker = "lines" },
+    { key = "p", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
+    { key = ".", mods = "CTRL|SHIFT", builtin_picker = "words" },
+}
+```
+
+Themes, command palette, lines, and words always exist, even when omitted from
+the config. Their overrides accept the corresponding picker options except
+`type` and `regex`, which are built in. The source defaults are Themes,
+CommandPalette, nonblank logical lines/Navigate, and unique `\S+` words/SendInput.
+Lines preview starts visible; words preview starts hidden. Theme and command
+palette pickers default to Cursor position with previews hidden. A built-in
+override may also be a function of the same cursor context as custom picker
+factories; its returned table is merged with defaults each time it opens.
+For example, a words factory can seed `initial_query` and install a callback
+to replace the word before the cursor. Existing custom `pickers` remain supported.
+`picker = "words"` references a custom picker, while `builtin_picker = "words"`
+references the built-in. Names beginning with `builtin.` are reserved; internal
+names such as `builtin.words` also identify built-ins in the command palette.
+
+These are partial overrides: omitted line break values use the defaults (Bottom,
+seven result rows, twelve preview rows, preview visible). `line_break` applies to
+Ctrl+B in copy mode and in scrollback pickers. Alt+Left restores the parent
+picker's position and preview state. Ctrl+P still toggles the line break preview.
+Result rows must be 1–256 and preview rows 1–12. Source and selection behavior
+remain built in; unknown picker names or fields are rejected. Manual config
+reload applies these settings to subsequent line break openings.
+Unmodified arrow and page keys continue to navigate the results.
+
+### Custom pickers in Lua
+
+Add definitions to the `pickers` table returned by your
+[Lua configuration](ghostty.lua), then bind them with `picker = "name"`.
+Merge examples into your existing tables rather than creating duplicate fields.
+Providing `keys` replaces the complete shortcut list; retain any application
+and built-in picker bindings you still want.
+
+| Source type | Candidates | Acceptance |
+| --- | --- | --- |
+| `Scrollback` | Frozen logical lines, or matches extracted with `regex`. | `Navigate` enters Vim Copy Mode; `SendInput` pastes text. |
+| `FileSystem` | Paths under configured `roots`, with depth and file/directory filters (Windows only). | Paste the raw path without quoting or Enter. |
+| `Items` | An `items` Lua provider or JSON items from a named pipe request. | Paste the selected value by default. |
+| `Command` | Lines streamed from an executable's stdout. | Paste the selected line by default. |
+| `Themes` | Installed themes. | Apply the selected theme. |
+| `CommandPalette` | Application actions and configured pickers. | Dispatch the selected action. |
+| `ErrorLog` | Session error history. | Show the selected error's details. |
+
 Named pickers and their shortcuts can also be defined in Lua:
 
 ```lua
@@ -487,7 +624,7 @@ These fields belong inside the returned configuration table.
 ### Action bindings
 
 The same `keys` table accepts top-level application actions. Each binding must
-specify exactly one of `action` or `picker`:
+specify exactly one of `action`, `picker`, or `builtin_picker`:
 
 ```lua
 keys = {
@@ -516,9 +653,11 @@ bindings. Top-level bindings do not intercept modal query input. Window and
 floating-pane actions remain available in ordinary overlays; the command palette
 keeps its input modal. Search and quick select can still be focused or toggled
 using their configured bindings while active. In query and hint overlays, bindings
-without Ctrl, Alt, or Cmd are left to local text input. `ExitCopyMode` is available only
+without Ctrl or Alt are left to local text input. `ExitCopyMode` is available only
 while copying; Escape retains its existing copy-mode behavior, including clearing
 pending motions, visual selection, and search before exiting.
+
+### Dynamic Lua picker factories
 
 Picker names can also map to functions. The function runs when its keybinding or
 named pipe request opens the picker, and returns the same table as a static picker:
@@ -541,6 +680,8 @@ works for both static and function pickers. The function may choose `type`,
 Function results use the same validation as static definitions; errors are
 printed and the picker stays closed.
 
+### Picker sources and common options
+
 Every picker type accepts `position = "Top"`, `"Center"`, `"Bottom"`, or
 `"Cursor"`; the default is `"Bottom"`. Cursor placement puts the query near
 the live terminal cursor, or the copy cursor when opened from copy mode, and
@@ -556,7 +697,8 @@ are unaffected.
 
 `Scrollback` regexes,
 `FileSystem` options, and `Command` arguments have separate schemas: fields from another picker type
-are rejected. All types support an `action` callback; `Scrollback` also supports
+are rejected. Candidate sources support an `action` callback; CommandPalette
+dispatches its built-in actions instead. `Scrollback` also supports
 both `enter_action` values. Omitting `type`
 defaults to `Scrollback`. Scrollback regexes
 extract individual candidates from logical
@@ -602,6 +744,8 @@ and restores newlines. An unfinished group is kept when the command exits.
 Set `unique = true` on a Command picker to retain only the first occurrence
 of each exact accepted value in the process output. Deduplication happens after
 continuation lines are joined. The default is `false`.
+
+### Preview configuration
 
 Every picker type accepts an optional preview. `preview = { type = "Text",
 text = "{item}" }` displays literal text; `type = "Ansi"` interprets terminal
@@ -682,55 +826,54 @@ Set `preview_visible = false` on any picker definition to start with its
 preview hidden. The default is `true`. While the picker is open, Ctrl+P
 toggles the preview, and Ctrl+PageUp or Ctrl+PageDown scrolls it by half a page.
 
-Built-in picker presentation can be overridden separately from custom `pickers`:
+### Custom selection callbacks
+
+A picker can define local Lua keybindings in `keys`. They take precedence over
+the picker's default shortcuts and receive `(app, item, params)`, just like an
+acceptance callback. The selected item is captured before the callback runs.
+Callbacks leave the picker open unless they call `app:close_picker()`:
 
 ```lua
 builtin_pickers = {
-    themes = { position = "Cursor", sort = "Score" },
-    command_palette = { position = "Cursor", preview_visible = false },
-    lines = { preview_visible = true },
-    words = { preview_visible = false },
-    line_break = {
-        preview_visible = false,
-        -- position = "Center",
-        -- result_rows = 7,
-        -- preview_rows = 12,
+  lines = {
+    keys = {
+      { key = "Enter", mods = "CTRL", description = "Paste selected line", action = function(app, item)
+        app:close_picker()
+        app:paste(item.value)
+      end },
     },
-},
-```
-
-Bind these directly with `builtin_picker`, independently of custom picker names:
-
-```lua
-keys = {
-    { key = "f", mods = "CTRL|SHIFT", builtin_picker = "lines" },
-    { key = "p", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
-    { key = ".", mods = "CTRL|SHIFT", builtin_picker = "words" },
+  },
 }
 ```
 
-Themes, command palette, lines, and words always exist, even when omitted from
-the config. Their overrides accept the corresponding picker options except
-`type` and `regex`, which are built in. The source defaults are Themes,
-CommandPalette, nonblank logical lines/Navigate, and unique `\S+` words/SendInput.
-Lines preview starts visible; words preview starts hidden. Theme and command
-palette pickers default to Cursor position with previews hidden. A built-in
-override may also be a function of the same cursor context as custom picker
-factories; its returned table is merged with defaults each time it opens.
-For example, a words factory can seed `initial_query` and install a callback
-to replace the word before the cursor. Existing custom `pickers` remain supported.
-`picker = "words"` references a custom picker, while `builtin_picker = "words"`
-references the built-in. Names beginning with `builtin.` are reserved; internal
-names such as `builtin.words` also identify built-ins in the command palette.
+Here Enter still navigates to the line, while Ctrl+Enter closes the picker and
+pastes its text without submitting it. The optional `description` appears in
+picker help; it defaults to "Run picker Lua action". Local bindings support the same key and
+modifier names as application bindings, with a Lua function as `action`. They also
+work in named picker definitions and tables returned by picker factories.
+They run only with a current selection; repeated keydown events do not invoke
+them again. Local callbacks are disabled for pipe-owned picker requests, which
+return their selection to the requesting process.
 
-These are partial overrides: omitted line break values use the defaults (Bottom,
-seven result rows, twelve preview rows, preview visible). `line_break` applies to
-Ctrl+B in copy mode and in scrollback pickers. Alt+Left restores the parent
-picker's position and preview state. Ctrl+P still toggles the line break preview.
-Result rows must be 1–256 and preview rows 1–12. Source and selection behavior
-remain built in; unknown picker names or fields are rejected. Manual config
-reload applies these settings to subsequent line break openings.
-Unmodified arrow and page keys continue to navigate the results.
+Use `key = "DoubleClick"` to override double-click acceptance on a result row:
+
+```lua
+{ key = "DoubleClick", description = "Paste clicked line", action = function(app, item)
+  app:close_picker()
+  app:paste(item.value)
+end },
+```
+
+The callback receives the clicked item and leaves the picker open until explicitly
+closed. `DoubleClick` does not accept modifiers. On pickers that normally accept a
+single click, installing this override makes a single click select only, allowing
+the double-click callback to run. Without an override, mouse acceptance is unchanged.
+
+Enter has a default implementation that closes the picker and runs its existing
+`enter_action` or acceptance callback. Double-click has the same default behavior.
+Overriding either trigger replaces that behavior with your Lua function, which
+must call `app:close_picker()` if it should close. There is no configurable
+`Accept` binding action.
 
 A picker may override `enter_action` with a Lua callback:
 
@@ -774,19 +917,87 @@ that Cargo path on other machines. Filesystem pickers are currently Windows-only
 Linux support will use NFM when it becomes available. Filesystem scans do not
 capture or read terminal snapshots, and cancellation leaves existing copy mode intact.
 
+### Opening pickers from the shell over a named pipe
+
 Shells open allowlisted named pickers through the authenticated local named pipe.
-See [PICKER-PIPE.md](PICKER-PIPE.md) and `Invoke-GhosttyPicker.ps1` for setup,
-parameters, streamed items, results, and cancellation. Custom OSC picker requests
-are no longer supported.
+This integration is Windows-only; the supplied helper requires PowerShell 7.3+.
+Pipe access is disabled by default. Add this to your returned Lua table, restart
+the application, then load the helper inside its newly launched shell:
+
+```lua
+picker_pipe = {
+  enabled = true,
+  named = { "files", "builtin.lines" },
+  allow_stream = true,
+},
+```
+
+`named` is an exact allowlist. `files` refers to the custom Lua picker above;
+built-ins use their `builtin.` names. `allow_stream` permits candidates sent
+directly from the shell.
+
+#### Open a configured picker by name
+
+```powershell
+. C:\src\ghostty2\example\rust-egui-terminal\Invoke-GhosttyPicker.ps1
+
+$path = Invoke-GhosttyPicker -Name files
+$line = Invoke-GhosttyPicker -Name builtin.lines
+
+# For a configured Command picker such as Ripgrep in the sample Lua file:
+$match = Invoke-GhosttyPicker -Name Ripgrep -Parameters @{ pattern = 'TODO'; cwd = $PWD.Path }
+```
+
+Allowlist `Ripgrep` as well to run that example. Named requests use the source,
+preview, and factory configured in Lua. String parameters are available to
+callbacks as `params`; Command sources substitute whole `{name}` arguments from
+them, and `params.cwd` overrides the command's configured directory. FileSystem
+roots still come from Lua, independently of the shell's working directory.
+
+Pipe acceptance returns the selected value to the caller. It bypasses terminal
+insertion, navigation, and acceptance callbacks, including for `builtin.lines`.
+The shell decides how to use the result.
+
+#### Stream custom candidates from the shell
+
+No named Lua picker is needed; enable `allow_stream` and dot-source the helper
+as above. It returns the selected original object, or the property specified
+with `-ValueProperty`:
+
+```powershell
+# Return the selected FileInfo object.
+$file = Get-ChildItem -File | Invoke-GhosttyPicker -DisplayProperty Name
+
+# Return its FullName string instead.
+$path = Get-ChildItem -File |
+    Invoke-GhosttyPicker -DisplayProperty Name -ValueProperty FullName
+
+# Inspect status, query, and selection.
+'first', 'second', 'third' | Invoke-GhosttyPicker -PassThruResult
+```
+
+Enter accepts; Escape cancels. Ctrl+C disconnects the client and cancels its
+picker. Ordinary completion keeps the authenticated connection for the next
+request. Use `Disconnect-GhosttyPicker` to release it before connecting from
+another process in the same pane. Another active overlay can return `busy`;
+requests are not queued. Returned paths are not automatically shell-quoted.
+
+See [PICKER-PIPE.md](PICKER-PIPE.md) and
+[Invoke-GhosttyPicker.ps1](Invoke-GhosttyPicker.ps1) for PSReadLine bindings,
+stream options, protocol limits, authentication, cancellation, and diagnostics.
+Executable sources and command previews must be defined in allowlisted Lua
+pickers; clients cannot submit executable definitions. Custom OSC picker
+requests are no longer supported.
 
 Keys accept egui names such as `f`, `Space`, and `ArrowUp`; modifiers are joined
-with `|` (`CTRL`, `SHIFT`, `ALT`; `CMD`/`SUPER` are macOS-only). Definitions and regexes are compiled
+with `|` (`CTRL`, `SHIFT`, `ALT`). Definitions and regexes are compiled
 at startup; unknown action or picker names, invalid patterns, ambiguous targets,
 and duplicate bindings report configuration errors. Picker bindings trigger from
 terminal or copy mode, leaving modal query input unaffected.
-Without `pickers`, the built-in `lines` and `commands` pickers remain available.
-Without `keys`, built-in action bindings are retained, Ctrl+Shift+F opens `lines`
-if defined, and Ctrl+Shift+Space opens the built-in `commands` palette if defined.
+Without `pickers`, all four named built-ins remain available.
+Without `keys`, built-in action bindings are retained, Ctrl+Shift+F opens built-in
+`lines`, Ctrl+Shift+P opens built-in `words`, and Ctrl+Shift+Space opens the
+built-in command palette.
 An explicit empty `keys = {}` disables top-level action and picker shortcuts.
 Explicit `pickers` and `keys` replace their respective defaults.
 
@@ -904,6 +1115,27 @@ terminal cell dimensions to size its text and rows, including zoom and DPI chang
 Matched positions use bold red text; selection uses a background highlight.
 Unsupported non-SFNT font formats use egui's monospace fallback.
 
+## Vim Copy Mode
+
+### Entering copy mode
+
+These are the default bindings. Lua `keys` can override application shortcuts;
+the modal motion and selection keys below are built into the shared copy engine.
+Focus the terminal before using the terminal shortcuts. Close any picker or
+query field first, or use its acceptance action to enter copy mode.
+
+| Entry point | Result |
+| --- | --- |
+| Ctrl+Shift+M | Enter at the terminal cursor. The Lua action is `EnterCopyMode`. |
+| Ctrl+Shift+Up / Ctrl+Shift+Down | Enter at the previous / next recognized command prompt. |
+| Search: Ctrl+Shift+/, type a query, then Enter | Enter at the selected match, retaining the search results. |
+| Scrollback picker: Ctrl+Shift+F, select a line, then Enter | Enter at the first nonblank cell of that line. |
+| Quick select: Alt+Space, then type a displayed hint | Enter at the hinted word. Holding Shift on the final letter pastes the word into the live terminal instead. |
+
+Scrollback picker previews have their own copy-mode focus: show the preview with
+Ctrl+P or Ctrl+Space, then press Ctrl+W to focus it. Preview motions and yanks
+operate on the preview document, including history beyond the displayed page.
+
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter copy
 mode. Ghostty freezes the visible terminal and scrollback while the live PTY
 keeps running. A steady, styled cell marks the terminal's insertion point.
@@ -913,6 +1145,28 @@ mode and a yellow `NORMAL` label in copy mode. Visual selection changes the
 label and top separator to orange and shows `VISUAL`, `V-LINE`, or `V-BLOCK`.
 The right side shows the copy cursor's one-based scrollback row and column.
 The status row never covers terminal content or changes size when switching modes.
+Keyboard motions and selection commands control the saved output while this mode
+is active. New shell output continues in the background and becomes visible when
+you exit. Copying writes to the clipboard; it does not paste or run a command.
+
+### A first copy
+
+1. Press Ctrl+Shift+M. Check that the status row says `NORMAL`.
+2. Use Up/Down or Page Up to reach the output you want, then Left/Right to
+   position the cursor on its first character.
+3. Press `v` (`VISUAL`), then move to its last character. Both endpoints are
+   included. For complete logical lines, use Shift+V (`V-LINE`) instead.
+4. Press `y`. The selected text goes to the system clipboard and briefly
+   flashes; the selection clears and copy mode remains open.
+5. Press Escape until the status row says `TERMINAL`. You can now paste the
+   clipboard into the terminal or another application.
+
+For a whole line without selecting first, move to it and type `yy`.
+Uppercase commands mean holding Shift; sequences such as `yy`, `gg`, and `yiw`
+mean pressing the keys in order, without Ctrl or Alt. A count is typed before
+the command, for example `10j` moves down ten rows.
+
+### Moving through output
 
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Up</kbd>/<kbd>Down</kbd> also enter copy
 mode and move to the previous/next regex-matched command prompt. In copy mode,
@@ -956,6 +1210,37 @@ In visual mode, <kbd>o</kbd> swaps the cursor and selection anchor so you can
 extend the other end. <kbd>O</kbd> does the same in characterwise/linewise mode;
 in rectangular mode it switches to the other horizontal corner.
 
+### Searching from copy mode
+
+Press `/` for forward search toward newer output or `?` for backward search
+toward older output. Type a query in the search field; Ctrl+R toggles regex
+matching. Literal search ignores case; regex search honors case unless you use
+an inline flag such as `(?i)`. Matches can cross soft wraps within a logical
+line, but cannot span separate logical lines.
+
+Press Enter to return to copy mode at the selected match. If the search is still
+running, Enter waits; an invalid query or no matches leaves the field open.
+Escape cancels the field and restores the copy cursor and selection from before
+the search. Use `n` to repeat the accepted search direction and `N` to reverse
+it; navigation wraps through the snapshot. `*` and `#` start a search for the
+word under the cursor toward newer and older output respectively.
+
+### Selecting and copying
+
+| Keys | Selection or copy |
+| --- | --- |
+| `v` | Toggle characterwise selection (`VISUAL`). |
+| Shift+V (`V`) | Toggle logical-line selection (`V-LINE`), including soft wraps. |
+| Ctrl+Q | Toggle rectangular selection (`V-BLOCK`) across physical rows. |
+| `o` / `O` | Adjust the other end of a selection; `O` switches horizontal corners in block mode. |
+| `y` with a selection | Copy the selection and stay in copy mode. |
+| `yy` / `2yy` | Copy the current logical line / two logical lines. |
+| `y` followed by a motion | Copy through that motion, for example `y$`, `yw`, or `y3w`. |
+| `yiw` / `yaw` | Copy the word under the cursor, excluding / including adjacent whitespace. |
+| `yic` / `yac` | Copy command output / its prompt and output using recognized prompt boundaries. |
+| Shift+Y (`Y`) | Show hints; choose one to copy logical lines through its word's line. |
+| Ctrl+B | Open the line-split picker for the current physical row. Escape returns; Enter inserts the piece into the live terminal and exits copy mode. |
+
 Press <kbd>Ctrl</kbd>+<kbd>Q</kbd> in copy mode to toggle rectangular selection.
 The block covers the same inclusive columns on each physical row, including
 soft-wrapped rows. Use motions to adjust it, then <kbd>y</kbd> to copy one line
@@ -995,8 +1280,19 @@ Like WezTerm, a command block ends immediately before the next matching
 prompt line. Text that resembles a prompt can create a false boundary.
 Every successful yank briefly highlights the copied cells for 250 ms; a new
 yank replaces and restarts the highlight.
-Escape cancels a pending yank. Press Escape outside visual selection to return to the live
-terminal.
+### Canceling and exiting
+
+Escape first cancels a pending yank, text object, or viewport-placement sequence.
+With a visual selection, it clears the selection and keeps copy mode open.
+With retained search matches, it clears those matches and keeps copy mode open.
+Otherwise, it exits to the live terminal. Press Escape again as needed until
+the status row reads `TERMINAL`. Exiting does not stop the shell or clear the
+clipboard.
+
+For a direct exit binding, assign the `ExitCopyMode` application action in Lua
+`keys`, for example `{ key = "x", mods = "CTRL|SHIFT", action = "ExitCopyMode" }`.
+This action is available while copy mode is active and exits without stepping
+through selection and search cancellation.
 
 The native C Win32 sample remains available through
 `zig build win32-sample -Doptimize=ReleaseFast`.

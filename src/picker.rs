@@ -24,6 +24,8 @@ const RESULT_ROWS: usize = 7;
 /// Ghostty owns source readers, terminal snapshots and Lua callbacks.
 /// The shared NFM control owns query input, streaming search and picker drawing.
 pub(crate) struct Picker {
+    context: egui::Context,
+    keys: Vec<config::PickerKey>,
     shared: nfm_egui::Picker<source::Snapshot>,
     pub(crate) cursor_row: Option<u32>,
     position: config::Position,
@@ -65,10 +67,21 @@ pub(crate) enum Action {
         std::collections::BTreeMap<String, String>,
     ),
     Cancel,
-    Accept(SnapshotCell),
+    Navigate(SnapshotCell),
     SendInput(String),
 }
 impl Picker {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.shared.is_closed()
+    }
+    pub(crate) fn surrender_focus(&self) {
+        self.context.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+        self.context.request_repaint();
+    }
     pub(crate) fn attach_pipe(
         &mut self,
         ctx: &egui::Context,
@@ -253,9 +266,17 @@ impl Picker {
             );
         }
         shared.set_external_preview(options.preview.is_some() && !nfm_preview);
+        let mut help = Vec::new();
         if source.is_scrollback() {
-            shared.set_keybinding_help(vec![("Ctrl+B".into(), "Split selected line".into())]);
+            help.push(("Ctrl+B".into(), "Split selected line".into()));
         }
+        help.extend(options.keys.iter().map(|binding| {
+            (
+                binding.trigger.label(binding.mods),
+                binding.description.clone(),
+            )
+        }));
+        shared.set_keybinding_help(help);
         let command_preview = match options.preview {
             Some(source @ config::Preview::Command { .. }) => {
                 Some(preview::CommandPreview::new(source))
@@ -263,6 +284,8 @@ impl Picker {
             _ => None,
         };
         Self {
+            context: ctx.clone(),
+            keys: options.keys,
             pipe_session: None,
             pipe_items: Vec::new(),
             pipe_publisher: None,
@@ -384,6 +407,45 @@ impl Picker {
             }
         }
         let appearance = self.appearance(ctx);
+        self.shared.set_report_double_click(
+            self.pipe_session.is_none()
+                && self
+                    .keys
+                    .iter()
+                    .any(|binding| binding.trigger == config::BindingTrigger::DoubleClick),
+        );
+        let mut binding_action = None;
+        if interactive && self.pipe_session.is_none() && !self.shared.keybinding_help_visible() {
+            ctx.input_mut(|input| {
+                let mut events = std::mem::take(&mut input.events).into_iter().peekable();
+                while let Some(event) = events.next() {
+                    let binding = if let egui::Event::Key { key, modifiers, .. } = &event {
+                        self.keys.iter().find(|binding| {
+                            binding.trigger == config::BindingTrigger::Key(*key)
+                                && crate::config::keybindings::same_mods(binding.mods, *modifiers)
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(binding) = binding {
+                        let egui::Event::Key {
+                            pressed, repeat, ..
+                        } = event
+                        else {
+                            unreachable!()
+                        };
+                        if pressed && !repeat && binding_action.is_none() {
+                            binding_action = Some(binding.action.clone());
+                        }
+                        if pressed && matches!(events.peek(), Some(egui::Event::Text(_))) {
+                            events.next();
+                        }
+                    } else {
+                        input.events.push(event);
+                    }
+                }
+            });
+        }
         if interactive && !self.shared.keybinding_help_visible() && self.source.is_scrollback() {
             if self.split_parent.is_some()
                 && ctx.input_mut(|input| {
@@ -403,8 +465,7 @@ impl Picker {
                     self.shared.set_presentation(results, previews, visible);
                 }
                 self.refresh_scrollback_preview(ctx);
-                self.shared
-                    .set_keybinding_help(vec![("Ctrl+B".into(), "Split selected line".into())]);
+                self.set_keybinding_help(vec![("Ctrl+B".into(), "Split selected line".into())]);
             } else if !self.line_split
                 && self.pipe_session.is_none()
                 && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::B))
@@ -464,9 +525,24 @@ impl Picker {
         // An accepted event owns its searched snapshot even after the control closes.
         let selection = match &output.event {
             Some(nfm_egui::PickerEvent::Accepted(selection))
+            | Some(nfm_egui::PickerEvent::DoubleClicked(selection))
             | Some(nfm_egui::PickerEvent::CopyRequested(selection)) => Some(selection.clone()),
             _ => self.shared.selection(),
         };
+        if matches!(output.event, Some(nfm_egui::PickerEvent::DoubleClicked(_))) {
+            binding_action = self
+                .keys
+                .iter()
+                .find(|binding| binding.trigger == config::BindingTrigger::DoubleClick)
+                .map(|binding| binding.action.clone());
+        }
+        if output.event.is_none()
+            || matches!(output.event, Some(nfm_egui::PickerEvent::DoubleClicked(_)))
+        {
+            if let (Some(callback), Some(selection)) = (binding_action, selection.as_ref()) {
+                return self.invoke_callback(callback, selection.clone());
+            }
+        }
         if let Some(preview) = &mut self.command_preview {
             if output.preview_rect.is_some() && !self.shared.is_closed() {
                 if let Some(selection) = &selection {
@@ -508,8 +584,28 @@ impl Picker {
                 None
             }
             Some(nfm_egui::PickerEvent::Accepted(selection)) => self.accept(selection),
+            Some(nfm_egui::PickerEvent::DoubleClicked(_)) => None,
             None => None,
         }
+    }
+    fn invoke_callback(
+        &self,
+        callback: std::rc::Rc<crate::lua_callbacks::Callback>,
+        selection: nfm_egui::Selection<source::Candidate>,
+    ) -> Option<Action> {
+        let result = SearchResult {
+            node_index: selection.item.node_index,
+            score: 0,
+            path: selection.text.clone(),
+        };
+        Some(Action::Custom(
+            callback,
+            selection.text,
+            self.source.is_filesystem(),
+            self.selected_range(&selection.item),
+            self.source.accepted_value(&result),
+            self.request_params.clone(),
+        ))
     }
     fn accept(&self, selection: nfm_egui::Selection<source::Candidate>) -> Option<Action> {
         if let Some(session) = &self.pipe_session {
@@ -560,7 +656,7 @@ impl Picker {
         } else {
             self.enter_action
         } {
-            config::EnterAction::Navigate => range.map(|r| Action::Accept(r.start)),
+            config::EnterAction::Navigate => range.map(|r| Action::Navigate(r.start)),
             config::EnterAction::SendInput => Some(Action::SendInput(value)),
         }
     }
@@ -578,10 +674,19 @@ impl Picker {
         self.line_split = true;
         self.apply_line_break_presentation();
         self.refresh_scrollback_preview(ctx);
-        self.shared.set_keybinding_help(vec![(
+        self.set_keybinding_help(vec![(
             "Alt+Left".into(),
             "Return to scrollback results".into(),
         )]);
+    }
+    fn set_keybinding_help(&mut self, mut help: Vec<(String, String)>) {
+        help.extend(self.keys.iter().map(|binding| {
+            (
+                binding.trigger.label(binding.mods),
+                binding.description.clone(),
+            )
+        }));
+        self.shared.set_keybinding_help(help);
     }
     fn apply_line_break_presentation(&mut self) {
         let settings = self.builtin_pickers.line_break;
@@ -632,6 +737,7 @@ impl Picker {
             view.total_rows,
             ctx.clone(),
             config::Options {
+                keys: Vec::new(),
                 source: config::Source::CommandPalette(vec![]),
                 preview: Some(config::Preview::Scrollback { rows: 12 }),
                 enter_action: config::EnterAction::SendInput,

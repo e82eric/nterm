@@ -1,3 +1,6 @@
+pub(crate) mod keybindings;
+pub(crate) mod model;
+
 use mlua::{Lua, LuaSerdeExt};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -61,17 +64,12 @@ impl PickerFactory {
                 self.name
             ));
         }
-        let bindings = crate::picker::config::Bindings::compile_with_defaults(
-            Some(std::collections::BTreeMap::from([(
-                self.name.clone(),
-                definition,
-            )])),
-            Some(vec![]),
-            defaults,
-        )?;
-        match bindings.named(&self.name) {
-            Some(crate::picker::config::PickerEntry::Static(options)) => Ok(options),
-            _ => Err(format!("pickers.{}: invalid picker definition", self.name)),
+        match definition.resolve(&self.name, defaults)? {
+            crate::picker::config::PickerEntry::Static(options) => Ok(options),
+            crate::picker::config::PickerEntry::Factory(..) => Err(format!(
+                "pickers.{}: factory must return a picker table",
+                self.name
+            )),
         }
     }
 }
@@ -99,6 +97,16 @@ fn parse_picker_table(
             .raw_set("type", "Scrollback")
             .map_err(|e| e.to_string())?;
     }
+    let local_keys = keybindings::parse_picker_keys(
+        lua,
+        name,
+        definition
+            .raw_get::<_, Option<mlua::Table>>("keys")
+            .map_err(|e| e.to_string())?,
+    )?;
+    definition
+        .raw_set("keys", mlua::Value::Nil)
+        .map_err(|e| e.to_string())?;
     let mut callback = None;
     let action: mlua::Value = definition.raw_get("action").map_err(|e| e.to_string())?;
     if !matches!(action, mlua::Value::Nil) {
@@ -196,6 +204,9 @@ fn parse_picker_table(
     let mut parsed: crate::picker::config::Definition = lua
         .from_value(mlua::Value::Table(definition.clone()))
         .map_err(|e| format!("pickers.{name}: {e}"))?;
+    if let Some(keys) = parsed.keys_mut() {
+        *keys = local_keys;
+    }
     if let Some(callback) = callback {
         parsed.set_callback(callback);
     }
@@ -337,9 +348,18 @@ impl AppConfig {
         if !matches!(value, mlua::Value::Table(_)) {
             return Err("config must return a table".into());
         }
+        let mut parsed_keys = None;
         let mut parsed_pickers = None;
         let mut actions = std::collections::BTreeMap::new();
         if let mlua::Value::Table(root) = &value {
+            if let Some(keys) = root
+                .get::<_, Option<mlua::Table>>("keys")
+                .map_err(|e| e.to_string())?
+            {
+                parsed_keys = Some(keybindings::parse_application_keys(&lua, keys)?);
+                root.raw_set("keys", mlua::Value::Nil)
+                    .map_err(|e| e.to_string())?;
+            }
             if let Some(configured) = root
                 .get::<_, Option<mlua::Table>>("actions")
                 .map_err(|e| e.to_string())?
@@ -471,6 +491,7 @@ impl AppConfig {
         let mut config: Self = lua.from_value(value).map_err(|error| error.to_string())?;
         config.builtin_pickers.validate()?;
         config.picker_defaults.validate()?;
+        config.keys = parsed_keys;
         config.pickers = parsed_pickers;
         config.actions = actions;
         Ok(config)
@@ -780,6 +801,54 @@ fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn picker_local_keys_parse_validate_and_keep_lua_functions() {
+        let mut config = parse("return { builtin_pickers = { lines = { keys = {{key='Enter',mods='CTRL',action=function(app,item) app:close_picker(); app:paste(item.value) end}} } } }").unwrap();
+        let keys = config
+            .pickers
+            .as_mut()
+            .unwrap()
+            .get_mut("builtin.lines")
+            .unwrap()
+            .keys_mut()
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].trigger,
+            keybindings::BindingTrigger::Key(egui::Key::Enter)
+        );
+        assert!(keys[0].mods.ctrl);
+        assert_eq!(keys[0].description, "Run picker Lua action");
+        let commands = keys[0]
+            .action
+            .call("line", "line", false, None, None, &Default::default())
+            .unwrap();
+        assert!(
+            matches!(&commands[..], [crate::lua_callbacks::Command::ClosePicker, crate::lua_callbacks::Command::Paste(text)] if text == "line")
+        );
+        for binding in [
+            "{key='Enter',action='Paste'}",
+            "{key='UnknownKey',action=function() end}",
+            "{key='Enter',mods='TYPO',action=function() end}",
+            "{key='Enter',extra=true,action=function() end}",
+        ] {
+            assert!(parse(&format!("return {{pickers={{x={{keys={{{binding}}}}}}}}}")).is_err());
+        }
+        assert!(parse("return {pickers={x={keys={{key='Enter',action=function() end},{key='Enter',action=function() end}}}}}").is_err());
+        let mut described = parse("return {pickers={x={keys={{key='Enter',description='Paste selected line',action=function() end}}}}}").unwrap();
+        assert_eq!(
+            described
+                .pickers
+                .as_mut()
+                .unwrap()
+                .get_mut("x")
+                .unwrap()
+                .keys_mut()
+                .unwrap()[0]
+                .description,
+            "Paste selected line"
+        );
+    }
     #[test]
     fn reload_fonts_respect_cli_options_but_ignore_shell_arguments() {
         let directory = std::env::temp_dir().join(format!(

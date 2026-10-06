@@ -1236,6 +1236,18 @@ impl TerminalPane {
                             Self::replace_picker_prompt(self.host, &text, before, after);
                         }
                         crate::lua_callbacks::Command::Navigate(_) => {}
+                        crate::lua_callbacks::Command::ClosePicker => {
+                            if let Some(picker) = self.picker.take() {
+                                picker.surrender_focus();
+                                let (generation, from_copy) = (picker.generation, picker.from_copy);
+                                drop(picker);
+                                self.handle_picker_action(
+                                    crate::picker::Action::Cancel,
+                                    generation,
+                                    from_copy,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1411,6 +1423,20 @@ impl TerminalPane {
             .and_then(|picker| picker.show_in_bounds(ui.ctx(), bounds));
         let mut application_action = None;
         if let Some(action) = action {
+            if matches!(&action, crate::picker::Action::Custom(..))
+                && self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| !picker.is_closed())
+            {
+                let picker = self
+                    .picker
+                    .as_ref()
+                    .expect("picker key action requires active picker");
+                self.pending_callback = Some((action, picker.generation, picker.from_copy));
+                ui.ctx().request_repaint();
+                return (true, None);
+            }
             let picker = self
                 .picker
                 .take()
@@ -1447,7 +1473,7 @@ impl TerminalPane {
         match action {
             crate::picker::Action::Execute(action) => return Some(action),
             crate::picker::Action::Cancel => restore_copy(self),
-            crate::picker::Action::Accept(target) => {
+            crate::picker::Action::Navigate(target) => {
                 if let Some(generation) = generation {
                     self.accept_picker_cell(generation, target);
                 }
@@ -1486,6 +1512,17 @@ impl TerminalPane {
                 let mut sent = false;
                 for command in commands {
                     match command {
+                        crate::lua_callbacks::Command::ClosePicker => {
+                            if let Some(picker) = &self.picker {
+                                picker.surrender_focus();
+                            }
+                            self.picker = None;
+                            if sent {
+                                self.close_copy_mode();
+                            } else if !navigated {
+                                restore_copy(self);
+                            }
+                        }
                         crate::lua_callbacks::Command::ShowToast {
                             title,
                             message,
@@ -1506,7 +1543,9 @@ impl TerminalPane {
                             }
                         }
                         crate::lua_callbacks::Command::Paste(text) => {
-                            self.close_copy_mode();
+                            if self.picker.is_none() {
+                                self.close_copy_mode();
+                            }
                             sent = true;
                             unsafe {
                                 ghostty_ffi::ghostty_egui_host_text(
@@ -1517,7 +1556,9 @@ impl TerminalPane {
                             }
                         }
                         crate::lua_callbacks::Command::SendText(text) => {
-                            self.close_copy_mode();
+                            if self.picker.is_none() {
+                                self.close_copy_mode();
+                            }
                             sent = true;
                             Self::send_picker_text(self.host, &text);
                         }
@@ -1526,19 +1567,23 @@ impl TerminalPane {
                             before,
                             after,
                         } => {
-                            self.close_copy_mode();
+                            if self.picker.is_none() {
+                                self.close_copy_mode();
+                            }
                             sent = true;
                             Self::replace_picker_prompt(self.host, &text, before, after);
                         }
                     }
                 }
-                if !sent && !navigated {
+                if !sent && !navigated && self.picker.is_none() {
                     restore_copy(self);
                 }
             }
             Err(error) => {
                 self.show_error("Picker action failed", error);
-                restore_copy(self);
+                if self.picker.is_none() {
+                    restore_copy(self);
+                }
             }
         }
     }
@@ -2847,10 +2892,6 @@ mod copy_shortcut_tests {
                 },
                 egui::Modifiers {
                     alt: true,
-                    ..modifiers
-                },
-                egui::Modifiers {
-                    mac_cmd: true,
                     ..modifiers
                 },
                 egui::Modifiers {

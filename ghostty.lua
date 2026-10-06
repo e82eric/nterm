@@ -68,7 +68,14 @@ return {
   builtin_pickers = {
     themes = { position = "Cursor", sort = "Score" },
     command_palette = { position = "Cursor", preview_visible = false },
-    lines = {},
+    lines = {
+      keys = {
+        { key = "Enter", mods = "CTRL", description = "Paste selected line", action = function(app, item)
+          app:close_picker()
+          app:paste(item.value)
+        end },
+      },
+    },
     words = {},
     line_break = { preview_visible = false },
   },

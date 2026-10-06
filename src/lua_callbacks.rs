@@ -387,6 +387,7 @@ mod tests {
 }
 #[derive(Debug)]
 pub(crate) enum Command {
+    ClosePicker,
     Paste(String),
     SendText(String),
     ReplacePrompt {
@@ -502,6 +503,7 @@ impl UserData for App {
         methods.add_method("paste", |_, app, text: String| {
             app.push(Command::Paste(text))
         });
+        methods.add_method("close_picker", |_, app, ()| app.push(Command::ClosePicker));
         methods.add_method("send_text", |_, app, text: String| {
             app.push(Command::SendText(text))
         });

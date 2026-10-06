@@ -1,3 +1,4 @@
+use crate::config::keybindings::same_mods;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -171,6 +172,8 @@ pub(crate) enum Definition {
         sort: Sort,
         #[serde(default)]
         initial_query: Option<String>,
+        #[serde(skip)]
+        keys: Vec<PickerKey>,
         #[serde(default)]
         preview: Option<Preview>,
         #[serde(default)]
@@ -183,6 +186,8 @@ pub(crate) enum Definition {
         sort: Sort,
         #[serde(default)]
         initial_query: Option<String>,
+        #[serde(skip)]
+        keys: Vec<PickerKey>,
         #[serde(default)]
         preview: Option<Preview>,
         #[serde(default)]
@@ -195,6 +200,8 @@ pub(crate) enum Definition {
         sort: Sort,
         #[serde(default)]
         initial_query: Option<String>,
+        #[serde(skip)]
+        keys: Vec<PickerKey>,
         #[serde(default)]
         preview: Option<Preview>,
         #[serde(default)]
@@ -217,6 +224,8 @@ pub(crate) enum Definition {
         enter_action: Option<EnterAction>,
         #[serde(default)]
         initial_query: Option<String>,
+        #[serde(skip)]
+        keys: Vec<PickerKey>,
         #[serde(default)]
         preview: Option<Preview>,
         #[serde(default = "default_preview_visible")]
@@ -235,6 +244,8 @@ pub(crate) enum Definition {
         enter_action: Option<EnterAction>,
         #[serde(default)]
         initial_query: Option<String>,
+        #[serde(skip)]
+        keys: Vec<PickerKey>,
         #[serde(default)]
         preview: Option<Preview>,
         #[serde(default = "default_preview_visible")]
@@ -262,6 +273,8 @@ pub(crate) enum Definition {
         enter_action: Option<EnterAction>,
         #[serde(default)]
         initial_query: Option<String>,
+        #[serde(skip)]
+        keys: Vec<PickerKey>,
         #[serde(default)]
         preview: Option<Preview>,
         #[serde(default = "default_preview_visible")]
@@ -286,6 +299,8 @@ pub(crate) enum Definition {
         enter_action: Option<EnterAction>,
         #[serde(default)]
         initial_query: Option<String>,
+        #[serde(skip)]
+        keys: Vec<PickerKey>,
         #[serde(default)]
         preview: Option<Preview>,
         #[serde(default = "default_preview_visible")]
@@ -299,7 +314,327 @@ fn default_preview_visible() -> bool {
     true
 }
 
+pub(crate) type PickerKey = KeyBinding<std::rc::Rc<crate::lua_callbacks::Callback>>;
+
 impl Definition {
+    /// Resolve one definition without constructing or compiling shortcut bindings.
+    pub(crate) fn resolve(
+        self,
+        name: &str,
+        defaults: PickerDefaults,
+    ) -> Result<PickerEntry, String> {
+        defaults.validate()?;
+        if name.trim().is_empty() {
+            return Err("picker names must not be empty".into());
+        }
+        if let Self::Factory { factory } = self {
+            return Ok(PickerEntry::Factory(
+                factory.ok_or("missing picker factory")?,
+                defaults,
+            ));
+        }
+        let mut definition = self;
+        let (callback, enter_action) = definition.acceptance();
+        let position = match &definition {
+            Definition::Scrollback { position, .. }
+            | Definition::Items { position, .. }
+            | Definition::Command { position, .. }
+            | Definition::FileSystem { position, .. }
+            | Definition::ErrorLog { position, .. }
+            | Definition::Themes { position, .. }
+            | Definition::CommandPalette { position, .. } => *position,
+            Definition::Factory { .. } => unreachable!(),
+        };
+        let sort = match &definition {
+            Definition::Command { sort, .. }
+            | Definition::Scrollback { sort, .. }
+            | Definition::Items { sort, .. }
+            | Definition::FileSystem { sort, .. }
+            | Definition::ErrorLog { sort, .. }
+            | Definition::Themes { sort, .. }
+            | Definition::CommandPalette { sort, .. } => *sort,
+            Definition::Factory { .. } => unreachable!(),
+        };
+        let initial_query = match &definition {
+            Definition::Scrollback { initial_query, .. }
+            | Definition::Items { initial_query, .. }
+            | Definition::Command { initial_query, .. }
+            | Definition::FileSystem { initial_query, .. }
+            | Definition::ErrorLog { initial_query, .. }
+            | Definition::Themes { initial_query, .. }
+            | Definition::CommandPalette { initial_query, .. } => initial_query.clone(),
+            Definition::Factory { .. } => unreachable!(),
+        };
+        let mut preview = match &definition {
+            Definition::Scrollback { preview, .. }
+            | Definition::Items { preview, .. }
+            | Definition::Command { preview, .. }
+            | Definition::FileSystem { preview, .. }
+            | Definition::ErrorLog { preview, .. }
+            | Definition::Themes { preview, .. }
+            | Definition::CommandPalette { preview, .. } => preview.clone(),
+            Definition::Factory { .. } => unreachable!(),
+        };
+        let preview_visible = match &definition {
+            Definition::Scrollback {
+                preview_visible, ..
+            }
+            | Definition::Items {
+                preview_visible, ..
+            }
+            | Definition::Command {
+                preview_visible, ..
+            }
+            | Definition::FileSystem {
+                preview_visible, ..
+            }
+            | Definition::ErrorLog {
+                preview_visible, ..
+            }
+            | Definition::Themes {
+                preview_visible, ..
+            }
+            | Definition::CommandPalette {
+                preview_visible, ..
+            } => *preview_visible,
+            Definition::Factory { .. } => unreachable!(),
+        };
+        if let Some(Preview::Command {
+            max_bytes,
+            max_scrollback_lines,
+            ..
+        }) = &mut preview
+        {
+            *max_bytes = Some(
+                max_bytes
+                    .or(defaults.preview_max_bytes)
+                    .unwrap_or(10 * 1024 * 1024),
+            );
+            *max_scrollback_lines = Some(
+                max_scrollback_lines
+                    .or(defaults.preview_max_scrollback_lines)
+                    .unwrap_or(8192),
+            );
+        }
+        if let Some(preview) = &preview {
+            preview
+                .validate()
+                .map_err(|error| format!("pickers.{name}.preview: {error}"))?;
+        }
+        let local_keys = definition
+            .keys_mut()
+            .map(|keys| std::mem::take(keys))
+            .unwrap_or_default();
+        let mut options = match definition {
+            Definition::Themes { .. } => Options {
+                position,
+                sort,
+                callback: None,
+                keys: Vec::new(),
+                source: Source::Themes,
+                enter_action: EnterAction::Navigate,
+                params: BTreeMap::new(),
+                preview: None,
+                preview_visible: false,
+            },
+            Definition::ErrorLog { .. } => Options {
+                position,
+                sort,
+                callback: None,
+                keys: Vec::new(),
+                source: Source::ErrorLog,
+                enter_action: EnterAction::Navigate,
+                params: BTreeMap::new(),
+                preview: None,
+                preview_visible: false,
+            },
+            Definition::CommandPalette { .. } => Options {
+                position,
+                sort,
+                callback: None,
+                keys: Vec::new(),
+                source: Source::CommandPalette(Vec::new()),
+                enter_action: EnterAction::SendInput,
+                params: BTreeMap::new(),
+                preview: None,
+                preview_visible,
+            },
+            Definition::Factory { .. } => unreachable!(),
+            Definition::Scrollback { regex, unique, .. } => {
+                let regex = Regex::new(&regex.unwrap_or_else(default_regex))
+                    .map_err(|error| format!("pickers.{name}.regex: {error}"))?;
+                if regex.is_match("") {
+                    return Err(format!("pickers.{name}.regex must not match empty text"));
+                }
+                Options {
+                    position,
+                    sort,
+                    callback,
+                    keys: Vec::new(),
+                    source: Source::Scrollback {
+                        regex,
+                        unique: unique.unwrap_or(defaults.unique),
+                    },
+                    enter_action: enter_action.unwrap_or(EnterAction::Navigate),
+                    params: BTreeMap::new(),
+                    preview: None,
+                    preview_visible,
+                }
+            }
+            Definition::Items {
+                items, provider, ..
+            } => {
+                crate::picker::wire::validate_items(&items)?;
+                if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
+                    return Err(format!(
+                        "pickers.{name}: Items only supports enter_action SendInput"
+                    ));
+                }
+                Options {
+                    position,
+                    sort,
+                    callback,
+                    keys: Vec::new(),
+                    source: Source::Items(ItemsOptions {
+                        values: items,
+                        provider,
+                    }),
+                    enter_action: EnterAction::SendInput,
+                    params: BTreeMap::new(),
+                    preview: None,
+                    preview_visible,
+                }
+            }
+            Definition::Command {
+                args,
+                cwd,
+                line_continuation,
+                unique,
+                success_exit_codes,
+                ..
+            } => {
+                if args.is_empty()
+                    || args[0].trim().is_empty()
+                    || (args[0].starts_with('{') && args[0].ends_with('}'))
+                {
+                    return Err(format!("pickers.{name}.args requires an executable"));
+                }
+                if let Some(index) = args.iter().position(|arg| arg.contains('\0')) {
+                    return Err(format!("pickers.{name}.args[{index}] contains NUL"));
+                }
+                if cwd.as_ref().is_some_and(|value| value.contains('\0')) {
+                    return Err(format!("pickers.{name}.cwd contains NUL"));
+                }
+                if line_continuation
+                    .as_ref()
+                    .is_some_and(|value| value.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n')))
+                {
+                    return Err(format!(
+                        "pickers.{name}.line_continuation cannot contain NUL or a newline; use a literal continuation marker"
+                    ));
+                }
+                if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
+                    return Err(format!(
+                        "pickers.{name}: Command only supports enter_action SendInput"
+                    ));
+                }
+                if success_exit_codes.as_ref().is_some_and(|codes| {
+                    codes.is_empty() || codes.len() > 16 || codes.iter().any(|code| *code < 0)
+                }) {
+                    return Err(format!(
+                        "pickers.{name}.success_exit_codes must contain 1 to 16 nonnegative exit codes"
+                    ));
+                }
+                Options {
+                    position,
+                    sort,
+                    callback,
+                    keys: Vec::new(),
+                    source: Source::Command(CommandOptions {
+                        args,
+                        cwd,
+                        line_continuation: line_continuation.filter(|value| !value.is_empty()),
+                        unique: unique.unwrap_or(defaults.unique),
+                        success_exit_codes,
+                    }),
+                    enter_action: EnterAction::SendInput,
+                    params: BTreeMap::new(),
+                    preview: None,
+                    preview_visible,
+                }
+            }
+            Definition::FileSystem {
+                roots,
+                max_depth,
+                files_only,
+                directories_only,
+                ..
+            } => {
+                if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
+                    return Err(format!(
+                        "pickers.{name}: FileSystem only supports enter_action SendInput"
+                    ));
+                }
+                if files_only && directories_only {
+                    return Err(format!(
+                        "pickers.{name}: files_only and directories_only cannot both be true"
+                    ));
+                }
+                if max_depth.is_some_and(|depth| depth < 0) {
+                    return Err(format!("pickers.{name}.max_depth must be nonnegative"));
+                }
+                if roots
+                    .iter()
+                    .any(|root| root.trim().is_empty() || root.contains('\0'))
+                {
+                    return Err(format!("pickers.{name}.roots must contain nonempty paths"));
+                }
+                Options {
+                    position,
+                    sort,
+                    callback,
+                    keys: Vec::new(),
+                    source: Source::FileSystem(FileOptions {
+                        roots: roots.into_iter().map(std::path::PathBuf::from).collect(),
+                        max_depth: max_depth.unwrap_or(i32::MAX),
+                        files_only,
+                        directories_only,
+                    }),
+                    enter_action: EnterAction::SendInput,
+                    params: BTreeMap::new(),
+                    preview: None,
+                    preview_visible,
+                }
+            }
+        };
+        options.keys = local_keys;
+        if let Some(query) = initial_query {
+            options.params.insert("query".into(), query);
+        }
+        if matches!(&preview, Some(Preview::Scrollback { .. }))
+            && !matches!(&options.source, Source::Scrollback { .. })
+        {
+            return Err(format!(
+                "pickers.{name}.preview: Scrollback requires a scrollback picker"
+            ));
+        }
+        options.preview = preview;
+        Ok(PickerEntry::Static(options))
+    }
+
+    pub(crate) fn keys_mut(&mut self) -> Option<&mut Vec<PickerKey>> {
+        match self {
+            Self::Scrollback { keys, .. }
+            | Self::Items { keys, .. }
+            | Self::Command { keys, .. }
+            | Self::FileSystem { keys, .. }
+            | Self::Themes { keys, .. }
+            | Self::ErrorLog { keys, .. }
+            | Self::CommandPalette { keys, .. } => Some(keys),
+            Self::Factory { .. } => None,
+        }
+    }
+
     pub(crate) fn set_preview_command(
         &mut self,
         value: std::rc::Rc<crate::lua_callbacks::PreviewCommand>,
@@ -392,12 +727,9 @@ fn default_regex() -> String {
     r"\S(?:[^\r\n]*\S)?".into()
 }
 
-pub(crate) struct KeyBinding {
-    pub(crate) key: String,
-    pub(crate) mods: String,
-    pub(crate) target: BindingTarget,
-}
+pub(crate) use crate::config::keybindings::{BindingTrigger, KeyBinding};
 
+#[derive(Clone)]
 pub(crate) enum BindingTarget {
     Action(crate::actions::AppAction),
     Picker(String),
@@ -423,47 +755,12 @@ pub(crate) fn builtin_defaults(name: &str) -> serde_json::Value {
     }
 }
 
-impl<'de> Deserialize<'de> for KeyBinding {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct RawBinding {
-            key: String,
-            #[serde(default)]
-            mods: String,
-            picker: Option<String>,
-            builtin_picker: Option<String>,
-            action: Option<String>,
-        }
-        let raw = RawBinding::deserialize(deserializer)?;
-        let target = match (raw.action, raw.picker, raw.builtin_picker) {
-            (Some(name), None, None) => BindingTarget::Action(
-                crate::actions::AppAction::from_name(&name)
-                    .unwrap_or(crate::actions::AppAction::Lua(name)),
-            ),
-            (None, Some(name), None) => BindingTarget::Picker(name),
-            (None, None, Some(name)) if BUILTIN_NAMES.contains(&name.as_str()) => {
-                BindingTarget::Picker(format!("builtin.{name}"))
-            }
-            _ => {
-                return Err(serde::de::Error::custom(
-                    "key binding must specify exactly one of action, picker, or a known builtin_picker",
-                ));
-            }
-        };
-        Ok(Self {
-            key: raw.key,
-            mods: raw.mods,
-            target,
-        })
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct Options {
     pub(crate) position: Position,
     pub(crate) sort: Sort,
     pub(crate) callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
+    pub(crate) keys: Vec<PickerKey>,
     pub(crate) source: Source,
     pub(crate) enter_action: EnterAction,
     pub(crate) params: BTreeMap<String, String>,
@@ -538,6 +835,7 @@ impl Default for Options {
             position: Position::Bottom,
             sort: Sort::default(),
             callback: None,
+            keys: Vec::new(),
             source: Source::Scrollback {
                 regex: Regex::new(&default_regex()).unwrap(),
                 unique: false,
@@ -550,12 +848,7 @@ impl Default for Options {
     }
 }
 
-#[derive(Clone)]
-struct Binding {
-    action: crate::actions::AppAction,
-    key: egui::Key,
-    mods: egui::Modifiers,
-}
+type Binding = KeyBinding<crate::actions::AppAction>;
 
 #[derive(Clone)]
 pub(crate) enum PickerEntry {
@@ -585,8 +878,7 @@ pub(crate) struct Bindings {
     pub(crate) builtin_pickers: BuiltinPickers,
     pub(crate) cursor_scroll_padding: u32,
     bindings: Vec<Binding>,
-    definitions: BTreeMap<String, PickerEntry>,
-    actions: BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
+    model: std::rc::Rc<crate::config::model::Model>,
 }
 
 impl Bindings {
@@ -610,13 +902,7 @@ impl Bindings {
             }
         }
         let definition: Definition = serde_json::from_value(value).map_err(|e| e.to_string())?;
-        let compiled = Self::compile(
-            Some(BTreeMap::from([("ipc".into(), definition)])),
-            Some(Vec::new()),
-        )?;
-        compiled
-            .named("ipc")
-            .ok_or("invalid picker definition".into())
+        definition.resolve("ipc", PickerDefaults::default())
     }
     pub(crate) fn compile(
         definitions: Option<BTreeMap<String, Definition>>,
@@ -639,335 +925,21 @@ impl Bindings {
         defaults: PickerDefaults,
         actions: BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
     ) -> Result<Self, String> {
-        defaults.validate()?;
-        let mut definitions = definitions.unwrap_or_else(|| {
-            BTreeMap::from([
-                (
-                    "lines".into(),
-                    Definition::Scrollback {
-                        position: Position::Bottom,
-                        sort: Sort::default(),
-                        unique: None,
-                        callback: None,
-                        regex: None,
-                        enter_action: None,
-                        initial_query: None,
-                        preview: None,
-                        preview_visible: true,
-                    },
-                ),
-                (
-                    "commands".into(),
-                    Definition::CommandPalette {
-                        position: Position::Cursor,
-                        sort: Sort::default(),
-                        initial_query: None,
-                        preview: None,
-                        preview_visible: false,
-                    },
-                ),
-            ])
-        });
-        for name in BUILTIN_NAMES {
-            definitions
-                .entry(format!("builtin.{name}"))
-                .or_insert_with(|| {
-                    serde_json::from_value(builtin_defaults(name)).expect("valid builtin defaults")
-                });
-        }
-        let mut compiled = BTreeMap::new();
-        for (name, definition) in definitions {
-            if name.trim().is_empty() {
-                return Err("picker names must not be empty".into());
-            }
-            if let Definition::Factory { factory } = definition {
-                compiled.insert(
-                    name,
-                    PickerEntry::Factory(factory.ok_or("missing picker factory")?, defaults),
-                );
-                continue;
-            }
-            let (callback, enter_action) = definition.acceptance();
-            let position = match &definition {
-                Definition::Scrollback { position, .. }
-                | Definition::Items { position, .. }
-                | Definition::Command { position, .. }
-                | Definition::FileSystem { position, .. }
-                | Definition::ErrorLog { position, .. }
-                | Definition::Themes { position, .. }
-                | Definition::CommandPalette { position, .. } => *position,
-                Definition::Factory { .. } => unreachable!(),
-            };
-            let sort = match &definition {
-                Definition::Command { sort, .. }
-                | Definition::Scrollback { sort, .. }
-                | Definition::Items { sort, .. }
-                | Definition::FileSystem { sort, .. }
-                | Definition::ErrorLog { sort, .. }
-                | Definition::Themes { sort, .. }
-                | Definition::CommandPalette { sort, .. } => *sort,
-                Definition::Factory { .. } => unreachable!(),
-            };
-            let initial_query = match &definition {
-                Definition::Scrollback { initial_query, .. }
-                | Definition::Items { initial_query, .. }
-                | Definition::Command { initial_query, .. }
-                | Definition::FileSystem { initial_query, .. }
-                | Definition::ErrorLog { initial_query, .. }
-                | Definition::Themes { initial_query, .. }
-                | Definition::CommandPalette { initial_query, .. } => initial_query.clone(),
-                Definition::Factory { .. } => unreachable!(),
-            };
-            let mut preview = match &definition {
-                Definition::Scrollback { preview, .. }
-                | Definition::Items { preview, .. }
-                | Definition::Command { preview, .. }
-                | Definition::FileSystem { preview, .. }
-                | Definition::ErrorLog { preview, .. }
-                | Definition::Themes { preview, .. }
-                | Definition::CommandPalette { preview, .. } => preview.clone(),
-                Definition::Factory { .. } => unreachable!(),
-            };
-            let preview_visible = match &definition {
-                Definition::Scrollback {
-                    preview_visible, ..
-                }
-                | Definition::Items {
-                    preview_visible, ..
-                }
-                | Definition::Command {
-                    preview_visible, ..
-                }
-                | Definition::FileSystem {
-                    preview_visible, ..
-                }
-                | Definition::ErrorLog {
-                    preview_visible, ..
-                }
-                | Definition::Themes {
-                    preview_visible, ..
-                }
-                | Definition::CommandPalette {
-                    preview_visible, ..
-                } => *preview_visible,
-                Definition::Factory { .. } => unreachable!(),
-            };
-            if let Some(Preview::Command {
-                max_bytes,
-                max_scrollback_lines,
-                ..
-            }) = &mut preview
-            {
-                *max_bytes = Some(
-                    max_bytes
-                        .or(defaults.preview_max_bytes)
-                        .unwrap_or(10 * 1024 * 1024),
-                );
-                *max_scrollback_lines = Some(
-                    max_scrollback_lines
-                        .or(defaults.preview_max_scrollback_lines)
-                        .unwrap_or(8192),
-                );
-            }
-            if let Some(preview) = &preview {
-                preview
-                    .validate()
-                    .map_err(|error| format!("pickers.{name}.preview: {error}"))?;
-            }
-            let mut options = match definition {
-                Definition::Themes { .. } => Options {
-                    position,
-                    sort,
-                    callback: None,
-                    source: Source::Themes,
-                    enter_action: EnterAction::Navigate,
-                    params: BTreeMap::new(),
-                    preview: None,
-                    preview_visible: false,
-                },
-                Definition::ErrorLog { .. } => Options {
-                    position,
-                    sort,
-                    callback: None,
-                    source: Source::ErrorLog,
-                    enter_action: EnterAction::Navigate,
-                    params: BTreeMap::new(),
-                    preview: None,
-                    preview_visible: false,
-                },
-                Definition::CommandPalette { .. } => Options {
-                    position,
-                    sort,
-                    callback: None,
-                    source: Source::CommandPalette(Vec::new()),
-                    enter_action: EnterAction::SendInput,
-                    params: BTreeMap::new(),
-                    preview: None,
-                    preview_visible,
-                },
-                Definition::Factory { .. } => unreachable!(),
-                Definition::Scrollback { regex, unique, .. } => {
-                    let regex = Regex::new(&regex.unwrap_or_else(default_regex))
-                        .map_err(|error| format!("pickers.{name}.regex: {error}"))?;
-                    if regex.is_match("") {
-                        return Err(format!("pickers.{name}.regex must not match empty text"));
-                    }
-                    Options {
-                        position,
-                        sort,
-                        callback,
-                        source: Source::Scrollback {
-                            regex,
-                            unique: unique.unwrap_or(defaults.unique),
-                        },
-                        enter_action: enter_action.unwrap_or(EnterAction::Navigate),
-                        params: BTreeMap::new(),
-                        preview: None,
-                        preview_visible,
-                    }
-                }
-                Definition::Items {
-                    items, provider, ..
-                } => {
-                    crate::picker::wire::validate_items(&items)?;
-                    if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
-                        return Err(format!(
-                            "pickers.{name}: Items only supports enter_action SendInput"
-                        ));
-                    }
-                    Options {
-                        position,
-                        sort,
-                        callback,
-                        source: Source::Items(ItemsOptions {
-                            values: items,
-                            provider,
-                        }),
-                        enter_action: EnterAction::SendInput,
-                        params: BTreeMap::new(),
-                        preview: None,
-                        preview_visible,
-                    }
-                }
-                Definition::Command {
-                    args,
-                    cwd,
-                    line_continuation,
-                    unique,
-                    success_exit_codes,
-                    ..
-                } => {
-                    if args.is_empty()
-                        || args[0].trim().is_empty()
-                        || (args[0].starts_with('{') && args[0].ends_with('}'))
-                    {
-                        return Err(format!("pickers.{name}.args requires an executable"));
-                    }
-                    if let Some(index) = args.iter().position(|arg| arg.contains('\0')) {
-                        return Err(format!("pickers.{name}.args[{index}] contains NUL"));
-                    }
-                    if cwd.as_ref().is_some_and(|value| value.contains('\0')) {
-                        return Err(format!("pickers.{name}.cwd contains NUL"));
-                    }
-                    if line_continuation.as_ref().is_some_and(|value| {
-                        value.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n'))
-                    }) {
-                        return Err(format!(
-                            "pickers.{name}.line_continuation cannot contain NUL or a newline; use a literal continuation marker"
-                        ));
-                    }
-                    if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
-                        return Err(format!(
-                            "pickers.{name}: Command only supports enter_action SendInput"
-                        ));
-                    }
-                    if success_exit_codes.as_ref().is_some_and(|codes| {
-                        codes.is_empty() || codes.len() > 16 || codes.iter().any(|code| *code < 0)
-                    }) {
-                        return Err(format!(
-                            "pickers.{name}.success_exit_codes must contain 1 to 16 nonnegative exit codes"
-                        ));
-                    }
-                    Options {
-                        position,
-                        sort,
-                        callback,
-                        source: Source::Command(CommandOptions {
-                            args,
-                            cwd,
-                            line_continuation: line_continuation.filter(|value| !value.is_empty()),
-                            unique: unique.unwrap_or(defaults.unique),
-                            success_exit_codes,
-                        }),
-                        enter_action: EnterAction::SendInput,
-                        params: BTreeMap::new(),
-                        preview: None,
-                        preview_visible,
-                    }
-                }
-                Definition::FileSystem {
-                    roots,
-                    max_depth,
-                    files_only,
-                    directories_only,
-                    ..
-                } => {
-                    if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
-                        return Err(format!(
-                            "pickers.{name}: FileSystem only supports enter_action SendInput"
-                        ));
-                    }
-                    if files_only && directories_only {
-                        return Err(format!(
-                            "pickers.{name}: files_only and directories_only cannot both be true"
-                        ));
-                    }
-                    if max_depth.is_some_and(|depth| depth < 0) {
-                        return Err(format!("pickers.{name}.max_depth must be nonnegative"));
-                    }
-                    if roots
-                        .iter()
-                        .any(|root| root.trim().is_empty() || root.contains('\0'))
-                    {
-                        return Err(format!("pickers.{name}.roots must contain nonempty paths"));
-                    }
-                    Options {
-                        position,
-                        sort,
-                        callback,
-                        source: Source::FileSystem(FileOptions {
-                            roots: roots.into_iter().map(std::path::PathBuf::from).collect(),
-                            max_depth: max_depth.unwrap_or(i32::MAX),
-                            files_only,
-                            directories_only,
-                        }),
-                        enter_action: EnterAction::SendInput,
-                        params: BTreeMap::new(),
-                        preview: None,
-                        preview_visible,
-                    }
-                }
-            };
-            if let Some(query) = initial_query {
-                options.params.insert("query".into(), query);
-            }
-            if matches!(&preview, Some(Preview::Scrollback { .. }))
-                && !matches!(&options.source, Source::Scrollback { .. })
-            {
-                return Err(format!(
-                    "pickers.{name}.preview: Scrollback requires a scrollback picker"
-                ));
-            }
-            options.preview = preview;
-            compiled.insert(name, PickerEntry::Static(options));
-        }
+        let model = std::rc::Rc::new(crate::config::model::Model::compile(
+            definitions,
+            defaults,
+            actions,
+        )?);
+        let compiled = &model.pickers;
+        let actions = &model.actions;
         let keys = keys.unwrap_or_else(|| {
             let mut keys = crate::actions::default_bindings();
             {
                 keys.push(KeyBinding {
-                    key: "f".into(),
-                    mods: "CTRL|SHIFT".into(),
-                    target: BindingTarget::Picker(
+                    trigger: BindingTrigger::Key(egui::Key::F),
+                    description: String::new(),
+                    mods: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    action: BindingTarget::Picker(
                         if compiled.contains_key("lines") {
                             "lines"
                         } else {
@@ -988,9 +960,10 @@ impl Bindings {
             });
             {
                 keys.push(KeyBinding {
-                    key: "Space".into(),
-                    mods: "CTRL|SHIFT".into(),
-                    target: BindingTarget::Picker(
+                    trigger: BindingTrigger::Key(egui::Key::Space),
+                    description: String::new(),
+                    mods: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    action: BindingTarget::Picker(
                         if legacy_commands {
                             "commands"
                         } else {
@@ -1004,37 +977,19 @@ impl Bindings {
         });
         let mut bindings: Vec<Binding> = Vec::new();
         for binding in keys {
-            let key_name = if binding.key.len() == 1 && binding.key.is_ascii() {
-                binding.key.to_uppercase()
-            } else {
-                binding.key.clone()
+            let BindingTrigger::Key(key) = binding.trigger else {
+                return Err("application bindings require a keyboard trigger".into());
             };
-            let key = egui::Key::from_name(&key_name)
-                .ok_or_else(|| format!("unknown key binding key {:?}", binding.key))?;
-            let mut mods = egui::Modifiers::NONE;
-            for part in binding
-                .mods
-                .split('|')
-                .filter(|part| !part.trim().is_empty())
-            {
-                match part.trim().to_uppercase().as_str() {
-                    "CTRL" => mods.ctrl = true,
-                    "SHIFT" => mods.shift = true,
-                    "ALT" => mods.alt = true,
-                    "CMD" | "SUPER" if cfg!(target_os = "macos") => mods.mac_cmd = true,
-                    _ => return Err(format!("unknown key binding modifier {part:?}")),
-                }
-            }
-            if bindings
-                .iter()
-                .any(|existing| existing.key == key && same_mods(existing.mods, mods))
-            {
+            let mods = binding.mods;
+            if bindings.iter().any(|existing| {
+                existing.trigger == binding.trigger && same_mods(existing.mods, mods)
+            }) {
                 return Err(format!(
-                    "duplicate key binding {}+{}",
-                    binding.mods, binding.key
+                    "duplicate key binding {}",
+                    crate::actions::shortcut_label(key, mods)
                 ));
             }
-            let action = match binding.target {
+            let action = match binding.action {
                 BindingTarget::Action(action) => {
                     if let crate::actions::AppAction::Lua(name) = &action {
                         if !actions.contains_key(name) {
@@ -1050,13 +1005,17 @@ impl Bindings {
                     crate::actions::AppAction::OpenPicker(name)
                 }
             };
-            bindings.push(Binding { action, key, mods });
+            bindings.push(Binding {
+                action,
+                trigger: binding.trigger,
+                mods,
+                description: binding.description,
+            });
         }
         Ok(Self {
             bindings,
             pipe_policy: super::pipe::Policy::default(),
-            definitions: compiled,
-            actions,
+            model,
             builtin_pickers: BuiltinPickers::default(),
             cursor_scroll_padding: nfm_egui::copy_mode::SCROLL_PADDING_ROWS,
         })
@@ -1073,33 +1032,35 @@ impl Bindings {
     }
 
     pub(crate) fn named(&self, name: &str) -> Option<PickerEntry> {
-        self.definitions.get(name).cloned()
+        self.model.picker(name)
     }
 
     pub(crate) fn lua_action(&self, name: &str) -> Option<std::rc::Rc<crate::actions::LuaAction>> {
-        self.actions.get(name).cloned()
+        self.model.action(name)
     }
 
     pub(crate) fn lua_actions(&self) -> impl Iterator<Item = (&str, &crate::actions::LuaAction)> {
-        self.actions
+        self.model
+            .actions
             .iter()
             .map(|(name, action)| (name.as_str(), action.as_ref()))
     }
 
     pub(crate) fn has_themes_picker(&self) -> bool {
-        self.definitions.values().any(|entry| {
+        self.model.pickers.values().any(|entry| {
             matches!(entry, PickerEntry::Static(options) if matches!(options.source, Source::Themes))
         })
     }
 
     pub(crate) fn has_error_log_picker(&self) -> bool {
-        self.definitions.values().any(|entry| {
+        self.model.pickers.values().any(|entry| {
             matches!(entry, PickerEntry::Static(options) if matches!(options.source, Source::ErrorLog))
         })
     }
 
     pub(crate) fn palette_entries(&self) -> impl Iterator<Item = (&str, Option<String>)> {
-        self.definitions
+        self.model
+            .pickers
             .iter()
             .filter(|(_, entry)| match entry {
                 PickerEntry::Factory(..) => true,
@@ -1128,7 +1089,7 @@ impl Bindings {
             .bindings
             .iter()
             .filter(|binding| binding.action == *action)
-            .map(|binding| crate::actions::shortcut_label(binding.key, binding.mods))
+            .map(|binding| binding.trigger.label(binding.mods))
             .collect::<Vec<_>>()
             .join(", ");
         (!text.is_empty()).then_some(text)
@@ -1159,7 +1120,9 @@ impl Bindings {
             } = &event
             {
                 self.bindings.iter().find(|binding| {
-                    (binding.key == *key || Some(binding.key) == *physical_key)
+                    (binding.trigger == BindingTrigger::Key(*key)
+                        || physical_key
+                            .is_some_and(|key| binding.trigger == BindingTrigger::Key(key)))
                         && same_mods(binding.mods, *modifiers)
                         && allows(&binding.action, binding.mods)
                 })
@@ -1192,12 +1155,6 @@ impl Default for Bindings {
     fn default() -> Self {
         Self::compile(None, None).unwrap()
     }
-}
-
-fn same_mods(a: egui::Modifiers, b: egui::Modifiers) -> bool {
-    // egui's `command` mirrors Ctrl on Windows/Linux, so compare physical
-    // modifier fields rather than this platform-dependent alias.
-    (a.ctrl, a.shift, a.alt, a.mac_cmd) == (b.ctrl, b.shift, b.alt, b.mac_cmd)
 }
 
 #[cfg(test)]

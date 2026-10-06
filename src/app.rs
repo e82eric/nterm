@@ -697,9 +697,7 @@ impl GlutinWindowContext {
             .as_raw();
         #[cfg(windows)]
         let preference = glutin::display::DisplayApiPreference::WglThenEgl(raw_window);
-        #[cfg(target_os = "macos")]
-        let preference = glutin::display::DisplayApiPreference::Cgl;
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(windows))]
         let preference = glutin::display::DisplayApiPreference::EglThenGlx(Box::new(
             winit::platform::x11::register_xlib_error_hook,
         ));

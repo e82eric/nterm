@@ -187,12 +187,11 @@ fn mods(value: egui::Modifiers) -> i32 {
     (if value.shift { 1 } else { 0 })
         | (if value.ctrl { 2 } else { 0 })
         | (if value.alt { 4 } else { 0 })
-        | (if value.mac_cmd { 8 } else { 0 })
 }
 
 #[cfg(windows)]
 fn win32_picker_key(key: egui::Key, modifiers: egui::Modifiers, pressed: bool) -> Option<CString> {
-    if !modifiers.ctrl || !modifiers.shift || modifiers.alt || modifiers.mac_cmd {
+    if !modifiers.ctrl || !modifiers.shift || modifiers.alt {
         return None;
     }
     let (virtual_key, scan_code, unicode) = match key {
