@@ -226,7 +226,6 @@ struct Shared {
     shell: Mutex<Option<Arc<Shell>>>,
     policy: Mutex<Policy>,
     active: Mutex<Option<(Arc<Session>, Capability)>>,
-    history: Mutex<std::collections::VecDeque<Arc<super::super::diagnostics::Trace>>>,
     identity: Identity,
     context: egui::Context,
     native_wake: Mutex<
@@ -237,13 +236,10 @@ struct Shared {
     >,
 }
 impl Shared {
-    fn wake_ui(&self, trace: Arc<super::super::diagnostics::Trace>) {
+    fn wake_ui(&self) {
         if let Some((proxy, window_id)) = self.native_wake.lock().unwrap().as_ref() {
-            trace.mark("pipe_wake_queued", None);
             let _ = proxy.send_event(crate::app::UserEvent::PickerWake {
                 window_id: *window_id,
-                trace,
-                search: false,
             });
         }
         self.context.request_repaint();
@@ -371,7 +367,6 @@ impl Service {
             shell: Mutex::new(None),
             policy: Mutex::new(Policy::default()),
             active: Mutex::new(None),
-            history: Mutex::new(std::collections::VecDeque::new()),
             identity: id,
             context,
             native_wake: Mutex::new(None),
@@ -416,13 +411,6 @@ impl Service {
         window_id: egui_winit::winit::window::WindowId,
     ) {
         *self.shared.native_wake.lock().unwrap() = Some((proxy, window_id));
-    }
-    pub fn mark_active(&self, stage: &'static str) {
-        if let Some((session, _)) = self.shared.active.lock().unwrap().as_ref() {
-            if !session.done() {
-                session.trace.mark(stage, None);
-            }
-        }
     }
     pub fn enabled(&self) -> bool {
         self.shared.policy.lock().unwrap().enabled
@@ -604,8 +592,10 @@ mod tests {
                     Start-Sleep -Milliseconds 20
                 }
                 Start-Sleep -Milliseconds 200
+                Initialize-GhosttyPickerClient
+                $original = $script:GhosttyPickerConnection.Client
                 'warm' | Invoke-GhosttyPicker -PassThruResult | Out-Null
-                $script:GhosttyPickerLastTimings.reused | ConvertTo-Json -Depth 16 -Compress
+                [object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client) | ConvertTo-Json -Depth 16 -Compress
             "#,
                 &service.token,
                 background,
@@ -676,31 +666,38 @@ mod tests {
             &service,
             r#"
             $results = [System.Collections.Generic.List[object]]::new()
+            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
             $r = 1..20 | Invoke-GhosttyPicker -PassThruResult
             $original = $script:GhosttyPickerConnection.Client
-            $results.Add(@{status=$r.status;reused=$script:GhosttyPickerLastTimings.reused})
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
             Start-Sleep -Milliseconds 200
+            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
             $r = 'cancel' | Invoke-GhosttyPicker -CancelAfterSeconds 1 -PassThruResult
             if (-not [object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client)) { throw 'Connection changed after acceptance' }
-            $results.Add(@{status=$r.status;reused=$script:GhosttyPickerLastTimings.reused})
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
             try { 'denied' | Invoke-GhosttyPicker -Options @{preview_rows=0}; throw 'Invalid options accepted' }
             catch { if ($_ -notmatch 'capability_denied') { throw } }
             if (-not [object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client)) { throw 'Connection changed after cancellation/denial' }
+            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
             $r = Invoke-GhosttyPicker -Name demo -PassThruResult
-            $results.Add(@{status=$r.status;reused=$script:GhosttyPickerLastTimings.reused})
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
             Disconnect-GhosttyPicker
+            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
             $r = 'reconnect' | Invoke-GhosttyPicker -PassThruResult
             if ([object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client)) { throw 'Disconnected client was reused' }
-            $results.Add(@{status=$r.status;reused=$script:GhosttyPickerLastTimings.reused})
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
             foreach ($i in 1..2) {
+            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
                 $r = 'fresh' | Invoke-GhosttyPicker -FreshConnection -PassThruResult
                 if ($null -ne $script:GhosttyPickerConnection) { throw 'Fresh connection was cached' }
-                $results.Add(@{status=$r.status;reused=$script:GhosttyPickerLastTimings.reused;fresh=$script:GhosttyPickerLastTimings.fresh_connection;idle=$script:GhosttyPickerLastTimings.idle_ms})
+                $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
             }
+            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
             $r = 'persistent-again' | Invoke-GhosttyPicker -PassThruResult
-            $results.Add(@{status=$r.status;reused=$script:GhosttyPickerLastTimings.reused})
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
+            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
             $r = 'reuse-again' | Invoke-GhosttyPicker -PassThruResult
-            $results.Add(@{status=$r.status;reused=$script:GhosttyPickerLastTimings.reused})
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
             ConvertTo-Json -InputObject $results.ToArray() -Compress
         "#,
             &service.token,
@@ -761,8 +758,6 @@ mod tests {
         for index in [4, 5] {
             assert_eq!(results[index]["status"], "accepted");
             assert_eq!(results[index]["reused"], false);
-            assert_eq!(results[index]["fresh"], true);
-            assert!(results[index]["idle"].is_number());
         }
         assert_eq!(results[6]["reused"], false);
         assert_eq!(results[7]["reused"], true);
@@ -787,10 +782,11 @@ mod tests {
         let mut child = run_client(
             &service,
             r#"
+            $original = $script:GhosttyPickerConnection.Client
             'first' | Invoke-GhosttyPicker -PassThruResult | Out-Null
             Start-Sleep -Milliseconds 800
             'second' | Invoke-GhosttyPicker -PassThruResult | Out-Null
-            $script:GhosttyPickerLastTimings.reused | ConvertTo-Json -Depth 16 -Compress
+            [object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client) | ConvertTo-Json -Depth 16 -Compress
         "#,
             &service.token,
         );
@@ -843,91 +839,6 @@ mod tests {
         );
         assert_eq!(opens, 2);
         assert!(revoked);
-    }
-    #[test]
-    fn client_and_server_diagnostics_correlate_without_changing_picker_output() {
-        let service = Service::new(egui::Context::default()).unwrap();
-        service.update(
-            &Policy {
-                enabled: true,
-                allow_stream: true,
-                ..Default::default()
-            },
-            unsafe { GetCurrentProcessId() },
-            creation(unsafe { GetCurrentProcess() }).unwrap(),
-        );
-        let mut child = run_client(
-            &service,
-            r#"
-            Set-StrictMode -Version Latest
-            if (@(Get-GhosttyPickerDiagnostics -Server).Count -ne 0) { throw 'History should start empty' }
-            foreach ($i in 1..3) {
-                $value = [pscustomobject]@{Text="private-item-$i";Value='selected-value'} | Invoke-GhosttyPicker -DisplayProperty Text -ValueProperty Value
-                if ($value -ne 'selected-value') { throw 'Diagnostics polluted selected output' }
-            }
-            $local = @(Get-GhosttyPickerDiagnostics)
-            $remote = @(Get-GhosttyPickerDiagnostics -Server)
-            if ($local.Count -ne 3 -or $remote.Count -ne 3) { throw 'Missing timing history' }
-            for ($i=0; $i -lt 3; $i++) {
-                if ($local[$i].request_id -ne $remote[$i].request_id -or $local[$i].request_id -ne $local[$i].server_trace.request_id) { throw 'Correlation ID mismatch' }
-                if ($null -eq $local[$i].first_ack_ms -or $local[$i].total_ms -lt $local[$i].result_ms) { throw 'Missing client milestones' }
-            }
-            $serialized = ConvertTo-Json -InputObject $local -Depth 16 -Compress
-            if ($serialized -match 'private-item|selected-value' -or $serialized.Contains($env:GHOSTTY_PICKER_TOKEN)) { throw 'Timing history retained sensitive data' }
-            $endpoint = $env:GHOSTTY_PICKER_ENDPOINT
-            $env:GHOSTTY_PICKER_ENDPOINT = ''
-            foreach ($i in 1..70) { try { 'unavailable' | Invoke-GhosttyPicker } catch {} }
-            if (@(Get-GhosttyPickerDiagnostics -Last 64).Count -ne 64) { throw 'Client history is not bounded' }
-            $env:GHOSTTY_PICKER_ENDPOINT = $endpoint
-            if (@(Get-GhosttyPickerDiagnostics -Server).Count -ne 3) { throw 'Diagnostics query opened a picker' }
-            $serialized
-        "#,
-            &service.token,
-        );
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut opens = 0;
-        loop {
-            if let Ok(event) = service.events.recv_timeout(Duration::from_millis(20)) {
-                match event {
-                    Event::Open { session, .. } => {
-                        opens += 1;
-                        session.reply(json!({"type":"opened","request_id":session.id}));
-                    }
-                    Event::Items {
-                        sequence, session, ..
-                    } => session
-                        .reply(json!({"type":"ack","request_id":session.id,"sequence":sequence})),
-                    Event::End { session } => session.finish(
-                        "accepted",
-                        json!({"selected":[{"id":"0","value":"selected-value"}]}),
-                    ),
-                }
-            }
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                panic!("Diagnostics client stalled");
-            }
-        }
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let history: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(opens, 3);
-        assert_eq!(history.as_array().unwrap().len(), 3);
-        assert_eq!(history[0]["outcome"], "accepted");
-        assert!(
-            history[0]["server_trace"]["events"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|event| event["stage"] == "first_items_received")
-        );
     }
     #[test]
     fn wrong_token_never_reaches_picker_dispatch() {
@@ -1525,7 +1436,7 @@ fn serve(
     }
     send(
         pipe,
-        &json!({"type":"ready","version":1,"persistent":true,"diagnostics":true,"proof":hex(&proof(token,endpoint,&nonce,&client_nonce,"server")),"capabilities":{"named":policy.named,"stream":policy.allow_stream},"limits":{"max_frame_bytes":MAX_FRAME,"max_item_bytes":MAX_ITEM,"max_batch_items":1024,"max_items":MAX_ITEMS,"max_storage_bytes":MAX_STORAGE,"in_flight_batches":1}}),
+        &json!({"type":"ready","version":1,"persistent":true,"proof":hex(&proof(token,endpoint,&nonce,&client_nonce,"server")),"capabilities":{"named":policy.named,"stream":policy.allow_stream},"limits":{"max_frame_bytes":MAX_FRAME,"max_item_bytes":MAX_ITEM,"max_batch_items":1024,"max_items":MAX_ITEMS,"max_storage_bytes":MAX_STORAGE,"in_flight_batches":1}}),
         state,
     )?;
     struct Connected<'a>(&'a Shared);
@@ -1543,28 +1454,6 @@ fn serve(
         state.idle.store(true, Ordering::Release);
         let request = read(pipe, state, None, None)?;
         state.idle.store(false, Ordering::Release);
-        if let Message::Diagnostics { request_id } = &request {
-            authorize(pipe, client.0, state)?;
-            if !state.policy.lock().unwrap().enabled
-                || request_id.is_empty()
-                || request_id.len() > 128
-            {
-                return Err(Failure::Error);
-            }
-            let traces: Vec<_> = state
-                .history
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|trace| trace.snapshot())
-                .collect();
-            send(
-                pipe,
-                &json!({"type":"diagnostics","request_id":request_id,"traces":traces}),
-                state,
-            )?;
-            continue;
-        }
         let request_id = match &request {
             Message::Open { request_id, .. } => request_id.clone(),
             _ => return Err(Failure::Error),
@@ -1594,7 +1483,6 @@ fn serve_request(
     events: &Sender<Event>,
     request: Message,
 ) -> IoResult<()> {
-    let received = Instant::now();
     let Message::Open {
         request_id,
         request,
@@ -1605,22 +1493,12 @@ fn serve_request(
     if request_id.is_empty() || request_id.len() > 128 {
         return Err(Failure::Error);
     }
-    let trace = super::super::diagnostics::Trace::new(request_id.clone(), received);
     authorize(pipe, client, state)?;
-    trace.mark("security_checked", None);
-    {
-        let mut history = state.history.lock().unwrap();
-        if history.len() == super::super::diagnostics::HISTORY_LIMIT {
-            history.pop_front();
-        }
-        history.push_back(trace.clone());
-    }
     let permission = state.policy.lock().unwrap().authorize(&request);
     if let Err(message) = permission {
-        trace.mark("result_ready", None);
         send_reply(
             pipe,
-            &json!({"type":"result","request_id":request_id,"status":"error","code":"capability_denied","message":message,"server_trace":trace.snapshot()}),
+            &json!({"type":"result","request_id":request_id,"status":"error","code":"capability_denied","message":message}),
             state,
         )?;
         return Ok(());
@@ -1630,8 +1508,7 @@ fn serve_request(
         Open::Named { name, .. } => Capability::Named(name.clone()),
         Open::Stream { .. } => Capability::Stream,
     };
-    trace.mark("authorized", None);
-    let (session, rx) = Session::with_trace(request_id, trace);
+    let (session, rx) = Session::new(request_id);
     *state.active.lock().unwrap() = Some((session.clone(), capability));
     struct Disconnect<'a> {
         session: Arc<Session>,
@@ -1641,7 +1518,6 @@ fn serve_request(
     impl Drop for Disconnect<'_> {
         fn drop(&mut self) {
             self.session.cancelled.store(true, Ordering::Release);
-            self.session.trace.mark("request_released", None);
             self.active.lock().unwrap().take();
             self.context.request_repaint();
         }
@@ -1657,7 +1533,7 @@ fn serve_request(
             session: session.clone(),
         })
         .map_err(|_| Failure::Error)?;
-    state.wake_ui(session.trace.clone());
+    state.wake_ui();
     if wait_reply(pipe, state, &rx)? {
         return Ok(());
     }
@@ -1715,7 +1591,6 @@ fn serve_request(
                 sequence: received,
                 items,
             } if stream && !ended && request_id == session.id && received == sequence => {
-                session.trace.mark("first_items_received", None);
                 if items.is_empty() || items.len() > 1024 {
                     return Err(Failure::Error);
                 }
@@ -1767,7 +1642,7 @@ fn serve_request(
             continue;
         }
         events.try_send(event).map_err(|_| Failure::Error)?;
-        state.wake_ui(session.trace.clone());
+        state.wake_ui();
         if wait_reply(pipe, state, &rx)? {
             return Ok(());
         }

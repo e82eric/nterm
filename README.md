@@ -912,8 +912,8 @@ in order only after a successful return; errors discard them and are printed to
 stderr. App handles expire when the callback returns. Navigation requires an
 active snapshot; perform it before any action that returns to the live terminal.
 
-Windows uses `nfm_file_system` from `G:/src/RustWin32Host/nfm-file-system`; adjust
-that Cargo path on other machines. Filesystem pickers are currently Windows-only;
+Windows uses `nfm_file_system` from [npicker](https://github.com/e82eric/npicker),
+pinned to `de012392133660e8678c54afadefaadf1ec4c1b3`. Filesystem pickers are currently Windows-only;
 Linux support will use NFM when it becomes available. Filesystem scans do not
 capture or read terminal snapshots, and cancellation leaves existing copy mode intact.
 
@@ -984,7 +984,7 @@ requests are not queued. Returned paths are not automatically shell-quoted.
 
 See [PICKER-PIPE.md](PICKER-PIPE.md) and
 [Invoke-GhosttyPicker.ps1](Invoke-GhosttyPicker.ps1) for PSReadLine bindings,
-stream options, protocol limits, authentication, cancellation, and diagnostics.
+stream options, protocol limits, authentication and cancellation.
 Executable sources and command previews must be defined in allowlisted Lua
 pickers; clients cannot submit executable definitions. Custom OSC picker
 requests are no longer supported.
@@ -1107,8 +1107,9 @@ nonblank cell of the selected line. Escape returns to the originating mode.
 Results fill upward from the query, with the first result at the bottom.
 Arrow and page keys follow that visual direction; Ctrl+N moves to the next
 result in ranking order. Ctrl+P toggles the preview when configured.
-The sample currently uses the local `nfm_search_core` crate
-at `G:/src/RustWin32Host/nfm-search-core`; adjust its Cargo path on other machines.
+The sample uses `nfm_search_core` and the other NFM crates from
+[npicker](https://github.com/e82eric/npicker), pinned to
+`de012392133660e8678c54afadefaadf1ec4c1b3` in Cargo.toml.
 
 The picker imports Ghostty's resolved primary regular and bold fonts and uses the current
 terminal cell dimensions to size its text and rows, including zoom and DPI changes.

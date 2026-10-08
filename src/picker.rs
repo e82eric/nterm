@@ -1,6 +1,5 @@
 pub(crate) mod command;
 pub(crate) mod config;
-pub(crate) mod diagnostics;
 pub(crate) mod files;
 pub(crate) mod font;
 pub(crate) mod pipe;
@@ -101,12 +100,6 @@ impl Picker {
                 options.preview_visible,
             );
         }
-        self.shared
-            .set_search_wake_callback(Arc::new(move |timings| {
-                if !session.done() {
-                    diagnostics::record_search(&session.trace, &timings);
-                }
-            }));
     }
     pub(crate) fn bind_pipe_search_wake(
         &self,
@@ -121,14 +114,8 @@ impl Picker {
                 if session.done() {
                     return;
                 }
-                diagnostics::record_search(&session.trace, &timings);
                 if timings.first_matches_ready.is_some() {
-                    session.trace.mark("search_wake_queued", None);
-                    let _ = proxy.send_event(crate::app::UserEvent::PickerWake {
-                        window_id,
-                        trace: session.trace.clone(),
-                        search: true,
-                    });
+                    let _ = proxy.send_event(crate::app::UserEvent::PickerWake { window_id });
                 }
             }));
     }
@@ -148,7 +135,6 @@ impl Picker {
                         self.pipe_items.push(item);
                     }
                     publisher.publish();
-                    sender.trace.mark("first_items_published", None);
                     sender.reply(serde_json::json!({"type":"ack","request_id":sender.id,"sequence":sequence}));
                     ctx.request_repaint();
                 }
@@ -407,45 +393,22 @@ impl Picker {
             }
         }
         let appearance = self.appearance(ctx);
-        self.shared.set_report_double_click(
-            self.pipe_session.is_none()
-                && self
-                    .keys
-                    .iter()
-                    .any(|binding| binding.trigger == config::BindingTrigger::DoubleClick),
-        );
-        let mut binding_action = None;
-        if interactive && self.pipe_session.is_none() && !self.shared.keybinding_help_visible() {
-            ctx.input_mut(|input| {
-                let mut events = std::mem::take(&mut input.events).into_iter().peekable();
-                while let Some(event) = events.next() {
-                    let binding = if let egui::Event::Key { key, modifiers, .. } = &event {
-                        self.keys.iter().find(|binding| {
-                            binding.trigger == config::BindingTrigger::Key(*key)
-                                && crate::config::keybindings::same_mods(binding.mods, *modifiers)
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some(binding) = binding {
-                        let egui::Event::Key {
-                            pressed, repeat, ..
-                        } = event
-                        else {
-                            unreachable!()
-                        };
-                        if pressed && !repeat && binding_action.is_none() {
-                            binding_action = Some(binding.action.clone());
-                        }
-                        if pressed && matches!(events.peek(), Some(egui::Event::Text(_))) {
-                            events.next();
-                        }
-                    } else {
-                        input.events.push(event);
-                    }
-                }
-            });
-        }
+        self.shared.set_bindings(if self.pipe_session.is_none() {
+            self.keys
+                .iter()
+                .enumerate()
+                .map(|(action, binding)| nfm_egui::PickerBinding {
+                    trigger: match binding.trigger {
+                        config::BindingTrigger::Key(key) => nfm_egui::PickerTrigger::Key(key),
+                        config::BindingTrigger::DoubleClick => nfm_egui::PickerTrigger::DoubleClick,
+                    },
+                    modifiers: binding.mods,
+                    action,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        });
         if interactive && !self.shared.keybinding_help_visible() && self.source.is_scrollback() {
             if self.split_parent.is_some()
                 && ctx.input_mut(|input| {
@@ -487,65 +450,14 @@ impl Picker {
                 }
             }
         }
-        if interactive {
-            ctx.input_mut(|input| {
-                // egui-winit translates Ctrl+C into Copy; NFM expects the key.
-                for event in &mut input.events {
-                    if matches!(event, egui::Event::Copy) {
-                        *event = egui::Event::Key {
-                            key: egui::Key::C,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: egui::Modifiers::CTRL,
-                        };
-                    }
-                }
-            });
-        }
         self.shared.set_error(self.error.lock().unwrap().clone());
-        if let Some(session) = &self.pipe_session {
-            session.trace.mark("picker_frame_started", None);
-        }
         let output = self
             .shared
             .show(ctx, self.placement(bounds), &appearance, !interactive);
-        if let Some(session) = &self.pipe_session {
-            diagnostics::record_search(&session.trace, &self.shared.search_timings());
-            session.trace.mark("picker_frame_built", None);
-            if output.matched > 0 && !self.shared.keybinding_help_visible() {
-                session.trace.mark("first_results_frame_built", None);
-            }
-            if output.preview_rendered {
-                if let Some(preview) = &self.command_preview {
-                    preview.rendered(&session.trace, output.preview_selection);
-                }
-            }
-        }
-        // An accepted event owns its searched snapshot even after the control closes.
-        let selection = match &output.event {
-            Some(nfm_egui::PickerEvent::Accepted(selection))
-            | Some(nfm_egui::PickerEvent::DoubleClicked(selection))
-            | Some(nfm_egui::PickerEvent::CopyRequested(selection)) => Some(selection.clone()),
-            _ => self.shared.selection(),
-        };
-        if matches!(output.event, Some(nfm_egui::PickerEvent::DoubleClicked(_))) {
-            binding_action = self
-                .keys
-                .iter()
-                .find(|binding| binding.trigger == config::BindingTrigger::DoubleClick)
-                .map(|binding| binding.action.clone());
-        }
-        if output.event.is_none()
-            || matches!(output.event, Some(nfm_egui::PickerEvent::DoubleClicked(_)))
-        {
-            if let (Some(callback), Some(selection)) = (binding_action, selection.as_ref()) {
-                return self.invoke_callback(callback, selection.clone());
-            }
-        }
+        let selection = output.selection();
         if let Some(preview) = &mut self.command_preview {
             if output.preview_rect.is_some() && !self.shared.is_closed() {
-                if let Some(selection) = &selection {
+                if let Some(selection) = selection {
                     let value = self
                         .pipe_items
                         .get(selection.item.node_index)
@@ -569,9 +481,6 @@ impl Picker {
                         &value,
                         self.source.is_filesystem(),
                         &self.request_params,
-                        self.pipe_session
-                            .as_ref()
-                            .map(|session| session.trace.clone()),
                     );
                 }
             }
@@ -584,7 +493,10 @@ impl Picker {
                 None
             }
             Some(nfm_egui::PickerEvent::Accepted(selection)) => self.accept(selection),
-            Some(nfm_egui::PickerEvent::DoubleClicked(_)) => None,
+            Some(nfm_egui::PickerEvent::CustomAction { action, selection }) => self
+                .keys
+                .get(action)
+                .and_then(|binding| self.invoke_callback(binding.action.clone(), selection)),
             None => None,
         }
     }

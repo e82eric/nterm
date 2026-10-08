@@ -86,9 +86,6 @@ pub(crate) enum Message {
     Received {
         request_id: String,
     },
-    Diagnostics {
-        request_id: String,
-    },
 }
 
 pub(crate) enum Event {
@@ -108,26 +105,16 @@ pub(crate) enum Event {
 
 pub(crate) struct Session {
     pub id: String,
-    pub trace: Arc<super::diagnostics::Trace>,
     pub cancelled: AtomicBool,
     done: AtomicBool,
     replies: Sender<Value>,
 }
 impl Session {
-    #[cfg(test)]
     pub fn new(id: String) -> (Arc<Self>, Receiver<Value>) {
-        let trace = super::diagnostics::Trace::new(id.clone(), std::time::Instant::now());
-        Self::with_trace(id, trace)
-    }
-    pub fn with_trace(
-        id: String,
-        trace: Arc<super::diagnostics::Trace>,
-    ) -> (Arc<Self>, Receiver<Value>) {
         let (tx, rx) = crossbeam_channel::bounded(4);
         (
             Arc::new(Self {
                 id,
-                trace,
                 cancelled: AtomicBool::new(false),
                 done: AtomicBool::new(false),
                 replies: tx,
@@ -146,21 +133,12 @@ impl Session {
         {
             return;
         }
-        self.trace.mark("result_ready", None);
-        self.trace.mark(
-            match status {
-                "accepted" => "result_accepted",
-                "cancelled" => "result_cancelled",
-                _ => "result_error",
-            },
-            None,
-        );
-        let mut value = json!({"type":"result", "request_id":self.id, "status":status, "server_trace":self.trace.snapshot()});
+        let mut value = json!({"type":"result", "request_id":self.id, "status":status});
         if let (Some(dst), Some(src)) = (value.as_object_mut(), extra.as_object()) {
             dst.extend(src.clone());
         }
         if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() > MAX_FRAME) {
-            value = json!({"type":"result","request_id":self.id,"status":"error","code":"result_limit","message":"picker result exceeds 1 MiB","server_trace":self.trace.snapshot()});
+            value = json!({"type":"result","request_id":self.id,"status":"error","code":"result_limit","message":"picker result exceeds 1 MiB"});
         }
         self.reply(value);
     }

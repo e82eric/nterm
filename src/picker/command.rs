@@ -67,10 +67,6 @@ pub(crate) fn start(
         }
     };
     let mut spec = CommandSpec::new(program);
-    let trace = super::diagnostics::current();
-    if let Some(trace) = &trace {
-        spec.observer = Some(super::diagnostics::command_observer(trace.clone(), None));
-    }
     spec.arguments = args;
     spec.working_directory = cwd.map(std::path::PathBuf::from);
     spec.output_limit = 16 * 1024;
@@ -94,15 +90,6 @@ pub(crate) fn start(
     let control = CommandControl {
         cancelled,
         changed: Arc::new(move || {
-            if let Some(trace) = &trace {
-                use nfm_search_core::store::ItemsSource;
-                if budget_store
-                    .snapshot()
-                    .is_some_and(|snapshot| snapshot.len() > 0)
-                {
-                    trace.mark("command_first_items_published", None);
-                }
-            }
             if ipc {
                 use nfm_search_core::store::ItemsSource;
                 if let Some(snapshot) = budget_store.snapshot() {

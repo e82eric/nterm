@@ -71,9 +71,7 @@ during script load. Reloading the script preserves a healthy connection.
 Loading outside Ghostty defines the helper without attempting a pipe connection.
 Startup connection failures do not interrupt the profile; a later picker call
 tries again and reports any failure. `Disconnect-GhosttyPicker` also collects and
-closes a pending background connection. Startup connection/authentication timings
-are available as `$script:GhosttyPickerInitializationTimings` after synchronous
-loading or after the first call collects background initialization.
+closes a pending background connection.
 
 The helper opens one authenticated connection per PowerShell session during
 script loading. Selection, Escape, and timed cancellation end the request and retain
@@ -88,64 +86,6 @@ otherwise. To explicitly release the pane's connection slot:
 ```powershell
 Disconnect-GhosttyPicker
 ```
-
-Use `Invoke-GhosttyPicker -Verbose` for initialization, connection, authentication,
-open-response, and first-item-send timings. After the call,
-`$script:GhosttyPickerLastTimings` contains the same measurements and a `reused`
-flag. First-item time is measured from function entry; producer startup before
-entry and preview subprocess startup are not measured separately in those client
-fields (server traces measure preview processes). No request contents,
-credentials, or authentication proofs are included in diagnostics.
-
-## Timing diagnostics
-
-Timing collection is automatic and kept in memory. The PowerShell helper and
-each pane retain the most recent 64 requests. Client records include the existing
-wire `request_id`, UTC start time, connection reuse, initialization, connection,
-authentication, open response, first item send, first batch acknowledgment, input
-completion, result receipt, idle acknowledgment, total duration, and outcome.
-Failed and interrupted calls are retained too. `-Verbose` prefixes measurements
-with the request ID. These diagnostics do not write files unless you export them.
-
-After a slow picker, inspect or export recent calls:
-
-```powershell
-# Client timings with a server trace captured at the terminal result.
-Get-GhosttyPickerDiagnostics -Last 5 | ConvertTo-Json -Depth 16
-
-# Current server history, including cleanup events after result delivery.
-Get-GhosttyPickerDiagnostics -Server -Last 5 | ConvertTo-Json -Depth 16
-
-# Durations between server milestones for the last picker.
-$last = Get-GhosttyPickerDiagnostics -Last 1
-$last.request_id
-$last.server_trace.spans | Format-Table name, preview_id, duration_ms
-```
-
-Server traces include authorization, UI dispatch, definition resolution, first
-picker frame, first streamed items received/published, first results frame,
-command spawn start/completion, first stdout, and command completion. Each command
-preview gets a monotonic `preview_id` within its request and separate resolution,
-worker, spawn, first stdout, command completion, document-ready, and first frame
-milestones. Missing milestones remain absent (for example, a cancelled preview
-or a command with no stdout). Each trace retains up to 64 events, preserves startup
-milestones, and reports dropped older preview events as `dropped_events`.
-
-All event durations use a monotonic clock local to that process. Correlate client
-and server records by `request_id`; do not subtract timestamps across processes.
-`*_frame_built` measures completion of egui paint-command construction, not GPU
-presentation or the time pixels appear on screen. Command timings cover commands
-spawned by Ghostty/NFM. An arbitrary upstream PowerShell producer is observable
-only through the time until the client sends its first items; its executable
-launch before function entry is not measured separately.
-
-Diagnostics contain timing milestones, IDs, and outcomes; they do not retain
-command lines, item values, query text, credentials, or proofs. The server query
-uses the same authenticated connection and effective-identity/ancestry checks,
-requires the pipe to remain enabled, and does not open a picker. Query support
-is advertised with `diagnostics:true` in `ready`; the updated Ghostty binary is
-required. A terminal result includes `server_trace` when available. Serialize
-`-PassThruResult` with sufficient JSON depth (for example, `-Depth 16`).
 
 Example PSReadLine binding (append to your profile after dot-sourcing):
 
@@ -186,7 +126,7 @@ Handshake:
 2. Client sends `authenticate` with `version`, `client_nonce`, and `proof`.
 3. Server verifies the effective client token, process ancestry, and client proof.
 4. Server sends `ready` with `version`, server `proof`, capability policy, limits,
-   `diagnostics:true`, and `persistent:true` to advertise sequential connection reuse. The client
+   `persistent:true` to advertise sequential connection reuse. The client
    falls back to closing after each request when this field is absent.
 5. Client verifies the server proof before sending a picker request.
 
@@ -204,15 +144,6 @@ requests reuse authentication, but effective identity, process/shell ancestry,
 and current capabilities are checked again for every open. Request IDs are
 nonempty strings up to 128 bytes. The pane cannot be retargeted by the request.
 
-Between requests, a diagnostic query is allowed:
-
-```json
-{"type":"diagnostics","request_id":"diagnostic-query-id"}
-```
-
-The server replies with `type:"diagnostics"`, the same query ID, and `traces`.
-Each trace has its original picker request ID. This query is not a picker request
-and does not enter the request history or require a result/idle acknowledgment.
 
 ```json
 {"type":"open","request_id":"r1","request":{"kind":"named","name":"files","params":{"cwd":"G:\\src"}}}
@@ -364,14 +295,6 @@ References: [pipe ACLs](https://learn.microsoft.com/en-us/windows/win32/ipc/name
 Pipe requests and search-result updates now wake the native window event loop
 and request a redraw directly. Egui repaint requests remain as a fallback.
 GPU presentation keeps its existing pacing.
-
-The server trace separates `pipe_wake_delivery`, `pipe_wake_to_redraw`, and
-`redraw_to_ui`. Search milestones distinguish session startup, the first nonempty
-source snapshot, worker results becoming ready, and the UI taking those results.
-`search_worker_to_snapshot` includes waiting for source data; it is not purely
-search CPU time. `search_results_to_ui_pickup` and `search_wake_delivery` help
-identify UI scheduling delays. Security timing now starts at receipt of the open
-message, before authorization, rather than after the security checks.
 
 To compare a new authenticated connection per request with connection reuse:
 

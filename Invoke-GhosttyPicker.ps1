@@ -13,48 +13,6 @@ if (-not ($ExecutionContext.SessionState.PSVariable.Get('script:GhosttyPickerCon
     $script:GhosttyPickerConnection = $null
 }
 
-if (-not ($ExecutionContext.SessionState.PSVariable.Get('script:GhosttyPickerDiagnosticsHistory'))) {
-    $script:GhosttyPickerDiagnosticsHistory = [System.Collections.Generic.List[object]]::new()
-}
-
-function Get-GhosttyPickerDiagnostics {
-    [CmdletBinding()]
-    param([ValidateRange(1,64)][int]$Last=10, [switch]$Server)
-    if (-not $Server) {
-        $script:GhosttyPickerDiagnosticsHistory | Select-Object -Last $Last
-        return
-    }
-    Initialize-GhosttyPickerClient
-    $connection = $script:GhosttyPickerConnection
-    if ($null -eq $connection -or -not $connection.Client.IsAlive -or
-        $connection.Endpoint -ne $env:GHOSTTY_PICKER_ENDPOINT -or $connection.Token -ne $env:GHOSTTY_PICKER_TOKEN) {
-        Disconnect-GhosttyPicker
-        $connection = & $script:GhosttyPickerConnectScript $script:GhosttyPickerClientSource $env:GHOSTTY_PICKER_ENDPOINT $env:GHOSTTY_PICKER_TOKEN
-        if ($null -eq $connection) { throw 'Run server diagnostics inside a Ghostty shell.' }
-        Save-GhosttyPickerInitialConnection $connection
-    }
-    if (-not $connection.ContainsKey('SupportsDiagnostics') -or -not $connection.SupportsDiagnostics) { throw 'This Ghostty build does not support pipe timing diagnostics.' }
-    $client = $connection.Client
-    $id = [guid]::NewGuid().ToString('N')
-    $acquired = $false
-    try {
-        $client.BeginRequest($id)
-        $acquired = $true
-        $client.Send((ConvertTo-Json -Compress @{type='diagnostics';request_id=$id}))
-        $deadline = [datetime]::UtcNow.AddSeconds(10)
-        while ([datetime]::UtcNow -lt $deadline) {
-            $raw = $client.Next(100)
-            if ($null -eq $raw) { continue }
-            $reply = ConvertFrom-Json -AsHashtable $raw
-            if ($reply.type -ne 'diagnostics' -or $reply.request_id -ne $id) { throw 'Unexpected timing diagnostics response.' }
-            $reply.traces | Select-Object -Last $Last
-            return
-        }
-        throw 'Timed out retrieving server diagnostics.'
-    } catch { if ($acquired) { $client.Dispose() }; throw }
-    finally { if ($acquired) { $client.EndRequest() } }
-}
-
 function Disconnect-GhosttyPicker {
     [CmdletBinding()]
     param()
@@ -215,7 +173,6 @@ $script:GhosttyPickerConnectScript = {
     }
     if (-not $Endpoint -or -not $Token) { return }
     $client = $null
-    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     function Receive-AuthenticationMessage {
         $deadline = [datetime]::UtcNow.AddSeconds(10)
         while ([datetime]::UtcNow -lt $deadline) {
@@ -233,8 +190,6 @@ $script:GhosttyPickerConnectScript = {
     }
     try {
         $client = [GhosttyPickerPipeV2]::new($Endpoint)
-        $connectionMs = [math]::Round($clock.Elapsed.TotalMilliseconds, 2)
-        $phase = $clock.Elapsed.TotalMilliseconds
         $challenge = Receive-AuthenticationMessage
         if ($challenge.type -ne 'challenge' -or $challenge.version -ne 1 -or $challenge.nonce -notmatch '^[0-9a-f]{64}$') {
             throw 'Invalid picker authentication challenge.'
@@ -249,9 +204,6 @@ $script:GhosttyPickerConnectScript = {
         @{
             Client=$client; Endpoint=$Endpoint; Token=$Token
             Persistent=($ready.ContainsKey('persistent') -and $ready.persistent -eq $true)
-            SupportsDiagnostics=($ready.ContainsKey('diagnostics') -and $ready.diagnostics -eq $true)
-            ConnectionMs=$connectionMs
-            AuthenticationMs=[math]::Round($clock.Elapsed.TotalMilliseconds - $phase, 2)
         }
         $client = $null # Ownership passes to the caller or background output.
     } finally { if ($null -ne $client) { $client.Dispose() } }
@@ -262,9 +214,6 @@ function Save-GhosttyPickerInitialConnection($Connection) {
     if (-not $script:GhosttyPickerFreshConnection -and $Connection.Persistent -and $Connection.Endpoint -eq $env:GHOSTTY_PICKER_ENDPOINT -and
         $Connection.Token -eq $env:GHOSTTY_PICKER_TOKEN -and $Connection.Client.IsAlive) {
         $script:GhosttyPickerConnection = $Connection
-        $script:GhosttyPickerInitializationTimings = [pscustomobject]@{
-            connection_ms=$Connection.ConnectionMs; authentication_ms=$Connection.AuthenticationMs
-        }
     } else { $Connection.Client.Dispose() }
 }
 
@@ -333,53 +282,17 @@ function Invoke-GhosttyPicker {
         $client = $null
         $requestComplete = $false
         $persistent = $false
-        $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        $recordState = @{saved=$false}
         $result = $null
         $batch = [System.Collections.Generic.List[object]]::new()
         $sequence = 0L
         $nextId = 0L
         $originals = [System.Collections.Generic.Dictionary[string,object]]::new()
         $requestId = [guid]::NewGuid().ToString('N')
-        $timings = [ordered]@{
-            request_id=$requestId; started_utc=[datetime]::UtcNow.ToString('O')
-            reused=$false; fresh_connection=[bool]$FreshConnection; initialization_ms=0; connection_ms=0; authentication_ms=0
-            open_ms=0; first_items_ms=$null; first_ack_ms=$null; input_complete_ms=$null
-            result_ms=$null; idle_ms=$null; total_ms=$null; outcome='pending'; server_trace=$null
-        }
-        function Save-PickerDiagnostics {
-            if ($recordState.saved) { return }
-            $recordState.saved = $true
-            $timings.total_ms = [math]::Round($clock.Elapsed.TotalMilliseconds, 2)
-            $entry = [pscustomobject]$timings
-            $script:GhosttyPickerLastTimings = $entry
-            if ($script:GhosttyPickerDiagnosticsHistory.Count -ge 64) { $script:GhosttyPickerDiagnosticsHistory.RemoveAt(0) }
-            $script:GhosttyPickerDiagnosticsHistory.Add($entry)
-        }
-        function Observe-PickerResponse($message) {
-            $elapsed = [math]::Round($clock.Elapsed.TotalMilliseconds, 2)
-            switch ($message.type) {
-                ack { if ($null -eq $timings.first_ack_ms) { $timings.first_ack_ms = $elapsed } }
-                input_complete { $timings.input_complete_ms = $elapsed }
-                result {
-                    $timings.result_ms = $elapsed
-                    $timings.outcome = $message.status
-                    if ($message.ContainsKey('server_trace')) { $timings.server_trace = $message.server_trace }
-                }
-                idle { $timings.idle_ms = $elapsed }
-            }
-        }
         $endpoint = $env:GHOSTTY_PICKER_ENDPOINT
         if (-not $endpoint -or -not $env:GHOSTTY_PICKER_TOKEN) {
-            $timings.outcome = 'unavailable'
-            Save-PickerDiagnostics
             throw 'Run this function inside a newly launched Ghostty shell with picker pipe support.'
         }
         function Send-PickerMessage($message) {
-            if ($message.type -eq 'items' -and $null -eq $timings.first_items_ms) {
-                $timings.first_items_ms = [math]::Round($clock.Elapsed.TotalMilliseconds, 2)
-                Write-Verbose "[$requestId] Picker first items: $($timings.first_items_ms) ms since invocation."
-            }
             $client.Send((ConvertTo-Json -InputObject $message -Depth 32 -Compress))
         }
         function Receive-PickerMessage([int] $timeoutSeconds = 0) {
@@ -395,7 +308,6 @@ function Invoke-GhosttyPicker {
                     if ($message.type -in @('opened', 'ack', 'input_complete', 'result', 'idle') -and $message.request_id -ne $requestId) {
                         throw 'Picker response belongs to a different request.'
                     }
-                    Observe-PickerResponse $message
                     if ($message.type -eq 'result') {
                         $client.EndRequest()
                         Send-PickerMessage @{ type='received'; request_id=$requestId }
@@ -415,21 +327,17 @@ function Invoke-GhosttyPicker {
         }
         try {
             Initialize-GhosttyPickerClient
-            $timings.initialization_ms = [math]::Round($clock.Elapsed.TotalMilliseconds, 2)
             if ($FreshConnection) { Disconnect-GhosttyPicker }
             $cached = $script:GhosttyPickerConnection
             if ($null -ne $cached -and $cached.Endpoint -eq $endpoint -and
                 $cached.Token -eq $env:GHOSTTY_PICKER_TOKEN -and $cached.Client.IsAlive) {
                 $client = $cached.Client
                 $persistent = $true
-                $timings.reused = $true
             } else {
                 Disconnect-GhosttyPicker
                 $connection = & $script:GhosttyPickerConnectScript $script:GhosttyPickerClientSource $endpoint $env:GHOSTTY_PICKER_TOKEN
                 $client = $connection.Client
                 $persistent = $connection.Persistent
-                $timings.connection_ms = $connection.ConnectionMs
-                $timings.authentication_ms = $connection.AuthenticationMs
                 if ($persistent -and -not $FreshConnection) { $script:GhosttyPickerConnection = $connection }
             }
             $client.BeginRequest($requestId)
@@ -444,18 +352,12 @@ function Invoke-GhosttyPicker {
                     @{ kind='stream'; options=$streamOptions }
                 }
             }
-            $phase = $clock.Elapsed.TotalMilliseconds
             Send-PickerMessage @{ type='open'; request_id=$requestId; request=$request }
             $reply = Receive-PickerMessage 15
-            $timings.open_ms = [math]::Round($clock.Elapsed.TotalMilliseconds - $phase, 2)
-            $script:GhosttyPickerLastTimings = [pscustomobject]$timings
-            Write-Verbose "[$requestId] Picker reused=$($timings.reused); initialize=$($timings.initialization_ms) ms; connect=$($timings.connection_ms) ms; authenticate=$($timings.authentication_ms) ms; open=$($timings.open_ms) ms."
             if ($reply.type -eq 'result') { $result = $reply }
             elseif ($reply.type -ne 'opened') { throw 'Unexpected picker open response.' }
             if ($CancelAfterSeconds -and $null -eq $result) { $client.CancelAfter($requestId, $CancelAfterSeconds * 1000) }
         } catch {
-            if ($timings.outcome -eq 'pending') { $timings.outcome = 'transport_error' }
-            Save-PickerDiagnostics
             if ($null -ne $client) { $client.Dispose() }
             throw
         }
@@ -467,7 +369,6 @@ function Invoke-GhosttyPicker {
                 if ($null -ne $raw) {
                     $reply = ConvertFrom-Json -InputObject $raw -AsHashtable
                     if ($reply.type -ne 'result' -or $reply.request_id -ne $requestId) { throw 'Unexpected picker response during streaming.' }
-                    Observe-PickerResponse $reply
                     $client.EndRequest()
                     Send-PickerMessage @{ type='received'; request_id=$requestId }
                     $result = $reply
@@ -481,8 +382,6 @@ function Invoke-GhosttyPicker {
                     if ($batch.Count -ge 8) { $result = Flush-PickerItems; $sequence++ }
                 }
             } catch {
-                if ($timings.outcome -eq 'pending') { $timings.outcome = 'transport_error' }
-                Save-PickerDiagnostics
                 $client.Dispose()
                 throw
             }
@@ -508,7 +407,6 @@ function Invoke-GhosttyPicker {
             }
             $client.EndRequest()
             $requestComplete = $true
-            $script:GhosttyPickerLastTimings = [pscustomobject]$timings
             if ($result.status -eq 'error') { throw "Picker request failed ($($result.code)): $($result.message)" }
             if ($PassThruResult) { $result }
             elseif ($result.status -eq 'accepted') {
@@ -519,16 +417,10 @@ function Invoke-GhosttyPicker {
                 }
             }
         } finally {
-            if ($timings.outcome -eq 'pending') { $timings.outcome = 'interrupted' }
-            Save-PickerDiagnostics
             if ($null -ne $client -and ($FreshConnection -or -not $persistent -or -not $requestComplete)) { $client.Dispose() }
         }
     }
     clean {
-        if (-not $recordState.saved) {
-            if ($timings.outcome -eq 'pending') { $timings.outcome = 'interrupted' }
-            Save-PickerDiagnostics
-        }
         if ($null -ne $client -and ($FreshConnection -or -not $persistent -or -not $requestComplete)) { $client.Dispose() }
     }
 }

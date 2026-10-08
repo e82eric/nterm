@@ -182,11 +182,7 @@ pub(crate) enum UserEvent {
     Repaint(Instant),
     GhosttyWake,
     FrameReady(winit::window::WindowId),
-    PickerWake {
-        window_id: winit::window::WindowId,
-        trace: Arc<crate::picker::diagnostics::Trace>,
-        search: bool,
-    },
+    PickerWake { window_id: winit::window::WindowId },
 }
 
 struct NativeApp {
@@ -248,14 +244,8 @@ impl NativeWindow {
     }
 
     fn redraw(&mut self) -> Result<(), FatalError> {
-        self.shell
-            .as_ref()
-            .expect("terminal shell")
-            .terminal
-            .mark_pipe_timing("redraw_started");
         self.gl_window.make_current()?;
         let shell = self.shell.as_mut().expect("terminal shell");
-        shell.terminal.mark_pipe_timing("ui_frame_started");
         let (output, changed) = self
             .egui
             .run(self.gl_window.window(), |ui| shell.ui(ui, &self.gl));
@@ -529,19 +519,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             return;
         }
         match event {
-            UserEvent::PickerWake {
-                window_id,
-                trace,
-                search,
-            } => {
-                trace.mark(
-                    if search {
-                        "search_wake_handled"
-                    } else {
-                        "pipe_wake_handled"
-                    },
-                    None,
-                );
+            UserEvent::PickerWake { window_id } => {
                 if let Some(window) = self.windows.get_mut(&window_id) {
                     // Service queued work immediately; only GPU presentation is paced.
                     window.gl_window.window().request_redraw();

@@ -267,14 +267,6 @@ extern "C" fn ghostty_egui_theme_colors(
 }
 
 impl TerminalPane {
-    pub(super) fn mark_pipe_timing(&self, stage: &'static str) {
-        #[cfg(windows)]
-        if let Some(pipe) = &self.wake.pipe {
-            pipe.mark_active(stage);
-        }
-        #[cfg(not(windows))]
-        let _ = stage;
-    }
     pub(super) fn show_error(&mut self, title: &str, error: String) {
         crate::error_log::error("terminal", title, &error);
         self.toasts.push_error(title.into(), error, 10000);
@@ -1329,7 +1321,6 @@ impl TerminalPane {
             };
             match event {
                 Event::Open { request, session } => {
-                    session.trace.mark("ui_dispatched", None);
                     if session.cancelled.load(Ordering::Acquire) {
                         continue;
                     }
@@ -1348,7 +1339,6 @@ impl TerminalPane {
                         );
                         continue;
                     }
-                    session.trace.mark("definition_resolution_started", None);
                     let (entry, params) = match &request {
                         Open::Named { name, params } => (
                             bindings
@@ -1372,9 +1362,6 @@ impl TerminalPane {
                     };
                     let mut params = params.unwrap_or_default();
                     params.insert("__ipc_request".into(), "1".into());
-                    session.trace.mark("definition_resolution_finished", None);
-                    let _timing_scope =
-                        crate::picker::diagnostics::Scope::enter(session.trace.clone());
                     self.open_picker(ctx, entry, Some(params), bindings, has_floating);
                     if let Some(picker) = &mut self.picker {
                         picker.attach_pipe(
@@ -1386,7 +1373,6 @@ impl TerminalPane {
                             },
                         );
                         picker.bind_pipe_search_wake(self.wake.proxy.clone(), self.wake.window_id);
-                        session.trace.mark("picker_created", None);
                         session.reply(serde_json::json!({"type":"opened","request_id":session.id}));
                     } else {
                         session.finish("error",serde_json::json!({"code":"open_failed","message":"unable to open picker"}));

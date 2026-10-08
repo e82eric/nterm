@@ -126,12 +126,6 @@ impl TerminalView {
         }
         acquired
     }
-    pub(crate) fn mark_pipe_timing(&self, stage: &'static str) {
-        self.main.mark_pipe_timing(stage);
-        for floating in &self.floating.entries {
-            floating.pane.mark_pipe_timing(stage);
-        }
-    }
 
     fn pane_mut(&mut self, id: Option<u64>) -> Option<&mut TerminalPane> {
         match id {

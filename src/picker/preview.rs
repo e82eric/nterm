@@ -388,22 +388,10 @@ fn highlight_scrollback(
 pub(crate) struct CommandPreview {
     source: super::config::Preview,
     key: Option<(usize, String, String)>,
-    cycle: u64,
-    document_key: Option<(u64, usize)>,
 }
 impl CommandPreview {
     pub(crate) fn new(source: super::config::Preview) -> Self {
-        Self {
-            source,
-            key: None,
-            cycle: 0,
-            document_key: None,
-        }
-    }
-    pub fn rendered(&self, trace: &super::diagnostics::Trace, key: Option<(u64, usize)>) {
-        if key.is_some() && key.map(|key| key.1) == self.document_key.map(|key| key.1) {
-            trace.mark("preview_frame_built", Some(self.cycle));
-        }
+        Self { source, key: None }
     }
     pub(super) fn prepare(
         &mut self,
@@ -413,19 +401,12 @@ impl CommandPreview {
         value: &str,
         filesystem: bool,
         params: &std::collections::BTreeMap<String, String>,
-        trace: Option<Arc<super::diagnostics::Trace>>,
     ) {
         let key = (selection.index, selection.text.clone(), value.to_owned());
         if self.key.as_ref() == Some(&key) {
             return;
         }
         self.key = Some(key);
-        self.cycle += 1;
-        let cycle = self.cycle;
-        self.document_key = Some((selection.source_version, selection.index));
-        if let Some(trace) = &trace {
-            trace.mark("preview_requested", Some(cycle));
-        }
         let super::config::Preview::Command {
             args,
             cwd,
@@ -448,10 +429,6 @@ impl CommandPreview {
             }))
         };
         let expected_index = selection.index;
-        if let Some(trace) = &trace {
-            trace.mark("preview_resolved", Some(cycle));
-        }
-        let command_trace = trace.clone();
         let expected_text = selection.text.clone();
         let provider = nfm_egui::byte_preview::BytePreviewProvider::new(
             move |selected: &nfm_egui::Selection<super::source::Candidate>, cancel| {
@@ -461,9 +438,6 @@ impl CommandPreview {
                 if selected.index != expected_index || selected.text != expected_text {
                     return Err("Preview command is being resolved".into());
                 }
-                if let Some(trace) = &command_trace {
-                    trace.mark("preview_worker_started", Some(cycle));
-                }
                 let result = match &resolved {
                     Ok(Some(spec)) => {
                         let program = spec
@@ -471,12 +445,6 @@ impl CommandPreview {
                             .first()
                             .ok_or("preview command requires an executable")?;
                         let mut command = nfm_egui::byte_preview::CommandSpec::new(program);
-                        if let Some(trace) = &command_trace {
-                            command.observer = Some(super::diagnostics::command_observer(
-                                trace.clone(),
-                                Some(cycle),
-                            ));
-                        }
                         command.arguments = spec.args[1..].to_vec();
                         command.working_directory = spec.cwd.as_ref().map(std::path::PathBuf::from);
                         command.output_limit = max_bytes;
@@ -504,62 +472,9 @@ impl CommandPreview {
             },
         );
         let provider = provider.with_limits(max_bytes, max_scrollback_lines);
-        if let Some(trace) = trace {
-            shared.set_preview_provider(
-                ctx,
-                Arc::new(MeasuredPreview {
-                    provider,
-                    trace,
-                    cycle,
-                }),
-            );
-        } else {
-            shared.set_preview_provider(ctx, Arc::new(provider));
-        }
+        shared.set_preview_provider(ctx, Arc::new(provider));
         shared.set_external_preview(false);
         ctx.request_repaint();
-    }
-}
-
-struct MeasuredPreview {
-    provider: nfm_egui::byte_preview::BytePreviewProvider<super::source::Candidate>,
-    trace: Arc<super::diagnostics::Trace>,
-    cycle: u64,
-}
-impl nfm_egui::PreviewProvider<super::source::Candidate> for MeasuredPreview {
-    fn preview(
-        &self,
-        request: nfm_egui::PreviewRequest<super::source::Candidate>,
-        cancel: nfm_egui::Cancellation,
-    ) -> Result<nfm_egui::Preview, String> {
-        self.preview_viewport(request, cancel)
-            .map(|page| page.document)
-    }
-    fn preview_viewport(
-        &self,
-        request: nfm_egui::PreviewRequest<super::source::Candidate>,
-        cancel: nfm_egui::Cancellation,
-    ) -> Result<nfm_egui::preview::PreviewViewport, String> {
-        let result = self.provider.preview_viewport(request, cancel);
-        self.trace.mark(
-            if result.is_ok() {
-                "preview_document_ready"
-            } else {
-                "preview_failed"
-            },
-            Some(self.cycle),
-        );
-        result
-    }
-    fn copy_document(
-        &self,
-        version: u64,
-        index: usize,
-    ) -> Result<Option<Arc<dyn nfm_egui::copy_document::CopyDocument>>, String> {
-        self.provider.copy_document(version, index)
-    }
-    fn page_step(&self, rows: usize) -> usize {
-        self.provider.page_step(rows)
     }
 }
 

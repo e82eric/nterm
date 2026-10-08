@@ -4,97 +4,6 @@ use nfm_search_core::{
 };
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
-#[test]
-fn pipe_timing_trace_covers_command_first_results_and_current_preview_frame() {
-    let ctx = egui::Context::default();
-    let trace = diagnostics::Trace::new("timing-correlation".into(), Instant::now());
-    let scope = diagnostics::Scope::enter(trace.clone());
-    let mut picker = Picker::start(
-        std::ptr::null_mut(),
-        None,
-        false,
-        0,
-        ctx.clone(),
-        config::Options {
-            source: config::Source::Command(config::CommandOptions {
-                args: vec![
-                    "cmd.exe".into(),
-                    "/d".into(),
-                    "/c".into(),
-                    "echo timing-item".into(),
-                ],
-                cwd: None,
-                line_continuation: None,
-                unique: false,
-                success_exit_codes: None,
-            }),
-            preview: Some(config::Preview::Command {
-                args: vec![
-                    "cmd.exe".into(),
-                    "/d".into(),
-                    "/c".into(),
-                    "echo preview-timing".into(),
-                ],
-                cwd: None,
-                command: None,
-                max_bytes: None,
-                max_scrollback_lines: None,
-            }),
-            preview_visible: true,
-            ..Default::default()
-        },
-    );
-    drop(scope);
-    let (session, _rx) = pipe::Session::with_trace("timing-correlation".into(), trace.clone());
-    picker.attach_pipe(&ctx, session, None);
-    wait_preview_rendered_text(&ctx, &mut picker, "preview-timing");
-    // Attaching after worker completion still wakes the host with existing results.
-    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
-    picker
-        .shared
-        .set_search_wake_callback(Arc::new(move |timings| {
-            wake_tx.send(timings).unwrap();
-        }));
-    let timings = wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert!(timings.started.unwrap() <= timings.first_snapshot_ready.unwrap());
-    assert!(timings.first_snapshot_ready.unwrap() <= timings.first_matches_ready.unwrap());
-    assert!(timings.first_matches_ready.unwrap() <= timings.first_matches_taken.unwrap());
-    let snapshot = trace.snapshot();
-    let events = snapshot["events"].as_array().unwrap();
-    for stage in [
-        "command_spawn_started",
-        "command_spawned",
-        "command_first_stdout",
-        "command_first_items_published",
-        "picker_frame_built",
-        "first_results_frame_built",
-        "search_started",
-        "search_snapshot_ready",
-        "search_matches_ready",
-        "search_matches_taken",
-        "preview_requested",
-        "preview_spawned",
-        "preview_first_stdout",
-        "preview_process_finished",
-        "preview_document_ready",
-        "preview_frame_built",
-    ] {
-        assert!(
-            events.iter().any(|event| event["stage"] == stage),
-            "missing {stage}: {snapshot}"
-        );
-    }
-    assert_eq!(snapshot["request_id"], "timing-correlation");
-    assert!(
-        snapshot["spans"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|span| span["name"] == "preview_prepare_to_frame")
-    );
-}
-
 #[test]
 fn pipe_stream_publishes_before_end_and_returns_value_without_pasting() {
     let ctx = egui::Context::default();
@@ -646,14 +555,19 @@ fn picker_local_lua_key_receives_selection_without_closing() {
         action: callback,
     });
     wait_selection(&ctx, &mut picker);
+    let query = picker.shared.query().to_owned();
     let (action, _) = frame(
         &ctx,
         &mut picker,
-        vec![key(egui::Key::Enter, egui::Modifiers::CTRL)],
+        vec![
+            key(egui::Key::Enter, egui::Modifiers::CTRL),
+            egui::Event::Text("x".into()),
+        ],
     );
     let Some(Action::Custom(callback, text, filesystem, range, value, params)) = action else {
         panic!("missing callback");
     };
+    assert_eq!(picker.shared.query(), query);
     assert!(!picker.shared.is_closed());
     let commands = callback
         .call_with_selection(
@@ -669,6 +583,25 @@ fn picker_local_lua_key_receives_selection_without_closing() {
     assert!(
         matches!(&commands[..], [crate::lua_callbacks::Command::ClosePicker, crate::lua_callbacks::Command::Paste(text)] if text == "inserted value")
     );
+    let mut repeat = key(egui::Key::Enter, egui::Modifiers::CTRL);
+    if let egui::Event::Key { repeat, .. } = &mut repeat {
+        *repeat = true;
+    }
+    assert!(
+        frame(
+            &ctx,
+            &mut picker,
+            vec![repeat, egui::Event::Text("x".into())]
+        )
+        .0
+        .is_none()
+    );
+    assert_eq!(picker.shared.query(), query);
+    let mut release = key(egui::Key::Enter, egui::Modifiers::CTRL);
+    if let egui::Event::Key { pressed, .. } = &mut release {
+        *pressed = false;
+    }
+    assert!(frame(&ctx, &mut picker, vec![release]).0.is_none());
     let (action, _) = frame(
         &ctx,
         &mut picker,
