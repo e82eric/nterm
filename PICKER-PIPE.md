@@ -7,6 +7,52 @@ implemented here.
 
 ## Enable and test
 
+For a portable set of PowerShell bindings, see [profile.example.ps1](profile.example.ps1).
+Use `ghostty.example.lua`, or merge these entries into your Lua configuration
+(preserving any existing pickers and permissions):
+
+```lua
+picker_pipe = {
+  enabled = true,
+  allow_stream = true,
+  named = { "ProfileFiles", "ProfileDirectories" },
+},
+pickers = {
+  ProfileFiles = {
+    type = "FileSystem", roots = { "." }, files_only = true,
+    position = "Cursor", preview_visible = false,
+  },
+  ProfileDirectories = {
+    type = "FileSystem", roots = { "." }, directories_only = true,
+    position = "Cursor", preview_visible = false,
+  },
+},
+```
+
+Then add this to your PowerShell `$PROFILE`, replacing the path:
+
+```powershell
+. 'C:\path\to\ghostty2\example\rust-egui-terminal\profile.example.ps1' -PickerRoots @('C:\your\projects')
+```
+
+The helper is loaded relative to the example script. Omit `-PickerRoots` to use
+the directory where the profile loads. Ctrl+T/Ctrl+O search files/directories
+under the current directory; Alt+T/Alt+O use the configured roots. Alt+R searches
+PSReadLine's saved history, Ctrl+Shift+G searches with `rg` and inserts an `nvim`
+command for review, and Ctrl+Space opens PowerShell completions. Customize the
+editor command and shortcuts as needed; dot-sourcing replaces those bindings.
+
+PowerShell 7.3+ and PSReadLine are required. Ripgrep is optional for text search,
+and `fzf` on `PATH` enables the fallback outside Ghostty. File and directory
+bindings use Ghostty's builtin FileWalker through the named FileSystem pickers,
+passing the selected roots and current directory. Outside Ghostty they enumerate
+with `Get-ChildItem`; no `fd` or custom history-reader executable is required.
+History, text search, and completions use streamed requests and collect candidates
+before opening the picker. Command previews are optional in `ghostty.example.lua`.
+Fresh connections avoid retaining the pane's connection slot between requests;
+profile initialization still connects until the first request completes. Run
+`Disconnect-GhosttyPicker` before starting another PowerShell process in that pane.
+
 Add this to the table returned by your Ghostty Lua configuration:
 
 ```lua

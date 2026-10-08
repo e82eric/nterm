@@ -159,6 +159,14 @@ filename in Messages and starts with defaults for Lua settings, without falling
 back to another file. A persistent configuration indicator remains until restart.
 See `ghostty.lua` in this example for a starting configuration:
 
+[ghostty.example.lua](ghostty.example.lua) is an extended Windows sample with
+custom picker callbacks, command previews, snippets, and a Codex suggestion
+picker. Its filesystem roots default to `.` and tools are resolved from `PATH`.
+Read its header for dependencies and optional integrations. Snippets use
+`GHOSTTY_SNIPPETS_FILE` or `~/ghostty-snippets.json`; initialize the file with
+`{"snippets": []}`. The Codex picker sends terminal context to `codex exec`.
+Run it with `--lua-config=example/rust-egui-terminal/ghostty.example.lua`.
+
 ```powershell
 .\zig-out\bin\ghostty_egui.exe --lua-config=example/rust-egui-terminal/ghostty.lua
 ```
@@ -985,6 +993,8 @@ requests are not queued. Returned paths are not automatically shell-quoted.
 See [PICKER-PIPE.md](PICKER-PIPE.md) and
 [Invoke-GhosttyPicker.ps1](Invoke-GhosttyPicker.ps1) for PSReadLine bindings,
 stream options, protocol limits, authentication and cancellation.
+For a portable PowerShell profile with file, directory, history, text-search,
+and completion bindings, see [profile.example.ps1](profile.example.ps1).
 Executable sources and command previews must be defined in allowlisted Lua
 pickers; clients cannot submit executable definitions. Custom OSC picker
 requests are no longer supported.
