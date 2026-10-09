@@ -164,6 +164,75 @@ fn lua_preview_worker_cancels_busy_lua_and_retains_helpers_and_closures() {
 }
 
 #[test]
+fn dynamic_preview_survives_stream_publications_before_completion() {
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::Items(config::ItemsOptions {
+                values: Vec::new(),
+                provider: None,
+            }),
+            preview: Some(config::Preview::Dynamic {
+                resolve: Some(worker_resolver(
+                    "function(item) calls=(calls or 0)+1; return {type='Text',text='preview call '..calls} end",
+                )),
+                max_bytes: None,
+                max_scrollback_lines: None,
+            }),
+            sort: config::Sort::SourceOrder,
+            ..Default::default()
+        },
+    );
+    let (session, rx) = pipe::Session::new("preview-stream-test".into());
+    picker.attach_pipe(
+        &ctx,
+        session.clone(),
+        Some(&pipe::StreamOptions {
+            preview_visible: true,
+            ..Default::default()
+        }),
+    );
+    for sequence in 0..4 {
+        let previous_version = picker.shared.selection().map(|s| s.source_version);
+        picker.pipe_event(
+            &ctx,
+            pipe::Event::Items {
+                sequence,
+                items: vec![pipe::Item {
+                    id: format!("item-{sequence}"),
+                    text: format!("item {sequence}"),
+                    value: serde_json::json!(format!("value-{sequence}")),
+                }],
+                session: session.clone(),
+            },
+        );
+        assert_eq!(rx.try_recv().unwrap()["type"], "ack");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            frame(&ctx, &mut picker, Vec::new());
+            if picker
+                .shared
+                .selection()
+                .is_some_and(|s| Some(s.source_version) != previous_version)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stream publication was not displayed"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        wait_preview_rendered_text(&ctx, &mut picker, "preview call 1");
+    }
+}
+
+#[test]
 fn pipe_stream_publishes_before_end_and_returns_value_without_pasting() {
     let ctx = egui::Context::default();
     let mut picker = items(&ctx);

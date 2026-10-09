@@ -1310,7 +1310,15 @@ impl TerminalPane {
             drop(picker);
             self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
         }
+        // A producer can refill the queue as batches are acknowledged. Yield to
+        // input and preview painting instead of draining it indefinitely.
+        let pipe_deadline = std::time::Instant::now() + std::time::Duration::from_millis(4);
+        let mut pipe_events_processed = 0;
         loop {
+            if pipe_events_processed >= 8 || std::time::Instant::now() >= pipe_deadline {
+                ctx.request_repaint();
+                break;
+            }
             let event = self
                 .wake
                 .pipe
@@ -1319,6 +1327,7 @@ impl TerminalPane {
             let Some(event) = event else {
                 break;
             };
+            pipe_events_processed += 1;
             match event {
                 Event::Open { request, session } => {
                     if session.cancelled.load(Ordering::Acquire) {

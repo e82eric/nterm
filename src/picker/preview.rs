@@ -386,7 +386,7 @@ fn highlight_scrollback(
 /// Dynamic Lua is resolved by a separate Lua owner; the UI only installs providers.
 pub(crate) struct ResolvedPreview {
     source: super::config::Preview,
-    key: Option<(u64, usize, String, String)>,
+    key: Option<(usize, String, String)>,
 }
 impl ResolvedPreview {
     pub(crate) fn new(source: super::config::Preview) -> Self {
@@ -401,12 +401,7 @@ impl ResolvedPreview {
         filesystem: bool,
         params: &std::collections::BTreeMap<String, String>,
     ) {
-        let key = (
-            selection.source_version,
-            selection.index,
-            selection.text.clone(),
-            value.to_owned(),
-        );
+        let key = (selection.index, selection.text.clone(), value.to_owned());
         if self.key.as_ref() == Some(&key) {
             return;
         }
@@ -420,7 +415,6 @@ impl ResolvedPreview {
             if let Some(worker) = &resolve.worker {
                 let worker = worker.clone();
                 let text = selection.text.clone();
-                let expected_version = selection.source_version;
                 let expected_index = selection.index;
                 let value = value.to_owned();
                 let params = params.clone();
@@ -428,10 +422,7 @@ impl ResolvedPreview {
                 let max_lines = max_scrollback_lines.unwrap_or(8192);
                 let provider = nfm_preview_file::resolved::ResolvedPreviewProvider::new(
                     move |selected: &nfm_egui::Selection<super::source::Candidate>, cancel| {
-                        if selected.source_version != expected_version
-                            || selected.index != expected_index
-                            || selected.text != text
-                        {
+                        if selected.index != expected_index || selected.text != text {
                             return Err("Preview is being resolved".into());
                         }
                         worker.resolve(
