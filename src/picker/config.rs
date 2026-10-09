@@ -77,6 +77,14 @@ pub(crate) enum Preview {
     Ansi {
         text: String,
     },
+    Dynamic {
+        #[serde(skip)]
+        resolve: Option<std::rc::Rc<crate::lua_callbacks::PreviewResolver>>,
+        #[serde(default)]
+        max_bytes: Option<usize>,
+        #[serde(default)]
+        max_scrollback_lines: Option<usize>,
+    },
     Scrollback {
         #[serde(default = "default_preview_rows")]
         rows: usize,
@@ -86,8 +94,6 @@ pub(crate) enum Preview {
         args: Vec<String>,
         #[serde(default)]
         cwd: Option<String>,
-        #[serde(skip)]
-        command: Option<std::rc::Rc<crate::lua_callbacks::PreviewCommand>>,
         #[serde(default)]
         max_bytes: Option<usize>,
         #[serde(default)]
@@ -98,9 +104,30 @@ pub(crate) enum Preview {
 fn default_preview_rows() -> usize {
     12
 }
+pub(crate) fn file_syntax(value: &str) -> nfm_preview_file::SyntaxChoice {
+    match value {
+        "Auto" => nfm_preview_file::SyntaxChoice::Auto,
+        "PlainText" => nfm_preview_file::SyntaxChoice::PlainText,
+        name => nfm_preview_file::SyntaxChoice::Named(name.into()),
+    }
+}
 
 impl Preview {
     fn validate(&self) -> Result<(), String> {
+        if let Self::Dynamic {
+            resolve,
+            max_bytes,
+            max_scrollback_lines,
+        } = self
+        {
+            validate_preview_limits(*max_bytes, *max_scrollback_lines)?;
+            if max_bytes.is_some_and(|bytes| bytes > 256 * 1024 * 1024) {
+                return Err("Dynamic preview max_bytes must not exceed 256 MiB".into());
+            }
+            if resolve.is_none() {
+                return Err("Dynamic preview requires a resolve function".into());
+            }
+        }
         if let Self::Scrollback { rows } = self {
             if !(1..=12).contains(rows) {
                 return Err("scrollback preview rows must be between 1 and 12".into());
@@ -109,16 +136,12 @@ impl Preview {
         if let Self::Command {
             args,
             cwd,
-            command,
             max_bytes,
             max_scrollback_lines,
         } = self
         {
             validate_preview_limits(*max_bytes, *max_scrollback_lines)?;
-            if command.is_some() && !args.is_empty() {
-                return Err("preview command cannot specify both args and command".into());
-            }
-            if command.is_none() && args.first().is_none_or(String::is_empty) {
+            if args.first().is_none_or(String::is_empty) {
                 return Err("preview command requires an executable".into());
             }
             if args.iter().any(|arg| arg.contains('\0'))
@@ -130,9 +153,12 @@ impl Preview {
         Ok(())
     }
 
-    pub(crate) fn set_command(&mut self, value: std::rc::Rc<crate::lua_callbacks::PreviewCommand>) {
-        if let Self::Command { command, .. } = self {
-            *command = Some(value);
+    pub(crate) fn set_resolver(
+        &mut self,
+        value: std::rc::Rc<crate::lua_callbacks::PreviewResolver>,
+    ) {
+        if let Self::Dynamic { resolve, .. } = self {
+            *resolve = Some(value);
         }
     }
 }
@@ -399,11 +425,18 @@ impl Definition {
             } => *preview_visible,
             Definition::Factory { .. } => unreachable!(),
         };
-        if let Some(Preview::Command {
-            max_bytes,
-            max_scrollback_lines,
-            ..
-        }) = &mut preview
+        if let Some(
+            Preview::Command {
+                max_bytes,
+                max_scrollback_lines,
+                ..
+            }
+            | Preview::Dynamic {
+                max_bytes,
+                max_scrollback_lines,
+                ..
+            },
+        ) = &mut preview
         {
             *max_bytes = Some(
                 max_bytes
@@ -635,23 +668,22 @@ impl Definition {
         }
     }
 
-    pub(crate) fn set_preview_command(
+    pub(crate) fn set_preview_resolver(
         &mut self,
-        value: std::rc::Rc<crate::lua_callbacks::PreviewCommand>,
+        value: std::rc::Rc<crate::lua_callbacks::PreviewResolver>,
     ) {
-        match self {
+        let preview = match self {
             Self::Scrollback { preview, .. }
             | Self::Items { preview, .. }
             | Self::Command { preview, .. }
             | Self::FileSystem { preview, .. }
             | Self::ErrorLog { preview, .. }
             | Self::Themes { preview, .. }
-            | Self::CommandPalette { preview, .. } => {
-                if let Some(preview) = preview {
-                    preview.set_command(value);
-                }
-            }
-            Self::Factory { .. } => {}
+            | Self::CommandPalette { preview, .. } => preview,
+            Self::Factory { .. } => return,
+        };
+        if let Some(preview) = preview {
+            preview.set_resolver(value);
         }
     }
     pub(crate) fn set_items_provider(

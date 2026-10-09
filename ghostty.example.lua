@@ -1,6 +1,8 @@
 -- Extended Windows sample. Customize tool dependencies and picker names as needed.
--- Previews require pwsh with -CommandWithArgs, bat, and file on PATH; text search
--- requires rg. ProfileHistory additionally requires PowershellHistoryReader.exe.
+-- Lua reads text/images; directory previews use cmd /c dir and video previews use
+-- configurable ffmpeg/ffprobe commands. Help/history command previews require pwsh with
+-- -CommandWithArgs (history also uses bat). Text search requires rg; ProfileHistory
+-- additionally requires PowershellHistoryReader.exe.
 -- Snippets use GHOSTTY_SNIPPETS_FILE or ~/ghostty-snippets.json, with initial JSON:
 -- {"snippets": []}. SaveSnippet writes to that file.
 -- CodexSuggestions invokes codex exec and sends the current terminal context.
@@ -11,45 +13,167 @@
 local snippets_path = os.getenv("GHOSTTY_SNIPPETS_FILE")
   or ((os.getenv("USERPROFILE") or os.getenv("HOME") or ".") .. "/ghostty-snippets.json")
 
-local pipe_file_preview = [==[
-        $ErrorActionPreference = 'Stop'
-        # The file and bat commands must be available on PATH.
+-- Dynamic previews run in a dedicated Lua state, away from the UI thread.
+local preview_tools = { ffmpeg = "ffmpeg.exe", ffprobe = "ffprobe.exe", video_position = 0.25 }
+local preview_images = {png=true,jpg=true,jpeg=true,gif=true,bmp=true,webp=true,tif=true,tiff=true}
+local preview_videos = {mp4=true,mkv=true,mov=true,avi=true,webm=true,m4v=true,wmv=true}
+local function preview_command(args, cwd)
+  local result = preview.run {args=args,cwd=cwd,timeout_ms=10000}
+  assert(result.exit_code == 0, result.stderr)
+  return result.stdout
+end
+local function preview_path(path, cwd)
+  if not cwd or path:match('^%a:') or path:match('^[\\/]') then return path end
+  return cwd .. '/' .. path
+end
+local function preview_read_bytes(path)
+  local file = assert(io.open(path, 'rb'))
+  local ok, bytes = pcall(function()
+    local bytes, read_error = file:read(10 * 1024 * 1024 + 1)
+    assert(not read_error, read_error)
+    bytes = bytes or ''
+    assert(#bytes <= 10 * 1024 * 1024, 'File preview exceeds 10 MiB')
+    return bytes
+  end)
+  file:close()
+  assert(ok, bytes)
+  return bytes
+end
+local function preview_read_text(path, display_path)
+  local file = assert(io.open(path, 'rb'))
+  local ok, result = pcall(function()
+    local function read(count)
+      local bytes, read_error = file:read(count)
+      assert(not read_error, read_error)
+      return bytes or ''
+    end
+    local function binary(bytes)
+      return bytes:find(string.char(0), 1, true) ~= nil or utf8.len(bytes) == nil
+    end
+    local function metadata()
+      local size = assert(file:seek('end'))
+      return {text='Binary file\n' .. display_path .. '\n' .. size .. ' bytes', binary=true}
+    end
+    local sample = read(4096)
+    -- Finish a UTF-8 character cut by the sample boundary before classifying it.
+    local length, invalid = utf8.len(sample)
+    if not length and invalid > #sample - 3 then
+      local lead = sample:byte(invalid)
+      local width = lead >= 194 and lead <= 223 and 2
+        or lead >= 224 and lead <= 239 and 3
+        or lead >= 240 and lead <= 244 and 4
+      if width and #sample - invalid + 1 < width then
+        sample = sample .. read(width - (#sample - invalid + 1))
+      end
+    end
+    if binary(sample) then return metadata() end
+    assert(file:seek('set', 0))
+    local limit = 10 * 1024 * 1024
+    local bytes = read(limit + 1)
+    local truncated = #bytes > limit
+    local warning = '\n\n[Preview truncated: file exceeds the 10 MiB text limit.]\n'
+    if truncated then
+      bytes = bytes:sub(1, limit - #warning)
+      -- Drop an incomplete final UTF-8 character, not a complete code point.
+      local valid, position = utf8.len(bytes)
+      if not valid and position > #bytes - 3 then
+        local lead = bytes:byte(position)
+        local width = lead >= 194 and lead <= 223 and 2
+          or lead >= 224 and lead <= 239 and 3
+          or lead >= 240 and lead <= 244 and 4
+        if width and #bytes - position + 1 < width then
+          bytes = bytes:sub(1, position - 1)
+        end
+      end
+    end
+    if binary(bytes) then return metadata() end
+    local text = bytes:gsub('^\239\187\191', '')
+    if truncated then text = text .. warning end
+    return {text=text, binary=false}
+  end)
+  file:close()
+  assert(ok, result)
+  return result.text, result.binary
+end
 
-        $path = (Resolve-Path -LiteralPath $args[0] -ErrorAction Stop).Path
+local function preview_directory(path, cwd)
+  -- The path is the process working directory, never interpolated into shell code.
+  local ok, result = pcall(preview.run, {
+    args={'cmd.exe','/d','/v:off','/u','/c',
+      'dir /a'},
+    cwd=preview_path(path,cwd), timeout_ms=10000,
+  })
+  -- A regular file cannot be used as a process working directory.
+  if not ok then return nil end
+  assert(result.exit_code == 0, result.stderr)
+  -- cmd /u emits UTF-16LE, including filenames outside the current code page.
+  local bytes, chars, index = result.stdout, {}, 1
+  while index < #bytes do
+    local code = bytes:byte(index) + bytes:byte(index+1) * 256
+    index = index + 2
+    if code >= 0xd800 and code <= 0xdbff and index < #bytes then
+      local low = bytes:byte(index) + bytes:byte(index+1) * 256
+      if low >= 0xdc00 and low <= 0xdfff then
+        code = 0x10000 + (code-0xd800)*1024 + low-0xdc00
+        index = index + 2
+      end
+    end
+    if code >= 0xd800 and code <= 0xdfff then code = 0xfffd end
+    chars[#chars+1] = utf8.char(code)
+  end
+  return table.concat(chars)
+end
 
-        if (Test-Path -LiteralPath $path -PathType Container) {
-            Get-ChildItem -LiteralPath $path -Force
-            return
-        }
+local function file_preview()
+  return {
+    type = "Dynamic",
+    resolve = function(item, params)
+      local path = item.value
+      local extension = path:match("%.([^./\\]+)$") or ""
+      local directory = preview_directory(path, params.cwd)
+      if directory then
+        return {type="Text",text=directory,syntax="PlainText",
+          theme="gruvbox-dark"}
+      end
+      if preview_images[extension:lower()] then
+        return {type="Image",bytes=preview_read_bytes(preview_path(path,params.cwd))}
+      end
+      if preview_videos[extension:lower()] then
+        local duration = tonumber(preview_command({preview_tools.ffprobe,"-v","error",
+          "-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",path}, params.cwd))
+        assert(duration and duration >= 0 and duration < math.huge, "Invalid video duration")
+        local seek = string.format("%.3f", duration * preview_tools.video_position)
+        local bytes = preview_command({preview_tools.ffmpeg,"-loglevel","error","-ss",seek,
+          "-i",path,"-frames:v","1","-vf","scale=1280:1280:force_original_aspect_ratio=decrease",
+          "-f","image2pipe","-vcodec","png","pipe:1"}, params.cwd)
+        return {type="Image",bytes=bytes}
+      end
+      local text, binary = preview_read_text(preview_path(path,params.cwd), path)
+      if binary then return {type="Text",text=text,syntax="PlainText",theme="gruvbox-dark"} end
+      return {type="Text",text=text,syntax="Auto",extension=extension,name=path,
+        theme="gruvbox-dark"}
+    end,
+  }
+end
 
-        $mime = & file --mime-type -b -- $path 2>$null
+local function rg_preview()
+  return {
+    type = "Dynamic",
+    resolve = function(item, params)
+      local path, line = item.value:match("^(.-):(%d+):%d+:")
+      if not path then return nil end
+      local text, binary = preview_read_text(preview_path(path,params.cwd), path)
+      if binary then return {type="Text",text=text,syntax="PlainText",theme="gruvbox-dark"} end
+      local extension = path:match("%.([^./\\]+)$")
+      return {type="Text",text=text,name=path,
+        syntax="Auto",extension=extension,
+        theme="gruvbox-dark",
+        center_line=tonumber(line),
+        highlight_line=tonumber(line)}
+    end,
+  }
+end
 
-        if ($mime -match '^text/' -or $mime -in @(
-            'application/json'
-            'application/xml'
-            'application/javascript'
-            'application/x-sh'
-            'application/x-powershell'
-        )) {
-            & bat.exe --color=always --paging=never --style=plain `
-                --theme=gruvbox-dark --line-range 1:1000 -- $path
-        } else {
-            Get-ChildItem -LiteralPath $path -Force
-        }
-]==]
-local pipe_rg_preview = [==[
-          $match = [regex]::Match($args[0], '^(.+?):(\d+):\d+:')
-          if (-not $match.Success) { return }
-
-          $path = $match.Groups[1].Value
-          $row = [int]$match.Groups[2].Value
-          $start = [Math]::Max(1, $row - 5)
-          $end = $row + 10
-
-          & bat.exe --color=always --paging=never --wrap=never `
-              --line-range "${start}:${end}" --highlight-line $row `
-              --style=plain --theme=gruvbox-dark -- $path
-]==]
 local pipe_help_preview = [==[
           $commandName = $args[0]
           $item = $args[1].Trim([char[]]@([char]39, [char]34))
@@ -69,11 +193,13 @@ local pipe_help_preview = [==[
 ]==]
 
 local function profile_preview(script, extra)
-  return {type="Command", command=function(item, params)
+  return {type="Dynamic", resolve=function(item, params)
     local args={"pwsh.exe","-NoProfile","-CommandWithArgs",script}
     if extra then args[#args+1]=params[extra] or "" end
     args[#args+1]=item.value
-    return {args=args,cwd=params.cwd}
+    local result = preview.run {args=args,cwd=params.cwd}
+    assert(result.exit_code == 0, "Preview command failed: " .. result.stderr)
+    return {type="Ansi",bytes=result.stdout}
   end}
 end
 
@@ -206,12 +332,12 @@ return {
     ProfileFiles = {
       type = "FileSystem", roots = {"."}, max_depth = 0,
       position = "Cursor", preview_visible = false,
-      preview = profile_preview(pipe_file_preview),
+      preview = file_preview(),
     },
     ProfileFilesPreview = {
       type = "FileSystem", roots = {"."}, max_depth = 0,
       position = "Cursor", preview_visible = true,
-      preview = profile_preview(pipe_file_preview),
+      preview = file_preview(),
     },
     ProfileDirectories = {
       type = "FileSystem", roots = {"."}, directories_only = true,
@@ -221,7 +347,7 @@ return {
       type = "Command", position = "Cursor", success_exit_codes = {0,1},
       args = {"rg.exe","--crlf","--max-columns=500","--max-columns-preview","--no-messages","--hidden","--color=never","-i","--vimgrep","--","{pattern}"},
       preview_visible = true,
-      preview = profile_preview(pipe_rg_preview),
+      preview = rg_preview(),
     },
     ProfileHistory = {
       type = "Command", args = {"PowershellHistoryReader.exe"},

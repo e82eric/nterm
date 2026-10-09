@@ -14,6 +14,7 @@ mod native_error;
 mod painter;
 mod picker;
 mod presentation;
+mod preview_worker;
 mod search;
 mod terminal;
 mod themes;

@@ -124,7 +124,6 @@ return {
     end,
     files = {
       type = "FileSystem",
-      -- preview = { type = "Command", args = { "bat.exe", "--color=always", "{item}" } },
       roots = { [[G:\src, C:\src]] },
       files_only = true,
       max_depth = 0, -- Zero means unlimited.

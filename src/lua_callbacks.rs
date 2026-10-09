@@ -20,12 +20,204 @@ pub(crate) struct ItemsProvider {
     pub(crate) key: RegistryKey,
 }
 
-pub(crate) struct PreviewCommand {
+pub(crate) struct PreviewResolver {
     pub(crate) lua: Rc<Lua>,
     pub(crate) key: RegistryKey,
     pub(crate) name: String,
+    pub(crate) worker: Option<crate::preview_worker::Worker>,
 }
-
+#[derive(Deserialize)]
+pub(crate) enum PreviewOutput {
+    Text,
+    Ansi,
+    Image,
+}
+fn default_preview_output() -> PreviewOutput {
+    PreviewOutput::Ansi
+}
+fn default_success_codes() -> Vec<i32> {
+    vec![0]
+}
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum ResolvedPreviewSpec {
+    Text {
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        lines: Option<Vec<String>>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        extension: Option<String>,
+        #[serde(default)]
+        syntax: Option<String>,
+        #[serde(default)]
+        theme: Option<String>,
+        #[serde(default)]
+        center_line: Option<usize>,
+        #[serde(default)]
+        highlight_line: Option<usize>,
+    },
+    Command {
+        args: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default = "default_preview_output")]
+        output: PreviewOutput,
+        #[serde(default)]
+        center_line: Option<usize>,
+        #[serde(default = "default_success_codes")]
+        success_exit_codes: Vec<i32>,
+    },
+}
+impl PreviewResolver {
+    pub(crate) fn call(
+        &self,
+        text: &str,
+        value: &str,
+        filesystem: bool,
+        params: &std::collections::BTreeMap<String, String>,
+        max_bytes: usize,
+        max_scrollback_lines: usize,
+    ) -> Result<Option<nfm_preview_file::resolved::PreviewPlan>, String> {
+        use nfm_preview_file::resolved::{CommandOutput, CommandSpec, PreviewPlan};
+        let result = (|| -> Result<Option<PreviewPlan>, String> {
+            let function: mlua::Function = self
+                .lua
+                .registry_value(&self.key)
+                .map_err(|e| e.to_string())?;
+            let item = self.lua.create_table().map_err(|e| e.to_string())?;
+            item.set("text", text).map_err(|e| e.to_string())?;
+            item.set("value", value).map_err(|e| e.to_string())?;
+            if filesystem {
+                item.set("path", value).map_err(|e| e.to_string())?;
+            }
+            let lua_params = self.lua.create_table().map_err(|e| e.to_string())?;
+            for (key, value) in params {
+                lua_params
+                    .set(key.as_str(), value.as_str())
+                    .map_err(|e| e.to_string())?;
+            }
+            let value: mlua::Value = function
+                .call((item, lua_params))
+                .map_err(|e| e.to_string())?;
+            if matches!(value, mlua::Value::Nil) {
+                return Ok(None);
+            }
+            if let mlua::Value::Table(table) = &value {
+                if table.get::<_, String>("type").ok().as_deref() == Some("Ansi") {
+                    for pair in table.clone().pairs::<String, mlua::Value>() {
+                        let (key, _) = pair.map_err(|e| e.to_string())?;
+                        if !matches!(key.as_str(), "type" | "bytes" | "center_line") {
+                            return Err(format!("Unknown Ansi field {key}"));
+                        }
+                    }
+                    let bytes: mlua::String = table.get("bytes").map_err(|e| e.to_string())?;
+                    let plan = PreviewPlan::Ansi {
+                        bytes: std::sync::Arc::from(bytes.as_bytes()),
+                        center_line: table.get("center_line").map_err(|e| e.to_string())?,
+                        max_bytes,
+                        max_scrollback_lines,
+                    };
+                    plan.validate()?;
+                    return Ok(Some(plan));
+                }
+                if table.get::<_, String>("type").ok().as_deref() == Some("Image") {
+                    for pair in table.clone().pairs::<String, mlua::Value>() {
+                        let (key, _) = pair.map_err(|e| e.to_string())?;
+                        if key != "type" && key != "bytes" {
+                            return Err(format!("Unknown Image field {key}"));
+                        }
+                    }
+                    let bytes: mlua::String = table.get("bytes").map_err(|e| e.to_string())?;
+                    if bytes.as_bytes().len() > max_bytes {
+                        return Err("Image exceeds max_bytes".into());
+                    }
+                    let plan = PreviewPlan::Image {
+                        bytes: std::sync::Arc::from(bytes.as_bytes()),
+                    };
+                    plan.validate()?;
+                    return Ok(Some(plan));
+                }
+            }
+            let spec: ResolvedPreviewSpec =
+                self.lua.from_value(value).map_err(|e| e.to_string())?;
+            let plan = match spec {
+                ResolvedPreviewSpec::Text {
+                    text,
+                    lines,
+                    name,
+                    extension,
+                    syntax,
+                    theme,
+                    center_line,
+                    highlight_line,
+                } => {
+                    let content = match (text, lines) {
+                        (Some(text), None) => text,
+                        (None, Some(lines)) => lines.join("\n"),
+                        _ => {
+                            return Err("Text preview requires exactly one of text or lines".into());
+                        }
+                    };
+                    let mut request = nfm_preview_file::text::TextPreviewRequest::snapshot(content);
+                    request.name = name;
+                    request.extension = extension;
+                    request.syntax = syntax.as_deref().map(crate::picker::config::file_syntax);
+                    request.center_line = center_line;
+                    request.highlight_line = highlight_line;
+                    let defaults = nfm_preview_file::text::TextPreviewOptions::default();
+                    PreviewPlan::Text {
+                        request,
+                        options: nfm_preview_file::text::TextPreviewOptions {
+                            theme: theme.unwrap_or(defaults.theme),
+                            max_bytes,
+                            syntax: defaults.syntax,
+                        },
+                    }
+                }
+                ResolvedPreviewSpec::Command {
+                    args,
+                    cwd,
+                    output,
+                    center_line,
+                    success_exit_codes,
+                } => {
+                    if args.first().is_none_or(String::is_empty)
+                        || args.iter().any(|s| s.contains('\0'))
+                        || cwd.as_ref().is_some_and(|s| s.contains('\0'))
+                    {
+                        return Err("Invalid preview command".into());
+                    }
+                    if center_line.is_some() && !matches!(output, PreviewOutput::Ansi) {
+                        return Err("center_line requires Ansi command output".into());
+                    }
+                    let mut command = CommandSpec::new(&args[0]);
+                    command.arguments = args[1..].to_vec();
+                    command.working_directory = cwd
+                        .or_else(|| params.get("cwd").cloned())
+                        .map(std::path::PathBuf::from);
+                    command.output_limit = max_bytes;
+                    PreviewPlan::Command {
+                        command,
+                        output: match output {
+                            PreviewOutput::Text => CommandOutput::Text,
+                            PreviewOutput::Ansi => CommandOutput::Ansi,
+                            PreviewOutput::Image => CommandOutput::Image,
+                        },
+                        center_line,
+                        max_scrollback_lines,
+                        success_exit_codes,
+                    }
+                }
+            };
+            plan.validate()?;
+            Ok(Some(plan))
+        })();
+        result.map_err(|e| format!("picker {} preview.resolve: {e}", self.name))
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreviewCommandSpec {
@@ -34,49 +226,6 @@ pub(crate) struct PreviewCommandSpec {
     pub(crate) cwd: Option<String>,
     #[serde(default)]
     pub(crate) center_line: Option<usize>,
-}
-
-impl PreviewCommand {
-    pub(crate) fn call(
-        &self,
-        value: &str,
-        filesystem: bool,
-        params: &std::collections::BTreeMap<String, String>,
-    ) -> Result<Option<PreviewCommandSpec>, String> {
-        let result = (|| -> mlua::Result<Option<PreviewCommandSpec>> {
-            let function: mlua::Function = self.lua.registry_value(&self.key)?;
-            let item = self.lua.create_table()?;
-            item.set("text", value)?;
-            item.set("value", value)?;
-            if filesystem {
-                item.set("path", value)?;
-                item.set("is_directory", std::path::Path::new(value).is_dir())?;
-            }
-            let lua_params = self.lua.create_table()?;
-            for (key, value) in params {
-                lua_params.set(key.as_str(), value.as_str())?;
-            }
-            let selected: mlua::Value = function.call((item, lua_params))?;
-            if matches!(selected, mlua::Value::Nil) {
-                return Ok(None);
-            }
-            self.lua.from_value(selected).map(Some)
-        })();
-        let spec =
-            result.map_err(|error| format!("picker {} preview.command: {error}", self.name))?;
-        if let Some(spec) = &spec {
-            if spec.args.first().is_none_or(String::is_empty)
-                || spec.args.iter().any(|arg| arg.contains('\0'))
-                || spec.cwd.as_ref().is_some_and(|cwd| cwd.contains('\0'))
-            {
-                return Err(format!(
-                    "picker {} preview.command: invalid command",
-                    self.name
-                ));
-            }
-        }
-        Ok(spec)
-    }
 }
 
 impl ItemsProvider {

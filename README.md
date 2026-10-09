@@ -755,6 +755,120 @@ continuation lines are joined. The default is `false`.
 
 ### Preview configuration
 
+Use a Dynamic preview when Lua should choose the provider and external tools:
+
+```lua
+preview = {
+  type = "Dynamic",
+  max_bytes = 10 * 1024 * 1024,
+  resolve = function(item, params)
+    local extension = (item.value:match("%.([^./\\]+)$") or ""):lower()
+    if extension == "png" then
+      return {
+        type = "Command", output = "Image", cwd = params.cwd,
+        args = { "ffmpeg.exe", "-loglevel", "error", "-i", item.value,
+          "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1" },
+      }
+    end
+    local path = item.path or item.value
+    -- Resolve relative paths against params.cwd as appropriate.
+    local file = assert(io.open(path, "rb"))
+    local contents = file:read(1024 * 1024) or ""
+    file:close()
+    return { type = "Text", text = contents, name = path,
+      syntax = "Auto", theme = "gruvbox-dark" }
+  end,
+}
+```
+
+The Dynamic resolver runs on a dedicated Lua thread once per selection, returning
+owned data. It has a separate Lua state that evaluates the same configuration
+source immediately when configuration loading/reload creates the worker, retaining
+captured helpers and settings. Initialization runs in the background without waiting
+for the first preview request. Initialization errors are printed to stderr and
+reported by subsequent preview requests. Keep configuration evaluation
+free of side effects: it runs in the UI state and each preview state. Reload creates
+new workers from the new source; existing previews retain their original configuration.
+Factory preview workers initialize when the factory is resolved, once its runtime
+picker context is available, and before receiving selection requests.
+NFM handles rendering, VT parsing, image decoding, stale results, and repainting.
+It receives `item.text`, `item.value`, and `params`; filesystem items also expose
+`item.path`. Return `nil` for a blank preview. Command plans accept `args`,
+`cwd`, `output` (`Ansi` by default, or `Text`/`Image`), optional `center_line`
+for Ansi, and `success_exit_codes` (default `{0}`). Command working directories
+fall back to `params.cwd`; arguments are passed literally, without implicit placeholders.
+Returned plans cannot contain another Lua callback or Dynamic preview.
+
+Within Dynamic resolvers, use Lua's `io.open(path, "rb")`, `file:read`, and
+`file:close` to read file bytes. The sample bounds reads to 10 MiB and checks
+for NUL bytes or invalid UTF-8 with `utf8.len` to classify binary content.
+Lua samples the first 4 KiB before loading text; binary previews use `file:seek("end")`
+to report the full size without reading the rest. A split UTF-8 character at the
+sample boundary is completed before classification. Oversized text is truncated
+within the 10 MiB byte budget, with a warning appended at the bottom and no split
+UTF-8 character. Lua owns path resolution,
+syntax choice, and binary metadata formatting.
+Standard Lua has no directory iterator: the Windows sample runs `cmd /u /c dir`
+through `preview.run` and displays its stdout as text after UTF-16LE decoding.
+The listing is not parsed or sorted by Lua. The selected directory is passed as the process working
+directory, without inserting its path into shell command text.
+No Rust-backed `preview.read_file`, `read_lines`, or `is_directory` API is provided.
+
+`preview.run {args={"ffmpeg.exe", ...}, cwd=params.cwd, timeout_ms=10000}` runs
+literal arguments and returns `{stdout=bytes, stderr=bytes, exit_code=number}`.
+Check `exit_code` before using output. Both streams are bounded; cancellation,
+timeout, and excessive output raise a Lua error. The default timeout is five seconds,
+with a maximum of two minutes.
+
+Return `{type="Ansi", bytes=result.stdout}` to preserve ANSI colors and text
+copy/search after running a command in Lua. Optional `center_line` follows the
+same coordinate convention as ANSI Command plans.
+Return `{type="Image", bytes=result.stdout}` for
+encoded image data; binary strings require no base64 encoding.
+
+Selection changes cancel queued work, Lua instruction loops, and helper commands.
+Ordinary blocking `io`/`os.execute` calls still run off the UI thread but cannot be
+interrupted by the Lua hook. Use `preview.run` for commands; cancellation terminates
+the direct child, so invoke FFmpeg directly rather than through a shell that spawns it.
+File-system calls can also wait for the operating system before observing cancellation.
+Preview state is separate from mutable globals used by UI actions.
+
+Dynamic resolvers can also supply text directly, without a filesystem reader:
+
+```lua
+return {
+  type = "Text",
+  lines = { "fn main() {", "    println!(\"hello\");", "}" },
+  syntax = "Rust", theme = "gruvbox-dark",
+}
+```
+
+Text plans require exactly one of `text` (a string) or `lines` (a list). They also
+accept `name` and `extension` as Auto syntax hints, `center_line`, and `highlight_line`.
+For example, `{type="Text", text=contents, extension="cs", syntax="Auto"}`
+selects C# from NFM's bundled definitions. A leading dot is optional. Filename-specific
+rules take precedence over the extension; explicit syntax choices take precedence
+over both. Unknown extensions fall back to filename/first-line detection, then plain text.
+The sample checks the initial file bytes for binary content before selecting syntax,
+returning binary metadata with `syntax="PlainText"` and no extension hint.
+Lua supplies an owned snapshot. Rust hosts can supply a `TextSource` worker
+reader instead. `nfm-preview-text` owns rendering and never opens files.
+Ghostty's Lua API does not accept File preview plans; Lua resolvers supply
+Text or Image data instead. NFM's filesystem adapter remains unused by Ghostty.
+
+Dynamic limits inherit `picker_defaults.preview_max_bytes` and
+`preview_max_scrollback_lines`. Images preserve their aspect ratio and have no
+text copy mode; PNG, JPEG, GIF, BMP, WebP, and TIFF output is decoded with an
+8192-pixel dimension limit and a 128 MiB RGBA-pixel limit. Paging/repainting reuse
+the current result. Errors appear in the preview. Pipe clients must use an
+allowlisted named picker for Dynamic previews; inline stream previews remain
+restricted to Text/Ansi.
+
+`ghostty.example.lua` demonstrates host-owned image/video extension routing and
+configurable FFmpeg/FFprobe paths. SimpleWindowManager's Rust configuration uses
+`file_preview_resolver`, a worker closure returning the same typed `PreviewPlan`;
+its `file_preview::MediaPreviewSettings` helper owns media routing and video probes.
+
 Every picker type accepts an optional preview. `preview = { type = "Text",
 text = "{item}" }` displays literal text; `type = "Ansi"` interprets terminal
 escape sequences; `preview = { type = "Command", args = { "bat", "--color=always",
@@ -764,11 +878,12 @@ Commands run without a shell and are cancelled when selection changes or the
 picker closes. Command preview output is limited to 10 MiB and displayed in 12 terminal
 rows. Ghostty's VT parser handles ANSI sequences in an isolated terminal; egui
 draws its text, colors, and basic styles using the picker's font.
-Instead of fixed `args`, a Command preview can use `command = function(item, params)`
-to return `{ args = {...}, cwd = "..." }` for each selected item. Return `nil`
-to leave that item's preview blank. `item.value` is the selected value;
-filesystem items also provide `item.path` and `item.is_directory`. The callback
-runs when the selected item changes.
+Instead of fixed `args`, use a `Dynamic` preview with `resolve = function(item, params)`
+to return `{ type = "Command", output = "Ansi", args = {...}, cwd = "..." }`.
+Return `nil` to leave that item's preview blank. `item.value` is the selected value;
+filesystem items also provide `item.path`. The resolver runs on the Lua worker
+when the selected item changes. Legacy `Command.command` and `File.file` callbacks
+are rejected during configuration loading; all Lua preview callbacks use `Dynamic.resolve`.
 
 Command preview limits can be configured globally:
 
@@ -789,11 +904,12 @@ Override either limit in a picker's preview table:
 
 ```lua
 preview = {
-  type = "Command",
+  type = "Dynamic",
   max_bytes = 20 * 1024 * 1024,
   max_scrollback_lines = 16384,
-  command = function(item, params)
-    return { args = { "bat", "--color=always", "--paging=never", item.value } }
+  resolve = function(item, params)
+    return { type = "Command", output = "Ansi",
+      args = { "bat", "--color=always", "--paging=never", item.value } }
   end,
 },
 ```
@@ -815,13 +931,10 @@ For example:
 
 ```lua
 preview = {
-  type = "Command",
-  command = function(item)
-    if item.is_directory then
-      return { args = { "pwsh", "-NoProfile", "-CommandWithArgs",
-        "Get-ChildItem -LiteralPath $args[0] | Format-Table -AutoSize", item.path } }
-    end
-    return { args = { "bat", "--color=always", "--paging=never", item.path } }
+  type = "Dynamic",
+  resolve = function(item, params)
+    return { type = "Command", output = "Ansi", cwd = params.cwd,
+      args = { "bat", "--color=always", "--paging=never", item.value } }
   end,
 }
 ```
@@ -921,7 +1034,7 @@ stderr. App handles expire when the callback returns. Navigation requires an
 active snapshot; perform it before any action that returns to the live terminal.
 
 Windows uses `nfm_file_system` from [npicker](https://github.com/e82eric/npicker),
-pinned to `de012392133660e8678c54afadefaadf1ec4c1b3`. Filesystem pickers are currently Windows-only;
+pinned to `b0a21d3f1d0c8f9e6c4f68f7dcf68eb126d1c1f7`. Filesystem pickers are currently Windows-only;
 Linux support will use NFM when it becomes available. Filesystem scans do not
 capture or read terminal snapshots, and cancellation leaves existing copy mode intact.
 
@@ -1119,7 +1232,10 @@ Arrow and page keys follow that visual direction; Ctrl+N moves to the next
 result in ranking order. Ctrl+P toggles the preview when configured.
 The sample uses `nfm_search_core` and the other NFM crates from
 [npicker](https://github.com/e82eric/npicker), pinned to
-`de012392133660e8678c54afadefaadf1ec4c1b3` in Cargo.toml.
+`b0a21d3f1d0c8f9e6c4f68f7dcf68eb126d1c1f7` in Cargo.toml.
+
+The text renderer and preview-plan provider come directly from the pinned NFM
+revision; no local NFM checkout or copied preview crates are required.
 
 The picker imports Ghostty's resolved primary regular and bold fonts and uses the current
 terminal cell dimensions to size its text and rows, including zoom and DPI changes.
@@ -1316,10 +1432,10 @@ centering, half-page scrolling, parsing, clipping and selected-range highlights.
 Ghostty supplies only the requested styled snapshot rows at the original
 terminal width. A guarded `SnapshotPreview` lease drains active reads before
 Ghostty releases the frozen snapshot. Command/Lua previews resolve an owned
-command specification on the Lua UI thread. NFM's shared command executor runs
+command specification on a dedicated Lua worker. NFM's shared command executor runs
 it with concurrent bounded stdout/stderr reads and cancellation, then retains
-the output through the complete-document API. Ghostty owns no preview worker,
-ANSI parser, page cache or half-page scrolling state.
+the output through the complete-document API. Ghostty owns the Lua resolver worker;
+NFM owns ANSI parsing, document caching and scrolling.
 
 Command picker candidates use `nfm_picker_sources::command`, backed by the same
 shared command executor in streaming mode. NFM handles pipe reads, newline and

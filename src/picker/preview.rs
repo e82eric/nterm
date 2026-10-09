@@ -383,8 +383,104 @@ fn highlight_scrollback(
     }
 }
 
-/// Lua remains on its owning UI thread. Only owned command specifications are
-/// transferred to NFM's preview worker; no process, VT or paging state lives here.
+/// Dynamic Lua is resolved by a separate Lua owner; the UI only installs providers.
+pub(crate) struct ResolvedPreview {
+    source: super::config::Preview,
+    key: Option<(u64, usize, String, String)>,
+}
+impl ResolvedPreview {
+    pub(crate) fn new(source: super::config::Preview) -> Self {
+        Self { source, key: None }
+    }
+    pub(super) fn prepare(
+        &mut self,
+        ctx: &egui::Context,
+        shared: &mut nfm_egui::Picker<super::source::Snapshot>,
+        selection: &nfm_egui::Selection<super::source::Candidate>,
+        value: &str,
+        filesystem: bool,
+        params: &std::collections::BTreeMap<String, String>,
+    ) {
+        let key = (
+            selection.source_version,
+            selection.index,
+            selection.text.clone(),
+            value.to_owned(),
+        );
+        if self.key.as_ref() == Some(&key) {
+            return;
+        }
+        self.key = Some(key);
+        if let super::config::Preview::Dynamic {
+            resolve: Some(resolve),
+            max_bytes,
+            max_scrollback_lines,
+        } = &self.source
+        {
+            if let Some(worker) = &resolve.worker {
+                let worker = worker.clone();
+                let text = selection.text.clone();
+                let expected_version = selection.source_version;
+                let expected_index = selection.index;
+                let value = value.to_owned();
+                let params = params.clone();
+                let max_bytes = max_bytes.unwrap_or(10 * 1024 * 1024);
+                let max_lines = max_scrollback_lines.unwrap_or(8192);
+                let provider = nfm_preview_file::resolved::ResolvedPreviewProvider::new(
+                    move |selected: &nfm_egui::Selection<super::source::Candidate>, cancel| {
+                        if selected.source_version != expected_version
+                            || selected.index != expected_index
+                            || selected.text != text
+                        {
+                            return Err("Preview is being resolved".into());
+                        }
+                        worker.resolve(
+                            text.clone(),
+                            value.clone(),
+                            filesystem,
+                            params.clone(),
+                            max_bytes,
+                            max_lines,
+                            cancel,
+                        )
+                    },
+                );
+                shared.set_preview_provider(ctx, Arc::new(provider));
+                shared.set_external_preview(false);
+                ctx.request_repaint();
+                return;
+            }
+        }
+        let resolved = match &self.source {
+            super::config::Preview::Dynamic { .. } => {
+                Err("Dynamic preview requires a Lua worker".to_owned())
+            }
+            _ => return,
+        };
+        let expected = (
+            selection.source_version,
+            selection.index,
+            selection.text.clone(),
+        );
+        let provider = nfm_preview_file::resolved::ResolvedPreviewProvider::new(
+            move |selected: &nfm_egui::Selection<super::source::Candidate>, _| {
+                if (
+                    selected.source_version,
+                    selected.index,
+                    selected.text.as_str(),
+                ) != (expected.0, expected.1, expected.2.as_str())
+                {
+                    return Err("Preview is being resolved".into());
+                }
+                resolved.clone()
+            },
+        );
+        shared.set_preview_provider(ctx, Arc::new(provider));
+        shared.set_external_preview(false);
+        ctx.request_repaint();
+    }
+}
+
 pub(crate) struct CommandPreview {
     source: super::config::Preview,
     key: Option<(usize, String, String)>,
@@ -399,8 +495,8 @@ impl CommandPreview {
         shared: &mut nfm_egui::Picker<super::source::Snapshot>,
         selection: &nfm_egui::Selection<super::source::Candidate>,
         value: &str,
-        filesystem: bool,
-        params: &std::collections::BTreeMap<String, String>,
+        _filesystem: bool,
+        _params: &std::collections::BTreeMap<String, String>,
     ) {
         let key = (selection.index, selection.text.clone(), value.to_owned());
         if self.key.as_ref() == Some(&key) {
@@ -410,7 +506,6 @@ impl CommandPreview {
         let super::config::Preview::Command {
             args,
             cwd,
-            command,
             max_bytes,
             max_scrollback_lines,
         } = &self.source
@@ -419,15 +514,12 @@ impl CommandPreview {
         };
         let max_bytes = max_bytes.unwrap_or(10 * 1024 * 1024);
         let max_scrollback_lines = max_scrollback_lines.unwrap_or(8192);
-        let resolved = if let Some(command) = command {
-            command.call(value, filesystem, params)
-        } else {
+        let resolved: Result<Option<crate::lua_callbacks::PreviewCommandSpec>, String> =
             Ok(Some(crate::lua_callbacks::PreviewCommandSpec {
                 args: args.iter().map(|a| a.replace("{item}", value)).collect(),
                 cwd: cwd.as_ref().map(|c| c.replace("{item}", value)),
                 center_line: None,
-            }))
-        };
+            }));
         let expected_index = selection.index;
         let expected_text = selection.text.clone();
         let provider = nfm_egui::byte_preview::BytePreviewProvider::new(

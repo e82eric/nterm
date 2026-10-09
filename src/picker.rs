@@ -32,6 +32,7 @@ pub(crate) struct Picker {
     pub(crate) from_copy: bool,
     pub(crate) typography: font::Typography,
     command_preview: Option<preview::CommandPreview>,
+    resolved_preview: Option<preview::ResolvedPreview>,
     snapshot_preview: Option<Arc<preview::SnapshotPreview>>,
     callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     request_params: std::collections::BTreeMap<String, String>,
@@ -263,6 +264,12 @@ impl Picker {
             )
         }));
         shared.set_keybinding_help(help);
+        let resolved_preview = match &options.preview {
+            Some(source @ config::Preview::Dynamic { .. }) => {
+                Some(preview::ResolvedPreview::new(source.clone()))
+            }
+            _ => None,
+        };
         let command_preview = match options.preview {
             Some(source @ config::Preview::Command { .. }) => {
                 Some(preview::CommandPreview::new(source))
@@ -283,6 +290,7 @@ impl Picker {
             typography: font::Typography::default(),
             snapshot_preview,
             command_preview,
+            resolved_preview,
             callback: options.callback,
             request_params: options.params,
             enter_action: options.enter_action,
@@ -455,6 +463,36 @@ impl Picker {
             .shared
             .show(ctx, self.placement(bounds), &appearance, !interactive);
         let selection = output.selection();
+        if let Some(preview) = &mut self.resolved_preview {
+            if output.preview_rect.is_some() && !self.shared.is_closed() {
+                if let Some(selection) = selection {
+                    let value = self
+                        .pipe_items
+                        .get(selection.item.node_index)
+                        .map(|item| {
+                            item.value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| item.value.to_string())
+                        })
+                        .unwrap_or_else(|| {
+                            self.source.accepted_value(&SearchResult {
+                                node_index: selection.item.node_index,
+                                score: 0,
+                                path: selection.text.clone(),
+                            })
+                        });
+                    preview.prepare(
+                        ctx,
+                        &mut self.shared,
+                        selection,
+                        &value,
+                        self.source.is_filesystem(),
+                        &self.request_params,
+                    );
+                }
+            }
+        }
         if let Some(preview) = &mut self.command_preview {
             if output.preview_rect.is_some() && !self.shared.is_closed() {
                 if let Some(selection) = selection {

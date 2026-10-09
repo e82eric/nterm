@@ -50,11 +50,19 @@ impl PickerFactory {
         let table: mlua::Table = function
             .call(argument)
             .map_err(|e| format!("pickers.{}: {e}", self.name))?;
+        self.lua
+            .set_app_data(crate::preview_worker::FactoryContext(serde_json::json!({
+                "line": context.line, "line_before_cursor": context.line_before_cursor,
+                "cursor_column": context.cursor_column, "recent_lines": context.recent_lines,
+            })));
         let definition = if let Some(name) = &self.builtin {
-            parse_builtin_table(&self.lua, name, &table)?
+            parse_builtin_table(&self.lua, name, &table)
         } else {
-            parse_picker_table(&self.lua, &self.name, &table)?
+            parse_picker_table(&self.lua, &self.name, &table)
         };
+        self.lua
+            .remove_app_data::<crate::preview_worker::FactoryContext>();
+        let definition = definition?;
         if matches!(
             definition,
             crate::picker::config::Definition::Factory { .. }
@@ -159,46 +167,68 @@ fn parse_picker_table(
             key,
         }));
     }
-    let mut preview_command = None;
+    let mut preview_resolver = None;
     if let Some(preview) = definition
         .raw_get::<_, Option<mlua::Table>>("preview")
         .map_err(|e| e.to_string())?
     {
-        let command: mlua::Value = preview.raw_get("command").map_err(|e| e.to_string())?;
-        if !matches!(command, mlua::Value::Nil) {
+        let resolve: mlua::Value = preview.raw_get("resolve").map_err(|e| e.to_string())?;
+        if !matches!(resolve, mlua::Value::Nil) {
             if preview
                 .raw_get::<_, String>("type")
                 .map_err(|e| e.to_string())?
-                != "Command"
+                != "Dynamic"
             {
                 return Err(format!(
-                    "pickers.{name}.preview.command requires type Command"
+                    "pickers.{name}.preview.resolve requires type Dynamic"
                 ));
             }
-            let mlua::Value::Function(function) = command else {
-                return Err(format!("pickers.{name}.preview.command must be a function"));
+            let mlua::Value::Function(function) = resolve else {
+                return Err(format!("pickers.{name}.preview.resolve must be a function"));
             };
             let key = lua
                 .create_registry_value(function)
                 .map_err(|e| e.to_string())?;
             let copy_preview = lua.create_table().map_err(|e| e.to_string())?;
-            for pair in preview.pairs::<mlua::Value, mlua::Value>() {
+            for pair in preview.clone().pairs::<mlua::Value, mlua::Value>() {
                 let (key, value) = pair.map_err(|e| e.to_string())?;
                 copy_preview
                     .raw_set(key, value)
                     .map_err(|e| e.to_string())?;
             }
             copy_preview
-                .raw_set("command", mlua::Value::Nil)
+                .raw_set("resolve", mlua::Value::Nil)
                 .map_err(|e| e.to_string())?;
             definition
                 .raw_set("preview", copy_preview)
                 .map_err(|e| e.to_string())?;
-            preview_command = Some(std::rc::Rc::new(crate::lua_callbacks::PreviewCommand {
+            preview_resolver = Some(std::rc::Rc::new(crate::lua_callbacks::PreviewResolver {
                 lua: lua.clone(),
                 key,
                 name: name.into(),
+                worker: lua
+                    .app_data_ref::<crate::preview_worker::ConfigSource>()
+                    .map(|source| {
+                        crate::preview_worker::Worker::new(
+                            source.clone(),
+                            name.into(),
+                            lua.app_data_ref::<crate::preview_worker::FactoryContext>()
+                                .map(|context| context.clone()),
+                        )
+                    }),
             }));
+        }
+        for field in ["command", "file"] {
+            if !matches!(
+                preview
+                    .raw_get::<_, mlua::Value>(field)
+                    .map_err(|e| e.to_string())?,
+                mlua::Value::Nil
+            ) {
+                return Err(format!(
+                    "pickers.{name}.preview.{field} is no longer supported; use type='Dynamic' with resolve=function(item, params) instead"
+                ));
+            }
         }
     }
     let mut parsed: crate::picker::config::Definition = lua
@@ -213,8 +243,8 @@ fn parse_picker_table(
     if let Some(provider) = provider {
         parsed.set_items_provider(provider);
     }
-    if let Some(command) = preview_command {
-        parsed.set_preview_command(command);
+    if let Some(resolve) = preview_resolver {
+        parsed.set_preview_resolver(resolve);
     }
     Ok(parsed)
 }
@@ -314,6 +344,11 @@ impl FloatingPadding {
 impl AppConfig {
     fn parse(source: &str, path: &Path) -> Result<Self, String> {
         let lua = std::rc::Rc::new(Lua::new());
+        crate::preview_worker::install_ui_api(&lua).map_err(|e| e.to_string())?;
+        lua.set_app_data(crate::preview_worker::ConfigSource(
+            source.into(),
+            format!("@{}", path.display()),
+        ));
         let ghostty = lua.create_table().map_err(|error| error.to_string())?;
         ghostty
             .set(
@@ -1950,90 +1985,377 @@ mod tests {
     }
 
     #[test]
-    fn preview_command_callback_selects_file_or_directory_command() {
-        let config = parse(
-            r#"return { pickers = { files = { type='FileSystem',
-            preview={type='Command', command=function(item, params)
-                if item.is_directory then
-                    return {args={'dir', item.path}, cwd=params.cwd}
-                end
-                return {args={'bat', item.path}, center_line=42}
-            end}
-        } } }"#,
-        )
-        .unwrap();
-        let bindings = crate::picker::config::Bindings::compile_with_actions(
-            config.pickers,
-            config.keys,
-            config.picker_defaults,
-            config.actions,
-        )
-        .unwrap();
-        let options = bindings
-            .named("files")
-            .unwrap()
-            .resolve(&Default::default())
-            .unwrap();
-        let Some(crate::picker::config::Preview::Command {
-            command: Some(command),
-            ..
-        }) = options.preview
-        else {
-            panic!("expected callback preview");
-        };
-        let params = [("cwd".into(), "C:/work".into())].into();
-        let directory = std::env::temp_dir();
-        let directory = command
-            .call(directory.to_str().unwrap(), true, &params)
-            .unwrap()
-            .unwrap();
-        assert_eq!(directory.args[0], "dir");
-        assert_eq!(directory.cwd.as_deref(), Some("C:/work"));
-        let file = command
-            .call("missing-file.txt", true, &params)
-            .unwrap()
-            .unwrap();
-        assert_eq!(file.args, ["bat", "missing-file.txt"]);
-        assert_eq!(file.center_line, Some(42));
-        assert_eq!(directory.center_line, None);
+    fn removed_preview_callbacks_report_worker_migration_at_load_time() {
+        for (kind, field) in [("Command", "command"), ("File", "file")] {
+            let preview =
+                format!("{{type='{kind}', {field}=function() error('must not execute') end}}");
+            for source in [
+                format!("return {{pickers={{x={{preview={preview}}}}}}}"),
+                format!("return {{builtin_pickers={{lines={{preview={preview}}}}}}}"),
+            ] {
+                let error = parse(&source).err().expect("removed callback accepted");
+                assert!(error.contains(&format!("preview.{field}")), "{error}");
+                assert!(
+                    error.contains("Dynamic") && error.contains("resolve"),
+                    "{error}"
+                );
+            }
+        }
+        let config = parse("return {pickers={x=function() return {preview={type='File',file=function() end}} end}}").unwrap();
+        let bindings =
+            crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        assert!(
+            bindings
+                .named("x")
+                .unwrap()
+                .resolve(&PickerContext::default())
+                .err()
+                .unwrap()
+                .contains("Dynamic")
+        );
     }
 
     #[test]
-    fn preview_command_callback_rejects_invalid_results() {
-        for result in [
-            "{args={}}",
-            "{args={'bat'}, extra=true}",
-            "{args={'bat', '\\0'}}",
-            "{args={'bat'}, center_line=-1}",
-            "{args={'bat'}, center_line=1.5}",
+    fn file_preview_configuration_is_rejected() {
+        assert!(parse("return {pickers={x={preview={type='File'}}}}").is_err());
+    }
+
+    #[test]
+    fn dynamic_preview_resolves_owned_text_command_and_empty_plans() {
+        use crate::picker::config::{Bindings, Preview};
+        use nfm_preview_file::resolved::{CommandOutput, PreviewPlan};
+        for (result, kind) in [
+            (
+                "{type='Text',text='sample',name=item.value,syntax='ps1',center_line=7}",
+                "File",
+            ),
+            (
+                "{type='Command',args={'ffmpeg.exe','-i',item.value},output='Image'}",
+                "Image",
+            ),
+            (
+                "{type='Command',args={'cmd.exe','/c','echo text'},output='Text'}",
+                "Text",
+            ),
+            (
+                "{type='Command',args={'bat.exe',item.value},output='Ansi',center_line=2}",
+                "Ansi",
+            ),
+            ("nil", "Empty"),
+            (
+                "{type='Text',lines={'fn main() {','}'},extension='.rs'}",
+                "Snapshot",
+            ),
+            (
+                "{type='Image',bytes=string.char(0,255,137,80)}",
+                "ImageBytes",
+            ),
         ] {
-            let source = format!(
-                "return {{pickers={{x={{preview={{type='Command', command=function() return {result} end}}}}}}}}"
-            );
-            let config = parse(&source).unwrap();
-            let bindings = crate::picker::config::Bindings::compile_with_actions(
+            let config = parse(&format!("return {{picker_defaults={{preview_max_bytes=2048}},pickers={{x={{type='Items',items=ghostty.json_parse('[]'),preview={{type='Dynamic',resolve=function(item,params) assert(item.text=='display');return {result} end}}}}}}}}" )).unwrap();
+            let defaults = config.picker_defaults;
+            let bindings = Bindings::compile_with_actions(
                 config.pickers,
                 config.keys,
-                config.picker_defaults,
+                defaults,
                 config.actions,
             )
             .unwrap();
             let options = bindings
                 .named("x")
                 .unwrap()
-                .resolve(&Default::default())
+                .resolve(&PickerContext::default())
                 .unwrap();
-            let Some(crate::picker::config::Preview::Command {
-                command: Some(command),
+            let Some(Preview::Dynamic {
+                resolve: Some(resolve),
+                max_bytes,
                 ..
             }) = options.preview
             else {
-                panic!("expected callback preview");
+                panic!()
             };
-            assert!(command.call("file", false, &Default::default()).is_err());
+            assert_eq!(max_bytes, Some(2048));
+            assert!(resolve.worker.is_some());
+            let params =
+                std::collections::BTreeMap::from([("cwd".into(), "C:/preview-root".into())]);
+            match (
+                kind,
+                resolve
+                    .call("display", "source.ps1", false, &params, 2048, 50)
+                    .unwrap(),
+            ) {
+                ("File", Some(PreviewPlan::Text { request, .. })) => {
+                    assert_eq!(request.name.as_deref(), Some("source.ps1"));
+                    assert_eq!(request.center_line, Some(7));
+                }
+                (
+                    "Image",
+                    Some(PreviewPlan::Command {
+                        command,
+                        output: CommandOutput::Image,
+                        ..
+                    }),
+                )
+                | (
+                    "Text",
+                    Some(PreviewPlan::Command {
+                        command,
+                        output: CommandOutput::Text,
+                        ..
+                    }),
+                )
+                | (
+                    "Ansi",
+                    Some(PreviewPlan::Command {
+                        command,
+                        output: CommandOutput::Ansi,
+                        ..
+                    }),
+                ) => {
+                    assert_eq!(command.output_limit, 2048);
+                    assert_eq!(command.working_directory, Some("C:/preview-root".into()));
+                }
+                ("Empty", None) => {}
+                ("ImageBytes", Some(PreviewPlan::Image { bytes })) => {
+                    assert_eq!(&*bytes, &[0, 255, 137, 80])
+                }
+                ("Snapshot", Some(PreviewPlan::Text { request, .. })) => {
+                    assert_eq!(request.extension.as_deref(), Some(".rs"));
+                    assert_eq!(
+                        request.source.read(2048, &|| false).unwrap().text,
+                        "fn main() {\n}"
+                    );
+                }
+                _ => panic!("unexpected resolved preview for {kind}"),
+            }
+        }
+        for preview in [
+            "{type='Dynamic'}",
+            "{type='Dynamic',resolve='oops'}",
+            "{type='Text',text='',resolve=function() end}",
+        ] {
+            let result = parse(&format!("return {{pickers={{x={{preview={preview}}}}}}}"));
+            assert!(
+                result
+                    .and_then(|config| Bindings::compile(config.pickers, config.keys))
+                    .is_err()
+            );
+        }
+        for result in [
+            "{type='Unknown'}",
+            "{type='Command',args={'x'},output='Bogus'}",
+            "{type='Command',args={}}",
+            "{type='Command',args={'x'},output='Image',center_line=1}",
+            "{type='File',path='x',syntax='missing'}",
+            "{type='File',path=''}",
+            "{type='File',path='x',unknown=true}",
+        ] {
+            let config = parse(&format!("return {{pickers={{x={{preview={{type='Dynamic',resolve=function() return {result} end}}}}}}}}" )).unwrap();
+            let bindings = Bindings::compile(config.pickers, config.keys).unwrap();
+            let options = bindings
+                .named("x")
+                .unwrap()
+                .resolve(&PickerContext::default())
+                .unwrap();
+            let Some(Preview::Dynamic {
+                resolve: Some(resolve),
+                ..
+            }) = options.preview
+            else {
+                panic!()
+            };
+            assert!(
+                resolve
+                    .call("x", "x", false, &Default::default(), 2048, 50)
+                    .is_err(),
+                "{result}"
+            );
         }
     }
 
+    #[test]
+    fn preview_helpers_can_be_captured_during_config_loading_and_extended_sample_compiles() {
+        let config = parse("local run = preview.run; return {pickers={x={type='Items',items={{text='x',value='x'}},preview={type='Dynamic',resolve=function(item) return {type='Text',text=run{args={'cmd.exe','/c','echo text'}}.stdout} end}}}}").unwrap();
+        crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
+        let config = parse(include_str!("../ghostty.example.lua")).unwrap();
+        crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+    }
+    #[test]
+    fn lua_ripgrep_preview_preserves_windows_path_syntax_and_match_location() {
+        nfm_preview_file::text::TextPreviewOptions {
+            syntax: nfm_preview_file::SyntaxChoice::Named("C#".into()),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        let source = include_str!("../ghostty.example.lua");
+        let start = source.find("local function rg_preview()").unwrap();
+        let end = source.find("local pipe_help_preview =").unwrap();
+        let lua = mlua::Lua::new();
+        let resolver: mlua::Function = lua.load(format!("local preview_syntax={{ps1='PowerShell'}}; local function preview_path(path,cwd) return path end; local function preview_read_text(path) assert(path=='C:\\\\folder\\\\file.ps1'); return 'file content', binary_test end; {} return rg_preview().resolve",&source[start..end])).eval().unwrap();
+        for binary in [false, true] {
+            lua.globals().set("binary_test", binary).unwrap();
+            let item = lua.create_table().unwrap();
+            item.set("value", "C:\\folder\\file.ps1:42:7:matching text")
+                .unwrap();
+            let output: mlua::Table = resolver.call((item, lua.create_table().unwrap())).unwrap();
+            assert_eq!(output.get::<_, String>("text").unwrap(), "file content");
+            assert_eq!(
+                output.get::<_, String>("syntax").unwrap(),
+                if binary { "PlainText" } else { "Auto" }
+            );
+            assert_eq!(
+                output.get::<_, Option<String>>("extension").unwrap(),
+                if binary { None } else { Some("ps1".into()) }
+            );
+            assert_eq!(
+                output.get::<_, Option<usize>>("center_line").unwrap(),
+                if binary { None } else { Some(42) }
+            );
+            assert_eq!(
+                output.get::<_, Option<usize>>("highlight_line").unwrap(),
+                if binary { None } else { Some(42) }
+            );
+        }
+        let item = lua.create_table().unwrap();
+        item.set("value", "not a ripgrep match").unwrap();
+        assert!(matches!(
+            resolver
+                .call::<_, mlua::Value>((item, lua.create_table().unwrap()))
+                .unwrap(),
+            mlua::Value::Nil
+        ));
+    }
+    #[test]
+    fn lua_file_preview_samples_binary_files_and_preserves_utf8_boundaries() {
+        let source = include_str!("../ghostty.example.lua");
+        let start = source.find("local function preview_read_text(").unwrap();
+        let end = source[start..]
+            .find("local function preview_directory(")
+            .unwrap()
+            + start;
+        let lua = mlua::Lua::new();
+        let reader: mlua::Function = lua
+            .load(format!("{}\nreturn preview_read_text", &source[start..end]))
+            .eval()
+            .unwrap();
+        let root =
+            std::env::temp_dir().join(format!("ghostty-lua-binary-sample-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("large.dll");
+        std::fs::File::create(&binary)
+            .unwrap()
+            .set_len(11 * 1024 * 1024)
+            .unwrap();
+        let (text, is_binary): (String, bool) = reader
+            .call((binary.to_str().unwrap(), "large.dll"))
+            .unwrap();
+        assert!(is_binary);
+        assert_eq!(
+            text,
+            format!("Binary file\nlarge.dll\n{} bytes", 11 * 1024 * 1024)
+        );
+        for (name, contents) in [
+            ("boundary.txt", "a".repeat(4095) + "猫 text"),
+            ("empty.txt", String::new()),
+            ("normal.txt", "hello\nworld".into()),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, &contents).unwrap();
+            let (text, is_binary): (String, bool) =
+                reader.call((path.to_str().unwrap(), name)).unwrap();
+            assert!(!is_binary, "{name}");
+            assert_eq!(text, contents);
+        }
+        let large_text = root.join("large.txt");
+        std::fs::write(&large_text, vec![b'a'; 10 * 1024 * 1024 + 1]).unwrap();
+        let (text, binary): (String, bool) = reader
+            .call((large_text.to_str().unwrap(), "large.txt"))
+            .unwrap();
+        assert!(!binary);
+        assert!(text.starts_with("aaaa"));
+        assert!(text.ends_with("[Preview truncated: file exceeds the 10 MiB text limit.]\n"));
+        assert!(text.len() <= 10 * 1024 * 1024);
+        std::fs::write(&large_text, "猫".repeat(4 * 1024 * 1024)).unwrap();
+        let (text, binary): (String, bool) = reader
+            .call((large_text.to_str().unwrap(), "large.txt"))
+            .unwrap();
+        assert!(!binary);
+        assert!(text.starts_with("猫"));
+        assert!(text.contains("Preview truncated:"));
+        assert!(text.len() <= 10 * 1024 * 1024);
+        // Parallel subprocess tests can retain inherited Windows file handles.
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            assert_eq!(error.raw_os_error(), Some(32), "fixture cleanup: {error}");
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn lua_cmd_directory_preview_preserves_unicode_and_shell_characters() {
+        let source = include_str!("../ghostty.example.lua");
+        let path_start = source.find("local function preview_path(").unwrap();
+        let path_end = source.find("local function preview_read_bytes(").unwrap();
+        let start = source.find("local function preview_directory(").unwrap();
+        let end = source[start..]
+            .find("local function file_preview(")
+            .unwrap()
+            + start;
+        let lua = mlua::Lua::new();
+        let preview = lua.create_table().unwrap();
+        preview
+            .set(
+                "run",
+                lua.create_function(|lua, spec: mlua::Table| {
+                    let args: Vec<String> = lua.from_value(spec.get("args")?)?;
+                    let cwd: String = spec.get("cwd")?;
+                    let output = std::process::Command::new(&args[0])
+                        .args(&args[1..])
+                        .current_dir(cwd)
+                        .output()
+                        .map_err(mlua::Error::external)?;
+                    let result = lua.create_table()?;
+                    result.set("stdout", lua.create_string(&output.stdout)?)?;
+                    result.set("stderr", lua.create_string(&output.stderr)?)?;
+                    result.set("exit_code", output.status.code())?;
+                    Ok(result)
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        lua.globals().set("preview", preview).unwrap();
+        let reader: mlua::Function = lua
+            .load(format!(
+                "{}\n{}\nreturn preview_directory",
+                &source[path_start..path_end],
+                &source[start..end]
+            ))
+            .eval()
+            .unwrap();
+        let root =
+            std::env::temp_dir().join(format!("ghostty-cmd-dir-{} % ! &", std::process::id()));
+        std::fs::create_dir_all(root.join("folder 猫 🚀")).unwrap();
+        std::fs::write(root.join("file % ! & 猫.txt"), "").unwrap();
+        let entries: String = reader
+            .call((root.to_str().unwrap(), mlua::Value::Nil))
+            .unwrap();
+        assert!(entries.contains("file % ! & 猫.txt"));
+        assert!(entries.contains("folder 猫 🚀"));
+        assert!(entries.contains("\r\n"));
+        let entries: String = reader
+            .call(("folder 猫 🚀", root.to_str().unwrap()))
+            .unwrap();
+        assert!(!entries.is_empty());
+        let entries: Option<String> = reader
+            .call(("file % ! & 猫.txt", root.to_str().unwrap()))
+            .unwrap();
+        assert!(entries.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn picker_defaults_unique_is_inherited_and_overridden_in_static_and_factory_pickers() {
         for (global, global_value) in [

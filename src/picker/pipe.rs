@@ -349,6 +349,16 @@ mod tests {
             },
         };
         assert!(policy.authorize(&command_preview).is_err());
+        assert!(
+            policy
+                .authorize(&Open::Stream {
+                    options: StreamOptions {
+                        preview: Some(json!({"type":"File"})),
+                        ..Default::default()
+                    }
+                })
+                .is_err()
+        );
         assert!(parse(br#"{"type":"open","request_id":"test","request":{"kind":"definition","definition":{"type":"Command","args":["pwsh.exe"]}}}"#).is_err());
         assert!(
             policy

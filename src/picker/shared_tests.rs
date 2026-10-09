@@ -4,6 +4,165 @@ use nfm_search_core::{
 };
 use std::time::{Duration, Instant};
 
+fn worker_resolver(callback: &str) -> std::rc::Rc<crate::lua_callbacks::PreviewResolver> {
+    let lua = std::rc::Rc::new(mlua::Lua::new());
+    let worker = crate::preview_worker::Worker::new(
+        crate::preview_worker::ConfigSource(
+            "return {pickers={test={preview={resolve=".to_owned() + callback + "}}}}",
+            "@preview-test".into(),
+        ),
+        "test".into(),
+        None,
+    );
+    std::rc::Rc::new(crate::lua_callbacks::PreviewResolver {
+        key: lua.create_registry_value(mlua::Value::Nil).unwrap(),
+        lua,
+        name: "test".into(),
+        worker: Some(worker),
+    })
+}
+
+#[test]
+fn lua_preview_worker_cancels_busy_lua_and_retains_helpers_and_closures() {
+    let root = std::env::temp_dir().join(format!("ghostty-lua-worker-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("text.txt"), "worker file content").unwrap();
+    std::fs::write(
+        root.join("image.png"),
+        [
+            137u8, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 244, 34, 127, 138, 0, 0, 0, 14, 73, 68, 65, 84, 120, 156, 99, 16, 145,
+            211, 248, 15, 194, 0, 9, 95, 2, 179, 214, 64, 22, 134, 0, 0, 0, 0, 73, 69, 78, 68, 174,
+            66, 96, 130,
+        ],
+    )
+    .unwrap();
+    let source = r#"
+        local function read_bytes(path, cwd)
+            local f = assert(io.open(cwd .. '/' .. path, 'rb'))
+            local data = f:read('*a'); f:close(); return data
+        end
+        local function read(path, cwd) return {read_bytes(path, cwd)} end
+        local run = preview.run
+        return {pickers={x=function(context)
+          local prefix = context.line
+          return {preview={resolve=function(item, params)
+            if item.value == 'slow' then
+                local f = assert(io.open(params.cwd .. '/started', 'w')); f:write('yes'); f:close()
+                while true do end
+            elseif item.value == 'file' then
+                return {type='Text',lines=read('text.txt', params.cwd)}
+            elseif item.value == 'image' then
+                return {type='Image',bytes=read_bytes('image.png', params.cwd)}
+            elseif item.value == 'timeout' then
+                local ok = pcall(run, {args={'pwsh.exe','-NoProfile','-Command','Start-Sleep -Seconds 30'},timeout_ms=100})
+                assert(not ok)
+                return {type='Text',text='timeout handled'}
+            else
+                local result = run {args={'cmd.exe','/d','/c','echo command'},cwd=params.cwd}
+                assert(result.exit_code == 0)
+                return {type='Text',text=prefix .. result.stdout}
+            end
+          end}}
+        end}}
+    "#;
+    let worker = crate::preview_worker::Worker::new(
+        crate::preview_worker::ConfigSource(source.into(), "@worker-test".into()),
+        "x".into(),
+        Some(crate::preview_worker::FactoryContext(
+            serde_json::json!({"line":"captured "}),
+        )),
+    );
+    let lua = std::rc::Rc::new(mlua::Lua::new());
+    let resolver = std::rc::Rc::new(crate::lua_callbacks::PreviewResolver {
+        key: lua.create_registry_value(mlua::Value::Nil).unwrap(),
+        lua,
+        name: "x".into(),
+        worker: Some(worker),
+    });
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::Items(config::ItemsOptions {
+                values: ["slow", "file", "command", "timeout", "image"]
+                    .into_iter()
+                    .map(|v| wire::Item {
+                        text: v.into(),
+                        value: v.into(),
+                    })
+                    .collect(),
+                provider: None,
+            }),
+            preview: Some(config::Preview::Dynamic {
+                resolve: Some(resolver),
+                max_bytes: Some(4096),
+                max_scrollback_lines: Some(100),
+            }),
+            params: [
+                ("cwd".into(), root.to_string_lossy().into_owned()),
+                ("query".into(), "slow".into()),
+            ]
+            .into(),
+            ..Default::default()
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !root.join("started").exists() {
+        frame(&ctx, &mut picker, vec![]);
+        assert!(Instant::now() < deadline, "worker did not start");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // The callback is spinning on another thread; UI frames must still finish.
+    let start = Instant::now();
+    frame(&ctx, &mut picker, vec![]);
+    assert!(start.elapsed() < Duration::from_secs(1));
+    picker.shared.set_query("file");
+    wait_preview_rendered_text(&ctx, &mut picker, "worker file content");
+    picker.shared.set_query("image");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                picker.show(ui.ctx(), 24.0);
+            },
+        );
+        let rendered = output
+            .textures_delta
+            .set
+            .iter()
+            .any(|(_, deltas)| deltas.iter().any(|delta| delta.image.size() == [2, 1]));
+        output.textures_delta.clear();
+        if rendered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Lua image bytes were not decoded and rendered"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    picker.shared.set_query("command");
+    wait_preview_rendered_text(&ctx, &mut picker, "captured command");
+    picker.shared.set_query("timeout");
+    wait_preview_rendered_text(&ctx, &mut picker, "timeout handled");
+    picker.shared.set_query("file");
+    wait_preview_rendered_text(&ctx, &mut picker, "worker file content");
+    drop(picker);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn pipe_stream_publishes_before_end_and_returns_value_without_pasting() {
     let ctx = egui::Context::default();
@@ -164,7 +323,7 @@ fn wait_preview_rendered_text(
         }
         assert!(
             Instant::now() < deadline,
-            "Preview never showed {expected_first_line}"
+            "Preview never showed {expected_first_line}; rendered lines: {lines:?}"
         );
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -199,7 +358,6 @@ fn command_preview_runs_through_nfm_using_the_accepted_value_and_cwd() {
                     "echo {item}& cd".into(),
                 ],
                 cwd: Some(cwd.clone()),
-                command: None,
             }),
             ..Default::default()
         },
@@ -215,17 +373,14 @@ fn command_preview_runs_through_nfm_using_the_accepted_value_and_cwd() {
 #[test]
 fn lua_command_preview_resolves_once_and_nfm_owns_centering_paging_and_selection_changes() {
     let ctx = egui::Context::default();
-    let lua = std::rc::Rc::new(mlua::Lua::new());
-    let function = lua.load(r#"calls = 0; return function(item, params)
+    let command = worker_resolver(
+        r#"function(item, params)
         assert(params.marker == 'passed')
-        calls = calls + 1
-        return { args={'cmd.exe','/d','/c','for /L %i in (0,1,29) do @echo row%i'}, center_line=tonumber(item.value) }
-    end"#).eval::<mlua::Function>().unwrap();
-    let command = std::rc::Rc::new(crate::lua_callbacks::PreviewCommand {
-        key: lua.create_registry_value(function).unwrap(),
-        lua: lua.clone(),
-        name: "test".into(),
-    });
+        local result = preview.run {args={'cmd.exe','/d','/c','for /L %i in (0,1,29) do @echo row%i'}}
+        assert(result.exit_code == 0)
+        return {type='Ansi',bytes=result.stdout,center_line=tonumber(item.value)}
+    end"#,
+    );
     let mut picker = Picker::start(
         std::ptr::null_mut(),
         None,
@@ -246,12 +401,10 @@ fn lua_command_preview_resolves_once_and_nfm_owns_centering_paging_and_selection
                 ],
                 provider: None,
             }),
-            preview: Some(config::Preview::Command {
+            preview: Some(config::Preview::Dynamic {
+                resolve: Some(command),
                 max_bytes: None,
                 max_scrollback_lines: None,
-                args: Vec::new(),
-                cwd: None,
-                command: Some(command),
             }),
             sort: config::Sort::SourceOrder,
             params: [("marker".into(), "passed".into())].into(),
@@ -264,21 +417,19 @@ fn lua_command_preview_resolves_once_and_nfm_owns_centering_paging_and_selection
         &mut picker,
         vec![key(egui::Key::PageUp, egui::Modifiers::CTRL)],
     );
-    wait_preview_rendered_text(&ctx, &mut picker, "row8");
+    wait_preview_rendered_text(&ctx, &mut picker, "row3");
     frame(
         &ctx,
         &mut picker,
         vec![key(egui::Key::PageDown, egui::Modifiers::CTRL)],
     );
     wait_preview_rendered_text(&ctx, &mut picker, "row14");
-    assert_eq!(lua.globals().get::<_, u32>("calls").unwrap(), 1);
     frame(
         &ctx,
         &mut picker,
         vec![key(egui::Key::N, egui::Modifiers::CTRL)],
     );
     wait_preview_rendered_text(&ctx, &mut picker, "row0");
-    assert_eq!(lua.globals().get::<_, u32>("calls").unwrap(), 2);
     frame(
         &ctx,
         &mut picker,
@@ -291,7 +442,6 @@ fn lua_command_preview_resolves_once_and_nfm_owns_centering_paging_and_selection
         vec![key(egui::Key::P, egui::Modifiers::CTRL)],
     );
     wait_preview_rendered_text(&ctx, &mut picker, "row0");
-    assert_eq!(lua.globals().get::<_, u32>("calls").unwrap(), 2);
 }
 fn items(ctx: &egui::Context) -> Picker {
     Picker::start(
@@ -425,6 +575,212 @@ fn complete_preview_uses_accepted_value_and_nfm_paging_and_copy() {
     );
     assert!(commands.contains(&egui::OutputCommand::CopyText("second\n".into())));
 }
+
+#[test]
+fn native_file_preview_callback_centers_pages_caches_and_copies_original_text() {
+    let root = std::env::temp_dir().join(format!(
+        "ghostty-native-file-preview-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("preview.rs");
+    let text = (0..40)
+        .map(|i| format!("row{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&path, &text).unwrap();
+    let file = worker_resolver(
+        r#"function(item, params)
+        assert(item.text == 'display')
+        local f = assert(io.open(params.cwd .. '/' .. item.value, 'rb')); local text = f:read('*a'); f:close(); return {type='Text',text=text,center_line=20,highlight_line=20}
+    end"#,
+    );
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::Items(config::ItemsOptions {
+                values: vec![wire::Item {
+                    text: "display".into(),
+                    value: "preview.rs".into(),
+                }],
+                provider: None,
+            }),
+            preview: Some(config::Preview::Dynamic {
+                resolve: Some(file),
+                max_bytes: None,
+                max_scrollback_lines: None,
+            }),
+            params: [("cwd".into(), root.to_string_lossy().into_owned())].into(),
+            ..Default::default()
+        },
+    );
+    wait_preview_rendered_text(&ctx, &mut picker, "row13");
+    std::fs::write(&path, "changed after preview").unwrap();
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::PageUp, egui::Modifiers::CTRL)],
+    );
+    wait_preview_rendered_text(&ctx, &mut picker, "row2");
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::W, egui::Modifiers::CTRL)],
+    );
+    assert!(picker.shared.preview_focused());
+    let (_, commands) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(
+            egui::Key::C,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        )],
+    );
+    assert!(commands.contains(&egui::OutputCommand::CopyText(text)));
+    drop(picker);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dynamic_preview_switches_between_native_file_image_and_text_and_caches_commands() {
+    let root = std::env::temp_dir().join(format!("ghostty-dynamic-preview-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("native.txt"), "native dynamic text").unwrap();
+    std::fs::write(
+        root.join("image.png"),
+        [
+            137u8, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 244, 34, 127, 138, 0, 0, 0, 14, 73, 68, 65, 84, 120, 156, 99, 16, 145,
+            211, 248, 15, 194, 0, 9, 95, 2, 179, 214, 64, 22, 134, 0, 0, 0, 0, 73, 69, 78, 68, 174,
+            66, 96, 130,
+        ],
+    )
+    .unwrap();
+    let resolve = worker_resolver(
+        r#"function(item, params)
+            calls = (calls or 0) + 1
+            if item.value == 'file' then
+                local f = assert(io.open(params.cwd .. '/native.txt', 'rb')); local text = f:read('*a'); f:close(); return {type='Text',text=text}
+            elseif item.value == 'image' then
+                return {type='Command',output='Image',args={'pwsh.exe','-NoProfile','-Command',
+                    '[IO.File]::AppendAllText("runs.txt", "x"); [Console]::OpenStandardOutput().Write([IO.File]::ReadAllBytes("image.png"))'}}
+            else
+                return {type='Command',output='Text',args={'cmd.exe','/d','/c','echo dynamic command text'}}
+            end
+        end"#,
+    );
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::Items(config::ItemsOptions {
+                values: ["file", "image", "text"]
+                    .into_iter()
+                    .map(|v| wire::Item {
+                        text: v.into(),
+                        value: v.into(),
+                    })
+                    .collect(),
+                provider: None,
+            }),
+            preview: Some(config::Preview::Dynamic {
+                resolve: Some(resolve),
+                max_bytes: Some(1024 * 1024),
+                max_scrollback_lines: Some(100),
+            }),
+            params: [
+                ("cwd".into(), root.to_string_lossy().into_owned()),
+                ("query".into(), "file".into()),
+            ]
+            .into(),
+            ..Default::default()
+        },
+    );
+    wait_preview_rendered_text(&ctx, &mut picker, "native dynamic text");
+    picker.shared.set_query("image");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                picker.show(ui.ctx(), 24.0);
+            },
+        );
+        let texture = output.textures_delta.set.iter().find_map(|(id, deltas)| {
+            deltas
+                .iter()
+                .any(|delta| delta.image.size() == [2, 1])
+                .then_some(*id)
+        });
+        let rendered = texture.is_some_and(|id| {
+            output.shapes.iter().any(
+                |shape| matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == id),
+            )
+        });
+        output.textures_delta.clear();
+        if rendered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Dynamic image preview was not rendered"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    for _ in 0..5 {
+        frame(
+            &ctx,
+            &mut picker,
+            vec![key(egui::Key::PageDown, egui::Modifiers::CTRL)],
+        );
+    }
+    assert_eq!(std::fs::read_to_string(root.join("runs.txt")).unwrap(), "x");
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::W, egui::Modifiers::CTRL)],
+    );
+    assert!(
+        !picker.shared.preview_focused(),
+        "Images must not enter text copy mode"
+    );
+    picker.shared.set_query("text");
+    wait_preview_rendered_text(&ctx, &mut picker, "dynamic command text");
+    picker.shared.set_query("file");
+    wait_preview_rendered_text(&ctx, &mut picker, "native dynamic text");
+    frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::W, egui::Modifiers::CTRL)],
+    );
+    let (_, commands) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(
+            egui::Key::C,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        )],
+    );
+    assert!(commands.contains(&egui::OutputCommand::CopyText("native dynamic text".into())));
+    drop(picker);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn floating_palette_selection_returns_id_instead_of_display_label() {
     let ctx = egui::Context::default();
