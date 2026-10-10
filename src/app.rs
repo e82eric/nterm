@@ -1,3 +1,7 @@
+thread_local! {
+    // WGL surface.is_current() checks only the context, not its drawable.
+    static CURRENT_GL_WINDOW: std::cell::Cell<Option<winit::window::WindowId>> = const { std::cell::Cell::new(None) };
+}
 use crate::native_error::{FatalError, FatalResult};
 use crate::presentation::Presentation;
 use std::cell::RefCell;
@@ -751,9 +755,16 @@ impl GlutinWindowContext {
 
     fn make_current(&self) -> Result<(), FatalError> {
         use glutin::context::PossiblyCurrentGlContext as _;
+        if self.context.is_current()
+            && CURRENT_GL_WINDOW.with(|current| current.get() == Some(self._window.id()))
+        {
+            return Ok(());
+        }
         self.context
             .make_current(&self.surface)
-            .fatal("activate the window OpenGL context")
+            .fatal("activate the window OpenGL context")?;
+        CURRENT_GL_WINDOW.with(|current| current.set(Some(self._window.id())));
+        Ok(())
     }
 
     fn get_proc_address(&self, name: &std::ffi::CStr) -> *const c_void {
@@ -828,10 +839,19 @@ impl GlutinWindowSurface {
 
     fn make_current(&self) -> Result<(), FatalError> {
         use glutin::context::PossiblyCurrentGlContext as _;
+        // The context is shared by windows: checking only the context would
+        // incorrectly skip switching the drawable when another window was used.
+        if self.graphics.context.is_current()
+            && CURRENT_GL_WINDOW.with(|current| current.get() == Some(self.window.id()))
+        {
+            return Ok(());
+        }
         self.graphics
             .context
             .make_current(&self.surface)
-            .fatal("activate the shared OpenGL context for this window")
+            .fatal("activate the shared OpenGL context for this window")?;
+        CURRENT_GL_WINDOW.with(|current| current.set(Some(self.window.id())));
+        Ok(())
     }
 
     fn window(&self) -> &winit::window::Window {

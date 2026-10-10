@@ -755,6 +755,10 @@ continuation lines are joined. The default is `false`.
 
 ### Preview configuration
 
+Native IME composition is disabled in this host to avoid blocking Windows
+composition calls during typing. Normal keyboard input, clipboard paste, and
+Unicode display remain supported.
+
 Use a Dynamic preview when Lua should choose the provider and external tools:
 
 ```lua
@@ -781,8 +785,8 @@ preview = {
 }
 ```
 
-The Dynamic resolver runs on a dedicated Lua thread once per selection, returning
-owned data. It has a separate Lua state that evaluates the same configuration
+The Dynamic resolver runs on a pool of dedicated Lua threads once per selection, returning
+owned data. Each thread has a separate Lua state that evaluates the same configuration
 source immediately when configuration loading/reload creates the worker, retaining
 captured helpers and settings. Initialization runs in the background without waiting
 for the first preview request. Initialization errors are printed to stderr and
@@ -808,10 +812,15 @@ sample boundary is completed before classification. Oversized text is truncated
 within the 10 MiB byte budget, with a warning appended at the bottom and no split
 UTF-8 character. Lua owns path resolution,
 syntax choice, and binary metadata formatting.
-Standard Lua has no directory iterator: the Windows sample runs `cmd /u /c dir`
-through `preview.run` and displays its stdout as text after UTF-16LE decoding.
-The listing is not parsed or sorted by Lua. The selected directory is passed as the process working
-directory, without inserting its path into shell command text.
+Standard Lua has no directory iterator. The sample uses
+`preview.directory_items(path)`, a Rust-backed helper available only inside a
+Dynamic preview resolver. It returns entries sorted by name, each containing
+`name` and `is_directory`, or `nil` for a regular file. Missing paths and IO errors
+raise Lua errors. Hidden entries are included; symlinks are not followed when
+classifying entries. Lua formats the listing, appending `/` for directories.
+Enumeration checks cancellation between entries and bounds returned names by
+the preview byte limit and 100,000 entries. It runs on the Lua preview pool,
+without launching a subprocess. Native filesystem calls can still block one lane.
 No Rust-backed `preview.read_file`, `read_lines`, or `is_directory` API is provided.
 
 `preview.run {args={"ffmpeg.exe", ...}, cwd=params.cwd, timeout_ms=10000}` runs
@@ -819,6 +828,19 @@ literal arguments and returns `{stdout=bytes, stderr=bytes, exit_code=number}`.
 Check `exit_code` before using output. Both streams are bounded; cancellation,
 timeout, and excessive output raise a Lua error. The default timeout is five seconds,
 with a maximum of two minutes.
+
+Cancellation releases the Lua resolver while process creation or cleanup is
+still pending. The background job retains responsibility for terminating and
+reaping the direct child. At most four command jobs run concurrently across
+preview workers; waiting for a slot also observes cancellation and timeout.
+Each picker also has four independent Lua preview contexts, initialized on
+load/reload. A blocking native Lua file read occupies one context while newer
+requests can use another. Reads already in the OS finish naturally; canceled
+results are discarded. If all four contexts are blocked, newer requests wait.
+Resolver closures retain separate state in each context: do not rely on mutable
+Lua state being shared between selection requests.
+The file-preview sample probes files with `io.open` before attempting a directory
+listing. Directory listing now uses the native helper without a command launch.
 
 Return `{type="Ansi", bytes=result.stdout}` to preserve ANSI colors and text
 copy/search after running a command in Lua. Optional `center_line` follows the

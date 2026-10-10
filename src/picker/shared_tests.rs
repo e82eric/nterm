@@ -49,7 +49,8 @@ fn lua_preview_worker_cancels_busy_lua_and_retains_helpers_and_closures() {
           return {preview={resolve=function(item, params)
             if item.value == 'slow' then
                 local f = assert(io.open(params.cwd .. '/started', 'w')); f:write('yes'); f:close()
-                while true do end
+                -- Unlike a Lua loop, this native call cannot observe the hook.
+                os.execute('cmd.exe /d /c ping -n 4 127.0.0.1 >nul')
             elseif item.value == 'file' then
                 return {type='Text',lines=read('text.txt', params.cwd)}
             elseif item.value == 'image' then
@@ -117,12 +118,17 @@ fn lua_preview_worker_cancels_busy_lua_and_retains_helpers_and_closures() {
         assert!(Instant::now() < deadline, "worker did not start");
         std::thread::sleep(Duration::from_millis(2));
     }
-    // The callback is spinning on another thread; UI frames must still finish.
+    // A native Lua call is blocked on another thread; UI frames must still finish.
     let start = Instant::now();
     frame(&ctx, &mut picker, vec![]);
     assert!(start.elapsed() < Duration::from_secs(1));
+    let handoff = Instant::now();
     picker.shared.set_query("file");
     wait_preview_rendered_text(&ctx, &mut picker, "worker file content");
+    assert!(
+        handoff.elapsed() < Duration::from_secs(2),
+        "new selection waited for blocked Lua IO"
+    );
     picker.shared.set_query("image");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -160,7 +166,18 @@ fn lua_preview_worker_cancels_busy_lua_and_retains_helpers_and_closures() {
     picker.shared.set_query("file");
     wait_preview_rendered_text(&ctx, &mut picker, "worker file content");
     drop(picker);
-    std::fs::remove_dir_all(root).unwrap();
+    // Lua can resume before a timed-out process finishes spawning and releases
+    // its working-directory handle. Cleanup remains owned by the command job.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => break,
+            Err(error) if error.raw_os_error() == Some(32) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("command did not release its fixture: {error}"),
+        }
+    }
 }
 
 #[test]

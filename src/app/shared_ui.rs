@@ -212,6 +212,8 @@ impl WindowUi {
         shared: &SharedUi,
     ) -> Self {
         let viewport_id = viewport_id(window.id());
+        // Direct keyboard input is used by this host; disable native IME once.
+        window.set_ime_allowed(false);
         Self {
             egui_ctx: shared.ctx.clone(),
             viewport_id,
@@ -252,6 +254,14 @@ impl WindowUi {
         self.changes.output_hook(&self.egui_ctx, &mut output);
         let changed = std::mem::take(&mut self.changes.changed);
         if let Some(viewport) = output.viewport_output.get_mut(&self.viewport_id) {
+            viewport.commands.retain(|command| {
+                !matches!(
+                    command,
+                    egui::ViewportCommand::IMEAllowed(_)
+                        | egui::ViewportCommand::IMERect(_)
+                        | egui::ViewportCommand::IMEPurpose(_)
+                )
+            });
             egui_winit::process_viewport_commands(
                 &self.egui_ctx,
                 &mut self.info,
@@ -260,8 +270,10 @@ impl WindowUi {
                 &mut Vec::new(),
             );
         }
-        self.state
-            .handle_platform_output(window, std::mem::take(&mut output.platform_output));
+        let mut platform_output = std::mem::take(&mut output.platform_output);
+        // Avoid composition interruption and cursor-area calls during typing.
+        platform_output.ime = None;
+        self.state.handle_platform_output(window, platform_output);
         (output, changed)
     }
 }

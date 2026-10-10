@@ -2234,12 +2234,15 @@ mod tests {
     #[test]
     fn lua_file_preview_samples_binary_files_and_preserves_utf8_boundaries() {
         let source = include_str!("../ghostty.example.lua");
-        let start = source.find("local function preview_read_text(").unwrap();
+        let start = source.find("local function preview_path(").unwrap();
         let end = source[start..]
             .find("local function preview_directory(")
             .unwrap()
             + start;
         let lua = mlua::Lua::new();
+        lua.globals()
+            .set("preview", lua.create_table().unwrap())
+            .unwrap();
         let reader: mlua::Function = lua
             .load(format!("{}\nreturn preview_read_text", &source[start..end]))
             .eval()
@@ -2296,7 +2299,7 @@ mod tests {
     }
     #[cfg(windows)]
     #[test]
-    fn lua_cmd_directory_preview_preserves_unicode_and_shell_characters() {
+    fn lua_directory_items_preview_preserves_unicode_and_shell_characters() {
         let source = include_str!("../ghostty.example.lua");
         let path_start = source.find("local function preview_path(").unwrap();
         let path_end = source.find("local function preview_read_bytes(").unwrap();
@@ -2309,20 +2312,18 @@ mod tests {
         let preview = lua.create_table().unwrap();
         preview
             .set(
-                "run",
-                lua.create_function(|lua, spec: mlua::Table| {
-                    let args: Vec<String> = lua.from_value(spec.get("args")?)?;
-                    let cwd: String = spec.get("cwd")?;
-                    let output = std::process::Command::new(&args[0])
-                        .args(&args[1..])
-                        .current_dir(cwd)
-                        .output()
-                        .map_err(mlua::Error::external)?;
-                    let result = lua.create_table()?;
-                    result.set("stdout", lua.create_string(&output.stdout)?)?;
-                    result.set("stderr", lua.create_string(&output.stderr)?)?;
-                    result.set("exit_code", output.status.code())?;
-                    Ok(result)
+                "directory_items",
+                lua.create_function(|lua, path: String| {
+                    let items = crate::preview_worker::directory_items(
+                        std::path::Path::new(&path),
+                        4096,
+                        || false,
+                    )
+                    .map_err(mlua::Error::external)?;
+                    match items {
+                        Some(items) => lua.to_value(&items),
+                        None => Ok(mlua::Value::Nil),
+                    }
                 })
                 .unwrap(),
             )
@@ -2345,7 +2346,10 @@ mod tests {
             .unwrap();
         assert!(entries.contains("file % ! & 猫.txt"));
         assert!(entries.contains("folder 猫 🚀"));
-        assert!(entries.contains("\r\n"));
+        assert!(entries.contains("folder 猫 🚀/"));
+        assert!(crate::preview_worker::directory_items(&root, 1, || false).is_err());
+        assert!(crate::preview_worker::directory_items(&root, 4096, || true).is_err());
+        assert!(entries.contains("\n"));
         let entries: String = reader
             .call(("folder 猫 🚀", root.to_str().unwrap()))
             .unwrap();
