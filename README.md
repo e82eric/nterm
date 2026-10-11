@@ -896,6 +896,14 @@ text = "{item}" }` displays literal text; `type = "Ansi"` interprets terminal
 escape sequences; `preview = { type = "Command", args = { "bat", "--color=always",
 "{item}" } }` runs a process and renders its output. `{item}` in preview text,
 arguments, or optional `cwd` is replaced with the selected item's accepted value.
+For literal `Text` previews, set `wrap = true` inside the preview object to wrap
+at the pane width by character: `preview = { type = "Text", text = "{item}", wrap = true }`.
+Omitting `wrap` or setting it to `false` clips long lines. Copying preserves the
+original line breaks, including with wide and combining Unicode characters.
+PowerShell uses the same option through
+`Invoke-GhosttyPicker -Options @{ preview_visible = $true; preview = @{ type = 'Text'; text = 'A long line'; wrap = $true } }`.
+This option applies to literal `Text` previews; ANSI, command, dynamic, and
+scrollback previews retain their existing layout behavior.
 Commands run without a shell and are cancelled when selection changes or the
 picker closes. Command preview output is limited to 10 MiB and displayed in 12 terminal
 rows. Ghostty's VT parser handles ANSI sequences in an isolated terminal; egui

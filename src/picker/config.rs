@@ -73,6 +73,9 @@ impl Sort {
 pub(crate) enum Preview {
     Text {
         text: String,
+        /// Wrap at the preview width without inserting hard line breaks.
+        #[serde(default)]
+        wrap: bool,
     },
     Ansi {
         text: String,

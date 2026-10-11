@@ -1243,6 +1243,32 @@ mod tests {
     }
 
     #[test]
+    fn text_preview_wrap_lua_options_validate() {
+        for (field, expected) in [
+            ("", false),
+            (", wrap = false", false),
+            (", wrap = true", true),
+        ] {
+            let config = parse(&"return {pickers={test={type='Items', items={{text='example', value='example'}}, preview={type='Text', text='long line'WRAP}}}}".replace("WRAP", field)).unwrap();
+            let bindings = crate::picker::config::Bindings::compile_with_defaults(
+                config.pickers,
+                config.keys,
+                config.picker_defaults,
+            )
+            .unwrap();
+            let options = bindings
+                .named("test")
+                .unwrap()
+                .resolve(&Default::default())
+                .unwrap();
+            assert!(
+                matches!(options.preview, Some(crate::picker::config::Preview::Text { wrap, .. }) if wrap == expected)
+            );
+        }
+        assert!(parse("return {pickers={test={type='Items', items={{text='example', value='example'}}, preview={type='Text', text='line', wrap='true'}}}}").is_err());
+    }
+
+    #[test]
     fn palette_is_a_named_picker_and_defers_picker_factories() {
         let config = parse("return { pickers = { commands = { type = 'CommandPalette', position = 'Center', preview_visible = false }, dynamic = function() error('factory must not run during catalog enumeration') end }, keys = { { key = 'k', mods = 'CTRL|SHIFT', picker = 'commands' } } }").unwrap();
         let bindings = crate::picker::config::Bindings::compile_with_defaults(

@@ -2564,11 +2564,7 @@ impl TerminalPane {
         let selection_layer = selection.map(|_| SnapshotDecorationLayer {
             ranges: selection_ranges.as_ptr(),
             range_count: selection_ranges.len(),
-            style: SnapshotDecorationStyle {
-                foreground_rgb: crate::colors::rgb(crate::colors::palette().selection_text),
-                background_rgb: crate::colors::rgb(crate::colors::palette().selection_background),
-                flags: 3,
-            },
+            style: copy_selection_style(),
         });
         let matches_layer = SnapshotDecorationLayer {
             ranges: self.copy_mode.search_matches().as_ptr(),
@@ -2721,6 +2717,17 @@ impl TerminalPane {
 
 // The renderer uses the first matching decoration. Yank feedback must cover the
 // caret, even when the copied range contains only the caret's cell.
+fn copy_selection_style() -> SnapshotDecorationStyle {
+    SnapshotDecorationStyle {
+        foreground_rgb: 0,
+        background_rgb: crate::colors::rgb(
+            nfm_egui::Palette::default().preview_selection_background,
+        ),
+        // Background only: let Ghostty retain each cell's syntax/ANSI foreground.
+        flags: 2,
+    }
+}
+
 fn active_search_layer(range: &SnapshotCellRange) -> SnapshotDecorationLayer {
     let palette = crate::colors::palette();
     SnapshotDecorationLayer {

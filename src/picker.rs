@@ -226,7 +226,7 @@ impl Picker {
                 None
             };
         let complete_preview = match &options.preview {
-            Some(config::Preview::Text { text }) => Some((text.clone(), true)),
+            Some(config::Preview::Text { text, wrap: true }) => Some((text.clone(), true)),
             Some(config::Preview::Ansi { text }) => Some((text.clone(), false)),
             _ => None,
         };
@@ -252,7 +252,31 @@ impl Picker {
                 )),
             );
         }
-        shared.set_external_preview(options.preview.is_some() && !nfm_preview);
+        if let Some(config::Preview::Text { text, wrap: false }) = &options.preview {
+            let text = text.clone();
+            let value = source.preview_value_resolver();
+            shared.set_preview_provider(
+                &ctx,
+                Arc::new(
+                    move |request: nfm_egui::PreviewRequest<source::Candidate>, _| {
+                        let text = text.replace("{item}", &value(&request.selection));
+                        if text.len() > 10 * 1024 * 1024 {
+                            return Err("Text preview exceeds configured byte limit".into());
+                        }
+                        Ok(nfm_egui::Preview::Text(
+                            text.chars()
+                                .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
+                                .collect(),
+                        ))
+                    },
+                ),
+            );
+        }
+        shared.set_external_preview(
+            options.preview.is_some()
+                && !nfm_preview
+                && !matches!(options.preview, Some(config::Preview::Text { .. })),
+        );
         let mut help = Vec::new();
         if source.is_scrollback() {
             help.push(("Ctrl+B".into(), "Split selected line".into()));
@@ -322,6 +346,8 @@ impl Picker {
                 muted: p.muted_text,
                 selection_background: p.selection_background,
                 selection_text: p.selection_text,
+                preview_selection_background: nfm_egui::Palette::default()
+                    .preview_selection_background,
                 match_highlight: p.picker_match_highlight.unwrap_or(p.match_highlight),
                 divider: p.border,
                 error: p.error,

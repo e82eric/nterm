@@ -4,6 +4,93 @@ use nfm_search_core::{
 };
 use std::time::{Duration, Instant};
 
+#[test]
+fn text_preview_wrap_pipe_options_validate() {
+    for (field, expected) in [(None, false), (Some(false), false), (Some(true), true)] {
+        let mut preview = serde_json::json!({"type":"Text", "text":"long line"});
+        if let Some(wrap) = field {
+            preview["wrap"] = wrap.into();
+        }
+        let options = config::Bindings::pipe_stream(&pipe::StreamOptions {
+            preview: Some(preview),
+            ..Default::default()
+        })
+        .unwrap()
+        .resolve(&Default::default())
+        .unwrap();
+        assert!(
+            matches!(options.preview, Some(config::Preview::Text { wrap, .. }) if wrap == expected)
+        );
+    }
+    assert!(
+        config::Bindings::pipe_stream(&pipe::StreamOptions {
+            preview: Some(serde_json::json!({"type":"Text", "text":"long line", "wrap":"true"})),
+            ..Default::default()
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn text_preview_wrap_copy_preserves_hard_breaks_and_unicode() {
+    for wrap in [false, true] {
+        let ctx = egui::Context::default();
+        let text = "a猫e\u{301}".repeat(80) + "\nsecond";
+        let mut picker = Picker::start(
+            std::ptr::null_mut(),
+            None,
+            false,
+            0,
+            ctx.clone(),
+            config::Options {
+                source: config::Source::Items(config::ItemsOptions {
+                    values: vec![wire::Item {
+                        text: "item".into(),
+                        value: "item".into(),
+                    }],
+                    provider: None,
+                }),
+                preview: Some(config::Preview::Text {
+                    text: text.clone(),
+                    wrap,
+                }),
+                ..Default::default()
+            },
+        );
+        wait_selection(&ctx, &mut picker);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !picker.shared.preview_focused() {
+                frame(
+                    &ctx,
+                    &mut picker,
+                    vec![key(egui::Key::W, egui::Modifiers::CTRL)],
+                );
+            }
+            let (_, commands) = frame(
+                &ctx,
+                &mut picker,
+                vec![key(
+                    egui::Key::C,
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                )],
+            );
+            if let Some(copied) = commands.iter().find_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text),
+                _ => None,
+            }) {
+                assert_eq!(copied.trim_end_matches('\n'), text, "wrap={wrap}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "text preview was not copied: wrap={wrap}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
 fn worker_resolver(callback: &str) -> std::rc::Rc<crate::lua_callbacks::PreviewResolver> {
     let lua = std::rc::Rc::new(mlua::Lua::new());
     let worker = crate::preview_worker::Worker::new(
@@ -1364,6 +1451,7 @@ fn preview_toggle_and_help_use_shared_control() {
             }),
             preview: Some(config::Preview::Text {
                 text: "Preview {item}".into(),
+                wrap: false,
             }),
             preview_visible: false,
             enter_action: config::EnterAction::SendInput,
