@@ -10,13 +10,14 @@ pub(crate) enum EnterAction {
     SendInput,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub(crate) enum Position {
     Top,
     Center,
     #[default]
     Bottom,
     Cursor,
+    FullPane,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -107,6 +108,9 @@ pub(crate) enum Preview {
 fn default_preview_rows() -> usize {
     12
 }
+fn default_result_rows() -> usize {
+    super::RESULT_ROWS
+}
 pub(crate) fn file_syntax(value: &str) -> nfm_preview_file::SyntaxChoice {
     match value {
         "Auto" => nfm_preview_file::SyntaxChoice::Auto,
@@ -190,105 +194,114 @@ impl PickerDefaults {
     }
 }
 
-// Repeat the shared acceptance fields so each variant can reject unknown fields.
+/// Shared picker settings; external Lua/IPC definitions remain flat.
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct PickerPresentation {
+    pub(crate) position: Position,
+    pub(crate) result_rows: usize,
+    pub(crate) sort: Sort,
+    pub(crate) initial_query: Option<String>,
+    #[serde(skip)]
+    pub(crate) keys: Vec<PickerKey>,
+    pub(crate) preview: Option<Preview>,
+    pub(crate) preview_visible: bool,
+}
+
+impl Default for PickerPresentation {
+    fn default() -> Self {
+        Self {
+            position: Position::default(),
+            result_rows: default_result_rows(),
+            sort: Sort::default(),
+            initial_query: None,
+            keys: Vec::new(),
+            preview: None,
+            preview_visible: true,
+        }
+    }
+}
+
+pub(crate) struct Definition {
+    pub(crate) presentation: PickerPresentation,
+    pub(crate) source: DefinitionSource,
+}
+
+impl<'de> Deserialize<'de> for Definition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut source = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        // Extract common fields before strict source deserialization. Keeping the
+        // residual map preserves unknown-field and cross-source validation.
+        let mut common = serde_json::Map::new();
+        for field in [
+            "position",
+            "result_rows",
+            "sort",
+            "initial_query",
+            "keys",
+            "preview",
+            "preview_visible",
+        ] {
+            if let Some(value) = source.remove(field) {
+                common.insert(field.into(), value);
+            }
+        }
+        if source.get("type").and_then(serde_json::Value::as_str) == Some("Factory")
+            && !common.is_empty()
+        {
+            return Err(D::Error::custom(
+                "Factory does not accept presentation fields",
+            ));
+        }
+        if !common.contains_key("preview_visible")
+            && matches!(
+                source.get("type").and_then(serde_json::Value::as_str),
+                Some("Themes" | "ErrorLog" | "CommandPalette")
+            )
+        {
+            common.insert("preview_visible".into(), false.into());
+        }
+        let presentation = serde_json::from_value(common.into()).map_err(D::Error::custom)?;
+        let source = serde_json::from_value(source.into()).map_err(D::Error::custom)?;
+        Ok(Self {
+            presentation,
+            source,
+        })
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
-pub(crate) enum Definition {
-    CommandPalette {
-        #[serde(default)]
-        position: Position,
-        #[serde(default)]
-        sort: Sort,
-        #[serde(default)]
-        initial_query: Option<String>,
-        #[serde(skip)]
-        keys: Vec<PickerKey>,
-        #[serde(default)]
-        preview: Option<Preview>,
-        #[serde(default)]
-        preview_visible: bool,
-    },
-    Themes {
-        #[serde(default)]
-        position: Position,
-        #[serde(default)]
-        sort: Sort,
-        #[serde(default)]
-        initial_query: Option<String>,
-        #[serde(skip)]
-        keys: Vec<PickerKey>,
-        #[serde(default)]
-        preview: Option<Preview>,
-        #[serde(default)]
-        preview_visible: bool,
-    },
-    ErrorLog {
-        #[serde(default)]
-        position: Position,
-        #[serde(default)]
-        sort: Sort,
-        #[serde(default)]
-        initial_query: Option<String>,
-        #[serde(skip)]
-        keys: Vec<PickerKey>,
-        #[serde(default)]
-        preview: Option<Preview>,
-        #[serde(default)]
-        preview_visible: bool,
-    },
+pub(crate) enum DefinitionSource {
+    CommandPalette {},
+    Themes {},
+    ErrorLog {},
     Factory {
         #[serde(skip)]
         factory: Option<std::rc::Rc<crate::config::PickerFactory>>,
     },
     Scrollback {
         #[serde(default)]
-        position: Position,
-        #[serde(default)]
-        sort: Sort,
-        #[serde(default)]
         regex: Option<String>,
         #[serde(default)]
         unique: Option<bool>,
         #[serde(default)]
         enter_action: Option<EnterAction>,
-        #[serde(default)]
-        initial_query: Option<String>,
-        #[serde(skip)]
-        keys: Vec<PickerKey>,
-        #[serde(default)]
-        preview: Option<Preview>,
-        #[serde(default = "default_preview_visible")]
-        preview_visible: bool,
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     },
     Items {
         #[serde(default)]
-        position: Position,
-        #[serde(default)]
-        sort: Sort,
-        #[serde(default)]
         items: Vec<crate::picker::wire::Item>,
         #[serde(default)]
         enter_action: Option<EnterAction>,
-        #[serde(default)]
-        initial_query: Option<String>,
-        #[serde(skip)]
-        keys: Vec<PickerKey>,
-        #[serde(default)]
-        preview: Option<Preview>,
-        #[serde(default = "default_preview_visible")]
-        preview_visible: bool,
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
         #[serde(skip)]
         provider: Option<std::rc::Rc<crate::lua_callbacks::ItemsProvider>>,
     },
     Command {
-        #[serde(default)]
-        position: Position,
-        #[serde(default)]
-        sort: Sort,
         args: Vec<String>,
         #[serde(default)]
         cwd: Option<String>,
@@ -300,22 +313,10 @@ pub(crate) enum Definition {
         unique: Option<bool>,
         #[serde(default)]
         enter_action: Option<EnterAction>,
-        #[serde(default)]
-        initial_query: Option<String>,
-        #[serde(skip)]
-        keys: Vec<PickerKey>,
-        #[serde(default)]
-        preview: Option<Preview>,
-        #[serde(default = "default_preview_visible")]
-        preview_visible: bool,
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     },
     FileSystem {
-        #[serde(default)]
-        position: Position,
-        #[serde(default)]
-        sort: Sort,
         #[serde(default)]
         roots: Vec<String>,
         #[serde(default)]
@@ -326,26 +327,23 @@ pub(crate) enum Definition {
         directories_only: bool,
         #[serde(default)]
         enter_action: Option<EnterAction>,
-        #[serde(default)]
-        initial_query: Option<String>,
-        #[serde(skip)]
-        keys: Vec<PickerKey>,
-        #[serde(default)]
-        preview: Option<Preview>,
-        #[serde(default = "default_preview_visible")]
-        preview_visible: bool,
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     },
 }
 
-fn default_preview_visible() -> bool {
-    true
-}
-
 pub(crate) type PickerKey = KeyBinding<std::rc::Rc<crate::lua_callbacks::Callback>>;
 
 impl Definition {
+    pub(crate) fn factory(factory: std::rc::Rc<crate::config::PickerFactory>) -> Self {
+        Self {
+            presentation: PickerPresentation::default(),
+            source: DefinitionSource::Factory {
+                factory: Some(factory),
+            },
+        }
+    }
+
     /// Resolve one definition without constructing or compiling shortcut bindings.
     pub(crate) fn resolve(
         self,
@@ -356,78 +354,29 @@ impl Definition {
         if name.trim().is_empty() {
             return Err("picker names must not be empty".into());
         }
-        if let Self::Factory { factory } = self {
+        if let DefinitionSource::Factory { factory } = self.source {
             return Ok(PickerEntry::Factory(
                 factory.ok_or("missing picker factory")?,
                 defaults,
             ));
         }
         let mut definition = self;
+        let result_rows = definition.presentation.result_rows;
+        if !(1..=256).contains(&result_rows) {
+            return Err(format!(
+                "pickers.{name}.result_rows must be between 1 and 256"
+            ));
+        }
         let (callback, enter_action) = definition.acceptance();
-        let position = match &definition {
-            Definition::Scrollback { position, .. }
-            | Definition::Items { position, .. }
-            | Definition::Command { position, .. }
-            | Definition::FileSystem { position, .. }
-            | Definition::ErrorLog { position, .. }
-            | Definition::Themes { position, .. }
-            | Definition::CommandPalette { position, .. } => *position,
-            Definition::Factory { .. } => unreachable!(),
-        };
-        let sort = match &definition {
-            Definition::Command { sort, .. }
-            | Definition::Scrollback { sort, .. }
-            | Definition::Items { sort, .. }
-            | Definition::FileSystem { sort, .. }
-            | Definition::ErrorLog { sort, .. }
-            | Definition::Themes { sort, .. }
-            | Definition::CommandPalette { sort, .. } => *sort,
-            Definition::Factory { .. } => unreachable!(),
-        };
-        let initial_query = match &definition {
-            Definition::Scrollback { initial_query, .. }
-            | Definition::Items { initial_query, .. }
-            | Definition::Command { initial_query, .. }
-            | Definition::FileSystem { initial_query, .. }
-            | Definition::ErrorLog { initial_query, .. }
-            | Definition::Themes { initial_query, .. }
-            | Definition::CommandPalette { initial_query, .. } => initial_query.clone(),
-            Definition::Factory { .. } => unreachable!(),
-        };
-        let mut preview = match &definition {
-            Definition::Scrollback { preview, .. }
-            | Definition::Items { preview, .. }
-            | Definition::Command { preview, .. }
-            | Definition::FileSystem { preview, .. }
-            | Definition::ErrorLog { preview, .. }
-            | Definition::Themes { preview, .. }
-            | Definition::CommandPalette { preview, .. } => preview.clone(),
-            Definition::Factory { .. } => unreachable!(),
-        };
-        let preview_visible = match &definition {
-            Definition::Scrollback {
-                preview_visible, ..
-            }
-            | Definition::Items {
-                preview_visible, ..
-            }
-            | Definition::Command {
-                preview_visible, ..
-            }
-            | Definition::FileSystem {
-                preview_visible, ..
-            }
-            | Definition::ErrorLog {
-                preview_visible, ..
-            }
-            | Definition::Themes {
-                preview_visible, ..
-            }
-            | Definition::CommandPalette {
-                preview_visible, ..
-            } => *preview_visible,
-            Definition::Factory { .. } => unreachable!(),
-        };
+        let position = definition.presentation.position;
+        let sort = definition.presentation.sort;
+        let initial_query = definition.presentation.initial_query.take();
+        let mut preview = definition.presentation.preview.take();
+        let preview_visible = definition.presentation.preview_visible
+            && !matches!(
+                definition.source,
+                DefinitionSource::Themes { .. } | DefinitionSource::ErrorLog { .. }
+            );
         if let Some(
             Preview::Command {
                 max_bytes,
@@ -461,63 +410,28 @@ impl Definition {
             .keys_mut()
             .map(|keys| std::mem::take(keys))
             .unwrap_or_default();
-        let mut options = match definition {
-            Definition::Themes { .. } => Options {
-                position,
-                sort,
-                callback: None,
-                keys: Vec::new(),
-                source: Source::Themes,
-                enter_action: EnterAction::Navigate,
-                params: BTreeMap::new(),
-                preview: None,
-                preview_visible: false,
-            },
-            Definition::ErrorLog { .. } => Options {
-                position,
-                sort,
-                callback: None,
-                keys: Vec::new(),
-                source: Source::ErrorLog,
-                enter_action: EnterAction::Navigate,
-                params: BTreeMap::new(),
-                preview: None,
-                preview_visible: false,
-            },
-            Definition::CommandPalette { .. } => Options {
-                position,
-                sort,
-                callback: None,
-                keys: Vec::new(),
-                source: Source::CommandPalette(Vec::new()),
-                enter_action: EnterAction::SendInput,
-                params: BTreeMap::new(),
-                preview: None,
-                preview_visible,
-            },
-            Definition::Factory { .. } => unreachable!(),
-            Definition::Scrollback { regex, unique, .. } => {
+        let (source, enter_action) = match definition.source {
+            DefinitionSource::Themes { .. } => (Source::Themes, EnterAction::Navigate),
+            DefinitionSource::ErrorLog { .. } => (Source::ErrorLog, EnterAction::Navigate),
+            DefinitionSource::CommandPalette { .. } => {
+                (Source::CommandPalette(Vec::new()), EnterAction::SendInput)
+            }
+            DefinitionSource::Factory { .. } => unreachable!(),
+            DefinitionSource::Scrollback { regex, unique, .. } => {
                 let regex = Regex::new(&regex.unwrap_or_else(default_regex))
                     .map_err(|error| format!("pickers.{name}.regex: {error}"))?;
                 if regex.is_match("") {
                     return Err(format!("pickers.{name}.regex must not match empty text"));
                 }
-                Options {
-                    position,
-                    sort,
-                    callback,
-                    keys: Vec::new(),
-                    source: Source::Scrollback {
+                (
+                    Source::Scrollback {
                         regex,
                         unique: unique.unwrap_or(defaults.unique),
                     },
-                    enter_action: enter_action.unwrap_or(EnterAction::Navigate),
-                    params: BTreeMap::new(),
-                    preview: None,
-                    preview_visible,
-                }
+                    enter_action.unwrap_or(EnterAction::Navigate),
+                )
             }
-            Definition::Items {
+            DefinitionSource::Items {
                 items, provider, ..
             } => {
                 crate::picker::wire::validate_items(&items)?;
@@ -526,22 +440,15 @@ impl Definition {
                         "pickers.{name}: Items only supports enter_action SendInput"
                     ));
                 }
-                Options {
-                    position,
-                    sort,
-                    callback,
-                    keys: Vec::new(),
-                    source: Source::Items(ItemsOptions {
+                (
+                    Source::Items(ItemsOptions {
                         values: items,
                         provider,
                     }),
-                    enter_action: EnterAction::SendInput,
-                    params: BTreeMap::new(),
-                    preview: None,
-                    preview_visible,
-                }
+                    EnterAction::SendInput,
+                )
             }
-            Definition::Command {
+            DefinitionSource::Command {
                 args,
                 cwd,
                 line_continuation,
@@ -581,25 +488,18 @@ impl Definition {
                         "pickers.{name}.success_exit_codes must contain 1 to 16 nonnegative exit codes"
                     ));
                 }
-                Options {
-                    position,
-                    sort,
-                    callback,
-                    keys: Vec::new(),
-                    source: Source::Command(CommandOptions {
+                (
+                    Source::Command(CommandOptions {
                         args,
                         cwd,
                         line_continuation: line_continuation.filter(|value| !value.is_empty()),
                         unique: unique.unwrap_or(defaults.unique),
                         success_exit_codes,
                     }),
-                    enter_action: EnterAction::SendInput,
-                    params: BTreeMap::new(),
-                    preview: None,
-                    preview_visible,
-                }
+                    EnterAction::SendInput,
+                )
             }
-            Definition::FileSystem {
+            DefinitionSource::FileSystem {
                 roots,
                 max_depth,
                 files_only,
@@ -625,25 +525,29 @@ impl Definition {
                 {
                     return Err(format!("pickers.{name}.roots must contain nonempty paths"));
                 }
-                Options {
-                    position,
-                    sort,
-                    callback,
-                    keys: Vec::new(),
-                    source: Source::FileSystem(FileOptions {
+                (
+                    Source::FileSystem(FileOptions {
                         roots: roots.into_iter().map(std::path::PathBuf::from).collect(),
                         max_depth: max_depth.unwrap_or(i32::MAX),
                         files_only,
                         directories_only,
                     }),
-                    enter_action: EnterAction::SendInput,
-                    params: BTreeMap::new(),
-                    preview: None,
-                    preview_visible,
-                }
+                    EnterAction::SendInput,
+                )
             }
         };
-        options.keys = local_keys;
+        let mut options = Options {
+            position,
+            result_rows,
+            sort,
+            callback,
+            keys: local_keys,
+            source,
+            enter_action,
+            params: BTreeMap::new(),
+            preview: None,
+            preview_visible,
+        };
         if let Some(query) = initial_query {
             options.params.insert("query".into(), query);
         }
@@ -659,15 +563,10 @@ impl Definition {
     }
 
     pub(crate) fn keys_mut(&mut self) -> Option<&mut Vec<PickerKey>> {
-        match self {
-            Self::Scrollback { keys, .. }
-            | Self::Items { keys, .. }
-            | Self::Command { keys, .. }
-            | Self::FileSystem { keys, .. }
-            | Self::Themes { keys, .. }
-            | Self::ErrorLog { keys, .. }
-            | Self::CommandPalette { keys, .. } => Some(keys),
-            Self::Factory { .. } => None,
+        if matches!(self.source, DefinitionSource::Factory { .. }) {
+            None
+        } else {
+            Some(&mut self.presentation.keys)
         }
     }
 
@@ -675,38 +574,29 @@ impl Definition {
         &mut self,
         value: std::rc::Rc<crate::lua_callbacks::PreviewResolver>,
     ) {
-        let preview = match self {
-            Self::Scrollback { preview, .. }
-            | Self::Items { preview, .. }
-            | Self::Command { preview, .. }
-            | Self::FileSystem { preview, .. }
-            | Self::ErrorLog { preview, .. }
-            | Self::Themes { preview, .. }
-            | Self::CommandPalette { preview, .. } => preview,
-            Self::Factory { .. } => return,
-        };
-        if let Some(preview) = preview {
+        if let Some(preview) = &mut self.presentation.preview {
             preview.set_resolver(value);
         }
     }
+
     pub(crate) fn set_items_provider(
         &mut self,
         value: std::rc::Rc<crate::lua_callbacks::ItemsProvider>,
     ) {
-        if let Self::Items { provider, .. } = self {
+        if let DefinitionSource::Items { provider, .. } = &mut self.source {
             *provider = Some(value);
         }
     }
     pub(crate) fn set_callback(&mut self, value: std::rc::Rc<crate::lua_callbacks::Callback>) {
-        match self {
-            Self::Scrollback { callback, .. }
-            | Self::FileSystem { callback, .. }
-            | Self::Command { callback, .. }
-            | Self::Items { callback, .. } => *callback = Some(value),
-            Self::Factory { .. }
-            | Self::ErrorLog { .. }
-            | Self::Themes { .. }
-            | Self::CommandPalette { .. } => {}
+        match &mut self.source {
+            DefinitionSource::Scrollback { callback, .. }
+            | DefinitionSource::FileSystem { callback, .. }
+            | DefinitionSource::Command { callback, .. }
+            | DefinitionSource::Items { callback, .. } => *callback = Some(value),
+            DefinitionSource::Factory { .. }
+            | DefinitionSource::ErrorLog { .. }
+            | DefinitionSource::Themes { .. }
+            | DefinitionSource::CommandPalette { .. } => {}
         }
     }
 
@@ -716,45 +606,45 @@ impl Definition {
         Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
         Option<EnterAction>,
     ) {
-        match self {
-            Self::Scrollback {
+        match &self.source {
+            DefinitionSource::Scrollback {
                 callback,
                 enter_action,
                 ..
             }
-            | Self::Items {
+            | DefinitionSource::Items {
                 callback,
                 enter_action,
                 ..
             }
-            | Self::Command {
+            | DefinitionSource::Command {
                 callback,
                 enter_action,
                 ..
             }
-            | Self::FileSystem {
+            | DefinitionSource::FileSystem {
                 callback,
                 enter_action,
                 ..
             } => (callback.clone(), *enter_action),
-            Self::Factory { .. }
-            | Self::ErrorLog { .. }
-            | Self::Themes { .. }
-            | Self::CommandPalette { .. } => (None, None),
+            DefinitionSource::Factory { .. }
+            | DefinitionSource::ErrorLog { .. }
+            | DefinitionSource::Themes { .. }
+            | DefinitionSource::CommandPalette { .. } => (None, None),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn callback(&self) -> Option<&std::rc::Rc<crate::lua_callbacks::Callback>> {
-        match self {
-            Self::Scrollback { callback, .. }
-            | Self::FileSystem { callback, .. }
-            | Self::Command { callback, .. }
-            | Self::Items { callback, .. } => callback.as_ref(),
-            Self::Factory { .. }
-            | Self::ErrorLog { .. }
-            | Self::Themes { .. }
-            | Self::CommandPalette { .. } => None,
+        match &self.source {
+            DefinitionSource::Scrollback { callback, .. }
+            | DefinitionSource::FileSystem { callback, .. }
+            | DefinitionSource::Command { callback, .. }
+            | DefinitionSource::Items { callback, .. } => callback.as_ref(),
+            DefinitionSource::Factory { .. }
+            | DefinitionSource::ErrorLog { .. }
+            | DefinitionSource::Themes { .. }
+            | DefinitionSource::CommandPalette { .. } => None,
         }
     }
 }
@@ -792,6 +682,7 @@ pub(crate) fn builtin_defaults(name: &str) -> serde_json::Value {
 
 #[derive(Clone)]
 pub(crate) struct Options {
+    pub(crate) result_rows: usize,
     pub(crate) position: Position,
     pub(crate) sort: Sort,
     pub(crate) callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
@@ -867,6 +758,7 @@ impl Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            result_rows: default_result_rows(),
             position: Position::Bottom,
             sort: Sort::default(),
             callback: None,
@@ -922,7 +814,7 @@ impl Bindings {
         self
     }
     pub(crate) fn pipe_stream(options: &super::pipe::StreamOptions) -> Result<PickerEntry, String> {
-        let value = serde_json::json!({"type":"Items","items":[],"initial_query":options.initial_query,"preview_visible":options.preview_visible,"preview":options.preview});
+        let value = serde_json::json!({"type":"Items","items":[],"position":options.position,"result_rows":options.result_rows.unwrap_or(7),"initial_query":options.initial_query,"preview_visible":options.preview_visible,"preview":options.preview});
         if let Some(preview) = value.get("preview") {
             if preview
                 .get("max_bytes")
@@ -1601,6 +1493,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_presentation_keeps_flat_schema_and_strict_source_validation() {
+        for kind in [
+            "Scrollback",
+            "Items",
+            "Command",
+            "FileSystem",
+            "Themes",
+            "ErrorLog",
+            "CommandPalette",
+        ] {
+            let mut value = serde_json::json!({"type":kind});
+            if kind == "Command" {
+                value["args"] = serde_json::json!(["cmd"]);
+            }
+            let defaults: Definition = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(defaults.presentation.result_rows, default_result_rows());
+            assert_eq!(
+                defaults.presentation.preview_visible,
+                !matches!(kind, "Themes" | "ErrorLog" | "CommandPalette")
+            );
+            value["position"] = "FullPane".into();
+            value["result_rows"] = 6.into();
+            value["sort"] = "SourceOrder".into();
+            value["initial_query"] = "needle".into();
+            value["preview_visible"] = true.into();
+            value["preview"] = serde_json::json!({"type":"Text", "text":"preview", "wrap":true});
+            let definition: Definition = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(definition.presentation.position, Position::FullPane);
+            assert_eq!(definition.presentation.result_rows, 6);
+            assert_eq!(
+                definition.presentation.initial_query.as_deref(),
+                Some("needle")
+            );
+            assert!(matches!(
+                definition.presentation.preview,
+                Some(Preview::Text { wrap: true, .. })
+            ));
+            for (field, invalid) in [
+                ("result_row", serde_json::json!(6)),
+                ("presentation", serde_json::json!({"result_rows":6})),
+                (
+                    if kind == "Scrollback" {
+                        "roots"
+                    } else {
+                        "regex"
+                    },
+                    serde_json::json!("unexpected"),
+                ),
+            ] {
+                let mut invalid_value = value.clone();
+                invalid_value[field] = invalid;
+                assert!(
+                    serde_json::from_value::<Definition>(invalid_value).is_err(),
+                    "{kind}.{field}"
+                );
+            }
+        }
+        assert!(
+            serde_json::from_value::<Definition>(
+                serde_json::json!({"type":"Factory", "result_rows":6})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn every_picker_type_accepts_position_and_defaults_to_bottom() {
         for kind in [
             "Scrollback",
@@ -1613,6 +1571,7 @@ mod tests {
                 ("Top", Position::Top),
                 ("Center", Position::Center),
                 ("Bottom", Position::Bottom),
+                ("FullPane", Position::FullPane),
                 ("Cursor", Position::Cursor),
             ] {
                 let source = if kind == "Command" {

@@ -138,7 +138,12 @@ impl TerminalView {
                 .map(|p| &mut p.value.pane),
         }
     }
-    fn run_picker_callback(&mut self, origin: Option<u64>, gl: &glow::Context) {
+    fn run_picker_callback(
+        &mut self,
+        origin: Option<u64>,
+        gl: &glow::Context,
+        ctx: &egui::Context,
+    ) {
         let Some(pane) = self.pane_mut(origin) else {
             return;
         };
@@ -155,8 +160,17 @@ impl TerminalView {
                         &text, &value, filesystem, generation, range, &params, selection,
                     )
                 });
+            let bindings = self.picker_bindings.clone();
+            let has_floating = !self.floating.is_empty();
             if let Some(pane) = self.pane_mut(origin) {
-                pane.finish_picker_callback(result, generation, from_copy);
+                pane.finish_picker_callback(
+                    result,
+                    generation,
+                    from_copy,
+                    ctx,
+                    &bindings,
+                    has_floating,
+                );
             }
         }
     }
@@ -577,7 +591,7 @@ impl TerminalView {
             self.main.show_search_overlay(ui.ctx(), rect);
         }
 
-        self.run_picker_callback(visible_id, gl);
+        self.run_picker_callback(visible_id, gl, ui.ctx());
         if let Some(action) = input.action {
             self.execute_action(action, floating_active, ui.ctx(), gl);
         }

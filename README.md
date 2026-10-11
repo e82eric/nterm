@@ -332,6 +332,10 @@ Cargo builds from this repository or the sample directory use `.cargo/config.tom
 Build the native libraries first with `zig build egui-sample`. Explicit
 `NFM_GHOSTTY_VT_INCLUDE_DIR`, `NFM_GHOSTTY_VT_LIB_DIR`, and
 `NFM_GHOSTTY_VT_LIB_NAME` environment variables can select another VT build.
+The repository's Cargo configuration currently overrides NFM dependencies with
+the companion checkout at `G:/src/RustWin32Host` for the new FullPane layout API.
+Those local layout changes must be published and the pinned revision updated
+before removing the override or building on a machine without that checkout.
 
 Recoverable errors and fallback warnings are retained in a session history
 (200 records, 16 KiB details per record). Repeated failures aggregate. They also
@@ -690,12 +694,42 @@ printed and the picker stays closed.
 
 ### Picker sources and common options
 
-Every picker type accepts `position = "Top"`, `"Center"`, `"Bottom"`, or
+Every picker type accepts `position = "Top"`, `"Center"`, `"Bottom"`, `"FullPane"`, or
 `"Cursor"`; the default is `"Bottom"`. Cursor placement puts the query near
 the live terminal cursor, or the copy cursor when opened from copy mode, and
 shows the panel below it when there is room, otherwise above it. The panel
 stays inside the terminal or floating pane. If the cursor is outside the
 visible viewport, placement falls back to Bottom.
+
+`FullPane` covers the active terminal or floating pane. Set `result_rows` (1–256,
+default 7) to reserve result rows; the preview uses all remaining complete rows
+after the query, optional header, and padding. Resizing recalculates the preview
+height. `preview_rows` is ignored in this mode. Hiding the preview leaves the
+remaining area blank, and very small panes reduce result rows to keep the query
+accessible. Named definitions and picker factories support `result_rows` in
+every position.
+
+```lua
+Details = {
+  type = "Items",
+  items = { { text = "Example", value = "example" } },
+  position = "FullPane",
+  result_rows = 7,
+  preview_visible = true,
+  preview = { type = "Text", text = "{item}", wrap = true },
+}
+```
+
+PowerShell stream requests use the same placement and row settings:
+
+```powershell
+'Example' | Invoke-GhosttyPicker -Options @{
+    position = 'FullPane'
+    result_rows = 7
+    preview_visible = $true
+    preview = @{ type = 'Text'; text = '{item}'; wrap = $true }
+}
+```
 
 Set the top-level `picker_defaults = { unique = true }` to enable deduplication
 by default for Scrollback and Command pickers, including function-defined
@@ -1050,6 +1084,23 @@ Scrollback items have `item.range.start` and `.end`, each with zero-based `x` an
 `app:paste(text)` pastes without Enter. `app:send_text(text)` sends typed input,
 with line breaks translated to Enter keys. `app:navigate(item)` enters copy mode
 at a scrollback item's first cell. Paths are not automatically shell-quoted.
+`app:replace_picker(name, params)` switches to a named picker from an acceptance
+callback or picker-local key. `params` is an optional table of string values,
+using the same request parameters as named pipe requests (including `query`,
+`items`, and `roots`). The destination installs its own source, previews,
+callbacks, and local keys; it replaces the current picker without a back stack.
+For example, an acceptance callback or local key action can use:
+
+```lua
+action = function(app, item)
+  app:replace_picker("Details", { selected = item.value, query = item.text })
+end
+```
+
+No `app:close_picker()` is needed before replacement. Compatible controls retain
+their displayed rows while new results load; changes to sorting or click
+acceptance create a fresh control. Picker factories resolve normally, with
+request parameters available to destination callbacks and preview resolvers.
 `app:replace_prompt(text, before, after)` sends `after` Delete and `before`
 Backspace key events, then pastes `text`; use the command-line cursor and length
 from the shell's named pipe request to replace text on both sides of the cursor.

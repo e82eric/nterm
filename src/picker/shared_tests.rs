@@ -5,6 +5,32 @@ use nfm_search_core::{
 use std::time::{Duration, Instant};
 
 #[test]
+fn full_pane_pipe_options_set_placement_and_result_rows() {
+    let stream: pipe::StreamOptions = serde_json::from_value(serde_json::json!({
+        "position":"FullPane", "result_rows":5, "preview_rows":1,
+        "preview_visible":true, "preview":{"type":"Text", "text":"preview", "wrap":true}
+    }))
+    .unwrap();
+    let options = config::Bindings::pipe_stream(&stream)
+        .unwrap()
+        .resolve(&Default::default())
+        .unwrap();
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(std::ptr::null_mut(), None, false, 0, ctx.clone(), options);
+    assert_eq!(picker.result_rows, 5);
+    assert_eq!(picker.position, config::Position::FullPane);
+    let bounds = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(800.0, 600.0));
+    assert_eq!(
+        picker.placement(bounds).position,
+        nfm_egui::Position::FullPane
+    );
+    let (session, _replies) = pipe::Session::new("full-pane".into());
+    picker.attach_pipe(&ctx, session, Some(&stream));
+    assert_eq!(picker.result_rows, 5);
+    assert_eq!(picker.position, config::Position::FullPane);
+}
+
+#[test]
 fn text_preview_wrap_pipe_options_validate() {
     for (field, expected) in [(None, false), (Some(false), false), (Some(true), true)] {
         let mut preview = serde_json::json!({"type":"Text", "text":"long line"});
@@ -1192,6 +1218,88 @@ fn picker_enter_override_replaces_default_acceptance() {
     );
     assert!(matches!(action, Some(Action::Custom(..))));
     assert!(!picker.shared.is_closed());
+}
+
+#[test]
+fn replace_picker_from_accept_and_local_key_resets_source_and_callbacks() {
+    for local_key in [false, true] {
+        let ctx = egui::Context::default();
+        let mut previous = items(&ctx);
+        let lua = std::rc::Rc::new(mlua::Lua::new());
+        let callback: mlua::Function = lua.load("return function(app,item) app:replace_picker('Details', {selected=item.value, query='target'}) end").eval().unwrap();
+        previous.callback = Some(std::rc::Rc::new(crate::lua_callbacks::Callback {
+            key: lua.create_registry_value(callback).unwrap(),
+            lua: lua.clone(),
+            name: "source".into(),
+        }));
+        if local_key {
+            let keys = lua.load("return {{key='d', action=function(app,item) app:replace_picker('Details', {selected=item.value, query='target'}) end}}").eval().unwrap();
+            previous.keys =
+                crate::config::keybindings::parse_picker_keys(&lua, "source", Some(keys)).unwrap();
+        }
+        wait_selection(&ctx, &mut previous);
+        let (action, _) = frame(
+            &ctx,
+            &mut previous,
+            vec![key(
+                if local_key {
+                    egui::Key::D
+                } else {
+                    egui::Key::Enter
+                },
+                egui::Modifiers::NONE,
+            )],
+        );
+        let Some(Action::Custom(callback, text, filesystem, range, value, params)) = action else {
+            panic!("expected callback")
+        };
+        assert_eq!(previous.is_closed(), !local_key);
+        let commands = callback
+            .call(&text, &value, filesystem, None, range, &params)
+            .unwrap();
+        let crate::lua_callbacks::Command::ReplacePicker { name, params } = &commands[0] else {
+            panic!("expected replacement")
+        };
+        assert_eq!(name, "Details");
+        assert_eq!(params["selected"], "inserted value");
+        let target = config::Options {
+            source: config::Source::Items(config::ItemsOptions {
+                values: vec![wire::Item {
+                    text: "target item".into(),
+                    value: "target value".into(),
+                }],
+                provider: None,
+            }),
+            enter_action: config::EnterAction::SendInput,
+            preview: Some(config::Preview::Text {
+                text: "new preview".into(),
+                wrap: true,
+            }),
+            ..Default::default()
+        }
+        .with_request(params.clone())
+        .unwrap();
+        let mut replacement = Picker::start_replacing(
+            std::ptr::null_mut(),
+            None,
+            false,
+            0,
+            ctx.clone(),
+            target,
+            Some(previous),
+        );
+        assert!(!replacement.is_closed());
+        assert!(replacement.callback.is_none());
+        assert!(replacement.keys.is_empty());
+        assert_eq!(replacement.shared.query(), "target");
+        assert_eq!(wait_selection(&ctx, &mut replacement).text, "target item");
+        let (action, _) = frame(
+            &ctx,
+            &mut replacement,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert!(matches!(action, Some(Action::SendInput(value)) if value == "target value"));
+    }
 }
 
 #[test]

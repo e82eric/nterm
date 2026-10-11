@@ -26,6 +26,8 @@ pub(crate) struct Picker {
     context: egui::Context,
     keys: Vec<config::PickerKey>,
     shared: nfm_egui::Picker<source::Snapshot>,
+    sort: nfm_search_core::search::SearchSortMode,
+    accept_on_click: bool,
     pub(crate) cursor_row: Option<u32>,
     position: config::Position,
     pub(crate) generation: Option<u64>,
@@ -173,11 +175,23 @@ impl Picker {
         from_copy: bool,
         rows: u64,
         ctx: egui::Context,
+        options: config::Options,
+    ) -> Self {
+        Self::start_replacing(host, generation, from_copy, rows, ctx, options, None)
+    }
+
+    pub(crate) fn start_replacing(
+        host: *mut Host,
+        generation: Option<u64>,
+        from_copy: bool,
+        rows: u64,
+        ctx: egui::Context,
         mut options: config::Options,
+        previous: Option<Self>,
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let session_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let initial_query = options
+        let initial_query: String = options
             .params
             .get("query")
             .map(|query| query.chars().take(4096).collect())
@@ -198,14 +212,17 @@ impl Picker {
                 config::Preview::Scrollback { rows } => *rows,
                 _ => 12,
             });
+        let sort = options.sort.mode();
+        let result_rows = options.result_rows;
+        let accept_on_click = matches!(source.label(), "GHOSTTY THEMES" | "ERROR HISTORY");
         let mut shared = nfm_egui::Picker::new(
             ("ghostty-picker", session_id),
             &ctx,
             source.provider(),
             nfm_egui::PickerConfig {
                 title: source.label().into(),
-                initial_query,
-                result_rows: RESULT_ROWS,
+                initial_query: initial_query.clone(),
+                result_rows,
                 accept_on_click: matches!(source.label(), "GHOSTTY THEMES" | "ERROR HISTORY"),
                 preview_rows: options.preview.as_ref().map_or(12, |p| match p {
                     config::Preview::Scrollback { rows } => *rows,
@@ -216,6 +233,23 @@ impl Picker {
                 ..Default::default()
             },
         );
+        if let Some(mut previous) = previous {
+            // NFM's source replacement retains presented rows and rejects stale
+            // selections. Recreate the control if its immutable settings differ.
+            if previous.sort == sort && previous.accept_on_click == accept_on_click {
+                std::mem::swap(&mut shared, &mut previous.shared);
+                shared.replace_source(&ctx, source.provider(), initial_query);
+                shared.set_presentation(result_rows, preview_rows, options.preview_visible);
+                shared.set_external_preview(false);
+                shared.set_keybinding_help(Vec::new());
+                shared.set_preview_provider(
+                    &ctx,
+                    Arc::new(|_: nfm_egui::PreviewRequest<source::Candidate>, _| {
+                        Ok(nfm_egui::Preview::Empty)
+                    }),
+                );
+            }
+        }
         let snapshot_preview =
             if matches!(options.preview, Some(config::Preview::Scrollback { .. })) {
                 let reader = Arc::new(preview::SnapshotPreview::new(host, generation));
@@ -316,13 +350,15 @@ impl Picker {
             command_preview,
             resolved_preview,
             callback: options.callback,
+            sort,
+            accept_on_click,
             request_params: options.params,
             enter_action: options.enter_action,
             source,
             split_parent: None,
             split_parent_presentation: None,
             builtin_pickers: config::BuiltinPickers::default(),
-            result_rows: RESULT_ROWS,
+            result_rows,
             preview_rows,
             line_split: false,
             host: host as usize,
@@ -377,6 +413,7 @@ impl Picker {
             config::Position::Top => nfm_egui::Position::Top,
             config::Position::Center => nfm_egui::Position::Center,
             config::Position::Bottom => nfm_egui::Position::Bottom,
+            config::Position::FullPane => nfm_egui::Position::FullPane,
             config::Position::Cursor if self.cursor_row.is_some() => nfm_egui::Position::Cursor,
             config::Position::Cursor => nfm_egui::Position::Bottom,
         };

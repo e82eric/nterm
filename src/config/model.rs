@@ -19,28 +19,25 @@ impl Model {
             BTreeMap::from([
                 (
                     "lines".into(),
-                    Definition::Scrollback {
-                        position: Position::Bottom,
-                        sort: Sort::default(),
-                        unique: None,
-                        callback: None,
-                        regex: None,
-                        enter_action: None,
-                        initial_query: None,
-                        keys: Vec::new(),
-                        preview: None,
-                        preview_visible: true,
+                    Definition {
+                        presentation: PickerPresentation::default(),
+                        source: DefinitionSource::Scrollback {
+                            unique: None,
+                            callback: None,
+                            regex: None,
+                            enter_action: None,
+                        },
                     },
                 ),
                 (
                     "commands".into(),
-                    Definition::CommandPalette {
-                        position: Position::Cursor,
-                        sort: Sort::default(),
-                        initial_query: None,
-                        keys: Vec::new(),
-                        preview: None,
-                        preview_visible: false,
+                    Definition {
+                        presentation: PickerPresentation {
+                            position: Position::Cursor,
+                            preview_visible: false,
+                            ..Default::default()
+                        },
+                        source: DefinitionSource::CommandPalette {},
                     },
                 ),
             ])

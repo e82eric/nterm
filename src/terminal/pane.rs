@@ -929,6 +929,18 @@ impl TerminalPane {
         bindings: &crate::picker::config::Bindings,
         has_floating: bool,
     ) {
+        self.open_picker_impl(ctx, entry, request_params, bindings, has_floating, false);
+    }
+
+    fn open_picker_impl(
+        &mut self,
+        ctx: &egui::Context,
+        entry: crate::picker::config::PickerEntry,
+        request_params: Option<std::collections::BTreeMap<String, String>>,
+        bindings: &crate::picker::config::Bindings,
+        has_floating: bool,
+        replace: bool,
+    ) {
         let host = self.host;
         let context = if entry.needs_context() {
             let mut row = ghostty_ffi::LiveCursorLine::default();
@@ -1001,7 +1013,13 @@ impl TerminalPane {
             }
         }
         let copy_generation = self.copy_mode.generation;
-        let from_copy = copy_generation.is_some();
+        let from_copy = if replace {
+            self.picker
+                .as_ref()
+                .map_or(copy_generation.is_some(), |picker| picker.from_copy)
+        } else {
+            copy_generation.is_some()
+        };
         let cursor_row = if options.position == crate::picker::config::Position::Cursor {
             self.picker_cursor_row()
         } else {
@@ -1014,7 +1032,8 @@ impl TerminalPane {
                 | crate::picker::config::Source::Items(_)
                 | crate::picker::config::Source::Command(_)
         ) {
-            self.picker = Some(crate::picker::Picker::start(
+            let previous = if replace { self.picker.take() } else { None };
+            self.picker = Some(crate::picker::Picker::start_replacing(
                 host,
                 if matches!(
                     options.source,
@@ -1028,6 +1047,7 @@ impl TerminalPane {
                 0,
                 ctx.clone(),
                 options,
+                previous,
             ));
         } else {
             let generation = if let Some(generation) = copy_generation {
@@ -1062,13 +1082,15 @@ impl TerminalPane {
             if !from_copy {
                 self.copy_mode.start(generation, view);
             }
-            self.picker = Some(crate::picker::Picker::start(
+            let previous = if replace { self.picker.take() } else { None };
+            self.picker = Some(crate::picker::Picker::start_replacing(
                 host,
                 Some(generation),
                 from_copy,
                 view.total_rows,
                 ctx.clone(),
                 options,
+                previous,
             ));
         }
         if let Some(picker) = self.picker.as_mut() {
@@ -1228,6 +1250,12 @@ impl TerminalPane {
                             Self::replace_picker_prompt(self.host, &text, before, after);
                         }
                         crate::lua_callbacks::Command::Navigate(_) => {}
+                        crate::lua_callbacks::Command::ReplacePicker { .. } => {
+                            self.show_error(
+                                "Picker replacement failed",
+                                "replace_picker requires a picker callback".into(),
+                            );
+                        }
                         crate::lua_callbacks::Command::ClosePicker => {
                             if let Some(picker) = self.picker.take() {
                                 picker.surrender_focus();
@@ -1418,12 +1446,7 @@ impl TerminalPane {
             .and_then(|picker| picker.show_in_bounds(ui.ctx(), bounds));
         let mut application_action = None;
         if let Some(action) = action {
-            if matches!(&action, crate::picker::Action::Custom(..))
-                && self
-                    .picker
-                    .as_ref()
-                    .is_some_and(|picker| !picker.is_closed())
-            {
+            if matches!(&action, crate::picker::Action::Custom(..)) {
                 let picker = self
                     .picker
                     .as_ref()
@@ -1491,6 +1514,9 @@ impl TerminalPane {
         result: Result<Vec<crate::lua_callbacks::Command>, String>,
         generation: Option<u64>,
         from_copy: bool,
+        ctx: &egui::Context,
+        bindings: &crate::picker::config::Bindings,
+        has_floating: bool,
     ) {
         let restore_copy = |pane: &mut Self| {
             if from_copy {
@@ -1503,10 +1529,40 @@ impl TerminalPane {
         };
         match result {
             Ok(commands) => {
+                // Accept callbacks normally close before executing commands.
+                // Keep the old control only when it is needed for replacement.
+                if !commands.iter().any(|command| {
+                    matches!(command, crate::lua_callbacks::Command::ReplacePicker { .. })
+                }) && self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.is_closed())
+                {
+                    if let Some(picker) = self.picker.take() {
+                        picker.surrender_focus();
+                    }
+                }
                 let mut navigated = false;
                 let mut sent = false;
                 for command in commands {
                     match command {
+                        crate::lua_callbacks::Command::ReplacePicker { name, params } => {
+                            if let Some(entry) = bindings.named(&name) {
+                                self.open_picker_impl(
+                                    ctx,
+                                    entry,
+                                    Some(params),
+                                    bindings,
+                                    has_floating,
+                                    true,
+                                );
+                            } else {
+                                self.show_error(
+                                    "Picker replacement failed",
+                                    format!("Unknown picker {name}"),
+                                );
+                            }
+                        }
                         crate::lua_callbacks::Command::ClosePicker => {
                             if let Some(picker) = &self.picker {
                                 picker.surrender_focus();
@@ -1570,12 +1626,30 @@ impl TerminalPane {
                         }
                     }
                 }
+                if self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.is_closed())
+                {
+                    if let Some(picker) = self.picker.take() {
+                        picker.surrender_focus();
+                    }
+                }
                 if !sent && !navigated && self.picker.is_none() {
                     restore_copy(self);
                 }
             }
             Err(error) => {
                 self.show_error("Picker action failed", error);
+                if self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.is_closed())
+                {
+                    if let Some(picker) = self.picker.take() {
+                        picker.surrender_focus();
+                    }
+                }
                 if self.picker.is_none() {
                     restore_copy(self);
                 }

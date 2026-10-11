@@ -533,10 +533,40 @@ mod tests {
             matches!(&commands[0], Command::ReplacePrompt { text, before: 3, after: 2 } if text == "replacement")
         );
     }
+
+    #[test]
+    fn replace_picker_queues_name_and_optional_parameters() {
+        let callback = callback(
+            "return function(app, item) app:replace_picker('Details', {selected=item.value, query='target'}); app:replace_picker('Other') end",
+        );
+        let commands = callback
+            .call("shown", "accepted", false, None, None, &Default::default())
+            .unwrap();
+        assert!(
+            matches!(&commands[0], Command::ReplacePicker { name, params } if name == "Details" && params["selected"] == "accepted" && params["query"] == "target")
+        );
+        assert!(
+            matches!(&commands[1], Command::ReplacePicker { name, params } if name == "Other" && params.is_empty())
+        );
+        for args in [
+            "''",
+            "'Details', {selected=false}",
+            "'Details', {selected='a' .. string.char(0)}",
+        ] {
+            let invalid = self::callback(&format!(
+                "return function(app) app:replace_picker({args}) end"
+            ));
+            assert!(invalid.call_action(String::new()).is_err(), "{args}");
+        }
+    }
 }
 #[derive(Debug)]
 pub(crate) enum Command {
     ClosePicker,
+    ReplacePicker {
+        name: String,
+        params: std::collections::BTreeMap<String, String>,
+    },
     Paste(String),
     SendText(String),
     ReplacePrompt {
@@ -653,6 +683,13 @@ impl UserData for App {
             app.push(Command::Paste(text))
         });
         methods.add_method("close_picker", |_, app, ()| app.push(Command::ClosePicker));
+        methods.add_method("replace_picker", |_, app, (name, params): (String, Option<std::collections::BTreeMap<String, String>>)| {
+            let params = params.unwrap_or_default();
+            if name.is_empty() || name.contains('\0') || params.iter().any(|(key, value)| key.contains('\0') || value.contains('\0')) {
+                return Err(mlua::Error::external("invalid picker replacement"));
+            }
+            app.push(Command::ReplacePicker { name, params })
+        });
         methods.add_method("send_text", |_, app, text: String| {
             app.push(Command::SendText(text))
         });

@@ -64,8 +64,8 @@ impl PickerFactory {
             .remove_app_data::<crate::preview_worker::FactoryContext>();
         let definition = definition?;
         if matches!(
-            definition,
-            crate::picker::config::Definition::Factory { .. }
+            definition.source,
+            crate::picker::config::DefinitionSource::Factory { .. }
         ) {
             return Err(format!(
                 "pickers.{}: factory must return a picker table",
@@ -461,14 +461,14 @@ impl AppConfig {
                             let key = lua
                                 .create_registry_value(function)
                                 .map_err(|e| e.to_string())?;
-                            crate::picker::config::Definition::Factory {
-                                factory: Some(std::rc::Rc::new(PickerFactory {
+                            crate::picker::config::Definition::factory(std::rc::Rc::new(
+                                PickerFactory {
                                     lua: lua.clone(),
                                     key,
                                     name: name.clone(),
                                     builtin: None,
-                                })),
-                            }
+                                },
+                            ))
                         }
                         _ => return Err(format!("pickers.{name} must be a table or function")),
                     };
@@ -499,14 +499,14 @@ impl AppConfig {
                             let key = lua
                                 .create_registry_value(function)
                                 .map_err(|e| e.to_string())?;
-                            crate::picker::config::Definition::Factory {
-                                factory: Some(std::rc::Rc::new(PickerFactory {
+                            crate::picker::config::Definition::factory(std::rc::Rc::new(
+                                PickerFactory {
                                     lua: lua.clone(),
                                     key,
                                     name: format!("builtin.{name}"),
                                     builtin: Some(name.clone()),
-                                })),
-                            }
+                                },
+                            ))
                         }
                         _ => {
                             return Err(format!(
@@ -1269,6 +1269,26 @@ mod tests {
     }
 
     #[test]
+    fn full_pane_lua_named_and_factory_pickers_accept_result_rows() {
+        let config = parse("return {pickers={fixed={type='Items', items={{text='item',value='value'}}, position='FullPane', result_rows=5, preview={type='Text',text='preview',wrap=true}}, dynamic=function() return {type='Items',items={{text='item',value='value'}},position='FullPane',result_rows=9} end}}").unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_defaults(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+        )
+        .unwrap();
+        for (name, rows) in [("fixed", 5), ("dynamic", 9)] {
+            let options = bindings
+                .named(name)
+                .unwrap()
+                .resolve(&Default::default())
+                .unwrap();
+            assert_eq!(options.position, crate::picker::config::Position::FullPane);
+            assert_eq!(options.result_rows, rows);
+        }
+    }
+
+    #[test]
     fn palette_is_a_named_picker_and_defers_picker_factories() {
         let config = parse("return { pickers = { commands = { type = 'CommandPalette', position = 'Center', preview_visible = false }, dynamic = function() error('factory must not run during catalog enumeration') end }, keys = { { key = 'k', mods = 'CTRL|SHIFT', picker = 'commands' } } }").unwrap();
         let bindings = crate::picker::config::Bindings::compile_with_defaults(
@@ -1668,7 +1688,7 @@ mod tests {
             "return {pickers={x={type='FileSystem', max_depth=-1}}}",
             "return {pickers={x={type='Command', args={'{program}'}}}}",
             "return {pickers={x={type='Command', args={'cmd'}, result_rows=0}}}",
-            "return {pickers={x={type='Command', args={'cmd'}, result_rows=31}}}",
+            "return {pickers={x={type='Command', args={'cmd'}, result_rows=257}}}",
             "return {pickers={x={type='Command', args={'cmd'}, sort='Invalid'}}}",
         ] {
             let result = parse(source).and_then(|config| {
@@ -1873,8 +1893,8 @@ mod tests {
         }
         let config = parse("return {pickers={x={regex='x'}}}").unwrap();
         assert!(matches!(
-            config.pickers.as_ref().unwrap()["x"],
-            crate::picker::config::Definition::Scrollback { .. }
+            config.pickers.as_ref().unwrap()["x"].source,
+            crate::picker::config::DefinitionSource::Scrollback { .. }
         ));
     }
 

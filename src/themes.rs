@@ -58,6 +58,7 @@ fn names_in_directories(paths: &[PathBuf]) -> Result<Vec<String>, String> {
 pub(crate) fn picker_options(names: Vec<String>) -> crate::picker::config::Options {
     use crate::picker::config::*;
     Options {
+        result_rows: Options::default().result_rows,
         position: Position::Center,
         sort: Sort::Score,
         callback: None,

@@ -44,6 +44,7 @@ pub(crate) enum Open {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct StreamOptions {
+    pub position: super::config::Position,
     pub initial_query: String,
     pub preview: Option<Value>,
     pub preview_visible: bool,
