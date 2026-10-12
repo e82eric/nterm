@@ -1,5 +1,6 @@
 pub(crate) mod keybindings;
 pub(crate) mod model;
+pub(crate) mod prompts;
 
 use mlua::{Lua, LuaSerdeExt};
 use serde::Deserialize;
@@ -279,6 +280,10 @@ struct AppConfig {
     picker_defaults: crate::picker::config::PickerDefaults,
     builtin_pickers: crate::picker::config::BuiltinPickers,
     cursor_scroll_padding: Option<u32>,
+    #[serde(default = "prompts::defaults")]
+    prompt_patterns: Vec<String>,
+    #[serde(skip)]
+    compiled_prompts: std::rc::Rc<prompts::Patterns>,
     picker_pipe: crate::picker::pipe::Policy,
     pickers: Option<std::collections::BTreeMap<String, crate::picker::config::Definition>>,
     keys: Option<Vec<crate::picker::config::KeyBinding>>,
@@ -524,6 +529,8 @@ impl AppConfig {
             }
         }
         let mut config: Self = lua.from_value(value).map_err(|error| error.to_string())?;
+        config.compiled_prompts =
+            std::rc::Rc::new(prompts::Patterns::compile(&config.prompt_patterns)?);
         config.builtin_pickers.validate()?;
         config.picker_defaults.validate()?;
         config.keys = parsed_keys;
@@ -655,6 +662,7 @@ impl ReloadSource {
                 )?
                 .with_builtin_pickers(config.builtin_pickers)
                 .with_pipe_policy(config.picker_pipe)
+                .with_prompt_patterns(config.compiled_prompts)
                 .with_cursor_scroll_padding(
                     config
                         .cursor_scroll_padding
@@ -756,6 +764,7 @@ pub(crate) fn prepare_with_reload(
                         )?
                         .with_builtin_pickers(config.builtin_pickers)
                         .with_pipe_policy(config.picker_pipe)
+                        .with_prompt_patterns(config.compiled_prompts)
                         .with_cursor_scroll_padding(
                             config
                                 .cursor_scroll_padding
@@ -1583,6 +1592,7 @@ mod tests {
         .unwrap()
         .with_builtin_pickers(config.builtin_pickers)
         .with_pipe_policy(config.picker_pipe)
+        .with_prompt_patterns(config.compiled_prompts)
         .with_cursor_scroll_padding(
             config
                 .cursor_scroll_padding
@@ -1951,6 +1961,34 @@ mod tests {
         for value in ["-1", "1.5", "'two'", "4294967296"] {
             assert!(parse(&format!("return {{ cursor_scroll_padding={value} }}")).is_err());
         }
+    }
+
+    #[test]
+    fn prompt_patterns_are_validated_and_replace_defaults() {
+        let defaults = parse("return {}").unwrap();
+        assert!(
+            defaults
+                .compiled_prompts
+                .prefix_end("PS C:\\src> ")
+                .is_some()
+        );
+        let custom = parse(r#"return { prompt_patterns = { [[^custom>\s*]] } }"#).unwrap();
+        assert_eq!(custom.compiled_prompts.prefix_end("custom> run"), Some(8));
+        assert_eq!(custom.compiled_prompts.prefix_end("PS C:> "), None);
+        assert!(
+            parse("return { prompt_patterns = { '[' } }")
+                .err()
+                .unwrap()
+                .contains("prompt_patterns[1]")
+        );
+        assert!(parse("return { prompt_patterns = 123 }").is_err());
+        assert_eq!(
+            parse("return { prompt_patterns = {} }")
+                .unwrap()
+                .compiled_prompts
+                .prefix_end("PS C:> "),
+            None
+        );
     }
 
     #[test]

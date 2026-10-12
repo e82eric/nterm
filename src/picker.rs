@@ -46,6 +46,7 @@ pub(crate) struct Picker {
     result_rows: usize,
     preview_rows: usize,
     line_split: bool,
+    prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     host: usize,
     #[cfg(test)]
     session_id: u64,
@@ -346,6 +347,7 @@ impl Picker {
             result_rows,
             preview_rows,
             line_split: false,
+            prompt_patterns: Default::default(),
             host: host as usize,
             #[cfg(test)]
             session_id,
@@ -373,6 +375,12 @@ impl Picker {
         loading
     }
 
+    pub(crate) fn set_prompt_patterns(
+        &mut self,
+        patterns: std::rc::Rc<crate::config::prompts::Patterns>,
+    ) {
+        self.prompt_patterns = patterns;
+    }
     pub(crate) fn set_cursor_scroll_padding(&mut self, rows: u32) {
         self.shared.set_cursor_scroll_padding(rows);
     }
@@ -548,6 +556,7 @@ impl Picker {
                             range.start.y,
                             view.total_rows,
                             view.columns as usize,
+                            &self.prompt_patterns,
                         ) {
                             Ok(source) => {
                                 self.enter_line_split(ctx, source);
@@ -778,6 +787,7 @@ impl Picker {
         row: u64,
         ctx: egui::Context,
         builtin_pickers: config::BuiltinPickers,
+        prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     ) -> Result<Self, String> {
         let source = PickerSource::split_line(
             host,
@@ -785,6 +795,7 @@ impl Picker {
             row,
             view.total_rows,
             view.columns as usize,
+            &prompt_patterns,
         )?;
         // An empty source avoids starting a whole-scrollback scan. The completed
         // split source uses the same frozen snapshot and preview lifetime.
@@ -806,6 +817,7 @@ impl Picker {
         picker.source = source;
         picker.line_split = true;
         picker.builtin_pickers = builtin_pickers;
+        picker.prompt_patterns = prompt_patterns;
         picker.apply_line_break_presentation();
         Ok(picker)
     }

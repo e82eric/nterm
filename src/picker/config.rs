@@ -804,11 +804,20 @@ pub(crate) struct Bindings {
     pub(crate) pipe_policy: super::pipe::Policy,
     pub(crate) builtin_pickers: BuiltinPickers,
     pub(crate) cursor_scroll_padding: u32,
+    pub(crate) prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     bindings: Vec<Binding>,
     model: std::rc::Rc<crate::config::model::Model>,
 }
 
 impl Bindings {
+    pub(crate) fn with_prompt_patterns(
+        mut self,
+        patterns: std::rc::Rc<crate::config::prompts::Patterns>,
+    ) -> Self {
+        self.prompt_patterns = patterns;
+        self
+    }
+
     pub(crate) fn with_pipe_policy(mut self, policy: super::pipe::Policy) -> Self {
         self.pipe_policy = policy;
         self
@@ -945,6 +954,7 @@ impl Bindings {
             model,
             builtin_pickers: BuiltinPickers::default(),
             cursor_scroll_padding: nfm_egui::copy_mode::SCROLL_PADDING_ROWS,
+            prompt_patterns: Default::default(),
         })
     }
 

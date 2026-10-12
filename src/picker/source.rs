@@ -121,6 +121,7 @@ impl PickerSource {
         row: u64,
         total_rows: u64,
         columns: usize,
+        patterns: &crate::config::prompts::Patterns,
     ) -> Result<Self, String> {
         let start = row.saturating_sub(10);
         let end = row.saturating_add(11).min(total_rows);
@@ -145,17 +146,15 @@ impl PickerSource {
             lines.push(split_line_cells(y, &text, columns));
         }
         let target = usize::try_from(row - start).map_err(|_| "Invalid line-split row")?;
-        let prompt =
-            regex::Regex::new(r"^(?:PS [^>]*>|\d+:\d+>|›)\s*").expect("valid prompt regex");
         let prompts = lines
             .get(target)
             .and_then(|line| {
                 let text: String = line.cells.iter().map(|cell| cell.text.as_str()).collect();
-                prompt.find(&text).map(|matched| {
+                patterns.prefix_end(&text).map(|matched_end| {
                     let mut bytes = 0;
                     let mut end = 0;
                     for cell in &line.cells {
-                        if bytes >= matched.end() {
+                        if bytes >= matched_end {
                             break;
                         }
                         bytes += cell.text.len();

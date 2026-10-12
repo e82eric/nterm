@@ -185,6 +185,24 @@ the base; Lua overrides them, and explicit command-line options override Lua.
 The picker still imports Ghostty's resolved font and tracks its cell dimensions.
 Use the command palette's Reload configuration action to apply supported Lua settings.
 
+`prompt_patterns` configures prompt detection for pane copy-mode command navigation
+and the line splitter. It replaces the default patterns; an empty list disables
+detection. Patterns match the beginning of a logical line and include the prompt
+text to exclude when splitting. They use Rust regex syntax and are compiled when
+the config loads; invalid expressions report the pattern index and reject the config.
+Successful configuration reloads also update the patterns.
+
+```lua
+return {
+  prompt_patterns = {
+    [[^PS [^>]*>\s*]],
+    [[^\d+:\d+>\s*]],
+    [[^›\s*]],
+    [[^────────────────────*]],
+  },
+}
+```
+
 The UI follows Ghostty's resolved theme colors. Optional `colors.ui` overrides
 take precedence for app chrome without changing terminal colors:
 

@@ -12,7 +12,6 @@ use crate::painter::TerminalPainter;
 use crate::search::{SearchUi, SnapshotSearchAdapter};
 use nfm_egui::copy_mode::{
     CopyAction, CopyMode, CopySelection, CopyTextObject, Motion, TextRow, VisualMode, YankCommand,
-    find_prompt_boundaries,
 };
 #[cfg(test)]
 use nfm_egui::copy_mode::{
@@ -201,6 +200,7 @@ pub(super) struct TerminalPane {
     copy_search_query: Option<(String, bool)>,
     copy_search_refresh: Option<u64>,
     prompt_boundaries: Option<(u64, Vec<u64>)>,
+    prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     pub(super) floating_palette_entries: Vec<crate::actions::Entry>,
     pub(super) pending_callback: Option<(crate::picker::Action, Option<u64>, bool)>,
 }
@@ -403,6 +403,7 @@ impl TerminalPane {
             copy_search_query: None,
             copy_search_refresh: None,
             prompt_boundaries: None,
+            prompt_patterns: Default::default(),
             floating_palette_entries: Vec::new(),
             pending_callback: None,
         })
@@ -829,6 +830,10 @@ impl TerminalPane {
         bounds: egui::Rect,
         bindings: &mut crate::picker::config::Bindings,
     ) -> PaneInput {
+        if !std::rc::Rc::ptr_eq(&self.prompt_patterns, &bindings.prompt_patterns) {
+            self.prompt_patterns = bindings.prompt_patterns.clone();
+            self.prompt_boundaries = None;
+        }
         self.copy_mode
             .set_scroll_padding(bindings.cursor_scroll_padding);
         let (picker_consumed, action) = self.handle_picker(ui, bounds, bindings);
@@ -1456,6 +1461,7 @@ impl TerminalPane {
         if let Some(picker) = self.picker.as_mut() {
             picker.typography = typography;
             picker.builtin_pickers = bindings.builtin_pickers;
+            picker.set_prompt_patterns(bindings.prompt_patterns.clone());
             picker.set_cursor_scroll_padding(bindings.cursor_scroll_padding);
         }
         let action = self
@@ -1794,7 +1800,7 @@ impl TerminalPane {
                 style: SnapshotDecorationStyle {
                     foreground_rgb: crate::colors::rgb(palette.accent),
                     background_rgb: crate::colors::rgb(palette.background),
-                    flags: 3,
+                    flags: 7,
                 },
                 bold: true,
             })
@@ -2345,6 +2351,7 @@ impl TerminalPane {
                             cursor.y,
                             ctx.clone(),
                             bindings.builtin_pickers,
+                            bindings.prompt_patterns.clone(),
                         )
                     } else {
                         Err("Unable to read the copy-mode snapshot".into())
@@ -2473,9 +2480,12 @@ impl TerminalPane {
         {
             return true;
         }
-        let Some(rows) = find_prompt_boundaries(self.copy_mode.total_rows(), |row| {
-            self.read_snapshot_row(generation, row)
-        }) else {
+        let Some(rows) = self
+            .prompt_patterns
+            .boundaries(self.copy_mode.total_rows(), |row| {
+                self.read_snapshot_row(generation, row)
+            })
+        else {
             return false;
         };
         self.prompt_boundaries = Some((generation, rows));
