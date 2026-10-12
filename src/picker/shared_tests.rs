@@ -5,6 +5,47 @@ use nfm_search_core::{
 use std::time::{Duration, Instant};
 
 #[test]
+fn scrollback_resize_retains_loaded_document_query_and_selection() {
+    let ctx = egui::Context::default();
+    let store = Arc::new(SnapshotStore::new());
+    let range = SnapshotCellRange {
+        start: SnapshotCell { x: 2, y: 50 },
+        end: SnapshotCell { x: 7, y: 51 },
+    };
+    let mut publisher = PublishingStreamingItemStoreWithPayload::new(store.clone());
+    publisher.add_item(b"chosen", range);
+    publisher.complete();
+    let mut picker = items(&ctx);
+    picker.source = PickerSource::test_scrollback(store);
+    let document = nfm_egui::styled_document::DocumentBuilder::default().finish();
+    assert!(picker.source.document().set(document.clone()).is_ok());
+    picker.shared = nfm_egui::Picker::new(
+        "resize-reset-test",
+        &ctx,
+        picker.source.provider(),
+        nfm_egui::PickerConfig::default(),
+    );
+    assert_eq!(wait_selection(&ctx, &mut picker).item.range, Some(range));
+    picker.shared.set_query("chosen");
+    wait_selection(&ctx, &mut picker);
+    assert!(!picker.prepare_snapshot_resize());
+    assert_eq!(picker.shared.query(), "chosen");
+    assert_eq!(picker.shared.selection().unwrap().item.range, Some(range));
+    assert!(Arc::ptr_eq(
+        picker.source.document().get().unwrap(),
+        &document
+    ));
+}
+
+#[test]
+fn scrollback_resize_closes_an_unfinished_capture() {
+    let ctx = egui::Context::default();
+    let mut picker = items(&ctx);
+    picker.source = PickerSource::test_scrollback(Arc::new(SnapshotStore::new()));
+    assert!(picker.prepare_snapshot_resize());
+}
+
+#[test]
 fn full_pane_pipe_options_set_placement_and_result_rows() {
     let stream: pipe::StreamOptions = serde_json::from_value(serde_json::json!({
         "position":"FullPane", "result_rows":5, "preview_rows":1,
@@ -1536,9 +1577,10 @@ fn scrollback_selection_retains_owned_cell_range_across_publication() {
     assert_eq!(selection.item.range, Some(range));
     publisher.add_item(b"later", SnapshotCellRange::default());
     publisher.complete();
-    assert!(
-        matches!(picker.accept(selection), Some(Action::Navigate(cell)) if cell == range.start)
-    );
+    assert_eq!(selection.item.range, Some(range));
+    // Native navigation now requires a retained logical document and a valid
+    // snapshot; an old physical payload alone must never be accepted.
+    assert!(picker.accept(selection).is_none());
 }
 #[test]
 fn preview_toggle_and_help_use_shared_control() {

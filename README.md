@@ -332,10 +332,8 @@ Cargo builds from this repository or the sample directory use `.cargo/config.tom
 Build the native libraries first with `zig build egui-sample`. Explicit
 `NFM_GHOSTTY_VT_INCLUDE_DIR`, `NFM_GHOSTTY_VT_LIB_DIR`, and
 `NFM_GHOSTTY_VT_LIB_NAME` environment variables can select another VT build.
-The repository's Cargo configuration currently overrides NFM dependencies with
-the companion checkout at `G:/src/RustWin32Host` for the new FullPane layout API.
-Those local layout changes must be published and the pinned revision updated
-before removing the override or building on a machine without that checkout.
+NFM dependencies use the Git revision pinned in `Cargo.toml`. No companion
+checkout or machine-specific path override is required.
 
 Recoverable errors and fallback warnings are retained in a session history
 (200 records, 16 KiB details per record). Repeated failures aggregate. They also
@@ -701,6 +699,12 @@ shows the panel below it when there is room, otherwise above it. The panel
 stays inside the terminal or floating pane. If the cursor is outside the
 visible viewport, placement falls back to Bottom.
 
+Ctrl+Shift+F toggles full-pane placement for any picker. The query
+and selected result stay unchanged; preview copy mode resets and content rewraps.
+Press it again to restore the configured placement. A picker configured as
+FullPane temporarily switches to Center. Custom picker bindings can override
+the shortcut.
+
 `FullPane` covers the active terminal or floating pane. Set `result_rows` (1–256,
 default 7) to reserve result rows; the preview uses all remaining complete rows
 after the query, optional header, and padding. Resizing recalculates the preview
@@ -1006,7 +1010,8 @@ preview = {
 For a scrollback picker, `preview = { type = "Scrollback", rows = 12 }` instead
 shows the frozen terminal rows around the selected match, retaining their
 colors and text attributes and highlighting the match. The row count can be
-1–12. Only the visible preview rows are read from the snapshot.
+1–12. The source loads text and style runs once; selection changes render only the
+visible rows from the shared Rust document.
 Set `preview_visible = false` on any picker definition to start with its
 preview hidden. The default is `true`. While the picker is open, Ctrl+P
 toggles the preview, and Ctrl+PageUp or Ctrl+PageDown scrolls it by half a page.
@@ -1508,11 +1513,19 @@ The native C Win32 sample remains available through
 ## Shared byte preview ownership
 
 Text and ANSI picker previews now use NFM's complete-document byte API.
-Scrollback previews use `nfm_egui::byte_preview::ByteSource::Paged`: NFM owns
-centering, half-page scrolling, parsing, clipping and selected-range highlights.
-Ghostty supplies only the requested styled snapshot rows at the original
-terminal width. A guarded `SnapshotPreview` lease drains active reads before
-Ghostty releases the frozen snapshot. Command/Lua previews resolve an owned
+Scrollback previews use NFM's compact `styled_document::DocumentPreviewProvider`.
+The source exports text and resolved style runs once, retaining hard line breaks
+and joining soft wraps into logical lines. Search candidates reference byte
+ranges in that same chunked text store. NFM builds one row-layout map per width,
+then renders only the requested viewport as a styled grid. Selecting another
+result reuses the layout; copy navigation, search, and yank use the same owned
+document. No preview terminal is cloned or reflowed, and selection changes do
+not acquire Ghostty's renderer mutex.
+
+The initial document load runs on the scrollback worker before candidates are
+published. Pane resize cancels an unfinished capture and closes the picker;
+loaded pickers retain their document and results. Old
+immutable documents can safely outlive the host. Command/Lua previews resolve an owned
 command specification on a dedicated Lua worker. NFM's shared command executor runs
 it with concurrent bounded stdout/stderr reads and cancellation, then retains
 the output through the complete-document API. Ghostty owns the Lua resolver worker;
@@ -1532,3 +1545,37 @@ Windows shells can invoke named Lua pickers, submit picker definitions, or strea
 items through an opt-in authenticated named pipe and receive a selection response.
 See [PICKER-PIPE.md](PICKER-PIPE.md) for the security policy, wire protocol, and
 [Invoke-GhosttyPicker.ps1](Invoke-GhosttyPicker.ps1) for the PowerShell client.
+
+Snapshot resize is coordinated by Rust. The pane retains a single frozen
+terminal: live output stays independent, while that terminal reflows in place.
+Before reflow, Rust drains search readers and closes unfinished scrollback captures.
+The resize API returns an owned translation map built during Ghostty's existing
+reflow pass. Sorted old-row/column segments and a row-offset table let Rust
+translate all retained pane cursor and selection cells with local
+indexed lookups. The map is released after translation. Zig also preserves the
+viewport's top-cell anchor. No original pane layout or permanent pane row table
+is retained. See [the reflow map design](../../src/terminal/REFLOW_MAP.md).
+
+Rust updates copy-mode dimensions and saved search-origin state, clears prompt
+caches and yank flashes, restarts search, and rebuilds quick-select hints with
+an empty prefix. Loaded scrollback pickers and line splitters retain their
+document, query, results, and selected item. Preview copy mode resets and the
+preview wraps at its new width. Native candidate positions remain in their
+capture layout; navigation, positional callbacks, and splitting a selected line
+derive logical document positions and resolve them against the current snapshot
+on demand. A scan counts hard line breaks and formats only the target logical
+lines to map UTF-8 offsets to cells. No per-candidate position table is added.
+Standalone line splitters retain their window's logical origin. An unfinished capture (including a retained line-split
+parent) is cancelled and the picker closes instead of reloading.
+
+Selections retain their exact copied text through repeated resizes. Block
+selections translate one range per selected row, so their highlights can become
+disjoint after reflow. Characterwise and linewise endpoints translate too.
+Moving a retained selection starts ordinary characterwise selection in the
+new layout; yanking an unchanged selection uses its captured text.
+
+A scrollback preview shares immutable Rust text and style runs with its search
+source. Width-specific layouts contain row boundaries and retain that content;
+copy mode keeps its layout fixed while focused. A pane resize exits preview
+copy mode and discards its viewport while retaining the loaded source and selection.
+Preview interaction and copying have no native terminal lease to drain.

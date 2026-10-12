@@ -47,8 +47,6 @@ pub(crate) struct Picker {
     preview_rows: usize,
     line_split: bool,
     host: usize,
-    snapshot_rows: u64,
-    snapshot_columns: usize,
     #[cfg(test)]
     session_id: u64,
     error: Arc<std::sync::Mutex<Option<String>>>,
@@ -196,13 +194,6 @@ impl Picker {
             .get("query")
             .map(|query| query.chars().take(4096).collect())
             .unwrap_or_default();
-        let snapshot_columns = generation
-            .and_then(|generation| {
-                let mut view = ghostty_ffi::SnapshotView::default();
-                unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view) }
-                    .then_some(view.columns as usize)
-            })
-            .unwrap_or(80);
         let (source, error) =
             PickerSource::start(host, generation, rows, ctx.clone(), &mut options);
         let preview_rows = options
@@ -252,8 +243,8 @@ impl Picker {
         }
         let snapshot_preview =
             if matches!(options.preview, Some(config::Preview::Scrollback { .. })) {
-                let reader = Arc::new(preview::SnapshotPreview::new(host, generation));
-                let provider = preview::scrollback_provider(reader.clone(), rows, snapshot_columns);
+                let reader = Arc::new(preview::SnapshotPreview::new(source.document()));
+                let provider = preview::scrollback_provider(reader.clone());
                 shared.set_preview_provider(&ctx, Arc::new(provider));
                 Some(reader)
             } else {
@@ -315,12 +306,6 @@ impl Picker {
         if source.is_scrollback() {
             help.push(("Ctrl+B".into(), "Split selected line".into()));
         }
-        help.extend(options.keys.iter().map(|binding| {
-            (
-                binding.trigger.label(binding.mods),
-                binding.description.clone(),
-            )
-        }));
         shared.set_keybinding_help(help);
         let resolved_preview = match &options.preview {
             Some(source @ config::Preview::Dynamic { .. }) => {
@@ -362,13 +347,32 @@ impl Picker {
             preview_rows,
             line_split: false,
             host: host as usize,
-            snapshot_rows: rows,
-            snapshot_columns,
             #[cfg(test)]
             session_id,
             error,
         }
     }
+    /// Returns true when resize must close an unfinished native capture.
+    pub(crate) fn prepare_snapshot_resize(&mut self) -> bool {
+        if !self.source.is_scrollback() {
+            return false;
+        }
+        let loading = self.source.document().get().is_none()
+            || self
+                .split_parent
+                .as_ref()
+                .is_some_and(|(parent, _)| parent.document().get().is_none());
+        if loading {
+            self.source.stop_scrollback_reader();
+            if let Some((parent, _)) = &mut self.split_parent {
+                parent.stop_scrollback_reader();
+            }
+        } else {
+            self.shared.reset_preview_layout(&self.context);
+        }
+        loading
+    }
+
     pub(crate) fn set_cursor_scroll_padding(&mut self, rows: u32) {
         self.shared.set_cursor_scroll_padding(rows);
     }
@@ -443,7 +447,25 @@ impl Picker {
     }
     fn selected_range(&self, candidate: &source::Candidate) -> Option<SnapshotCellRange> {
         if self.source.is_scrollback() {
-            candidate.range
+            let range = candidate.range?;
+            let Some(logical) = self.source.logical_range(range) else {
+                *self.error.lock().unwrap() = Some("Scrollback document unavailable".into());
+                return None;
+            };
+            let mut resolved = SnapshotCellRange::default();
+            if unsafe {
+                ghostty_ffi::ghostty_egui_host_snapshot_resolve_logical_range(
+                    self.host as *mut Host,
+                    self.generation?,
+                    logical,
+                    &mut resolved,
+                )
+            } {
+                Some(resolved)
+            } else {
+                *self.error.lock().unwrap() = Some("Unable to resolve scrollback selection".into());
+                None
+            }
         } else {
             None
         }
@@ -474,7 +496,8 @@ impl Picker {
                         config::BindingTrigger::DoubleClick => nfm_egui::PickerTrigger::DoubleClick,
                     },
                     modifiers: binding.mods,
-                    action,
+                    action: nfm_egui::PickerAction::Custom(action),
+                    description: Some(binding.description.clone()),
                 })
                 .collect()
         } else {
@@ -505,16 +528,30 @@ impl Picker {
                 && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::B))
             {
                 if let Some(selection) = self.shared.selection() {
-                    if let (Some(generation), Some(range)) = (self.generation, selection.item.range)
+                    if let (Some(generation), Some(range)) =
+                        (self.generation, self.selected_range(&selection.item))
                     {
+                        let mut view = ghostty_ffi::SnapshotView::default();
+                        if !unsafe {
+                            ghostty_ffi::ghostty_egui_host_snapshot_view(
+                                self.host as *mut Host,
+                                generation,
+                                &mut view,
+                            )
+                        } {
+                            *self.error.lock().unwrap() = Some("Snapshot unavailable".into());
+                            return None;
+                        }
                         match PickerSource::split_line(
                             self.host as *mut Host,
                             generation,
                             range.start.y,
-                            self.snapshot_rows,
-                            self.snapshot_columns,
+                            view.total_rows,
+                            view.columns as usize,
                         ) {
-                            Ok(source) => self.enter_line_split(ctx, source),
+                            Ok(source) => {
+                                self.enter_line_split(ctx, source);
+                            }
                             Err(error) => *self.error.lock().unwrap() = Some(error),
                         }
                     }
@@ -606,6 +643,10 @@ impl Picker {
         callback: std::rc::Rc<crate::lua_callbacks::Callback>,
         selection: nfm_egui::Selection<source::Candidate>,
     ) -> Option<Action> {
+        let range = self.selected_range(&selection.item);
+        if self.source.is_scrollback() && range.is_none() {
+            return None;
+        }
         let result = SearchResult {
             node_index: selection.item.node_index,
             score: 0,
@@ -615,7 +656,7 @@ impl Picker {
             callback,
             selection.text,
             self.source.is_filesystem(),
-            self.selected_range(&selection.item),
+            range,
             self.source.accepted_value(&result),
             self.request_params.clone(),
         ))
@@ -651,7 +692,16 @@ impl Picker {
             return Some(Action::Execute(action));
         }
         let value = self.source.accepted_value(&result);
-        let range = self.selected_range(&selection.item);
+        let needs_position =
+            self.callback.is_some() || matches!(self.enter_action, config::EnterAction::Navigate);
+        let range = if needs_position {
+            self.selected_range(&selection.item)
+        } else {
+            None
+        };
+        if needs_position && self.source.is_scrollback() && range.is_none() {
+            return None;
+        }
         if let Some(callback) = &self.callback
             && !self.line_split
         {
@@ -692,13 +742,7 @@ impl Picker {
             "Return to scrollback results".into(),
         )]);
     }
-    fn set_keybinding_help(&mut self, mut help: Vec<(String, String)>) {
-        help.extend(self.keys.iter().map(|binding| {
-            (
-                binding.trigger.label(binding.mods),
-                binding.description.clone(),
-            )
-        }));
+    fn set_keybinding_help(&mut self, help: Vec<(String, String)>) {
         self.shared.set_keybinding_help(help);
     }
     fn apply_line_break_presentation(&mut self) {
@@ -714,14 +758,15 @@ impl Picker {
         );
     }
     fn refresh_scrollback_preview(&mut self, ctx: &egui::Context) {
-        let reader = self.snapshot_preview.get_or_insert_with(|| {
-            Arc::new(preview::SnapshotPreview::new(
-                self.host as *mut Host,
-                self.generation,
-            ))
-        });
-        let provider =
-            preview::scrollback_provider(reader.clone(), self.snapshot_rows, self.snapshot_columns);
+        if let Some(previous) = self.snapshot_preview.take() {
+            previous.close();
+        }
+        // A splitter created after resize uses current native coordinates;
+        // its retained parent's document may describe an older layout.
+        let document = self.source.document();
+        let reader = Arc::new(preview::SnapshotPreview::new(document));
+        let provider = preview::scrollback_provider(reader.clone());
+        self.snapshot_preview = Some(reader);
         self.shared.set_preview_provider(ctx, Arc::new(provider));
         self.shared.set_external_preview(false);
     }

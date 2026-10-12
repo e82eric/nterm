@@ -182,40 +182,22 @@ GhosttyEguiHost *ghostty_egui_host_create(
         return NULL;
     }
 
+    ghostty_clear_error();
     ghostty_config_t config = ghostty_config_new();
     if (!config) {
-        startup_error(error_buffer, error_capacity, "allocate the terminal configuration", ghostty_last_init_error());
+        startup_error(error_buffer, error_capacity, "allocate the terminal configuration", NULL);
         return NULL;
     }
     ghostty_config_load_default_files(config);
-    if (ghostty_last_init_error()) {
-        startup_error(error_buffer, error_capacity, "load default configuration files", ghostty_last_init_error());
-        ghostty_config_free(config);
-        return NULL;
-    }
     ghostty_config_load_cli_args(config);
-    if (ghostty_last_init_error()) {
-        startup_error(error_buffer, error_capacity, "load terminal arguments", ghostty_last_init_error());
-        ghostty_config_free(config);
-        return NULL;
-    }
     ghostty_config_load_recursive_files(config);
-    if (ghostty_last_init_error()) {
-        startup_error(error_buffer, error_capacity, "load referenced configuration files", ghostty_last_init_error());
-        ghostty_config_free(config);
-        return NULL;
-    }
     // Retain inputs before theme finalization adds theme values to replay.
     ghostty_config_t base_config = ghostty_config_clone(config);
     if (!base_config) {
-        startup_error(error_buffer, error_capacity, "clone the terminal configuration", ghostty_last_init_error());
+        startup_error(error_buffer, error_capacity, "clone the terminal configuration", NULL);
         ghostty_config_free(config); return NULL;
     }
     ghostty_config_finalize(config);
-    if (ghostty_last_init_error()) {
-        startup_error(error_buffer, error_capacity, "finalize the terminal configuration", ghostty_last_init_error());
-        ghostty_config_free(base_config); ghostty_config_free(config); return NULL;
-    }
     report_theme_colors(config, userdata);
     for (uint32_t i = 0; i < ghostty_config_diagnostics_count(config); ++i) {
         ghostty_diagnostic_s diagnostic = ghostty_config_get_diagnostic(config, i);
@@ -234,7 +216,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
     };
     ghostty_app_t app = ghostty_app_new(&runtime, config);
     if (!app) {
-        startup_error(error_buffer, error_capacity, "create the embedded terminal application", ghostty_last_init_error());
+        startup_error(error_buffer, error_capacity, "create the embedded terminal application", NULL);
         ghostty_config_free(base_config); ghostty_config_free(config); return NULL;
     }
     ghostty_config_free(config);
@@ -252,9 +234,10 @@ GhosttyEguiHost *ghostty_egui_host_create(
     };
     options.env_vars = token_env;
     options.env_var_count = 2;
+    ghostty_clear_error();
     ghostty_surface_t surface = ghostty_surface_new(app, &options);
     if (!surface) {
-        startup_error(error_buffer, error_capacity, "create the main terminal surface", ghostty_last_init_error());
+        startup_error(error_buffer, error_capacity, "create the main terminal surface", NULL);
         ghostty_config_free(base_config);
         ghostty_app_free(app);
         return NULL;
@@ -331,7 +314,7 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
     host->platform = options.platform.opengl;
     host->surface = ghostty_surface_new(host->app, &options);
     if (!host->surface) {
-        startup_error(error_buffer, error_capacity, "create an additional terminal surface", ghostty_last_init_error());
+        startup_error(error_buffer, error_capacity, "create an additional terminal surface", NULL);
         free(host);
         return NULL;
     }
@@ -350,6 +333,7 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
 
 bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, const char *family, float size, char *error, size_t capacity) {
     if (!host || !host->shared->base_config) return false;
+    ghostty_clear_error();
     ghostty_config_t candidate = ghostty_config_clone(host->shared->base_config);
     if (!candidate) {
         snprintf(error, capacity, "Unable to allocate theme configuration");
@@ -360,12 +344,6 @@ bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, c
     ghostty_config_t inputs = loaded ? ghostty_config_clone(candidate) : NULL;
     if (loaded && !inputs) loaded = false;
     if (loaded) ghostty_config_finalize(candidate);
-    if (loaded && ghostty_last_init_error()) {
-        startup_error(error, capacity, "finalize the theme configuration", ghostty_last_init_error());
-        ghostty_config_free(candidate);
-        if (inputs) ghostty_config_free(inputs);
-        return false;
-    }
     uint32_t count = ghostty_config_diagnostics_count(candidate);
     if (!loaded || count) {
         snprintf(error, capacity, "%s", count ? ghostty_config_get_diagnostic(candidate, 0).message : "Unable to load theme configuration");
@@ -376,12 +354,6 @@ bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, c
     // One app owns all window and floating surfaces. The update propagates
     // to existing surfaces and becomes the configuration for future surfaces.
     ghostty_app_update_config(host->app, candidate);
-    if (ghostty_last_error()) {
-        startup_error(error, capacity, "apply the theme configuration", ghostty_last_error());
-        ghostty_config_free(candidate);
-        if (inputs) ghostty_config_free(inputs);
-        return false;
-    }
     for (GhosttyEguiHost *item = host->shared->hosts; item; item = item->next)
         report_theme_colors(candidate, ghostty_surface_userdata(item->surface));
     ghostty_config_free(host->shared->base_config);
@@ -467,6 +439,7 @@ bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *snapshot_
     bool succeeded = ghostty_surface_snapshot_begin(host->surface, snapshot_generation); runtime_error(host, "ghostty_egui_host_snapshot_begin"); return succeeded;
 }
 bool ghostty_egui_host_selection_text(GhosttyEguiHost *host, ghostty_snapshot_selection_text_s *result) {
+    ghostty_clear_error();
     ghostty_text_s text = {0};
     memset(result, 0, sizeof(*result));
     if (!ghostty_surface_read_selection(host->surface, &text)) {
@@ -502,6 +475,11 @@ bool ghostty_egui_host_snapshot_resolve_cell(
     ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_resolve_cell(
     host->surface, generation, requested, snap_right, actual
 ); runtime_error(host, "ghostty_egui_host_snapshot_resolve_cell"); return succeeded; }
+bool ghostty_egui_host_snapshot_resize(GhosttyEguiHost *host, uint64_t generation,
+    ghostty_snapshot_reflow_map_s *result) {
+    ghostty_clear_error();
+    return ghostty_surface_snapshot_resize(host->surface, generation, result);
+}
 bool ghostty_egui_host_snapshot_selection_text(
     GhosttyEguiHost *host, uint64_t generation,
     ghostty_snapshot_cell_range_s range, bool trim, bool rectangle,
@@ -531,13 +509,15 @@ bool ghostty_egui_host_snapshot_text_row(
 void ghostty_egui_host_snapshot_text_row_free(ghostty_snapshot_text_row_s *result) {
     ghostty_surface_snapshot_text_row_free(result);
 }
-bool ghostty_egui_host_snapshot_styled_rows(
-    GhosttyEguiHost *host, uint64_t generation, uint64_t first_row,
-    uint32_t row_count, ghostty_snapshot_styled_rows_s *result
-) {
-    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_styled_rows(host->surface, generation, first_row, row_count, result); runtime_error(host, "ghostty_egui_host_snapshot_styled_rows"); return succeeded; }
-void ghostty_egui_host_snapshot_styled_rows_free(ghostty_snapshot_styled_rows_s *result) {
-    ghostty_surface_snapshot_styled_rows_free(result);
+bool ghostty_egui_host_snapshot_style_runs(GhosttyEguiHost *host, uint64_t generation, uint64_t row, ghostty_snapshot_style_runs_s *result) {
+    return ghostty_surface_snapshot_style_runs(host->surface, generation, row, result);
+}
+
+bool ghostty_egui_host_snapshot_logical_position(GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_cell_s cell, ghostty_snapshot_logical_position_s *result) {
+    return ghostty_surface_snapshot_logical_position(host->surface, generation, cell, result);
+}
+bool ghostty_egui_host_snapshot_resolve_logical_range(GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_logical_range_s range, ghostty_snapshot_resolved_range_s *result) {
+    return ghostty_surface_snapshot_resolve_logical_range(host->surface, generation, range, result);
 }
 bool ghostty_egui_host_live_cursor_line(GhosttyEguiHost *host, ghostty_live_cursor_line_s *result) {
     ghostty_clear_error();

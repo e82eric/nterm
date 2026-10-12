@@ -14,8 +14,20 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
+
+type DocumentItems = nfm_egui::styled_document::DocumentItems<SnapshotCellRange>;
+fn complete_document_source(store: &SnapshotStore<DocumentItems>) {
+    if store.snapshot().is_none() {
+        let document = nfm_egui::styled_document::DocumentBuilder::default().finish();
+        store.publish(nfm_egui::styled_document::DocumentItemStore::new(document).snapshot());
+    }
+    store.complete();
+}
 enum Session {
     Streaming,
+    Document {
+        store: Arc<SnapshotStore<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>>,
+    },
     Structured {
         snapshot: Arc<StructuredStreamingSnapshot>,
     },
@@ -41,6 +53,8 @@ pub(super) struct Runtime {
     store: Arc<SnapshotStore<Items>>,
     cancelled: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
+    document: Arc<std::sync::OnceLock<Arc<nfm_egui::styled_document::StyledDocument>>>,
+    logical_origin: ghostty_ffi::SnapshotLogicalPosition,
 }
 
 pub(super) enum PickerSource {
@@ -62,6 +76,36 @@ pub(super) enum PickerSource {
 }
 
 impl PickerSource {
+    pub(super) fn document(
+        &self,
+    ) -> Arc<std::sync::OnceLock<Arc<nfm_egui::styled_document::StyledDocument>>> {
+        self.runtime().document.clone()
+    }
+    pub(super) fn logical_range(
+        &self,
+        range: SnapshotCellRange,
+    ) -> Option<ghostty_ffi::SnapshotLogicalRange> {
+        let runtime = self.runtime();
+        let document = runtime.document.get()?;
+        let convert = |cell: SnapshotCell| {
+            let position = document.source_position(cell.y as usize, cell.x)?;
+            Some(ghostty_ffi::SnapshotLogicalPosition {
+                line: runtime
+                    .logical_origin
+                    .line
+                    .checked_add(position.line as u64)?,
+                byte: (position.byte as u64).checked_add(if position.line == 0 {
+                    runtime.logical_origin.byte
+                } else {
+                    0
+                })?,
+            })
+        };
+        Some(ghostty_ffi::SnapshotLogicalRange {
+            start: convert(range.start)?,
+            end: convert(range.end)?,
+        })
+    }
     pub(super) fn begin_pipe_stream(
         &mut self,
     ) -> PublishingStreamingItemStoreWithPayload<SnapshotCellRange> {
@@ -81,8 +125,23 @@ impl PickerSource {
         let start = row.saturating_sub(10);
         let end = row.saturating_add(11).min(total_rows);
         let mut lines = Vec::new();
+        let mut document = nfm_egui::styled_document::DocumentBuilder::default()
+            .with_source_origin(start as usize);
+        let mut origin = ghostty_ffi::SnapshotLogicalPosition::default();
+        if !unsafe {
+            ghostty_ffi::ghostty_egui_host_snapshot_logical_position(
+                host,
+                generation,
+                SnapshotCell { x: 0, y: start },
+                &mut origin,
+            )
+        } {
+            return Err("Unable to locate line-split document".into());
+        }
         for y in start..end {
             let text = read_row(host, generation, y).ok_or("Unable to read line-split snapshot")?;
+            let styles = read_styles(host, generation, y)?;
+            document.push_row(&text.text, &text.columns, text.wraps_to_next, &styles)?;
             lines.push(split_line_cells(y, &text, columns));
         }
         let target = usize::try_from(row - start).map_err(|_| "Invalid line-split row")?;
@@ -107,9 +166,14 @@ impl PickerSource {
             })
             .into_iter()
             .collect::<Vec<_>>();
-        Ok(Self::split_candidates(
-            nfm_picker_sources::line_split::split(&lines, target, &prompts),
-        ))
+        let mut source = Self::split_candidates(nfm_picker_sources::line_split::split(
+            &lines, target, &prompts,
+        ));
+        let _ = source.runtime().document.set(document.finish());
+        if let Self::Scrollback(runtime) = &mut source {
+            runtime.logical_origin = origin;
+        }
+        Ok(source)
     }
 
     pub(super) fn split_candidates(
@@ -136,6 +200,8 @@ impl PickerSource {
             store,
             cancelled: Arc::new(AtomicBool::new(false)),
             reader: None,
+            document: Default::default(),
+            logical_origin: Default::default(),
         })
     }
     pub(super) fn start(
@@ -228,11 +294,15 @@ impl PickerSource {
                 let snapshot = structured.snapshot();
                 Session::Structured { snapshot }
             }
-            crate::picker::config::Source::Scrollback { .. }
-            | crate::picker::config::Source::Items(_)
-            | crate::picker::config::Source::Command(_) => Session::Streaming,
+            crate::picker::config::Source::Scrollback { .. } => Session::Document {
+                store: Arc::new(SnapshotStore::new_append_only()),
+            },
+            crate::picker::config::Source::Items(_) | crate::picker::config::Source::Command(_) => {
+                Session::Streaming
+            }
         };
         let cancelled = Arc::new(AtomicBool::new(false));
+        let document = Arc::new(std::sync::OnceLock::new());
         let reader = if let crate::picker::config::Source::Command(config) = &options.source {
             crate::picker::command::start(
                 config.clone(),
@@ -245,23 +315,60 @@ impl PickerSource {
             )
         } else if let crate::picker::config::Source::Scrollback { regex, unique } = &options.source
         {
+            let Session::Document {
+                store: document_items,
+            } = &session
+            else {
+                unreachable!()
+            };
+            let document_items = document_items.clone();
             let regex = regex.clone();
             let mut seen = unique.then(std::collections::HashSet::new);
             let generation = generation.expect("scrollback picker requires a snapshot");
-            let (store, cancelled, error) = (store.clone(), cancelled.clone(), error.clone());
+            let (cancelled, error) = (cancelled.clone(), error.clone());
             let host = host as usize;
             let failure_error = error.clone();
             let failure_ctx = ctx.clone();
-            let failure_store = store.clone();
+            let failure_store = document_items.clone();
+            let loaded_document = document.clone();
             crate::worker::spawn(
                 "picker scrollback worker",
                 move || {
-                    let mut publisher = PublishingStreamingItemStoreWithPayload::new(store);
+                    // Export the document once. Subsequent search and preview
+                    // reads use Rust storage without holding terminal locks.
+                    let mut builder = nfm_egui::styled_document::DocumentBuilder::default();
+                    for row in 0..rows {
+                        if cancelled.load(Ordering::Acquire) {
+                            complete_document_source(&document_items);
+                            return;
+                        }
+                        let captured = read_row(host as *mut Host, generation, row)
+                            .ok_or_else(|| "Unable to read scrollback snapshot".to_owned())
+                            .and_then(|text| {
+                                let styles = read_styles(host as *mut Host, generation, row)?;
+                                builder.push_row(
+                                    &text.text,
+                                    &text.columns,
+                                    text.wraps_to_next,
+                                    &styles,
+                                )
+                            });
+                        if let Err(message) = captured {
+                            *error.lock().unwrap() = Some(message);
+                            complete_document_source(&document_items);
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
+                    let document = builder.finish();
+                    let _ = loaded_document.set(document.clone());
+                    let mut publisher =
+                        nfm_egui::styled_document::DocumentItemStore::new(document.clone());
                     let read = |row| {
                         if cancelled.load(Ordering::Acquire) {
                             return None;
                         }
-                        let result = read_row(host as *mut Host, generation, row);
+                        let result = document.source_row(row as usize);
                         if result.is_none() && error.lock().unwrap().is_none() {
                             crate::error_log::error(
                                 "picker",
@@ -300,17 +407,23 @@ impl PickerSource {
                             if cancelled.load(Ordering::Acquire) {
                                 break;
                             }
-                            publisher.add_item(text.as_bytes(), range);
+                            let offset = document
+                                .source_byte_offset(range.start.y as usize, range.start.x)
+                                .expect("captured candidate position");
+                            publisher
+                                .add(offset, text.len(), range)
+                                .expect("captured candidate range");
                             batch += 1;
                             if batch >= 128 {
-                                publisher.publish();
+                                document_items.publish(publisher.snapshot());
                                 batch = 0;
                                 ctx.request_repaint();
                             }
                         }
                         bottom = start;
                     }
-                    publisher.complete();
+                    document_items.publish(publisher.snapshot());
+                    document_items.complete();
                     ctx.request_repaint();
                 },
                 move |message| {
@@ -318,7 +431,7 @@ impl PickerSource {
                     *failure_error
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()) = Some(message);
-                    PublishingStreamingItemStoreWithPayload::new(failure_store.clone()).complete();
+                    complete_document_source(&failure_store);
                     failure_ctx.request_repaint();
                 },
             )
@@ -339,6 +452,8 @@ impl PickerSource {
             store,
             cancelled,
             reader,
+            document,
+            logical_origin: Default::default(),
         };
         let source = match &options.source {
             config::Source::Themes | crate::picker::config::Source::ErrorLog => {
@@ -361,6 +476,15 @@ impl PickerSource {
             },
         };
         (source, error)
+    }
+
+    pub(super) fn stop_scrollback_reader(&mut self) {
+        if let Self::Scrollback(runtime) = self {
+            runtime.cancelled.store(true, Ordering::Release);
+            if let Some(reader) = runtime.reader.take() {
+                let _ = reader.join();
+            }
+        }
     }
 
     fn runtime(&self) -> &Runtime {
@@ -401,6 +525,7 @@ impl PickerSource {
     pub(super) fn provider(&self) -> Arc<Provider> {
         Arc::new(match &self.runtime().session {
             Session::Streaming => Provider::Streaming(self.runtime().store.clone()),
+            Session::Document { store } => Provider::Document(store.clone()),
             Session::Structured { snapshot } => Provider::Structured(snapshot.clone()),
             #[cfg(windows)]
             Session::FileSystem { store, .. } => Provider::FileSystem(store.clone()),
@@ -473,6 +598,8 @@ impl PickerSource {
             session: Session::Streaming,
             cancelled: Arc::new(AtomicBool::new(false)),
             reader: None,
+            document: Default::default(),
+            logical_origin: Default::default(),
         })
     }
 }
@@ -558,6 +685,43 @@ fn read_row(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
     })
 }
 
+fn read_styles(
+    host: *mut Host,
+    generation: u64,
+    row: u64,
+) -> Result<Vec<nfm_egui::styled_document::ColumnStyleRun>, String> {
+    use nfm_egui::styled_document::{ColumnStyleRun, Style};
+    let mut result = ghostty_ffi::SnapshotStyleRuns::default();
+    if !unsafe {
+        ghostty_ffi::ghostty_egui_host_snapshot_style_runs(host, generation, row, &mut result)
+    } {
+        return Err("Unable to read snapshot styles".into());
+    }
+    let color = |value: u32| {
+        (value != u32::MAX)
+            .then(|| egui::Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
+    };
+    let runs = if result.len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(result.runs, result.len) }
+            .iter()
+            .map(|run| ColumnStyleRun {
+                columns: run.start..run.end,
+                style: Style {
+                    foreground: color(run.foreground),
+                    background: color(run.background),
+                    underline_color: color(run.underline_color),
+                    flags: run.flags,
+                    underline: run.underline != 0,
+                },
+            })
+            .collect()
+    };
+    unsafe { ghostty_ffi::ghostty_snapshot_style_runs_free(&mut result) };
+    Ok(runs)
+}
+
 pub(super) fn logical_items(
     rows: &[(u64, TextRow)],
     regex: &regex::Regex,
@@ -611,6 +775,7 @@ pub(super) fn logical_item(rows: &[(u64, TextRow)]) -> Option<(String, SnapshotC
 /// Owned snapshots retain original indices and scrollback cell ranges.
 pub(super) enum Snapshot {
     Streaming(Arc<Items>),
+    Document(Arc<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>),
     Structured(Arc<StructuredStreamingSnapshot>),
     #[cfg(windows)]
     FileSystem(Arc<nfm_file_system::walker::PublishedSnapshot>),
@@ -624,6 +789,7 @@ macro_rules! delegate_snapshot {
     ($self:ident, $method:ident $(, $arg:expr)*) => {
         match $self {
             Snapshot::Streaming(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
+            Snapshot::Document(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
             Snapshot::Structured(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
             #[cfg(windows)]
             Snapshot::FileSystem(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
@@ -660,6 +826,7 @@ impl ItemsSource for Snapshot {
             node_index: index,
             range: match self {
                 Self::Streaming(s) => Some(*s.payload(index)),
+                Self::Document(s) => Some(*s.payload(index)),
                 _ => None,
             },
         })
@@ -686,14 +853,85 @@ impl ItemsSource for Snapshot {
 }
 pub(super) enum Provider {
     Streaming(Arc<SnapshotStore<Items>>),
+    Document(Arc<SnapshotStore<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>>),
     Structured(Arc<StructuredStreamingSnapshot>),
     #[cfg(windows)]
     FileSystem(Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>),
+}
+
+#[cfg(test)]
+mod document_source_tests {
+    use super::*;
+    #[test]
+    fn failed_document_load_publishes_an_empty_completed_source() {
+        let store = SnapshotStore::<DocumentItems>::new_append_only();
+        complete_document_source(&store);
+        assert!(store.is_done());
+        assert!(store.snapshot().unwrap().is_empty());
+    }
+    #[test]
+    fn windowed_document_positions_include_logical_origin_and_utf8_bytes() {
+        let mut source = PickerSource::test_scrollback(Arc::new(SnapshotStore::new()));
+        let mut builder =
+            nfm_egui::styled_document::DocumentBuilder::default().with_source_origin(40);
+        builder.push_row("a界", &[0, 1, 1, 1], true, &[]).unwrap();
+        builder.push_row("bc", &[0, 1], false, &[]).unwrap();
+        builder.push_row("next", &[0, 1, 2, 3], false, &[]).unwrap();
+        assert!(source.document().set(builder.finish()).is_ok());
+        if let PickerSource::Scrollback(runtime) = &mut source {
+            runtime.logical_origin = ghostty_ffi::SnapshotLogicalPosition { line: 12, byte: 7 };
+        }
+        let range = source
+            .logical_range(SnapshotCellRange {
+                start: SnapshotCell { x: 1, y: 41 },
+                end: SnapshotCell { x: 2, y: 42 },
+            })
+            .unwrap();
+        assert_eq!((range.start.line, range.start.byte), (12, 12));
+        assert_eq!((range.end.line, range.end.byte), (13, 2));
+    }
+
+    #[test]
+    fn document_source_reuses_text_and_returns_original_terminal_ranges() {
+        let mut builder = nfm_egui::styled_document::DocumentBuilder::default();
+        builder.push_row("abc", &[0, 1, 2], true, &[]).unwrap();
+        builder.push_row("def", &[0, 1, 2], false, &[]).unwrap();
+        let document = builder.finish();
+        let rows = (0..2)
+            .map(|y| (y, document.source_row(y as usize).unwrap()))
+            .collect::<Vec<_>>();
+        let matches = logical_items(&rows, &regex::Regex::new("bcde").unwrap());
+        let mut items = nfm_egui::styled_document::DocumentItemStore::new(document.clone());
+        let (text, range) = &matches[0];
+        items
+            .add(
+                document
+                    .source_byte_offset(range.start.y as usize, range.start.x)
+                    .unwrap(),
+                text.len(),
+                *range,
+            )
+            .unwrap();
+        let store = Arc::new(SnapshotStore::new_append_only());
+        store.publish(items.snapshot());
+        store.complete();
+        let provider = Provider::Document(store);
+        let snapshot = provider.snapshot().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.get_string_lossy(0, &mut Vec::new()), "bcde");
+        let candidate = snapshot.item(0).unwrap();
+        assert_eq!(candidate.range, Some(*range));
+        assert_eq!(range.start, SnapshotCell { x: 1, y: 0 });
+        assert_eq!(range.end, SnapshotCell { x: 1, y: 1 });
+        assert!(provider.is_append_only());
+        assert!(provider.is_done());
+    }
 }
 impl SearchSnapshotProvider<Snapshot> for Provider {
     fn snapshot(&self) -> Option<Arc<Snapshot>> {
         match self {
             Self::Streaming(s) => s.snapshot().map(|s| Arc::new(Snapshot::Streaming(s))),
+            Self::Document(s) => s.snapshot().map(|s| Arc::new(Snapshot::Document(s))),
             Self::Structured(s) => Some(Arc::new(Snapshot::Structured(s.clone()))),
             #[cfg(windows)]
             Self::FileSystem(s) => s.snapshot().map(|s| Arc::new(Snapshot::FileSystem(s))),
@@ -702,6 +940,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
     fn snapshot_version(&self) -> u64 {
         match self {
             Self::Streaming(s) => s.snapshot_version(),
+            Self::Document(s) => s.snapshot_version(),
             Self::Structured(s) => s.version(),
             #[cfg(windows)]
             Self::FileSystem(s) => s.snapshot_version(),
@@ -710,6 +949,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
     fn is_done(&self) -> bool {
         match self {
             Self::Streaming(s) => s.is_done(),
+            Self::Document(s) => s.is_done(),
             Self::Structured(_) => true,
             #[cfg(windows)]
             Self::FileSystem(s) => s.is_done(),
@@ -721,6 +961,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
     fn subscribe_updates(&self, wake: crossbeam_channel::Sender<()>) -> bool {
         match self {
             Self::Streaming(s) => s.subscribe_updates(wake),
+            Self::Document(s) => s.subscribe_updates(wake),
             Self::Structured(_) => true,
             #[cfg(windows)]
             Self::FileSystem(s) => s.subscribe_updates(wake),

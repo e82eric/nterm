@@ -1,4 +1,7 @@
 use crate::app::UserEvent;
+#[path = "snapshot_resize.rs"]
+mod snapshot_resize;
+
 use crate::ghostty_ffi::{
     self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
     SnapshotDecorationStyle, SnapshotTextRow, SnapshotView, SnapshotViewportOptions,
@@ -71,7 +74,9 @@ impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDoc
         } {
             return Err("The selected text is no longer available".into());
         }
-        let text = if result.text.is_null() {
+        let text = if result.len == 0 {
+            Ok(String::new())
+        } else if result.text.is_null() {
             Err("Unable to read selected text".into())
         } else {
             let bytes = unsafe { std::slice::from_raw_parts(result.text, result.len) };
@@ -193,6 +198,8 @@ pub(super) struct TerminalPane {
     picker_font: crate::picker::font::PickerFont,
     toasts: crate::toast::Toasts,
     copy_search_cursor: usize,
+    copy_search_query: Option<(String, bool)>,
+    copy_search_refresh: Option<u64>,
     prompt_boundaries: Option<(u64, Vec<u64>)>,
     pub(super) floating_palette_entries: Vec<crate::actions::Entry>,
     pub(super) pending_callback: Option<(crate::picker::Action, Option<u64>, bool)>,
@@ -393,6 +400,8 @@ impl TerminalPane {
             picker_font,
             toasts: crate::toast::Toasts::default(),
             copy_search_cursor: 0,
+            copy_search_query: None,
+            copy_search_refresh: None,
             prompt_boundaries: None,
             floating_palette_entries: Vec::new(),
             pending_callback: None,
@@ -456,27 +465,36 @@ impl TerminalPane {
         if self.size == size && self.scale == scale {
             return false;
         }
-        // Resize invalidates presentation snapshots and their text cursors.
-        if self.copy_mode.generation.is_some() {
-            self.picker = None;
-        }
-        self.cancel_quick_select();
-        self.close_search();
-        self.close_copy_mode();
+        // Resize the live surface, then coordinate frozen-terminal reflow.
+        // Readers are stopped before any frozen pages change.
         self.size = size;
         self.scale = scale;
         unsafe { ghostty_ffi::ghostty_egui_host_resize(self.host, size[0], size[1], scale as f64) };
+        if let Err(error) = self.resize_snapshot() {
+            self.picker = None;
+            self.quick_select = None;
+            self.close_search();
+            self.close_copy_mode();
+            self.show_error("Snapshot resize failed", error);
+        }
         true
     }
 
     pub(super) fn update_modes(&mut self, ctx: &egui::Context) {
+        // Font/scale changes can alter the native grid without changing pane pixels.
+        if let Err(error) = self.resize_snapshot() {
+            self.picker = None;
+            self.quick_select = None;
+            self.close_search();
+            self.close_copy_mode();
+            self.show_error("Snapshot resize failed", error);
+        }
         if self.pending_search_snapshot.is_some() {
             self.prepare_search_snapshot();
         }
         self.apply_search_result();
-        // The first live write turns a borrowed snapshot into an owned one.
-        // Native code invalidates decorations during that handoff even when
-        // the viewport has not scrolled or resized.
+        // Native code invalidates decorations when their presentation changes,
+        // including a reflow that leaves the viewport at the same row.
         self.refresh_decorations();
         if self.quick_select.is_none()
             && self.picker.is_none()
@@ -1171,29 +1189,29 @@ impl TerminalPane {
     }
 
     pub(super) fn selected_text(&self) -> String {
-        let mut result = ghostty_ffi::SnapshotSelectionText::default();
-        let copied = if let Some(generation) = self.copy_mode.generation {
-            let Some(selection) = self
+        if let Some(text) = self.copy_mode.reflow_selection_text() {
+            return text.to_owned();
+        }
+        if let Some(generation) = self.copy_mode.generation {
+            let document = SnapshotNavigationDocument {
+                host: self.host,
+                generation,
+                rows: self.copy_mode.total_rows(),
+                boundaries: None,
+            };
+            let selection = self
                 .copy_mode
                 .visual_selection_to(self.copy_mode.cursor, |row| {
                     self.read_snapshot_row(generation, row)
-                })
-            else {
-                return String::new();
-            };
-            unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_selection_text(
-                    self.host,
-                    generation,
-                    selection.range,
-                    selection.trim,
-                    selection.rectangle,
-                    &mut result,
-                )
-            }
-        } else {
-            unsafe { ghostty_ffi::ghostty_egui_host_selection_text(self.host, &mut result) }
-        };
+                });
+            use nfm_egui::copy_controller::CopyNavigationDocument;
+            return selection
+                .and_then(|selection| document.selection_text(&selection).ok())
+                .unwrap_or_default();
+        }
+        let mut result = ghostty_ffi::SnapshotSelectionText::default();
+        let copied =
+            unsafe { ghostty_ffi::ghostty_egui_host_selection_text(self.host, &mut result) };
         if !copied {
             return String::new();
         }
@@ -1697,9 +1715,7 @@ impl TerminalPane {
         if !from_copy {
             self.copy_mode.start(generation, view);
         }
-        self.quick_select = QuickSelect::new(generation, from_copy, view, |row| {
-            Self::read_snapshot_row_from(host, generation, row)
-        });
+        self.quick_select = self.build_quick_select(generation, from_copy, view, false);
         if self.quick_select.is_none() {
             if !from_copy {
                 self.close_quick_copy_mode();
@@ -1720,6 +1736,18 @@ impl TerminalPane {
         self.publish_quick_select_with_viewport(std::ptr::null())
     }
 
+    fn build_quick_select(
+        &self,
+        generation: u64,
+        from_copy: bool,
+        view: SnapshotView,
+        _paged: bool,
+    ) -> Option<QuickSelect> {
+        QuickSelect::new(generation, from_copy, view, |row| {
+            Self::read_snapshot_row_from(self.quick_host(), generation, row)
+        })
+    }
+
     fn page_quick_select(&mut self, down: bool) -> bool {
         let Some(quick) = &self.quick_select else {
             return false;
@@ -1736,9 +1764,7 @@ impl TerminalPane {
             return false;
         }
         let view = QuickSelect::paged_view(view, down);
-        let Some(mut quick) = QuickSelect::new(generation, from_copy, view, |row| {
-            Self::read_snapshot_row_from(host, generation, row)
-        }) else {
+        let Some(mut quick) = self.build_quick_select(generation, from_copy, view, true) else {
             return false;
         };
         quick.purpose = purpose;
@@ -2092,6 +2118,7 @@ impl TerminalPane {
         // Transfer ownership instead of closing search: ending this snapshot
         // would invalidate the match coordinates and briefly show live output.
         let search = std::mem::take(&mut self.search);
+        self.copy_search_query = Some((search.query.clone(), search.regex));
         view.cursor = actual;
         self.copy_mode.start(generation, view);
         self.copy_search_cursor = search.cursor;
@@ -2134,6 +2161,8 @@ impl TerminalPane {
             self.copy_mode = CopyMode::default();
             self.copy_mode.set_scroll_padding(padding);
             self.copy_search_cursor = 0;
+            self.copy_search_query = None;
+            self.copy_search_refresh = None;
             self.prompt_boundaries = None;
             self.wake.context.request_repaint();
         }
@@ -2240,9 +2269,11 @@ impl TerminalPane {
     ) -> bool {
         if update.changed {
             let viewport = SnapshotViewportOptions {
+                reveal: update.reveal.as_ref().map_or(std::ptr::null(), |cell| cell),
                 top_row: update
                     .viewport_top
                     .as_ref()
+                    .filter(|_| update.reveal.is_none())
                     .map_or(std::ptr::null(), |top| top),
                 padding_rows: self.copy_mode.scroll_padding(),
                 ..Default::default()
@@ -2281,6 +2312,8 @@ impl TerminalPane {
                     self.submit_copy_search(pattern, forward, count, regex);
                 }
                 CopyEffect::ClearSearch { cancel_pending } => {
+                    self.copy_search_query = None;
+                    self.copy_search_refresh = None;
                     if cancel_pending {
                         self.search_worker.cancel();
                     }
@@ -2505,6 +2538,23 @@ impl TerminalPane {
             }
         };
         if self.copy_mode.generation == Some(result.document_revision)
+            && self.copy_search_refresh == Some(result.query_revision)
+        {
+            self.copy_search_refresh = None;
+            if let Some(error) = result.error {
+                self.show_error("Copy search failed", error);
+            } else {
+                self.copy_mode
+                    .adopt_search(result.query_revision, result.matches);
+                self.publish_copy_decoration(
+                    result.document_revision,
+                    self.copy_mode.cursor,
+                    false,
+                );
+            }
+            return;
+        }
+        if self.copy_mode.generation == Some(result.document_revision)
             && self.copy_mode.search_accepts_result(result.query_revision)
         {
             self.finish_copy_search_result(result);
@@ -2564,6 +2614,8 @@ impl TerminalPane {
     }
 
     fn submit_copy_search(&mut self, pattern: String, forward: bool, count: u32, regex: bool) {
+        self.copy_search_query = Some((pattern.clone(), regex));
+        self.copy_search_refresh = None;
         let Some(generation) = self.copy_mode.generation else {
             return;
         };
@@ -2627,14 +2679,20 @@ impl TerminalPane {
         let selection = self
             .copy_mode
             .visual_selection_to(cell, |row| self.read_snapshot_row(generation, row));
-        let selection_ranges = self.copy_decoration_ranges(
-            generation,
-            selection.as_ref().map(|selection| selection.range),
-            selection
-                .as_ref()
-                .is_some_and(|selection| selection.rectangle),
-            viewport,
-        );
+        let selection_ranges = self
+            .copy_mode
+            .reflow_selection_ranges()
+            .map(<[_]>::to_vec)
+            .unwrap_or_else(|| {
+                self.copy_decoration_ranges(
+                    generation,
+                    selection.as_ref().map(|selection| selection.range),
+                    selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.rectangle),
+                    viewport,
+                )
+            });
         let selection_layer = selection.map(|_| SnapshotDecorationLayer {
             ranges: selection_ranges.as_ptr(),
             range_count: selection_ranges.len(),

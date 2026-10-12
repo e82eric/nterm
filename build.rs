@@ -11,10 +11,11 @@ fn main() {
         .warnings(true)
         .compile("ghostty_egui_shim");
 
-    println!(
-        "cargo:rustc-link-search=native={}",
-        root.join("zig-out/lib").display()
-    );
+    let library_dir = env::var_os("GHOSTTY_LIB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("zig-out/lib"));
+    println!("cargo:rustc-link-search=native={}", library_dir.display());
+    println!("cargo:rerun-if-env-changed=GHOSTTY_LIB_DIR");
     println!("cargo:rustc-link-lib=dylib=ghostty");
     if cfg!(target_family = "unix") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
