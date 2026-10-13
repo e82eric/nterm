@@ -8,6 +8,7 @@ use std::num::NonZeroU32;
 struct OwnedFrame {
     handle: usize,
     texture: u32,
+    size: [u32; 2],
     fence: Option<usize>,
 }
 
@@ -25,6 +26,8 @@ impl OwnedFrame {
 pub(crate) struct TerminalPainter {
     program: glow::Program,
     texture_uniform: Option<glow::UniformLocation>,
+    texture_scale_uniform: Option<glow::UniformLocation>,
+    background_uniform: Option<glow::UniformLocation>,
     vertex_array: glow::VertexArray,
     current: Option<OwnedFrame>,
     retired: Vec<OwnedFrame>,
@@ -48,7 +51,7 @@ impl TerminalPainter {
                     ),
                     (
                         glow::FRAGMENT_SHADER,
-                        "#version 330\nin vec2 uv;uniform sampler2D terminal_texture;out vec4 color;void main(){color=texture(terminal_texture,uv);}",
+                        "#version 330\nin vec2 uv;uniform sampler2D terminal_texture;uniform vec2 texture_scale;uniform vec4 background;out vec4 color;void main(){vec2 p=uv*texture_scale;color=(p.x>=1.0||p.y>=1.0)?background:texture(terminal_texture,p);}",
                         "create the terminal fragment shader",
                         "compile the terminal fragment shader",
                     ),
@@ -79,6 +82,8 @@ impl TerminalPainter {
                 Ok(Self {
                     program,
                     texture_uniform: gl.get_uniform_location(program, "terminal_texture"),
+                    texture_scale_uniform: gl.get_uniform_location(program, "texture_scale"),
+                    background_uniform: gl.get_uniform_location(program, "background"),
                     vertex_array,
                     current: None,
                     retired: Vec::new(),
@@ -101,6 +106,7 @@ impl TerminalPainter {
         let next = OwnedFrame {
             handle: frame.handle as usize,
             texture: frame.texture,
+            size: [frame.width, frame.height],
             fence: None,
         };
         if let Some(old) = self.current.replace(next) {
@@ -147,6 +153,21 @@ impl TerminalPainter {
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(glow::NativeTexture(texture)));
             gl.uniform_1_i32(self.texture_uniform.as_ref(), 0);
+            // Renderer frames arrive asynchronously. Sample the previous frame
+            // at its original pixel size instead of stretching it during resize.
+            let mut viewport = [0; 4];
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+            let size = self.current.as_ref().expect("current frame").size;
+            let scale = frame_texture_scale(size, [viewport[2], viewport[3]]);
+            gl.uniform_2_f32(self.texture_scale_uniform.as_ref(), scale[0], scale[1]);
+            let background = crate::colors::palette().background;
+            gl.uniform_4_f32(
+                self.background_uniform.as_ref(),
+                background.r() as f32 / 255.0,
+                background.g() as f32 / 255.0,
+                background.b() as f32 / 255.0,
+                1.0,
+            );
             gl.bind_vertex_array(Some(self.vertex_array));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
 
@@ -190,8 +211,25 @@ fn driver_log(log: String) -> String {
     }
 }
 
+fn frame_texture_scale(frame: [u32; 2], viewport: [i32; 2]) -> [f32; 2] {
+    [
+        viewport[0].max(0) as f32 / frame[0].max(1) as f32,
+        viewport[1].max(0) as f32 / frame[1].max(1) as f32,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resizing_keeps_old_frame_pixels_at_the_same_size() {
+        for viewport in [[400, 300], [800, 600], [1200, 900]] {
+            let scale = super::frame_texture_scale([800, 600], viewport);
+            // A texel at x=80/y=60 stays at that pixel position in every pane.
+            assert!((0.1 / scale[0] * viewport[0] as f32 - 80.0).abs() < 0.001);
+            assert!((0.1 / scale[1] * viewport[1] as f32 - 60.0).abs() < 0.001);
+        }
+    }
+
     #[test]
     fn shader_diagnostics_preserve_driver_log_and_explain_missing_log() {
         let log = "0:2: error: unsupported instruction\nDriver details: test";
