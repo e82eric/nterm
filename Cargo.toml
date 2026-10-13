@@ -25,10 +25,10 @@ hmac = "0.12"
 sha2 = "0.10"
 mlua = { version = "0.9.9", features = ["lua54", "vendored", "serialize"] }
 serde = { version = "1", features = ["derive"] }
-nfm_search_core = { path = "G:/src/RustWin32Host/nfm-search-core" }
-nfm-picker-sources = { path = "G:/src/RustWin32Host/nfm-picker-sources" }
-nfm-egui = { path = "G:/src/RustWin32Host/nfm-egui" }
-nfm-preview-file = { path = "G:/src/RustWin32Host/nfm-preview-file" }
+nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "514e9d9acc7ca0c3aa207a42aad7b4588f691af2" }
+nfm-picker-sources = { git = "https://github.com/e82eric/npicker", rev = "514e9d9acc7ca0c3aa207a42aad7b4588f691af2" }
+nfm-egui = { git = "https://github.com/e82eric/npicker", rev = "514e9d9acc7ca0c3aa207a42aad7b4588f691af2" }
+nfm-preview-file = { git = "https://github.com/e82eric/npicker", rev = "514e9d9acc7ca0c3aa207a42aad7b4588f691af2" }
 csv = "1.3"
 
 [build-dependencies]
@@ -36,4 +36,4 @@ cc = "1.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
-nfm_file_system = { path = "G:/src/RustWin32Host/nfm-file-system" }
+nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "514e9d9acc7ca0c3aa207a42aad7b4588f691af2" }
