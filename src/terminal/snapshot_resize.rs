@@ -245,7 +245,19 @@ impl TerminalPane {
         } else if let Some((pattern, regex)) = self.copy_search_query.clone() {
             self.restart_copy_search(pattern, regex, generation)?;
         }
-        self.refresh_decorations();
+        if self.copy_mode.generation.is_some()
+            && self.quick_select.is_none()
+            && self.search.snapshot_generation.is_none()
+        {
+            // Reflow preserves the old viewport's text position, but a shorter
+            // viewport can leave the translated selection cursor off screen.
+            // Reveal it using the same scroll padding as ordinary movement.
+            if !self.publish_copy_decoration(generation, self.copy_mode.cursor, true) {
+                return Err("Unable to reveal copy-mode cursor after resize".into());
+            }
+        } else {
+            self.refresh_decorations();
+        }
         Ok(())
     }
 
