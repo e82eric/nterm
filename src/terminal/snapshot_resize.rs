@@ -101,9 +101,11 @@ fn restore<D: nfm_egui::copy_controller::CopyNavigationDocument>(
         if let Some(error) = read_error {
             return Err(error);
         }
-        let expanded = expanded.ok_or("Unable to restore linewise selection after resize")?;
-        let text = mode.reflow_selection_text().map(str::to_owned);
-        mode.apply_reflow(view, cursor, anchor, vec![expanded], text);
+        expanded.ok_or("Unable to restore linewise selection after resize")?;
+        // A linewise selection is fully represented by its translated logical
+        // line endpoints. Keeping the special reflow selection would make the
+        // controller switch to characterwise mode on the next movement.
+        mode.apply_reflow(view, cursor, anchor, Vec::new(), None);
     }
     Ok(())
 }
@@ -342,7 +344,7 @@ mod tests {
                 Ok(cell)
             }
             fn selection_text(&self, _: &CopySelection) -> Result<String, String> {
-                Err("Retained yank text must survive without being read again".into())
+                Ok("original selected text\n".into())
             }
         }
         let mut mode = CopyMode::default();
@@ -378,19 +380,20 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                mode.reflow_selection_ranges().unwrap(),
-                &[SnapshotCellRange {
+                mode.visual_selection_to(mode.cursor, |row| {
+                    WrappedDocument.text_row(row).unwrap()
+                })
+                .unwrap()
+                .range,
+                SnapshotCellRange {
                     start: SnapshotCell { x: 0, y: 0 },
                     end: SnapshotCell {
                         x: columns - 1,
                         y: 2
                     },
-                }]
+                }
             );
-            assert_eq!(
-                mode.reflow_selection_text(),
-                Some("original selected text\n")
-            );
+            assert_eq!(mode.reflow_selection_text(), None);
             let mut next = Vec::new();
             capture(&mode, &WrappedDocument, &mut next).unwrap();
             assert_eq!(next[2], SnapshotCell { x: 0, y: 0 });
@@ -400,6 +403,20 @@ mod tests {
                     x: columns - 1,
                     y: 2
                 }
+            );
+            mode.moved_with_rows(Motion::Down, SnapshotCell { x: 1, y: 2 }, |row| {
+                WrappedDocument.text_row(row).unwrap()
+            });
+            assert_eq!(mode.visual_mode, VisualMode::Linewise);
+            assert_eq!(mode.cursor, SnapshotCell { x: 1, y: 2 });
+            assert_eq!(
+                mode.visual_selection_to(mode.cursor, |row| {
+                    WrappedDocument.text_row(row).unwrap()
+                })
+                .unwrap()
+                .range
+                .start,
+                SnapshotCell { x: 0, y: 0 }
             );
         }
     }

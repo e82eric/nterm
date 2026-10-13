@@ -695,6 +695,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -854,6 +864,15 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ghostty-vt-sys"
+version = "0.1.0"
+source = "git+https://github.com/e82eric/npicker?rev=39794093cd4a7a4d584c1769224deaf7795401e9#39794093cd4a7a4d584c1769224deaf7795401e9"
+dependencies = [
+ "flate2",
+ "tar",
 ]
 
 [[package]]
@@ -1365,7 +1384,7 @@ dependencies = [
 [[package]]
 name = "nfm-egui"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4#b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4"
+source = "git+https://github.com/e82eric/npicker?rev=39794093cd4a7a4d584c1769224deaf7795401e9#39794093cd4a7a4d584c1769224deaf7795401e9"
 dependencies = [
  "crossbeam-channel",
  "egui",
@@ -1380,7 +1399,7 @@ dependencies = [
 [[package]]
 name = "nfm-picker-sources"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4#b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4"
+source = "git+https://github.com/e82eric/npicker?rev=39794093cd4a7a4d584c1769224deaf7795401e9#39794093cd4a7a4d584c1769224deaf7795401e9"
 dependencies = [
  "chrono",
  "csv",
@@ -1393,12 +1412,12 @@ dependencies = [
 [[package]]
 name = "nfm-preview-command"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4#b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4"
+source = "git+https://github.com/e82eric/npicker?rev=39794093cd4a7a4d584c1769224deaf7795401e9#39794093cd4a7a4d584c1769224deaf7795401e9"
 
 [[package]]
 name = "nfm-preview-file"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4#b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4"
+source = "git+https://github.com/e82eric/npicker?rev=39794093cd4a7a4d584c1769224deaf7795401e9#39794093cd4a7a4d584c1769224deaf7795401e9"
 dependencies = [
  "image",
  "nfm-egui",
@@ -1409,7 +1428,7 @@ dependencies = [
 [[package]]
 name = "nfm-preview-text"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4#b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4"
+source = "git+https://github.com/e82eric/npicker?rev=39794093cd4a7a4d584c1769224deaf7795401e9#39794093cd4a7a4d584c1769224deaf7795401e9"
 dependencies = [
  "nfm-egui",
  "two-face",
@@ -1420,15 +1439,16 @@ dependencies = [
 [[package]]
 name = "nfm-preview-vt"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4#b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4"
+source = "git+https://github.com/e82eric/npicker?rev=39794093cd4a7a4d584c1769224deaf7795401e9#39794093cd4a7a4d584c1769224deaf7795401e9"
 dependencies = [
  "cc",
+ "ghostty-vt-sys",
 ]
 
 [[package]]
 name = "nfm_file_system"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4#b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4"
+source = "git+https://github.com/e82eric/npicker?rev=39794093cd4a7a4d584c1769224deaf7795401e9#39794093cd4a7a4d584c1769224deaf7795401e9"
 dependencies = [
  "crossbeam-channel",
  "hashbrown",
@@ -1439,7 +1459,7 @@ dependencies = [
 [[package]]
 name = "nfm_search_core"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4#b35c9b913da0c43ef0ed1f6ad7572d2e8f66bfa4"
+source = "git+https://github.com/e82eric/npicker?rev=39794093cd4a7a4d584c1769224deaf7795401e9#39794093cd4a7a4d584c1769224deaf7795401e9"
 dependencies = [
  "crossbeam-channel",
  "memchr",
@@ -2416,6 +2436,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3162,6 +3193,16 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix 1.1.5",
+]
 
 [[package]]
 name = "xcursor"
