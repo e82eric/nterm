@@ -101,11 +101,9 @@ fn restore<D: nfm_egui::copy_controller::CopyNavigationDocument>(
         if let Some(error) = read_error {
             return Err(error);
         }
-        expanded.ok_or("Unable to restore linewise selection after resize")?;
-        // A linewise selection is fully represented by its translated logical
-        // line endpoints. Keeping the special reflow selection would make the
-        // controller switch to characterwise mode on the next movement.
-        mode.apply_reflow(view, cursor, anchor, Vec::new(), None);
+        let expanded = expanded.ok_or("Unable to restore linewise selection after resize")?;
+        let text = mode.reflow_selection_text().map(str::to_owned);
+        mode.apply_reflow(view, cursor, anchor, vec![expanded], text);
     }
     Ok(())
 }
@@ -342,6 +340,44 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_resize_block_movement_keeps_rectangle_after_widening() {
+        use nfm_egui::copy_controller::CopyController;
+        let mut mode = CopyMode::default();
+        let view = SnapshotView {
+            cursor: SnapshotCell { x: 1, y: 0 },
+            total_rows: 3,
+            columns: 4,
+            viewport_rows: 3,
+            viewport_top: 0,
+        };
+        mode.start(1, view);
+        mode.toggle_visual(VisualMode::Blockwise);
+        mode.moved(Motion::CharacterJump, SnapshotCell { x: 3, y: 1 });
+        let mut cells = Vec::new();
+        let anchors = capture(&mode, &Document, &mut cells).unwrap();
+        let widened = SnapshotView { columns: 8, ..view };
+        restore(&mut mode, anchors, &cells, widened, &Document).unwrap();
+        assert!(mode.reflow_selection_ranges().is_some());
+        for motion in [Motion::Down, Motion::Left] {
+            CopyController::new(&mut mode, &Document, widened)
+                .execute(CopyAction::Motion {
+                    motion,
+                    count: 1,
+                    explicit_count: false,
+                })
+                .unwrap();
+            assert_eq!(mode.visual_mode, VisualMode::Blockwise);
+            let selection = mode
+                .visual_selection_to(mode.cursor, |row| Document.text_row(row).unwrap())
+                .unwrap();
+            assert!(selection.rectangle);
+            assert_eq!(selection.range.start, SnapshotCell { x: 1, y: 0 });
+        }
+        assert_eq!(mode.cursor, SnapshotCell { x: 2, y: 2 });
+        assert!(mode.reflow_selection_ranges().is_none());
+    }
+
+    #[test]
     fn snapshot_resize_linewise_selection_expands_translated_text_to_full_wrapped_rows() {
         struct WrappedDocument;
         impl CopyNavigationDocument for WrappedDocument {
@@ -405,7 +441,10 @@ mod tests {
                     },
                 }
             );
-            assert_eq!(mode.reflow_selection_text(), None);
+            assert_eq!(
+                mode.reflow_selection_text(),
+                Some("original selected text\n")
+            );
             let mut next = Vec::new();
             capture(&mode, &WrappedDocument, &mut next).unwrap();
             assert_eq!(next[2], SnapshotCell { x: 0, y: 0 });
