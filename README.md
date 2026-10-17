@@ -659,7 +659,7 @@ keys = {
   { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },
   { key = "w", mods = "CTRL|SHIFT", action = "CloseFloatingPane" },
   { key = "f", mods = "CTRL|SHIFT", action = "OpenSearch" },
-  { key = "Space", mods = "CTRL|SHIFT", picker = "commands" },
+  { key = "Space", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
 },
 ```
 
@@ -1226,7 +1226,8 @@ Without `keys`, built-in action bindings are retained, Ctrl+Shift+F opens built-
 `lines`, Ctrl+Shift+P opens built-in `words`, and Ctrl+Shift+Space opens the
 built-in command palette.
 An explicit empty `keys = {}` disables top-level action and picker shortcuts.
-Explicit `pickers` and `keys` replace their respective defaults.
+Explicit `keys` replace the default bindings. There are no default custom
+pickers; `picker = "lines"` requires a `lines` entry in `pickers`.
 
 The Rust source is divided by responsibility: `app.rs` owns the native window
 and event loop, `terminal.rs` handles pane layout, `terminal/pane.rs`

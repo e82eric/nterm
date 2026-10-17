@@ -514,7 +514,6 @@ fn wait_selection(
     }
 }
 
-#[cfg(windows)]
 fn wait_preview_rendered_text(
     ctx: &egui::Context,
     picker: &mut Picker,

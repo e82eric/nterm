@@ -15,33 +15,14 @@ impl Model {
         actions: BTreeMap<String, Rc<crate::actions::LuaAction>>,
     ) -> Result<Self, String> {
         defaults.validate()?;
-        let mut definitions = definitions.unwrap_or_else(|| {
-            BTreeMap::from([
-                (
-                    "lines".into(),
-                    Definition {
-                        presentation: PickerPresentation::default(),
-                        source: DefinitionSource::Scrollback {
-                            unique: None,
-                            callback: None,
-                            regex: None,
-                            enter_action: None,
-                        },
-                    },
-                ),
-                (
-                    "commands".into(),
-                    Definition {
-                        presentation: PickerPresentation {
-                            position: Position::Cursor,
-                            preview_visible: false,
-                            ..Default::default()
-                        },
-                        source: DefinitionSource::CommandPalette {},
-                    },
-                ),
-            ])
-        });
+        // Without custom pickers only the built-ins exist; default bindings
+        // fall back to them.
+        let mut definitions = definitions.unwrap_or_default();
+        // TODO(picker-defaults): built-in defaults are applied twice: overrides
+        // are merged onto builtin_defaults() when the config is parsed (and
+        // again on open for factory overrides), and missing built-ins are
+        // filled in here. Take overrides as a separate argument and build each
+        // built-in once from either its override or its defaults.
         for name in BUILTIN_NAMES {
             definitions
                 .entry(format!("builtin.{name}"))

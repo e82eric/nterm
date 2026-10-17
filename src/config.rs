@@ -250,6 +250,10 @@ fn parse_picker_table(
     Ok(parsed)
 }
 
+/// Merge `builtin_pickers.<name>` overrides onto the built-in defaults.
+// TODO(picker-defaults): one of the two places built-in defaults are applied;
+// see Model::compile. `line_break` is configured separately through
+// BuiltinPickers because it only opens from another picker or copy mode.
 fn parse_builtin_table(
     lua: &std::rc::Rc<Lua>,
     name: &str,
@@ -285,6 +289,10 @@ struct AppConfig {
     #[serde(skip)]
     compiled_prompts: std::rc::Rc<prompts::Patterns>,
     picker_pipe: crate::picker::pipe::Policy,
+    // TODO(picker-defaults): `None` used to select default custom pickers;
+    // it now means the same as an empty table, so this can be a plain map.
+    // `keys` stays optional: `None` keeps the default bindings and `{}`
+    // removes them.
     pickers: Option<std::collections::BTreeMap<String, crate::picker::config::Definition>>,
     keys: Option<Vec<crate::picker::config::KeyBinding>>,
     #[serde(skip)]
@@ -519,6 +527,12 @@ impl AppConfig {
                             ));
                         }
                     };
+                    // TODO(picker-defaults): built-in overrides share the
+                    // custom `pickers` map under `builtin.*` keys, which is
+                    // why custom names cannot start with `builtin.`, and
+                    // Model::compile fills in defaults for whichever slots
+                    // are still empty. Keep overrides in their own map and
+                    // pass both to Model::compile instead.
                     parsed_pickers
                         .get_or_insert_with(Default::default)
                         .insert(format!("builtin.{name}"), definition);
@@ -1752,8 +1766,44 @@ mod tests {
             empty.actions,
         )
         .unwrap();
-        assert!(bindings.named("lines").is_some());
+        assert!(bindings.named("lines").is_none());
+        assert!(bindings.named("commands").is_none());
+        assert!(matches!(
+            bindings
+                .named("builtin.lines")
+                .unwrap()
+                .resolve(&PickerContext::default())
+                .unwrap()
+                .preview,
+            Some(crate::picker::config::Preview::Scrollback { rows: 12 })
+        ));
         assert!(bindings.named("missing").is_none());
+        // Without pickers or keys, the default shortcuts open the built-ins.
+        let defaults = parse("return {}").unwrap();
+        let default_bindings = crate::picker::config::Bindings::compile_with_actions(
+            defaults.pickers,
+            defaults.keys,
+            defaults.picker_defaults,
+            defaults.actions,
+        )
+        .unwrap();
+        for (key, expected) in [
+            (egui::Key::F, "builtin.lines"),
+            (egui::Key::Space, "builtin.command_palette"),
+        ] {
+            let mut events = vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            }];
+            let (open, _) = default_bindings.consume(&mut events);
+            assert_eq!(
+                open,
+                Some(crate::actions::AppAction::OpenPicker(expected.into()))
+            );
+        }
         let mut events = vec![egui::Event::Key {
             key: egui::Key::F,
             physical_key: Some(egui::Key::F),
@@ -2506,7 +2556,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             bindings
-                .named("lines")
+                .named("builtin.lines")
                 .unwrap()
                 .resolve(&PickerContext::default())
                 .unwrap()

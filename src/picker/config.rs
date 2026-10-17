@@ -868,6 +868,12 @@ impl Bindings {
         )?);
         let compiled = &model.pickers;
         let actions = &model.actions;
+        // TODO(picker-defaults): the default Ctrl+Shift+F and Ctrl+Shift+Space
+        // bindings prefer custom pickers named `lines` and `commands` over
+        // the built-ins. This existed for the removed implicit default
+        // pickers; now it only rebinds a default shortcut when a user happens
+        // to use one of those names. Always bind `builtin.*` here instead and
+        // let users rebind through `keys`.
         let keys = keys.unwrap_or_else(|| {
             let mut keys = crate::actions::default_bindings();
             {
@@ -1157,7 +1163,7 @@ mod tests {
         let keys = serde_json::from_value(serde_json::json!([
             { "key": "k", "mods": "CTRL", "action": "ToggleFloatingPane" },
             { "key": "k", "mods": "ALT", "action": "ToggleFloatingPane" },
-            { "key": "e", "mods": "CTRL|SHIFT", "picker": "lines" },
+            { "key": "e", "mods": "CTRL|SHIFT", "picker": "builtin.lines" },
             { "key": "x", "mods": "CTRL|SHIFT", "action": "ExitCopyMode" }
         ]))
         .unwrap();
@@ -1175,7 +1181,7 @@ mod tests {
         )];
         assert_eq!(
             bindings.consume(&mut events),
-            (Some(AppAction::OpenPicker("lines".into())), true)
+            (Some(AppAction::OpenPicker("builtin.lines".into())), true)
         );
         let mut events = vec![key_event(
             egui::Key::N,
