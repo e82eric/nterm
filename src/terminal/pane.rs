@@ -98,7 +98,7 @@ impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDoc
 }
 
 struct WakeState {
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     pipe: Option<crate::picker::pipe::Service>,
     context: egui::Context,
     proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
@@ -106,6 +106,8 @@ struct WakeState {
     frame_ready_pending: AtomicBool,
     close: AtomicBool,
     title: std::sync::Mutex<String>,
+    /// The shell's working directory from OSC 7, if it reported one.
+    pwd: std::sync::Mutex<Option<String>>,
     clipboard_text: std::sync::Mutex<Option<String>>,
     config_issues: std::sync::Mutex<Vec<String>>,
     runtime_issues: std::sync::Mutex<Vec<(String, String)>>,
@@ -113,7 +115,7 @@ struct WakeState {
 
 impl WakeState {
     fn picker_environment(&self) -> (std::ffi::CString, std::ffi::CString) {
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         if let Some(pipe) = &self.pipe {
             return (
                 std::ffi::CString::new(pipe.endpoint.clone()).unwrap(),
@@ -134,6 +136,19 @@ extern "C" fn ghostty_egui_title(userdata: *mut c_void, title: *const c_char) {
         *state.title.lock().unwrap() = unsafe { std::ffi::CStr::from_ptr(title) }
             .to_string_lossy()
             .into_owned();
+    });
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ghostty_egui_pwd(userdata: *mut c_void, pwd: *const c_char) {
+    crate::native_error::ffi_boundary("handle terminal pwd", || {
+        if userdata.is_null() || pwd.is_null() {
+            return;
+        }
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        // An empty path means the shell no longer knows its directory.
+        let pwd = unsafe { std::ffi::CStr::from_ptr(pwd) }.to_string_lossy();
+        *state.pwd.lock().unwrap() = (!pwd.is_empty()).then(|| pwd.into_owned());
     });
 }
 
@@ -425,7 +440,7 @@ impl TerminalPane {
 
     pub(super) fn destroy(&mut self, gl: &glow::Context) {
         self.picker = None;
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         {
             self.wake.pipe.take();
         }
@@ -582,7 +597,7 @@ impl TerminalPane {
         argv: *mut *mut c_char,
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             pipe: Some(
                 crate::picker::pipe::Service::new(egui_ctx.clone()).map_err(|e| {
                     crate::native_error::FatalError::new("create secure picker pipe", e)
@@ -594,11 +609,12 @@ impl TerminalPane {
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             title: std::sync::Mutex::new(String::new()),
+            pwd: std::sync::Mutex::new(None),
             config_issues: std::sync::Mutex::new(Vec::new()),
             runtime_issues: std::sync::Mutex::new(Vec::new()),
             clipboard_text: std::sync::Mutex::new(None),
         });
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         if let Some(pipe) = &wake.pipe {
             pipe.bind_window(wake.proxy.clone(), wake.window_id);
         }
@@ -658,7 +674,7 @@ impl TerminalPane {
         options: &super::floating::CreateOptions,
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             pipe: Some(crate::picker::pipe::Service::new(ctx.clone()).map_err(|e| {
                 crate::native_error::FatalError::new("create secure picker pipe", e)
             })?),
@@ -668,11 +684,12 @@ impl TerminalPane {
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             title: std::sync::Mutex::new(String::new()),
+            pwd: std::sync::Mutex::new(None),
             config_issues: std::sync::Mutex::new(Vec::new()),
             runtime_issues: std::sync::Mutex::new(Vec::new()),
             clipboard_text: std::sync::Mutex::new(None),
         });
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         if let Some(pipe) = &wake.pipe {
             pipe.bind_window(wake.proxy.clone(), wake.window_id);
         }
@@ -732,6 +749,9 @@ impl TerminalPane {
 
     pub(super) fn title(&self) -> String {
         self.wake.title.lock().unwrap().clone()
+    }
+    pub(super) fn pwd(&self) -> Option<String> {
+        self.wake.pwd.lock().unwrap().clone()
     }
 
     pub(super) fn request_repaint(&self) {
@@ -808,7 +828,7 @@ impl TerminalPane {
             separator,
             detail,
             pipe_status: {
-                #[cfg(windows)]
+                #[cfg(any(windows, unix))]
                 {
                     self.wake
                         .pipe
@@ -816,7 +836,7 @@ impl TerminalPane {
                         .filter(|pipe| pipe.enabled())
                         .map(|pipe| pipe.connected())
                 }
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, unix)))]
                 {
                     None
                 }
@@ -987,6 +1007,7 @@ impl TerminalPane {
                 line_before_cursor: before,
                 cursor_column: row.cursor_column,
                 recent_lines: self.recent_picker_lines(),
+                cwd: self.pwd(),
             };
             unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line_free(&mut row) };
             context
@@ -1005,6 +1026,7 @@ impl TerminalPane {
                 return;
             }
         };
+        options.default_cwd(self.pwd());
         if matches!(options.source, crate::picker::config::Source::ErrorLog) {
             options.source = crate::error_log::picker_options().source;
             options
@@ -1339,7 +1361,7 @@ impl TerminalPane {
         }
         ctx.request_repaint();
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     pub(super) fn handle_pipe_requests(
         &mut self,
         ctx: &egui::Context,

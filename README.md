@@ -133,6 +133,13 @@ zig build egui-sample -Dapp-runtime=none -Doptimize=ReleaseFast
 ./zig-out/bin/ghostty_egui --command="$SHELL"
 ```
 
+To install it with a desktop entry for application launchers (such as
+awesome's menubar), and link `npick` into `~/.local/bin`, run
+`example/rust-egui-terminal/deploy.sh`. It builds,
+installs to `~/.local/opt/ghostty-egui` (or the folder given as its argument),
+and writes `~/.local/share/applications/ghostty-egui.desktop`. Pass
+`--skip-build` to install the existing build. Running instances are unaffected.
+
 The host uses WGL context sharing on Windows and explicitly selects EGL on
 Linux, including X11 and Wayland. `TerminalView` owns the Ghostty surface,
 input bridge separately from `ShellApp`. Its painter owns the current exported
@@ -702,6 +709,8 @@ pickers = {
 
 `cursor.line` is the visible physical terminal row, `line_before_cursor` is its
 text before the cursor, and `cursor_column` is the zero-based terminal cell column.
+`context.cwd` is the shell's working directory if it reports one with OSC 7
+(see [Shell working directory](#shell-working-directory)), otherwise `nil`.
 This is terminal output, not PSReadLine's private edit buffer. `initial_query`
 works for both static and function pickers. The function may choose `type`,
 `position`, `enter_action`, `action`, and other type-specific fields on every invocation.
@@ -798,16 +807,40 @@ Enter pastes the chosen value. Item lists are limited to 2,000 entries.
 lines into the fuzzy picker. An argument consisting of `{pattern}` is replaced
 with the named pipe request's `params.pattern`; other `{name}` arguments can use other
 request parameters. The request's `params.cwd` overrides optional configured
-`cwd`. The command stops when the picker closes. Without an `action` callback,
+`cwd`; without either, the command runs in the shell's working directory when
+known (see below), otherwise the application's. The command stops when the picker closes. Without an `action` callback,
 Enter pastes the selected line. The sample `Ripgrep` picker shows how to use
 `rg --vimgrep` and open a result in Neovim.
 For commands whose output uses continued lines, set `line_continuation` to the
 line-ending marker (for example, `` "`" `` for PowerShell history). Continued
 lines appear as one result joined with spaces; accepting it removes the markers
 and restores newlines. An unfinished group is kept when the command exits.
+Set `columns = { "Name", ... }` on a Command picker to show its output as a
+structured table: each line is split on `delimiter` (default tab) into those
+columns, with a header row, aligned cells and the same column queries as the
+command palette (`/:Branch=~main`). Missing fields are empty and extra
+delimiters stay in the last column. The accepted value, and `{item}` in
+previews, is still the whole output line. `columns` cannot be combined with
+`line_continuation` or `unique`.
 Set `unique = true` on a Command picker to retain only the first occurrence
 of each exact accepted value in the process output. Deduplication happens after
 continuation lines are joined. The default is `false`.
+
+#### Shell working directory
+
+Pickers opened with a key binding run commands and previews in the shell's
+current directory when the shell reports it with OSC 7. The application then
+sets `params.cwd` to that directory, unless a pipe request supplied `cwd` or a
+`Command` definition configures its own `cwd`. Factories also receive it as
+`context.cwd`. Ghostty accepts `file://` URLs and `kitty-shell-cwd://` URLs
+from the local host only. For bash, report it before each prompt:
+
+```bash
+__report_pwd() { printf '\e]7;kitty-shell-cwd://%s%s\a' "$HOSTNAME" "$PWD"; }
+PROMPT_COMMAND="__report_pwd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+```
+
+Without OSC 7, commands run in the application's working directory.
 
 ### Preview configuration
 
@@ -1144,8 +1177,10 @@ capture or read terminal snapshots, and cancellation leaves existing copy mode i
 
 ### Opening pickers from the shell over a named pipe
 
-Shells open allowlisted named pickers through the authenticated local named pipe.
-This integration is Windows-only; the supplied helper requires PowerShell 7.3+.
+Shells open allowlisted named pickers through the authenticated local named pipe
+(Windows) or Unix socket (Linux). On Linux, use `npick`, installed beside
+`ghostty_egui`; see [npick on Linux](#npick-on-linux). On Windows, the supplied
+helper requires PowerShell 7.3+.
 Pipe access is disabled by default. Add this to your returned Lua table, restart
 the application, then load the helper inside its newly launched shell:
 
@@ -1206,6 +1241,41 @@ picker. Ordinary completion keeps the authenticated connection for the next
 request. Use `Disconnect-GhosttyPicker` to release it before connecting from
 another process in the same pane. Another active overlay can return `busy`;
 requests are not queued. Returned paths are not automatically shell-quoted.
+
+#### npick on Linux
+
+With `picker_pipe` enabled as above, `npick` opens pickers from the shell
+running in a pane and prints the selected value:
+
+```sh
+npick files                        # a named picker from ghostty.lua
+git branch --format='%(refname:short)' | npick --query main
+```
+
+Without a name, each stdin line is a candidate. `--display N` and `--value N`
+show and return tab-separated fields (`-d` sets the separator), and `--json`
+reads `{"text": ..., "value": ...}` lines. It exits 0 with the value on stdout,
+130 when cancelled, and 2 on errors. For example, bind Ctrl+T in bash to insert
+a file:
+
+```bash
+__npick_file() {
+  local file
+  file=$(npick files) || return
+  READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}$file${READLINE_LINE:READLINE_POINT}"
+  READLINE_POINT=$((READLINE_POINT + ${#file}))
+}
+[[ -n $GHOSTTY_PICKER_ENDPOINT ]] && bind -x '"\C-t": __npick_file'
+```
+
+[npick-completion.bash](npick-completion.bash) is the bash counterpart of the
+PowerShell profile's completion picker. Source it from `~/.bashrc`
+(`deploy.sh` installs it to `share/ghostty-egui/` beside the app). In
+ghostty-egui panes, Ctrl+Space lists what Tab would complete for the word at
+the cursor, using bash-completion when it is installed; Enter replaces that
+word, quoting file names. A key binding cannot enable readline's unquoting, so
+for words containing quotes, backslashes or `~` it falls back to bash's own
+file, directory and `$variable` completion.
 
 See [PICKER-PIPE.md](PICKER-PIPE.md) and
 [Invoke-GhosttyPicker.ps1](Invoke-GhosttyPicker.ps1) for PSReadLine bindings,

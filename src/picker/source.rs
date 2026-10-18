@@ -31,9 +31,10 @@ enum Session {
     Structured {
         snapshot: Arc<StructuredStreamingSnapshot>,
     },
-    #[cfg(not(windows))]
-    UnsupportedFileSystem,
-    #[cfg(windows)]
+    /// A command with `columns`, streamed into structured rows.
+    StructuredCommand {
+        store: Arc<SnapshotStore<StructuredStreamingSnapshot>>,
+    },
     FileSystem {
         store: Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>,
         scan: nfm_file_system::walker::FileWalkerScan,
@@ -41,7 +42,6 @@ enum Session {
 }
 impl Session {
     fn stop(&self) {
-        #[cfg(windows)]
         if let Self::FileSystem { scan, .. } = self {
             scan.cancel();
         }
@@ -238,7 +238,7 @@ impl PickerSource {
         };
         let command_values = match &options.source {
             crate::picker::config::Source::Command(config)
-                if config.line_continuation.is_some() =>
+                if config.line_continuation.is_some() || config.columns.is_some() =>
             {
                 Some(Arc::default())
             }
@@ -251,7 +251,6 @@ impl PickerSource {
             }
         }
         let session = match &options.source {
-            #[cfg(windows)]
             crate::picker::config::Source::FileSystem(files) => {
                 let shared =
                     Arc::new(nfm_file_system::walker_search_store::FileSystemSearchStore::new());
@@ -268,12 +267,6 @@ impl PickerSource {
                     store: shared,
                     scan,
                 }
-            }
-            #[cfg(not(windows))]
-            crate::picker::config::Source::FileSystem(_) => {
-                *error.lock().unwrap() =
-                    Some("Filesystem pickers require NFM support for this platform".into());
-                Session::UnsupportedFileSystem
             }
             crate::picker::config::Source::Themes | crate::picker::config::Source::ErrorLog => {
                 unreachable!("theme source must be resolved before starting")
@@ -296,13 +289,38 @@ impl PickerSource {
             crate::picker::config::Source::Scrollback { .. } => Session::Document {
                 store: Arc::new(SnapshotStore::new_append_only()),
             },
+            crate::picker::config::Source::Command(config) if config.columns.is_some() => {
+                Session::StructuredCommand {
+                    store: Arc::new(SnapshotStore::new()),
+                }
+            }
             crate::picker::config::Source::Items(_) | crate::picker::config::Source::Command(_) => {
                 Session::Streaming
             }
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let document = Arc::new(std::sync::OnceLock::new());
-        let reader = if let crate::picker::config::Source::Command(config) = &options.source {
+        let reader = if let (
+            crate::picker::config::Source::Command(config),
+            Session::StructuredCommand { store: rows },
+        ) = (&options.source, &session)
+        {
+            crate::picker::command::start_structured(
+                config.clone(),
+                config
+                    .columns
+                    .clone()
+                    .expect("structured command has columns"),
+                options.params.clone(),
+                rows.clone(),
+                command_values
+                    .clone()
+                    .expect("structured command records values"),
+                cancelled.clone(),
+                error.clone(),
+                ctx.clone(),
+            )
+        } else if let crate::picker::config::Source::Command(config) = &options.source {
             crate::picker::command::start(
                 config.clone(),
                 options.params.clone(),
@@ -526,10 +544,8 @@ impl PickerSource {
             Session::Streaming => Provider::Streaming(self.runtime().store.clone()),
             Session::Document { store } => Provider::Document(store.clone()),
             Session::Structured { snapshot } => Provider::Structured(snapshot.clone()),
-            #[cfg(windows)]
+            Session::StructuredCommand { store } => Provider::StructuredStream(store.clone()),
             Session::FileSystem { store, .. } => Provider::FileSystem(store.clone()),
-            #[cfg(not(windows))]
-            Session::UnsupportedFileSystem => Provider::Streaming(self.runtime().store.clone()),
         })
     }
     pub(super) fn accepted_value(&self, result: &SearchResult) -> String {
@@ -776,7 +792,6 @@ pub(super) enum Snapshot {
     Streaming(Arc<Items>),
     Document(Arc<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>),
     Structured(Arc<StructuredStreamingSnapshot>),
-    #[cfg(windows)]
     FileSystem(Arc<nfm_file_system::walker::PublishedSnapshot>),
 }
 #[derive(Clone, Debug)]
@@ -790,7 +805,6 @@ macro_rules! delegate_snapshot {
             Snapshot::Streaming(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
             Snapshot::Document(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
             Snapshot::Structured(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
-            #[cfg(windows)]
             Snapshot::FileSystem(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
         }
     };
@@ -854,7 +868,7 @@ pub(super) enum Provider {
     Streaming(Arc<SnapshotStore<Items>>),
     Document(Arc<SnapshotStore<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>>),
     Structured(Arc<StructuredStreamingSnapshot>),
-    #[cfg(windows)]
+    StructuredStream(Arc<SnapshotStore<StructuredStreamingSnapshot>>),
     FileSystem(Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>),
 }
 
@@ -932,7 +946,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Streaming(s) => s.snapshot().map(|s| Arc::new(Snapshot::Streaming(s))),
             Self::Document(s) => s.snapshot().map(|s| Arc::new(Snapshot::Document(s))),
             Self::Structured(s) => Some(Arc::new(Snapshot::Structured(s.clone()))),
-            #[cfg(windows)]
+            Self::StructuredStream(s) => s.snapshot().map(|s| Arc::new(Snapshot::Structured(s))),
             Self::FileSystem(s) => s.snapshot().map(|s| Arc::new(Snapshot::FileSystem(s))),
         }
     }
@@ -941,7 +955,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Streaming(s) => s.snapshot_version(),
             Self::Document(s) => s.snapshot_version(),
             Self::Structured(s) => s.version(),
-            #[cfg(windows)]
+            Self::StructuredStream(s) => s.snapshot_version(),
             Self::FileSystem(s) => s.snapshot_version(),
         }
     }
@@ -950,19 +964,20 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Streaming(s) => s.is_done(),
             Self::Document(s) => s.is_done(),
             Self::Structured(_) => true,
-            #[cfg(windows)]
+            Self::StructuredStream(s) => s.is_done(),
             Self::FileSystem(s) => s.is_done(),
         }
     }
     fn is_append_only(&self) -> bool {
-        !matches!(self, Self::Structured(_))
+        // Structured rows realign as column widths grow, so re-search them.
+        !matches!(self, Self::Structured(_) | Self::StructuredStream(_))
     }
     fn subscribe_updates(&self, wake: crossbeam_channel::Sender<()>) -> bool {
         match self {
             Self::Streaming(s) => s.subscribe_updates(wake),
             Self::Document(s) => s.subscribe_updates(wake),
             Self::Structured(_) => true,
-            #[cfg(windows)]
+            Self::StructuredStream(s) => s.subscribe_updates(wake),
             Self::FileSystem(s) => s.subscribe_updates(wake),
         }
     }

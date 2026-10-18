@@ -1,21 +1,26 @@
 //! Transport-independent picker IPC schema and request lifecycle.
 //! An authenticated connection serves sequential requests; no request replay.
 use crossbeam_channel::{Receiver, Sender};
-use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::Sha256;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
+// Shared with the npick client binary, so it depends only on hmac and sha2.
+mod protocol;
+pub(crate) use protocol::{MAX_FRAME, hex, proof, verify_proof};
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::Service;
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub(crate) use unix::Service;
 
-pub(crate) const MAX_FRAME: usize = 1024 * 1024;
 pub(crate) const MAX_ITEM: usize = 64 * 1024;
 pub(crate) const MAX_ITEMS: usize = 1_000_000;
 pub(crate) const MAX_STORAGE: usize = 256 * 1024 * 1024;
@@ -190,56 +195,6 @@ impl Policy {
         }
         Ok(())
     }
-}
-
-pub(crate) fn proof(
-    token: &str,
-    endpoint: &str,
-    server: &str,
-    client: &str,
-    role: &str,
-) -> Vec<u8> {
-    transcript_mac(token, endpoint, server, client, role)
-        .finalize()
-        .into_bytes()
-        .to_vec()
-}
-fn transcript_mac(
-    token: &str,
-    endpoint: &str,
-    server: &str,
-    client: &str,
-    role: &str,
-) -> Hmac<Sha256> {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("HMAC accepts any key size");
-    // Length-prefixed transcript avoids ambiguous concatenation.
-    for part in ["ghostty-picker/1", endpoint, server, client, role] {
-        mac.update(&(part.len() as u32).to_le_bytes());
-        mac.update(part.as_bytes());
-    }
-    mac
-}
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-pub(crate) fn verify_proof(
-    token: &str,
-    endpoint: &str,
-    server: &str,
-    client: &str,
-    supplied: &str,
-) -> bool {
-    if supplied.len() != 64 || !supplied.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return false;
-    }
-    let decoded: Vec<_> = (0..64)
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&supplied[i..i + 2], 16).unwrap())
-        .collect();
-    transcript_mac(token, endpoint, server, client, "client")
-        .verify_slice(&decoded)
-        .is_ok()
 }
 
 /// Reject duplicate fields even inside definition/value objects.

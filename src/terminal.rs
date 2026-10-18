@@ -538,7 +538,7 @@ impl TerminalView {
         }
         let active_bounds = if floating_active { floating_rect } else { rect };
         let has_floating = !self.floating.is_empty();
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         {
             self.main.handle_pipe_requests(
                 ui.ctx(),

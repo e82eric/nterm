@@ -1,9 +1,9 @@
 # Picker pipe, protocol version 1
 
-The Windows egui host owns one local duplex byte-mode named pipe per pane.
-The protocol, schema, and request lifecycle are independent of Windows; a
-future Linux implementation can use a Unix-domain stream socket. Linux is not
-implemented here.
+The egui host owns one local connection endpoint per pane: a duplex byte-mode
+named pipe on Windows and a Unix-domain stream socket on Linux. Both speak the
+protocol below. On Linux, use the `npick` client; see
+[Linux transport](#linux-transport).
 
 ## Enable and test
 
@@ -162,7 +162,8 @@ GHOSTTY_PICKER_ENDPOINT=ghostty-picker-<random 256-bit identifier>
 GHOSTTY_PICKER_TOKEN=<independent random 256-bit token encoded as hex>
 ```
 
-The endpoint is a basename; the client connects to `\\.\pipe\<endpoint>`.
+On Windows the endpoint is a basename; the client connects to
+`\\.\pipe\<endpoint>`. On Linux it is the socket's absolute path.
 These variables are not persisted or set globally. Shell descendants inherit
 them. The token is the UTF-8 hex string used as the HMAC key, not decoded bytes.
 
@@ -283,6 +284,34 @@ deadline, and idle authenticated connections have no idle timeout. Cancellation
 is read concurrently with response delivery. A Lua reload that revokes the active
 request capability cancels that request. Disabling the pipe or exit of the pane
 shell closes idle connections; pane closure stops the service.
+
+## Linux transport
+
+Each pane listens on `$XDG_RUNTIME_DIR/ghostty-egui/<pid>/pane-<id>.sock`, or a
+`ghostty-egui-<uid>` directory under the temporary directory when no runtime
+directory is set. Both directories must be owned by the user and mode `0700`;
+the socket is `0600`. On startup, directories of terminals that are no longer
+running are removed; closing a pane removes its socket.
+
+The kernel reports the connecting process's user (`SO_PEERCRED`); connections
+from other users are closed before the challenge. The handshake, framing,
+limits, and request lifecycle are unchanged. Windows' token, integrity, and
+process ancestry checks have no equivalent: on Linux, processes of the same
+user can read each other's environment (including the token) and memory, so
+the token is not a boundary between them.
+
+`npick` is the client:
+
+```sh
+npick files                       # a named picker; prints the selected value
+npick root_cd                     # params: npick NAME KEY=VALUE...
+fd -t f | npick --query src       # stream lines from stdin
+ps -eo pid,comm | npick -d ' ' --value 1
+```
+
+Named requests add the caller's directory as `params.cwd` unless given. It
+exits 0 with the value on stdout, 130 when cancelled, and 2 on errors.
+`npick --help` lists all options.
 
 ## Security controls and remaining risks
 

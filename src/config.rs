@@ -12,6 +12,8 @@ pub(crate) struct PickerContext {
     pub(crate) line_before_cursor: String,
     pub(crate) cursor_column: u32,
     pub(crate) recent_lines: Vec<String>,
+    /// The shell's working directory from OSC 7, if it reported one.
+    pub(crate) cwd: Option<String>,
 }
 
 pub(crate) struct PickerFactory {
@@ -48,6 +50,9 @@ impl PickerFactory {
         argument
             .set("recent_lines", context.recent_lines.clone())
             .map_err(|e| e.to_string())?;
+        argument
+            .set("cwd", context.cwd.as_deref())
+            .map_err(|e| e.to_string())?;
         let table: mlua::Table = function
             .call(argument)
             .map_err(|e| format!("pickers.{}: {e}", self.name))?;
@@ -55,6 +60,7 @@ impl PickerFactory {
             .set_app_data(crate::preview_worker::FactoryContext(serde_json::json!({
                 "line": context.line, "line_before_cursor": context.line_before_cursor,
                 "cursor_column": context.cursor_column, "recent_lines": context.recent_lines,
+                "cwd": context.cwd,
             })));
         let definition = if let Some(name) = &self.builtin {
             parse_builtin_table(&self.lua, name, &table)
@@ -2973,5 +2979,34 @@ mod tests {
                 "--lua-config=child-option"
             ]
         );
+    }
+
+    #[test]
+    fn picker_factories_receive_shell_cwd() {
+        let config = parse(
+            "return { pickers = { here = function(context) return { type = 'Items', initial_query = context.cwd or 'none', items = { { text = 'x', value = 'x' } } } end } }",
+        )
+        .unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+        for (cwd, expected) in [
+            (Some("/home/user/project"), "/home/user/project"),
+            (None, "none"),
+        ] {
+            let options = bindings
+                .named("here")
+                .unwrap()
+                .resolve(&PickerContext {
+                    cwd: cwd.map(str::to_owned),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(options.params["query"], expected);
+        }
     }
 }

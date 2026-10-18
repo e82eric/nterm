@@ -1,6 +1,6 @@
 //! Ghostty config/request adapter for NFM's streaming command source.
 use crate::ghostty_ffi::SnapshotCellRange;
-use crate::picker::config::CommandOptions;
+use crate::picker::config::{CommandColumns, CommandOptions};
 pub(crate) use nfm_picker_sources::command::CommandValues;
 use nfm_search_core::{
     snapshot_store::SnapshotStore,
@@ -130,6 +130,173 @@ pub(crate) fn start(
     }
 }
 
+type StructuredItems = nfm_picker_sources::structured::StructuredStreamingSnapshot;
+
+/// One output line as a record with exactly `columns` fields. Missing fields
+/// are empty; extra delimiters stay in the last field.
+fn split_record(line: &[u8], delimiter: &str, columns: usize) -> csv::StringRecord {
+    let text = String::from_utf8_lossy(line);
+    let text = text.strip_suffix('\r').unwrap_or(&text);
+    let mut fields: Vec<&str> = text.splitn(columns, delimiter).collect();
+    fields.resize(columns, "");
+    csv::StringRecord::from(fields)
+}
+
+/// Add one output line as a row, recording the line itself as the row's
+/// accepted value. Returns false once `max_rows` is reached.
+fn add_row(
+    rows: &mut nfm_picker_sources::structured::StructuredStreamingStore,
+    values: &CommandValues,
+    line: &[u8],
+    columns: &CommandColumns,
+    max_rows: usize,
+) -> bool {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() {
+        return true;
+    }
+    if rows.len() >= max_rows {
+        return false;
+    }
+    let record = split_record(line, &columns.delimiter, columns.names.len());
+    // Values are installed before their rows are published.
+    values
+        .lock()
+        .unwrap()
+        .insert(rows.len(), String::from_utf8_lossy(line).into_owned());
+    rows.add_record(&record)
+        .expect("record matches column count");
+    true
+}
+
+/// Run a command with `columns`: split each stdout line on the delimiter and
+/// publish the rows to a structured store as they arrive. The store is
+/// completed when the command finishes, fails or is cancelled.
+pub(crate) fn start_structured(
+    options: CommandOptions,
+    columns: CommandColumns,
+    params: BTreeMap<String, String>,
+    store: Arc<SnapshotStore<StructuredItems>>,
+    values: CommandValues,
+    cancelled: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+    ctx: egui::Context,
+) -> Option<JoinHandle<()>> {
+    use nfm_picker_sources::structured::{StructuredSchema, StructuredStreamingStore};
+    use nfm_preview_command::{CommandSpec, Stream, no_match_exit, run_streaming};
+    use std::sync::atomic::Ordering;
+    let schema = StructuredSchema::new(columns.names.clone()).expect("validated command columns");
+    let mut rows = StructuredStreamingStore::new(schema);
+    let finish = {
+        let (store, ctx) = (store.clone(), ctx.clone());
+        move |rows: &mut StructuredStreamingStore| {
+            store.publish(rows.snapshot());
+            store.complete();
+            ctx.request_repaint();
+        }
+    };
+    let (program, args, cwd) = match resolve(&options, &params) {
+        Ok(command) => command,
+        Err(message) => {
+            crate::error_log::error("picker command", "Command failed", &message);
+            *error.lock().unwrap() = Some(message);
+            finish(&mut rows);
+            return None;
+        }
+    };
+    let mut spec = CommandSpec::new(program);
+    spec.arguments = args;
+    spec.working_directory = cwd.map(std::path::PathBuf::from);
+    spec.output_limit = 16 * 1024;
+    let success_codes = options.success_exit_codes.clone().unwrap_or_else(|| {
+        if no_match_exit(&spec.program.to_string_lossy()) {
+            vec![0, 1]
+        } else {
+            vec![0]
+        }
+    });
+    // Requests from npick share the IPC limits of plain command pickers.
+    let max_rows = if params.contains_key("__ipc_request") {
+        super::pipe::MAX_ITEMS
+    } else {
+        usize::MAX
+    };
+    let worker = std::thread::Builder::new()
+        .name("picker structured command".into())
+        .spawn(move || {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+                    let mut pending = Vec::new();
+                    let mut too_many = false;
+                    let output = run_streaming(
+                        &spec,
+                        || cancelled.load(Ordering::Acquire),
+                        |stream, bytes| {
+                            if stream != Stream::Stdout {
+                                return true;
+                            }
+                            pending.extend_from_slice(bytes);
+                            let mut start = 0;
+                            while let Some(end) =
+                                pending[start..].iter().position(|&byte| byte == b'\n')
+                            {
+                                too_many |= !add_row(
+                                    &mut rows,
+                                    &values,
+                                    &pending[start..start + end],
+                                    &columns,
+                                    max_rows,
+                                );
+                                start += end + 1;
+                            }
+                            pending.drain(..start);
+                            if start > 0 {
+                                store.publish(rows.snapshot());
+                                ctx.request_repaint();
+                            }
+                            !too_many
+                        },
+                    );
+                    if cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    too_many |= !add_row(&mut rows, &values, &pending, &columns, max_rows);
+                    if too_many {
+                        return Err("command output exceeds the picker's row limit".into());
+                    }
+                    let output = output?;
+                    if !output
+                        .status
+                        .code()
+                        .is_some_and(|code| success_codes.contains(&code))
+                    {
+                        return Err(format!(
+                            "{}\nProcess exited with {}\nStderr:\n{}",
+                            spec.describe(),
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr)
+                        ));
+                    }
+                    Ok(())
+                }));
+            let result = result.unwrap_or_else(|_| Err("Command picker worker failed".into()));
+            if let Err(message) = result {
+                if !cancelled.load(Ordering::Acquire) {
+                    crate::error_log::error("picker command", "Command failed", &message);
+                    *error.lock().unwrap() = Some(message);
+                }
+            }
+            finish(&mut rows);
+        });
+    match worker {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            crate::error_log::error("picker command", "Worker failed", &error.to_string());
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +310,7 @@ mod tests {
             line_continuation: None,
             unique: false,
             success_exit_codes: None,
+            columns: None,
         };
         let store = Arc::new(SnapshotStore::<Items>::new());
         let error = Arc::new(Mutex::new(None));
@@ -184,6 +352,7 @@ mod tests {
                 line_continuation: None,
                 unique: false,
                 success_exit_codes: None,
+                columns: None,
             },
             BTreeMap::new(),
             store.clone(),
@@ -242,6 +411,7 @@ mod tests {
                 line_continuation: None,
                 unique: false,
                 success_exit_codes: None,
+                columns: None,
             },
             BTreeMap::new(),
             store,
@@ -268,6 +438,7 @@ mod tests {
                 line_continuation: None,
                 unique: false,
                 success_exit_codes: Some(vec![0, 1]),
+                columns: None,
             },
             BTreeMap::new(),
             Arc::new(SnapshotStore::new()),
@@ -290,6 +461,7 @@ mod tests {
             line_continuation: None,
             unique: false,
             success_exit_codes: None,
+            columns: None,
         };
         let params = BTreeMap::from([
             ("pattern".into(), "a{2} | b".into()),
@@ -319,6 +491,7 @@ mod tests {
                 line_continuation: None,
                 unique: false,
                 success_exit_codes: None,
+                columns: None,
             },
             BTreeMap::new(),
             store.clone(),
@@ -350,6 +523,7 @@ mod tests {
                 line_continuation: Some("`".into()),
                 unique: true,
                 success_exit_codes: None,
+                columns: None,
             },
             BTreeMap::new(),
             store.clone(),
@@ -372,5 +546,124 @@ mod tests {
             "third` fourth"
         );
         assert_eq!(values.lock().unwrap().get(&1).unwrap(), "third\nfourth");
+    }
+
+    fn structured(
+        script: &str,
+        params: BTreeMap<String, String>,
+    ) -> (
+        Arc<SnapshotStore<StructuredItems>>,
+        CommandValues,
+        Arc<Mutex<Option<String>>>,
+    ) {
+        let store = Arc::new(SnapshotStore::new());
+        let values: CommandValues = Arc::default();
+        let error = Arc::new(Mutex::new(None));
+        let columns = CommandColumns {
+            names: vec!["Hash".into(), "Branch".into(), "Subject".into()],
+            delimiter: "\t".into(),
+        };
+        let worker = start_structured(
+            CommandOptions {
+                args: vec!["sh".into(), "-c".into(), script.into()],
+                cwd: None,
+                line_continuation: None,
+                unique: false,
+                success_exit_codes: None,
+                columns: Some(columns.clone()),
+            },
+            columns,
+            params,
+            store.clone(),
+            values.clone(),
+            Arc::new(AtomicBool::new(false)),
+            error.clone(),
+            egui::Context::default(),
+        );
+        worker.unwrap().join().unwrap();
+        (store, values, error)
+    }
+
+    #[test]
+    fn records_split_into_exactly_the_configured_columns() {
+        let fields = |line: &str, columns| {
+            split_record(line.as_bytes(), "\t", columns)
+                .iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fields("a\tb\tc\r", 3), ["a", "b", "c"]);
+        // Missing fields are empty; extra delimiters stay in the last column.
+        assert_eq!(fields("a", 3), ["a", "", ""]);
+        assert_eq!(fields("a\tb\tc\td", 3), ["a", "b", "c\td"]);
+        assert_eq!(
+            split_record("x :: y :: z".as_bytes(), " :: ", 2)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["x", "y :: z"]
+        );
+    }
+
+    #[test]
+    fn structured_command_streams_rows_with_a_header_and_original_lines() {
+        let (store, values, error) = structured(
+            "printf '9d33\\tmain\\tFirst commit\\n\\n0a50\\tresize\\tSecond\\tone\\r\\n3b3a\\tlinux\\tNo newline'",
+            BTreeMap::new(),
+        );
+        assert!(store.is_done());
+        assert!(error.lock().unwrap().is_none());
+        let snapshot = store.snapshot().unwrap();
+        // The blank line is skipped; the unterminated last line is kept.
+        assert_eq!(snapshot.len(), 3);
+        assert!(snapshot.header("").contains("Hash"));
+        assert!(snapshot.header("").contains("Branch"));
+        assert_eq!(snapshot.fields(1)["Branch"], "resize");
+        assert_eq!(snapshot.fields(1)["Subject"], "Second\tone");
+        let values = values.lock().unwrap();
+        assert_eq!(values[&0], "9d33\tmain\tFirst commit");
+        assert_eq!(values[&1], "0a50\tresize\tSecond\tone");
+        assert_eq!(values[&2], "3b3a\tlinux\tNo newline");
+    }
+
+    #[test]
+    fn structured_command_failure_keeps_rows_and_reports_stderr() {
+        let (store, _, error) = structured(
+            "printf 'a\\tb\\tc\\n'; echo broken >&2; exit 3",
+            BTreeMap::new(),
+        );
+        assert!(store.is_done());
+        assert_eq!(store.snapshot().unwrap().len(), 1);
+        let error = error.lock().unwrap().clone().unwrap();
+        assert!(error.contains("broken"), "{error}");
+    }
+
+    #[test]
+    fn structured_command_bad_parameters_complete_without_a_worker() {
+        let store = Arc::new(SnapshotStore::new());
+        let error = Arc::new(Mutex::new(None));
+        let columns = CommandColumns {
+            names: vec!["One".into()],
+            delimiter: "\t".into(),
+        };
+        let worker = start_structured(
+            CommandOptions {
+                args: vec!["sh".into(), "{missing}".into()],
+                cwd: None,
+                line_continuation: None,
+                unique: false,
+                success_exit_codes: None,
+                columns: Some(columns.clone()),
+            },
+            columns,
+            BTreeMap::new(),
+            store.clone(),
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+            error.clone(),
+            egui::Context::default(),
+        );
+        assert!(worker.is_none());
+        assert!(store.is_done());
+        assert!(error.lock().unwrap().as_ref().unwrap().contains("missing"));
     }
 }

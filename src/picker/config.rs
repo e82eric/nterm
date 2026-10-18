@@ -312,6 +312,10 @@ pub(crate) enum DefinitionSource {
         #[serde(default)]
         unique: Option<bool>,
         #[serde(default)]
+        columns: Option<Vec<String>>,
+        #[serde(default)]
+        delimiter: Option<String>,
+        #[serde(default)]
         enter_action: Option<EnterAction>,
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
@@ -454,6 +458,8 @@ impl Definition {
                 line_continuation,
                 unique,
                 success_exit_codes,
+                columns,
+                delimiter,
                 ..
             } => {
                 if args.is_empty()
@@ -488,13 +494,46 @@ impl Definition {
                         "pickers.{name}.success_exit_codes must contain 1 to 16 nonnegative exit codes"
                     ));
                 }
+                let columns = match (columns, delimiter) {
+                    (None, None) => None,
+                    (None, Some(_)) => {
+                        return Err(format!("pickers.{name}.delimiter requires columns"));
+                    }
+                    (Some(names), delimiter) => {
+                        if names.len() > 32 {
+                            return Err(format!(
+                                "pickers.{name}.columns allows at most 32 columns"
+                            ));
+                        }
+                        nfm_picker_sources::structured::StructuredSchema::new(names.clone())
+                            .map_err(|error| format!("pickers.{name}.columns: {error}"))?;
+                        let delimiter = delimiter.unwrap_or_else(|| "\t".into());
+                        if delimiter.is_empty()
+                            || delimiter.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n'))
+                        {
+                            return Err(format!(
+                                "pickers.{name}.delimiter must be nonempty without NUL or newlines"
+                            ));
+                        }
+                        // Structured rows are parsed per line and not deduplicated.
+                        if line_continuation.as_ref().is_some_and(|v| !v.is_empty())
+                            || unique == Some(true)
+                        {
+                            return Err(format!(
+                                "pickers.{name}.columns cannot be combined with line_continuation or unique"
+                            ));
+                        }
+                        Some(CommandColumns { names, delimiter })
+                    }
+                };
                 (
                     Source::Command(CommandOptions {
                         args,
                         cwd,
                         line_continuation: line_continuation.filter(|value| !value.is_empty()),
-                        unique: unique.unwrap_or(defaults.unique),
+                        unique: columns.is_none() && unique.unwrap_or(defaults.unique),
                         success_exit_codes,
+                        columns,
                     }),
                     EnterAction::SendInput,
                 )
@@ -718,6 +757,14 @@ pub(crate) struct CommandOptions {
     pub(crate) line_continuation: Option<String>,
     pub(crate) unique: bool,
     pub(crate) success_exit_codes: Option<Vec<i32>>,
+    /// Split each output line into these columns for a structured picker.
+    pub(crate) columns: Option<CommandColumns>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandColumns {
+    pub(crate) names: Vec<String>,
+    pub(crate) delimiter: String,
 }
 
 #[derive(Clone)]
@@ -730,6 +777,20 @@ pub(crate) struct FileOptions {
 }
 
 impl Options {
+    /// Commands and previews run relative to the shell's directory (`pwd`)
+    /// unless the request or the command definition chooses one.
+    pub(crate) fn default_cwd(&mut self, pwd: Option<String>) {
+        if self.params.contains_key("cwd") {
+            return;
+        }
+        let cwd = match &self.source {
+            Source::Command(command) if command.cwd.is_some() => command.cwd.clone(),
+            _ => pwd,
+        };
+        if let Some(cwd) = cwd {
+            self.params.insert("cwd".into(), cwd);
+        }
+    }
     pub(crate) fn with_request(mut self, params: BTreeMap<String, String>) -> Result<Self, String> {
         if let Source::Items(items) = &mut self.source {
             if params.contains_key("items") {
@@ -1673,6 +1734,84 @@ mod tests {
             assert!(consumed);
             assert_eq!(open.is_some(), !repeat);
             assert!(matches!(&events[..], [egui::Event::Text(text)] if text == "x"));
+        }
+    }
+
+    #[test]
+    fn default_cwd_prefers_request_then_command_then_shell() {
+        let command = |cwd: Option<&str>| Options {
+            source: Source::Command(CommandOptions {
+                args: vec!["fd".into()],
+                cwd: cwd.map(str::to_owned),
+                line_continuation: None,
+                unique: false,
+                success_exit_codes: None,
+                columns: None,
+            }),
+            ..Default::default()
+        };
+        let shell = Some("/home/user/project".to_owned());
+
+        // The shell's directory fills in when nothing else chose one.
+        let mut options = command(None);
+        options.default_cwd(shell.clone());
+        assert_eq!(options.params["cwd"], "/home/user/project");
+
+        // A command definition's cwd wins over the shell's directory.
+        let mut options = command(Some("/srv"));
+        options.default_cwd(shell.clone());
+        assert_eq!(options.params["cwd"], "/srv");
+
+        // A request's cwd (e.g. from the picker pipe) is never replaced.
+        let mut options = command(None);
+        options.params.insert("cwd".into(), "/tmp".into());
+        options.default_cwd(shell.clone());
+        assert_eq!(options.params["cwd"], "/tmp");
+
+        // Other pickers get it too, for previews.
+        let mut options = Options::default();
+        options.default_cwd(shell);
+        assert_eq!(options.params["cwd"], "/home/user/project");
+
+        // Without OSC 7 nothing is set and commands use the app's directory.
+        let mut options = command(None);
+        options.default_cwd(None);
+        assert!(!options.params.contains_key("cwd"));
+    }
+
+    #[test]
+    fn command_columns_are_validated() {
+        let compile = |extra: &str| {
+            let definition: Definition = serde_json::from_str(&format!(
+                r#"{{"type":"Command","args":["git","log"]{extra}}}"#
+            ))
+            .unwrap();
+            definition.resolve("log", PickerDefaults::default())
+        };
+        let Ok(PickerEntry::Static(options)) = compile(r#","columns":["Hash","Subject"]"#) else {
+            panic!("columns should compile");
+        };
+        let Source::Command(command) = options.source else {
+            panic!("expected a command");
+        };
+        let columns = command.columns.unwrap();
+        assert_eq!(columns.names, ["Hash", "Subject"]);
+        assert_eq!(columns.delimiter, "\t");
+        for (extra, message) in [
+            (r#","delimiter":",""#, "requires columns"),
+            (r#","columns":[]"#, "at least one column"),
+            (r#","columns":["A","a"]"#, "columns"),
+            (r##","columns":["A"],"delimiter":"""##, "delimiter"),
+            (r#","columns":["A"],"unique":true"#, "cannot be combined"),
+            (
+                r#","columns":["A"],"line_continuation":"`""#,
+                "cannot be combined",
+            ),
+        ] {
+            let Err(error) = compile(extra) else {
+                panic!("{extra} should be rejected");
+            };
+            assert!(error.contains(message), "{extra}: {error}");
         }
     }
 }

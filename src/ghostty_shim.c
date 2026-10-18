@@ -93,6 +93,7 @@ static void report_theme_colors(ghostty_config_t config, void *userdata) {
 }
 
 extern void ghostty_egui_title(void *userdata, const char *title);
+extern void ghostty_egui_pwd(void *userdata, const char *pwd);
 extern void ghostty_egui_app_wakeup(void);
 static void wake(void *userdata) { (void)userdata; ghostty_egui_app_wakeup(); }
 static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action_value) {
@@ -102,6 +103,10 @@ static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s 
     switch (action_value.tag) {
     case GHOSTTY_ACTION_SET_TITLE:
         ghostty_egui_title(userdata, action_value.action.set_title.title);
+        return true;
+    case GHOSTTY_ACTION_PWD:
+        // Ghostty validates OSC 7 (local host only) and decodes the path.
+        ghostty_egui_pwd(userdata, action_value.action.pwd.pwd);
         return true;
     case GHOSTTY_ACTION_RENDER:
         ghostty_egui_frame_ready(userdata);

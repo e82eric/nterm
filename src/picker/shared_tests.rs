@@ -1512,6 +1512,7 @@ fn command_source_order_survives_shared_search_and_navigation() {
                 line_continuation: None,
                 unique: false,
                 success_exit_codes: None,
+                columns: None,
             }),
             sort: config::Sort::SourceOrder,
             params: [("query".into(), "a".into())].into(),
@@ -1724,7 +1725,6 @@ fn pane_picker_focus_returns_after_floating_pane_is_shown_and_hidden() {
     assert_eq!(main.shared.query(), "caféace");
     assert_eq!(floating.shared.query(), "cafébd");
 }
-#[cfg(windows)]
 #[test]
 fn filesystem_picker_accepts_path_without_terminal_snapshot() {
     let root = std::env::temp_dir().join(format!("ghostty-shared-picker-{}", std::process::id()));
