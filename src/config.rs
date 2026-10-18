@@ -3066,7 +3066,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_git_module_quotes_switch_commands_and_builds_pickers() {
+    fn bundled_git_module_quotes_and_parses_and_builds_pickers() {
         let config = parse(
             r#"
             local git = require('ghostty.git')
@@ -3082,78 +3082,184 @@ mod tests {
               { quote = git.quote.posix, require_clean = true })
               == [[git diff --stat --exit-code HEAD && git switch 'it'\''s']])
             assert(git.switch_command('not a branch row') == nil)
+            assert(git.unquote_path('plain name.txt') == 'plain name.txt')
+            assert(git.unquote_path('"a\\tb \\"q\\" \\\\"') == 'a\tb "q" \\')
+            assert(git.unquote_path('"\\303\\251.txt"') == '\u{e9}.txt')
+            local code, path = git.status_entry('R  old.txt -> "new\\tname.txt"')
+            assert(code == 'R ' and path == 'new\tname.txt')
+            code, path = git.status_entry('?? "new file.txt"')
+            assert(code == '??' and path == 'new file.txt')
+            code, path = git.status_entry(' M src/app.rs')
+            assert(code == ' M' and path == 'src/app.rs')
+            local prompt = '^%$ '
             return { pickers = {
               commits = git.commits(),
-              branches = git.branches({ prompt = '^%$ ' }),
+              branches = git.branches({ prompt = prompt }),
+              status = git.status({ prompt = prompt }),
+              cherry_pick = git.cherry_pick(),
+              cherry_pick_commits = git.cherry_pick_commits({ prompt = prompt }),
+              stashes = git.stashes({ prompt = prompt }),
+              reflog = git.reflog(),
+              file_history = git.file_history({ prompt = prompt }),
+              file_history_commits = git.file_history_commits(),
+              fixups = git.fixups({ prompt = prompt }),
+              tags = git.tags({ prompt = prompt }),
             } }
             "#,
         )
         .unwrap();
         let bindings = compile(config);
-        for (name, columns) in [("commits", 5), ("branches", 6)] {
-            let options = bindings
-                .named(name)
-                .unwrap()
-                .resolve(&PickerContext {
-                    line: "$ ma".into(),
-                    line_before_cursor: "$ ma".into(),
-                    ..Default::default()
-                })
-                .unwrap();
+        let Some(repository) = git_fixture() else {
+            return;
+        };
+        let context = PickerContext {
+            line: "$ git log b.txt".into(),
+            line_before_cursor: "$ git log b.txt".into(),
+            ..Default::default()
+        };
+        // Picker, column count (None: plain lines) and the expected rows.
+        let expected: [(&str, Option<usize>, &[&str]); 11] = [
+            (
+                "commits",
+                Some(5),
+                &["second on main", "feature two", "feature one", "first"],
+            ),
+            ("branches", Some(6), &["main", "feature/x", "base"]),
+            (
+                "status",
+                None,
+                &[" M a.txt", "A  d.txt", "?? \"new file.txt\""],
+            ),
+            ("cherry_pick", Some(6), &["main", "feature/x", "base"]),
+            // "feature one" is already on main, so only "feature two" is offered.
+            ("cherry_pick_commits", Some(4), &["feature two"]),
+            ("stashes", Some(3), &["work in progress"]),
+            ("reflog", Some(4), &["HEAD@{0}"]),
+            // Tracked files, including the staged d.txt but not untracked ones.
+            ("file_history", None, &["a.txt", "b.txt", "d.txt"]),
+            ("file_history_commits", Some(4), &["second on main"]),
+            ("fixups", Some(4), &["second on main"]),
+            ("tags", Some(3), &["v1\t"]),
+        ];
+        let params = std::collections::BTreeMap::from([
+            ("range".to_owned(), "HEAD...feature/x".to_owned()),
+            ("path".to_owned(), "b.txt".to_owned()),
+        ]);
+        for (name, columns, rows) in expected {
+            let options = bindings.named(name).unwrap().resolve(&context).unwrap();
+            if name == "file_history" {
+                // The word at the cursor starts the file search.
+                assert_eq!(options.params["query"], "b.txt");
+            }
             let crate::picker::config::Source::Command(command) = &options.source else {
                 panic!("{name} should be a Command picker");
             };
             assert_eq!(command.args[0], "git", "{name} runs git directly");
-            assert_eq!(command.columns.as_ref().unwrap().names.len(), columns);
-            git_output_matches_columns(&command.args, columns);
+            assert_eq!(
+                command.columns.as_ref().map(|c| c.names.len()),
+                columns,
+                "{name}"
+            );
+            let args: Vec<_> = command
+                .args
+                .iter()
+                .map(
+                    |arg| match arg.strip_prefix('{').and_then(|a| a.strip_suffix('}')) {
+                        Some(key) => params[key].clone(),
+                        None => arg.clone(),
+                    },
+                )
+                .collect();
+            let output = std::process::Command::new(&args[0])
+                .args(&args[1..])
+                .current_dir(&repository)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let lines: Vec<_> = stdout.lines().filter(|line| !line.is_empty()).collect();
+            if name != "reflog" {
+                assert_eq!(lines.len(), rows.len(), "{name}: {stdout}");
+            }
+            // The fixture's commits share a timestamp, so order is not checked.
+            for row in rows {
+                assert!(
+                    lines.iter().any(|line| line.contains(row)),
+                    "{name}: no row contains {row:?} in {stdout}"
+                );
+            }
+            for line in &lines {
+                if let Some(columns) = columns {
+                    assert_eq!(line.split('\t').count(), columns, "{name}: {line:?}");
+                }
+                assert!(!line.contains("refs/"), "{name}: {line:?}");
+            }
         }
+        std::fs::remove_dir_all(&repository).unwrap();
     }
 
-    /// Run `args` in a scratch repository with a branch and a tag, and check
-    /// that every row has `columns` tab-separated fields with short ref names.
-    fn git_output_matches_columns(args: &[String], columns: usize) {
-        let git = |directory: &Path, args: &[&str]| {
-            std::process::Command::new("git")
-                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
-                .args(args)
-                .current_dir(directory)
-                .output()
-        };
-        let directory = std::env::temp_dir().join(format!(
-            "ghostty-git-module-{}-{columns}",
-            std::process::id()
-        ));
+    /// A scratch repository: main with a commit cherry-picked from feature/x,
+    /// main tracking base, a tag, a stash, and staged, modified and untracked
+    /// files. None when git is not installed.
+    fn git_fixture() -> Option<PathBuf> {
+        let directory =
+            std::env::temp_dir().join(format!("ghostty-git-module-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
-        if git(&directory, &["init", "-q", "-b", "main"]).is_err() {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args([
+                    "-c",
+                    "advice.detachedHead=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(&directory)
+                .output()
+        };
+        if git(&["init", "-q"]).is_err() {
             eprintln!("git is not installed; skipping the output check");
-            return;
+            return None;
         }
-        for step in [
-            &["commit", "-q", "--allow-empty", "-m", "first"][..],
-            &["branch", "feature/x"],
-            &["tag", "v1"],
-            &["commit", "-q", "--allow-empty", "-m", "second"],
-        ] {
-            assert!(git(&directory, step).unwrap().status.success());
-        }
-        let output = std::process::Command::new(&args[0])
-            .args(&args[1..])
-            .current_dir(&directory)
-            .output()
-            .unwrap();
-        std::fs::remove_dir_all(&directory).unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let rows: Vec<_> = stdout.lines().filter(|line| !line.is_empty()).collect();
-        assert_eq!(rows.len(), 2, "{stdout}");
-        for row in rows {
-            assert_eq!(row.split('\t').count(), columns, "{row}");
-            assert!(!row.contains("refs/"), "{row}");
-        }
+        let write = |name: &str, text: &str| std::fs::write(directory.join(name), text).unwrap();
+        let run = |args: &[&str]| {
+            let output = git(args).unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        write("a.txt", "one\n");
+        run(&["add", "a.txt"]);
+        run(&["commit", "-q", "-m", "first"]);
+        run(&["branch", "base"]);
+        run(&["switch", "-q", "-c", "feature/x"]);
+        write("b.txt", "b\n");
+        run(&["add", "b.txt"]);
+        run(&["commit", "-q", "-m", "feature one"]);
+        write("c.txt", "c\n");
+        run(&["add", "c.txt"]);
+        run(&["commit", "-q", "-m", "feature two"]);
+        run(&["switch", "-q", "main"]);
+        // Same change as "feature one", so --cherry-pick hides it.
+        write("b.txt", "b\n");
+        run(&["add", "b.txt"]);
+        run(&["commit", "-q", "-m", "second on main"]);
+        run(&["tag", "-a", "v1", "-m", "release one"]);
+        run(&["branch", "--set-upstream-to=base"]);
+        write("a.txt", "stashed\n");
+        run(&["stash", "push", "-q", "-m", "work in progress"]);
+        write("a.txt", "changed\n");
+        write("d.txt", "d\n");
+        run(&["add", "d.txt"]);
+        write("new file.txt", "untracked\n");
+        Some(directory)
     }
 }

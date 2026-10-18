@@ -177,9 +177,19 @@ fn worker_resolver(callback: &str) -> std::rc::Rc<crate::lua_callbacks::PreviewR
     })
 }
 
-#[test]
-fn bundled_git_branch_preview_loads_in_workers_and_runs_git_directly() {
-    let root = std::env::temp_dir().join(format!("ghostty-worker-git-{}", std::process::id()));
+/// The rendered preview of `value` in the bundled `ghostty.git` picker built
+/// by the Lua expression `picker` (e.g. `branches()`), in a scratch repository
+/// prepared by `setup`, once its first line is `first_line`. None when git is
+/// not installed.
+fn git_module_preview(
+    picker: &str,
+    setup: impl FnOnce(&std::path::Path, &dyn Fn(&[&str])),
+    value: &str,
+    first_line: &str,
+) -> Option<String> {
+    let label: String = picker.chars().filter(char::is_ascii_alphanumeric).collect();
+    let root =
+        std::env::temp_dir().join(format!("ghostty-worker-git-{}-{label}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let git = |args: &[&str]| {
@@ -191,28 +201,25 @@ fn bundled_git_branch_preview_loads_in_workers_and_runs_git_directly() {
     };
     if git(&["init", "-q", "-b", "main"]).is_err() {
         eprintln!("git is not installed; skipping");
-        return;
+        return None;
     }
-    for step in [
-        &["commit", "-q", "--allow-empty", "-m", "first"][..],
-        &["branch", "feature/x"],
-        &["commit", "-q", "--allow-empty", "-m", "second"],
-    ] {
-        assert!(git(step).unwrap().status.success());
-    }
+    setup(&root, &|args| {
+        let output = git(args).unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    });
     // Preview workers evaluate the config again, so they need the module path too.
     let lua = std::rc::Rc::new(mlua::Lua::new());
     let resolver = std::rc::Rc::new(crate::lua_callbacks::PreviewResolver {
         key: lua.create_registry_value(mlua::Value::Nil).unwrap(),
         lua,
-        name: "branches".into(),
+        name: "test".into(),
         worker: Some(crate::preview_worker::Worker::new(
             crate::preview_worker::ConfigSource(
-                "return { pickers = { branches = require('ghostty.git').branches() } }".into(),
+                format!("return {{ pickers = {{ test = require('ghostty.git').{picker} }} }}"),
                 "@git-module-test".into(),
                 crate::preview_worker::module_path(&root.join("ghostty.lua")),
             ),
-            "branches".into(),
+            "test".into(),
             Some(crate::preview_worker::FactoryContext(
                 serde_json::json!({"line": "", "line_before_cursor": ""}),
             )),
@@ -228,8 +235,8 @@ fn bundled_git_branch_preview_loads_in_workers_and_runs_git_directly() {
         config::Options {
             source: config::Source::Items(config::ItemsOptions {
                 values: vec![wire::Item {
-                    text: "feature/x".into(),
-                    value: " \tfeature/x\tlocal\t2026-01-01\tTest\tfirst".into(),
+                    text: value.into(),
+                    value: value.into(),
                 }],
                 provider: None,
             }),
@@ -242,10 +249,59 @@ fn bundled_git_branch_preview_loads_in_workers_and_runs_git_directly() {
             ..Default::default()
         },
     );
-    let text = wait_preview_rendered_text(&ctx, &mut picker, "feature/x: 0 ahead, 1 behind main");
+    let text = wait_preview_rendered_text(&ctx, &mut picker, first_line);
     drop(picker);
     std::fs::remove_dir_all(&root).unwrap();
+    Some(text)
+}
+
+#[test]
+fn bundled_git_branch_preview_loads_in_workers_and_runs_git_directly() {
+    let Some(text) = git_module_preview(
+        "branches()",
+        |_, git| {
+            git(&["commit", "-q", "--allow-empty", "-m", "first"]);
+            git(&["branch", "feature/x"]);
+            git(&["commit", "-q", "--allow-empty", "-m", "second"]);
+        },
+        " \tfeature/x\tlocal\t2026-01-01\tTest\tfirst",
+        "feature/x: 0 ahead, 1 behind main",
+    ) else {
+        return;
+    };
     assert!(text.contains("first") && !text.contains("second"), "{text}");
+}
+
+#[test]
+fn bundled_git_status_preview_shows_staged_unstaged_and_untracked_files() {
+    let Some(text) = git_module_preview(
+        "status()",
+        |root, git| {
+            std::fs::write(root.join("a.txt"), "one\n").unwrap();
+            git(&["add", "a.txt"]);
+            git(&["commit", "-q", "-m", "first"]);
+            std::fs::write(root.join("a.txt"), "two\n").unwrap();
+            git(&["add", "a.txt"]);
+            std::fs::write(root.join("a.txt"), "three\n").unwrap();
+        },
+        "MM a.txt",
+        "Staged",
+    ) else {
+        return;
+    };
+    // The unstaged diff follows, partly below the visible preview rows.
+    assert!(
+        text.contains("+two") && text.contains("Not staged"),
+        "{text}"
+    );
+
+    // An untracked name with a space is quoted by git and shown as file text.
+    git_module_preview(
+        "status()",
+        |root, _| std::fs::write(root.join("new file.txt"), "hello untracked\n").unwrap(),
+        "?? \"new file.txt\"",
+        "hello untracked",
+    );
 }
 
 #[test]

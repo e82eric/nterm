@@ -759,6 +759,28 @@ and can contain characters a shell interprets, so they are quoted for the
 shell: `quote` defaults to `git.quote.powershell` on Windows and
 `git.quote.posix` elsewhere; pass the other to match the shell you run.
 
+The module has more pickers, configured the same way:
+
+| Function | Rows | Enter at the prompt | Ctrl+P |
+| --- | --- | --- | --- |
+| `git.status()` | `git status --short` lines, paths relative to the shell's directory | Inserts the path, quoted | Staged and unstaged diffs, or an untracked file's text |
+| `git.cherry_pick()` | Branches | Opens the picker named by `commits` (default `"Git cherry-pick commits"`) | Ahead/behind and history |
+| `git.cherry_pick_commits()` | That branch's commits not in the current one, without merges or commits already applied | Types `git cherry-pick <hash>` | `git show` |
+| `git.stashes()` | Ref / Date / Message | Types `git stash apply <ref>` (keeps the stash) | The stash's patch |
+| `git.reflog()` | Hash / Entry / Date / Action, including commits no branch points to | Inserts the hash | `git show` |
+| `git.file_history()` | Tracked files under the shell's directory; the word at the cursor is the initial query | Opens the picker named by `commits` (default `"Git file history commits"`) | The file's last 15 commits |
+| `git.file_history_commits()` | Commits that changed that file, following renames | Inserts the hash | That commit's change to the file |
+| `git.fixups()` | Commits on the current branch not on its upstream (or on `base`) | Types `git commit --fixup <hash>` | `git show` |
+| `git.tags()` | Tag / Date / Subject, newest first | Inserts the tag, quoted | `git show` |
+
+Typed commands are not run; press Enter yourself, or pass `run = true`.
+Away from a prompt (without `prompt`, or e.g. in vim) Enter inserts the hash,
+ref, path or name unquoted. `git.cherry_pick_commits` takes the branch from the
+`range` parameter that `git.cherry_pick` passes with `app:replace_picker`, and
+`git.file_history_commits` takes the `path` parameter from `git.file_history`,
+so configure each pair, under the name given to `commits`; opened on its own
+the second picker reports a missing parameter. `git.branches` runs its switch command unless `run = false`.
+
 ### Picker sources and common options
 
 Every picker type accepts `position = "Top"`, `"Center"`, `"Bottom"`, `"FullPane"`, or
