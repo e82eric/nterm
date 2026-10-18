@@ -164,6 +164,7 @@ fn worker_resolver(callback: &str) -> std::rc::Rc<crate::lua_callbacks::PreviewR
         crate::preview_worker::ConfigSource(
             "return {pickers={test={preview={resolve=".to_owned() + callback + "}}}}",
             "@preview-test".into(),
+            String::new(),
         ),
         "test".into(),
         None,
@@ -174,6 +175,77 @@ fn worker_resolver(callback: &str) -> std::rc::Rc<crate::lua_callbacks::PreviewR
         name: "test".into(),
         worker: Some(worker),
     })
+}
+
+#[test]
+fn bundled_git_branch_preview_loads_in_workers_and_runs_git_directly() {
+    let root = std::env::temp_dir().join(format!("ghostty-worker-git-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .current_dir(&root)
+            .output()
+    };
+    if git(&["init", "-q", "-b", "main"]).is_err() {
+        eprintln!("git is not installed; skipping");
+        return;
+    }
+    for step in [
+        &["commit", "-q", "--allow-empty", "-m", "first"][..],
+        &["branch", "feature/x"],
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    ] {
+        assert!(git(step).unwrap().status.success());
+    }
+    // Preview workers evaluate the config again, so they need the module path too.
+    let lua = std::rc::Rc::new(mlua::Lua::new());
+    let resolver = std::rc::Rc::new(crate::lua_callbacks::PreviewResolver {
+        key: lua.create_registry_value(mlua::Value::Nil).unwrap(),
+        lua,
+        name: "branches".into(),
+        worker: Some(crate::preview_worker::Worker::new(
+            crate::preview_worker::ConfigSource(
+                "return { pickers = { branches = require('ghostty.git').branches() } }".into(),
+                "@git-module-test".into(),
+                crate::preview_worker::module_path(&root.join("ghostty.lua")),
+            ),
+            "branches".into(),
+            Some(crate::preview_worker::FactoryContext(
+                serde_json::json!({"line": "", "line_before_cursor": ""}),
+            )),
+        )),
+    });
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::Items(config::ItemsOptions {
+                values: vec![wire::Item {
+                    text: "feature/x".into(),
+                    value: " \tfeature/x\tlocal\t2026-01-01\tTest\tfirst".into(),
+                }],
+                provider: None,
+            }),
+            preview: Some(config::Preview::Dynamic {
+                resolve: Some(resolver),
+                max_bytes: None,
+                max_scrollback_lines: None,
+            }),
+            params: [("cwd".into(), root.to_string_lossy().into_owned())].into(),
+            ..Default::default()
+        },
+    );
+    let text = wait_preview_rendered_text(&ctx, &mut picker, "feature/x: 0 ahead, 1 behind main");
+    drop(picker);
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(text.contains("first") && !text.contains("second"), "{text}");
 }
 
 #[test]
@@ -222,7 +294,7 @@ fn lua_preview_worker_cancels_busy_lua_and_retains_helpers_and_closures() {
         end}}
     "#;
     let worker = crate::preview_worker::Worker::new(
-        crate::preview_worker::ConfigSource(source.into(), "@worker-test".into()),
+        crate::preview_worker::ConfigSource(source.into(), "@worker-test".into(), String::new()),
         "x".into(),
         Some(crate::preview_worker::FactoryContext(
             serde_json::json!({"line":"captured "}),

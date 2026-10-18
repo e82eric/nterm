@@ -364,9 +364,12 @@ impl AppConfig {
     fn parse(source: &str, path: &Path) -> Result<Self, String> {
         let lua = std::rc::Rc::new(Lua::new());
         crate::preview_worker::install_ui_api(&lua).map_err(|e| e.to_string())?;
+        let modules = crate::preview_worker::module_path(path);
+        crate::preview_worker::set_module_path(&lua, &modules).map_err(|e| e.to_string())?;
         lua.set_app_data(crate::preview_worker::ConfigSource(
             source.into(),
             format!("@{}", path.display()),
+            modules,
         ));
         let ghostty = lua.create_table().map_err(|error| error.to_string())?;
         ghostty
@@ -3007,6 +3010,150 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(options.params["query"], expected);
+        }
+    }
+
+    fn compile(config: AppConfig) -> crate::picker::config::Bindings {
+        crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn lua_modules_load_only_from_absolute_directories() {
+        let config = std::env::temp_dir().join("ghostty.lua");
+        let path = crate::preview_worker::module_path(&config);
+        let templates: Vec<_> = path.split(';').collect();
+        // The config's own directory comes first, so it can override bundled modules.
+        assert_eq!(
+            Path::new(templates[0]),
+            std::env::temp_dir().join("?.lua").as_path()
+        );
+        assert!(templates.iter().all(|t| Path::new(t).is_absolute()));
+        let lua = Lua::new();
+        crate::preview_worker::set_module_path(&lua, &path).unwrap();
+        let (search, native): (String, String) = lua
+            .load("return package.path, package.cpath")
+            .eval()
+            .unwrap();
+        assert_eq!(search, path);
+        assert_eq!(native, "");
+    }
+
+    #[test]
+    fn config_requires_modules_from_its_directory() {
+        let directory =
+            std::env::temp_dir().join(format!("ghostty-lua-modules-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("extra.lua"),
+            "return { picker = { type = 'Items', items = { { text = 'module', value = 'x' } } } }",
+        )
+        .unwrap();
+        let config = AppConfig::parse(
+            "return { pickers = { extra = require('extra').picker } }",
+            &directory.join("ghostty.lua"),
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+        let bindings = compile(config.unwrap());
+        assert!(bindings.named("extra").is_some());
+        // Lua's default ./?.lua is gone, so a missing module is an error.
+        assert!(parse("return { x = require('extra') }").is_err());
+    }
+
+    #[test]
+    fn bundled_git_module_quotes_switch_commands_and_builds_pickers() {
+        let config = parse(
+            r#"
+            local git = require('ghostty.git')
+            local posix = { quote = git.quote.posix }
+            assert(git.quote.posix('feature/x') == 'feature/x')
+            assert(git.quote.posix('$(touch${IFS}x)') == "'$(touch${IFS}x)'")
+            assert(git.quote.posix("it's") == [['it'\''s']])
+            assert(git.quote.powershell("it's") == "'it''s'")
+            assert(git.quote.powershell('a\u{2019}b') == "'a\u{2019}\u{2019}b'")
+            assert(git.switch_command(' \torigin/feat/x\tremote\t2026-01-01\tA\tS', posix)
+              == 'git switch feat/x')
+            assert(git.switch_command("*\tit's\tlocal\t2026-01-01\tA\tS",
+              { quote = git.quote.posix, require_clean = true })
+              == [[git diff --stat --exit-code HEAD && git switch 'it'\''s']])
+            assert(git.switch_command('not a branch row') == nil)
+            return { pickers = {
+              commits = git.commits(),
+              branches = git.branches({ prompt = '^%$ ' }),
+            } }
+            "#,
+        )
+        .unwrap();
+        let bindings = compile(config);
+        for (name, columns) in [("commits", 5), ("branches", 6)] {
+            let options = bindings
+                .named(name)
+                .unwrap()
+                .resolve(&PickerContext {
+                    line: "$ ma".into(),
+                    line_before_cursor: "$ ma".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let crate::picker::config::Source::Command(command) = &options.source else {
+                panic!("{name} should be a Command picker");
+            };
+            assert_eq!(command.args[0], "git", "{name} runs git directly");
+            assert_eq!(command.columns.as_ref().unwrap().names.len(), columns);
+            git_output_matches_columns(&command.args, columns);
+        }
+    }
+
+    /// Run `args` in a scratch repository with a branch and a tag, and check
+    /// that every row has `columns` tab-separated fields with short ref names.
+    fn git_output_matches_columns(args: &[String], columns: usize) {
+        let git = |directory: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(directory)
+                .output()
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "ghostty-git-module-{}-{columns}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        if git(&directory, &["init", "-q", "-b", "main"]).is_err() {
+            eprintln!("git is not installed; skipping the output check");
+            return;
+        }
+        for step in [
+            &["commit", "-q", "--allow-empty", "-m", "first"][..],
+            &["branch", "feature/x"],
+            &["tag", "v1"],
+            &["commit", "-q", "--allow-empty", "-m", "second"],
+        ] {
+            assert!(git(&directory, step).unwrap().status.success());
+        }
+        let output = std::process::Command::new(&args[0])
+            .args(&args[1..])
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let rows: Vec<_> = stdout.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(rows.len(), 2, "{stdout}");
+        for row in rows {
+            assert_eq!(row.split('\t').count(), columns, "{row}");
+            assert!(!row.contains("refs/"), "{row}");
         }
     }
 }

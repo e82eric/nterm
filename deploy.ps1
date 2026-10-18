@@ -76,7 +76,8 @@ foreach ($file in $files) {
 # finds both its terminfo sentinel and the bundled themes.
 $resourceDestination = Join-Path $destinationPath 'share'
 New-Item -ItemType Directory -Path $resourceDestination -Force | Out-Null
-foreach ($directory in @('ghostty', 'terminfo')) {
+# ghostty-egui holds the Lua modules a config can require.
+foreach ($directory in @('ghostty', 'terminfo', 'ghostty-egui')) {
     Copy-Item -LiteralPath (Join-Path $resourceSource $directory) -Destination $resourceDestination -Recurse -Force
 }
 

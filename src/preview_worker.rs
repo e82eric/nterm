@@ -4,8 +4,60 @@ use nfm_egui::Cancellation;
 use nfm_preview_file::resolved::PreviewPlan;
 use std::{collections::BTreeMap, sync::mpsc, time::Duration};
 
+/// Config source text, its Lua chunk name, and its `package.path`.
 #[derive(Clone)]
-pub(crate) struct ConfigSource(pub String, pub String);
+pub(crate) struct ConfigSource(pub String, pub String, pub String);
+
+/// The `package.path` for a config file: modules beside it, then those
+/// installed with the app (`share/ghostty-egui/lua`, beside or above the
+/// executable). Absolute only: the current directory is never searched, so a
+/// file in whatever directory the app was started from cannot replace a module.
+pub(crate) fn module_path(config: &std::path::Path) -> String {
+    let mut directories = Vec::new();
+    if let Some(directory) = config
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .and_then(|directory| std::path::absolute(directory).ok())
+    {
+        directories.push(directory);
+    }
+    if let Some(executable) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        for root in [Some(executable.as_path()), executable.parent()]
+            .into_iter()
+            .flatten()
+        {
+            directories.push(root.join("share").join("ghostty-egui").join("lua"));
+        }
+    }
+    if cfg!(test) {
+        directories.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua"));
+    }
+    directories
+        .iter()
+        // `;` separates templates and `?` is the module placeholder.
+        .filter_map(|directory| directory.to_str())
+        .filter(|directory| !directory.contains([';', '?']))
+        .flat_map(|directory| {
+            let directory = std::path::Path::new(directory);
+            [
+                directory.join("?.lua"),
+                directory.join("?").join("init.lua"),
+            ]
+        })
+        .map(|template| template.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Load Lua modules only from `path`, and never native (C) modules.
+pub(crate) fn set_module_path(lua: &Lua, path: &str) -> mlua::Result<()> {
+    let package: mlua::Table = lua.globals().get("package")?;
+    package.set("path", path)?;
+    package.set("cpath", "")
+}
 #[derive(Clone)]
 pub(crate) struct FactoryContext(pub serde_json::Value);
 #[derive(Clone)]
@@ -177,7 +229,11 @@ mod tests {
             let source = format!(
                 "local path = {quoted_path} .. '/' .. tostring({{}}):gsub('[^%w]', ''); local f = assert(io.open(path, 'w')); f:write('{generation}'); f:close(); return {{pickers={{x={{preview={{resolve=function() return nil end}}}}}}}}"
             );
-            let _worker = Worker::new(ConfigSource(source, "@init-test".into()), "x".into(), None);
+            let _worker = Worker::new(
+                ConfigSource(source, "@init-test".into(), String::new()),
+                "x".into(),
+                None,
+            );
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 let completed = std::fs::read_dir(&path)
@@ -218,6 +274,7 @@ impl Worker {
                     let lua = std::rc::Rc::new(Lua::new());
                     let initialized = (|| -> mlua::Result<_> {
                         install_helpers(&lua)?;
+                        set_module_path(&lua, &source.2)?;
                         // Configuration initialization has its own deadline, independent
                         // of selection requests. Start as soon as the worker is created.
                         let started = std::time::Instant::now();

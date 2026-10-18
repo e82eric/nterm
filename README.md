@@ -717,6 +717,48 @@ works for both static and function pickers. The function may choose `type`,
 Function results use the same validation as static definitions; errors are
 printed and the picker stays closed.
 
+### Lua modules
+
+`require("name")` loads `name.lua` (or `name/init.lua`) from the config file's
+directory, then from the modules installed with the app in
+`share/ghostty-egui/lua`. Dots become directories: `require("ghostty.git")`
+loads `ghostty/git.lua`. A module beside the config replaces a bundled one of
+the same name. The current directory is never searched, and native (C) modules
+cannot be loaded. The config is evaluated again in each preview worker, so
+modules load there too.
+
+The app bundles `ghostty.git`, with commit and branch pickers that run git
+directly and work in bash and PowerShell 7 on Linux and Windows:
+
+```lua
+local git = require("ghostty.git")
+return {
+  pickers = {
+    -- Commits of all branches, remote branches and tags, newest first, in
+    -- Hash / Date / Branch / Author / Subject columns. Enter inserts the hash.
+    ["Git commits"] = git.commits(),
+    -- Local and remote branches. At a prompt matching `prompt` (a Lua
+    -- pattern), Enter erases the typed text and runs `git switch`; elsewhere
+    -- it inserts the branch name.
+    ["Git branches"] = git.branches({
+      prompt = "^%[[^%]]*%][$#] ",
+      require_clean = true,
+    }),
+  },
+}
+```
+
+Both accept `position` (default `Cursor`) and `preview_visible` (default
+`false`; Ctrl+P shows `git show` for a commit, or how far a branch is ahead
+of or behind the current one and its recent history). For a remote branch,
+`git switch` uses the local branch of the same name, creating one that tracks
+the remote if needed. `require_clean = true` runs
+`git diff --stat --exit-code HEAD && git switch …`, which lists changed tracked
+files and does not switch while there are any. Branch names come from remotes
+and can contain characters a shell interprets, so they are quoted for the
+shell: `quote` defaults to `git.quote.powershell` on Windows and
+`git.quote.posix` elsewhere; pass the other to match the shell you run.
+
 ### Picker sources and common options
 
 Every picker type accepts `position = "Top"`, `"Center"`, `"Bottom"`, `"FullPane"`, or

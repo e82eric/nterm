@@ -38,6 +38,7 @@ fi
 # resources (share/ghostty) beside the terminfo sentinel in share/terminfo.
 icon=share/icons/hicolor/128x128/apps/com.mitchellh.ghostty.png
 for required in bin/ghostty_egui bin/npick lib/libghostty.so share/ghostty/themes \
+    share/ghostty-egui/lua/ghostty/git.lua \
     share/ghostty/shell-integration share/terminfo/x/xterm-ghostty "$icon"; do
     if [[ ! -e $output/$required ]]; then
         echo "Missing build output: $output/$required" >&2
@@ -58,8 +59,10 @@ cp "$output/bin/ghostty_egui" "$output/bin/npick" "$stage/bin/"
 cp "$output/lib/libghostty.so" "$stage/lib/"
 cp -R "$output/share/ghostty" "$output/share/terminfo" "$stage/share/"
 cp "$output/$icon" "$stage/$icon"
-# Ctrl+Space completion picker for bash; source it from ~/.bashrc.
+# Lua modules for require() in ghostty.lua, and the Ctrl+Space completion
+# picker for bash (source it from ~/.bashrc).
 mkdir -p "$stage/share/ghostty-egui"
+cp -R "$output/share/ghostty-egui/lua" "$stage/share/ghostty-egui/"
 cp "$repository/example/rust-egui-terminal/npick-completion.bash" "$stage/share/ghostty-egui/"
 
 if [[ -e $destination ]]; then
