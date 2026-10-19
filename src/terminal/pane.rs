@@ -148,8 +148,25 @@ extern "C" fn ghostty_egui_pwd(userdata: *mut c_void, pwd: *const c_char) {
         let state = unsafe { &*(userdata.cast::<WakeState>()) };
         // An empty path means the shell no longer knows its directory.
         let pwd = unsafe { std::ffi::CStr::from_ptr(pwd) }.to_string_lossy();
-        *state.pwd.lock().unwrap() = (!pwd.is_empty()).then(|| pwd.into_owned());
+        let pwd = shell_path(&pwd);
+        *state.pwd.lock().unwrap() = (!pwd.is_empty()).then(|| pwd.to_owned());
     });
+}
+
+/// An OSC 7 URL path for a Windows drive is `/C:/dir`; drop the leading slash
+/// so it names `C:/dir`.
+fn shell_path(pwd: &str) -> &str {
+    let bytes = pwd.as_bytes();
+    if cfg!(windows)
+        && bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        &pwd[1..]
+    } else {
+        pwd
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -585,6 +602,8 @@ pub(super) struct PaneStatus<'a> {
     pub(super) separator: egui::Color32,
     pub(super) detail: Option<String>,
     pub(super) pipe_status: Option<bool>,
+    /// The shell's working directory, when it reports one with OSC 7.
+    pub(super) cwd: Option<String>,
 }
 
 impl TerminalPane {
@@ -827,6 +846,14 @@ impl TerminalPane {
             accent,
             separator,
             detail,
+            // The core reports C:/dir; show it the Windows way.
+            cwd: self.pwd().map(|pwd| {
+                if cfg!(windows) {
+                    pwd.replace('/', "\\")
+                } else {
+                    pwd
+                }
+            }),
             pipe_status: {
                 #[cfg(any(windows, unix))]
                 {
@@ -2950,6 +2977,19 @@ fn snapshot_decoration_refresh(
 
 #[cfg(test)]
 mod copy_shortcut_tests {
+    #[test]
+    fn osc7_drive_paths_drop_leading_slash_on_windows() {
+        use super::shell_path;
+        let expected = if cfg!(windows) {
+            "C:/src/ghostty"
+        } else {
+            "/C:/src/ghostty"
+        };
+        assert_eq!(shell_path("/C:/src/ghostty"), expected);
+        assert_eq!(shell_path("/home/user"), "/home/user");
+        assert_eq!(shell_path(""), "");
+    }
+
     #[test]
     fn quick_select_labels_refresh_after_live_snapshot_handoff_without_navigation() {
         use super::*;

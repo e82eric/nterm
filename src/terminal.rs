@@ -703,13 +703,37 @@ impl TerminalView {
             }
         }
         if let Some(detail) = status.detail {
-            let text = painter.layout_no_wrap(detail, font, foreground);
+            let text = painter.layout_no_wrap(detail, font.clone(), foreground);
             let left = right_edge - text.size().x;
             if left > label_rect.right() + 8.0 {
                 painter.galley(
                     egui::pos2(left, rect.center().y + 1.0 - text.size().y / 2.0),
                     text,
                     foreground,
+                );
+                right_edge = left - 12.0;
+            }
+        }
+        if let Some(cwd) = status.cwd {
+            // Fill the space between the label and the right-hand items,
+            // dropping the start of a long path so its last directory shows.
+            let left = label_rect.right() + 16.0;
+            let color = crate::colors::palette().muted_text;
+            let layout = |text: String| painter.layout_no_wrap(text, font.clone(), color);
+            let mut text = layout(cwd.clone());
+            let mut start = 0;
+            while text.size().x > right_edge - left {
+                let Some((offset, _)) = cwd[start..].char_indices().nth(1) else {
+                    break;
+                };
+                start += offset;
+                text = layout(format!("…{}", &cwd[start..]));
+            }
+            if text.size().x <= right_edge - left {
+                painter.galley(
+                    egui::pos2(left, rect.center().y + 1.0 - text.size().y / 2.0),
+                    text,
+                    color,
                 );
             }
         }
