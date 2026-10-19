@@ -107,7 +107,7 @@ To build and deploy the Windows sample to another directory:
 .\example\rust-egui-terminal\deploy.ps1 C:\Apps\GhosttyEgui
 ```
 
-Windows `zig build`, `zig build egui-sample`, and `zig build win32-sample` also
+Windows `zig build` and `zig build egui-sample` also
 install the matched ConPTY DLL and console host into the build's `bin` directory
 (normally `zig-out/bin`). Run `zig build conpty` to install just those components.
 Build and deployment share the package pin in `conpty.ps1`.
@@ -1347,8 +1347,7 @@ stream options, protocol limits, authentication and cancellation.
 For a portable PowerShell profile with file, directory, history, text-search,
 and completion bindings, see [profile.example.ps1](profile.example.ps1).
 Executable sources and command previews must be defined in allowlisted Lua
-pickers; clients cannot submit executable definitions. Custom OSC picker
-requests are no longer supported.
+pickers; clients cannot submit executable definitions.
 
 Keys accept egui names such as `f`, `Space`, and `ArrowUp`; modifiers are joined
 with `|` (`CTRL`, `SHIFT`, `ALT`). Definitions and regexes are compiled
@@ -1659,9 +1658,6 @@ For a direct exit binding, assign the `ExitCopyMode` application action in Lua
 `keys`, for example `{ key = "x", mods = "CTRL|SHIFT", action = "ExitCopyMode" }`.
 This action is available while copy mode is active and exits without stepping
 through selection and search cancellation.
-
-The native C Win32 sample remains available through
-`zig build win32-sample -Doptimize=ReleaseFast`.
 
 ## Shared byte preview ownership
 
