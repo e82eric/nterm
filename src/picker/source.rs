@@ -271,9 +271,14 @@ impl PickerSource {
             crate::picker::config::Source::Themes | crate::picker::config::Source::ErrorLog => {
                 unreachable!("theme source must be resolved before starting")
             }
-            crate::picker::config::Source::CommandPalette(entries) => {
-                let schema = StructuredSchema::new(vec!["Action".into(), "Shortcut".into()])
-                    .expect("valid command palette schema");
+            crate::picker::config::Source::CommandPalette(entries)
+            | crate::picker::config::Source::Workspaces(entries) => {
+                let columns = if matches!(options.source, config::Source::Workspaces(_)) {
+                    vec!["Workspace".into(), "Layout / panes".into()]
+                } else {
+                    vec!["Action".into(), "Shortcut".into()]
+                };
+                let schema = StructuredSchema::new(columns).expect("valid command palette schema");
                 let mut structured = StructuredStreamingStore::new(schema);
                 for entry in entries {
                     structured
@@ -476,11 +481,13 @@ impl PickerSource {
             config::Source::Themes | crate::picker::config::Source::ErrorLog => {
                 unreachable!("theme source must be resolved before starting")
             }
-            config::Source::CommandPalette(entries) => Self::CommandPalette {
-                runtime,
-                entries: entries.clone(),
-                error_history: options.params.contains_key("__error_history"),
-            },
+            config::Source::CommandPalette(entries) | config::Source::Workspaces(entries) => {
+                Self::CommandPalette {
+                    runtime,
+                    entries: entries.clone(),
+                    error_history: options.params.contains_key("__error_history"),
+                }
+            }
             config::Source::FileSystem(_) => Self::FileSystem(runtime),
             config::Source::Scrollback { .. } => Self::Scrollback(runtime),
             config::Source::Items(_) => Self::Items {
@@ -521,6 +528,26 @@ impl PickerSource {
     }
     pub(super) fn label(&self) -> &'static str {
         match self {
+            Self::CommandPalette { entries, .. }
+                if entries.first().is_some_and(|entry| {
+                    matches!(
+                        entry.action,
+                        crate::actions::AppAction::SelectWorkspaceId(_)
+                    )
+                }) =>
+            {
+                "WORKSPACES"
+            }
+            Self::CommandPalette { entries, .. }
+                if entries.first().is_some_and(|entry| {
+                    matches!(
+                        entry.action,
+                        crate::actions::AppAction::MovePaneToWorkspaceId { .. }
+                    )
+                }) =>
+            {
+                "MOVE PANE TO WORKSPACE"
+            }
             Self::FileSystem(_) => "FILESYSTEM PICKER",
             Self::Scrollback(_) => "SCROLLBACK PICKER",
             Self::Items { .. } => "ITEMS PICKER",

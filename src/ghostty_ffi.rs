@@ -390,6 +390,7 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> *mut Host;
     pub(crate) fn ghostty_egui_host_destroy(host: *mut Host);
+    pub(crate) fn ghostty_egui_host_close_process(host: *mut Host);
     pub(crate) fn ghostty_egui_host_create_child(
         parent: *mut Host,
         userdata: *mut c_void,

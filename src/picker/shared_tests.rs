@@ -5,6 +5,56 @@ use nfm_search_core::{
 use std::time::{Duration, Instant};
 
 #[test]
+fn workspace_scope_expands_picker_without_changing_cursor_origin() {
+    for scope in [config::Scope::Pane, config::Scope::Workspace] {
+        let ctx = egui::Context::default();
+        let mut picker = items(&ctx);
+        picker.scope = scope;
+        picker.position = config::Position::FullPane;
+        let workspace = egui::Rect::from_min_size(egui::pos2(0.0, 24.0), egui::vec2(1000.0, 700.0));
+        let pane = egui::Rect::from_min_size(egui::pos2(510.0, 40.0), egui::vec2(460.0, 310.0));
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 750.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    picker.show_scoped(ui.ctx(), pane, Some(workspace), true);
+                },
+            );
+            output.textures_delta.clear();
+        }
+        let panel = ctx
+            .memory(|m| m.area_rect(egui::Id::new(("ghostty-picker", picker.session_id))))
+            .unwrap();
+        let expected = if scope == config::Scope::Workspace {
+            workspace
+        } else {
+            pane
+        };
+        assert!(
+            expected.expand(1.0).contains_rect(panel),
+            "{scope:?}: {panel:?}"
+        );
+        assert!(panel.width() > expected.width() * 0.9);
+        picker.position = config::Position::Cursor;
+        picker.cursor_row = Some(3);
+        let placement = picker.placement(workspace);
+        assert_eq!(
+            placement.anchor,
+            Some(egui::pos2(
+                pane.center().x,
+                pane.top() + 4.0 * picker.typography.row_height
+            ))
+        );
+    }
+}
+
+#[test]
 fn scrollback_resize_retains_loaded_document_query_and_selection() {
     let ctx = egui::Context::default();
     let store = Arc::new(SnapshotStore::new());
@@ -1218,6 +1268,45 @@ fn structured_command_palette_returns_typed_action() {
     assert!(
         matches!(action, Some(Action::Execute(crate::actions::AppAction::OpenPicker(name))) if name == "files")
     );
+}
+
+#[test]
+fn workspace_picker_uses_workspace_bottom_and_returns_stable_targets() {
+    use crate::actions::AppAction;
+    use crate::terminal::{workspace::Workspace, workspace_ui::workspace_picker_options};
+    let first = Workspace::new(41, 1);
+    let second = Workspace::new(97, 2);
+    for pane in [None, Some(123)] {
+        let ctx = egui::Context::default();
+        let mut options = workspace_picker_options(&[first.clone(), second.clone()], 41, pane);
+        assert_eq!(options.scope, config::Scope::Workspace);
+        assert!(matches!(options.position, config::Position::Bottom));
+        options.params.insert("query".into(), "2".into());
+        let mut picker = Picker::start(std::ptr::null_mut(), None, false, 0, ctx.clone(), options);
+        let selected = wait_selection(&ctx, &mut picker);
+        assert!(selected.text.contains("2"));
+        assert_eq!(
+            picker.source.label(),
+            if pane.is_some() {
+                "MOVE PANE TO WORKSPACE"
+            } else {
+                "WORKSPACES"
+            }
+        );
+        let (action, _) = frame(
+            &ctx,
+            &mut picker,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        let expected = match pane {
+            Some(pane) => AppAction::MovePaneToWorkspaceId {
+                pane,
+                workspace: 97,
+            },
+            None => AppAction::SelectWorkspaceId(97),
+        };
+        assert!(matches!(action, Some(Action::Execute(action)) if action == expected));
+    }
 }
 
 #[test]

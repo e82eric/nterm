@@ -1,7 +1,15 @@
 use crate::picker::config::{BindingTarget, Bindings, KeyBinding};
+use crate::terminal::workspace_ui::WorkspaceAction;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppAction {
+    Workspace(WorkspaceAction),
+    /// Picker results that refer to window-local IDs, not config indexes.
+    SelectWorkspaceId(u64),
+    MovePaneToWorkspaceId {
+        pane: u64,
+        workspace: u64,
+    },
     ReloadConfig,
     NewWindow,
     ShowMessages,
@@ -26,7 +34,14 @@ pub(crate) enum AppAction {
 }
 
 impl AppAction {
+    /// Whether a held key runs this action again on each auto-repeat.
+    pub(crate) fn allows_key_repeat(&self) -> bool {
+        matches!(self, Self::Workspace(action) if action.allows_key_repeat())
+    }
     pub(crate) fn from_name(name: &str) -> Option<Self> {
+        if let Some(action) = WorkspaceAction::parse(name) {
+            return Some(Self::Workspace(action));
+        }
         Some(match name {
             "ReloadConfig" => Self::ReloadConfig,
             "NewWindow" => Self::NewWindow,
@@ -51,7 +66,10 @@ impl AppAction {
     pub(crate) fn is_global(&self) -> bool {
         matches!(
             self,
-            Self::NewWindow
+            Self::Workspace(_)
+                | Self::SelectWorkspaceId(_)
+                | Self::MovePaneToWorkspaceId { .. }
+                | Self::NewWindow
                 | Self::ReloadConfig
                 | Self::ShowMessages
                 | Self::OpenErrorLog
@@ -128,6 +146,8 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
         action: BindingTarget::Action(AppAction::from_name(action).expect("known default action")),
     })
     .collect::<Vec<_>>();
+    let mut keys = keys;
+    keys.extend(crate::terminal::workspace_ui::default_bindings());
     keys
 }
 
@@ -276,6 +296,15 @@ pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) ->
                 action,
             });
         }
+    }
+    for workspace_action in WorkspaceAction::ALL {
+        let action = AppAction::Workspace(*workspace_action);
+        entries.push(Entry {
+            id: format!("workspace.{workspace_action}"),
+            label: workspace_action.label(),
+            shortcut: bindings.shortcut_for(&action),
+            action,
+        });
     }
     entries.extend(bindings.palette_entries().map(|(name, shortcut)| Entry {
         id: format!("picker.{name}"),

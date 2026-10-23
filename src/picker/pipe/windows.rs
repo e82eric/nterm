@@ -114,9 +114,12 @@ fn identity(token: HANDLE) -> Result<Identity, String> {
             privilege_data.PrivilegeCount as usize,
         )
     };
+    // Compare which privileges are held, not their enabled/used state: a process
+    // may toggle privileges it already holds (elevated pwsh enables several), so
+    // only SE_PRIVILEGE_REMOVED (0x4) is a meaningful difference.
     let mut privileges: Vec<_> = entries
         .iter()
-        .map(|p| (p.Luid.LowPart, p.Luid.HighPart, p.Attributes))
+        .map(|p| (p.Luid.LowPart, p.Luid.HighPart, p.Attributes & 0x4))
         .collect();
     privileges.sort_unstable();
     let label = token_data(token, TokenIntegrityLevel)?;
@@ -415,7 +418,13 @@ impl Service {
     pub fn enabled(&self) -> bool {
         self.shared.policy.lock().unwrap().enabled
     }
+    #[cfg(test)]
     pub fn update(&self, policy: &Policy, shell_pid: u32, expected_creation: u64) {
+        self.set_policy(policy);
+        self.identify_shell(shell_pid, expected_creation);
+    }
+    /// Applies a new policy, cancelling an active request it no longer permits.
+    pub fn set_policy(&self, policy: &Policy) {
         *self.shared.policy.lock().unwrap() = policy.clone();
         if let Some((session, capability)) = self.shared.active.lock().unwrap().as_ref() {
             if !capability.permitted(policy) {
@@ -424,6 +433,13 @@ impl Service {
                 self.shared.context.request_repaint();
             }
         }
+    }
+    pub fn shell_identified(&self) -> bool {
+        self.shared.shell.lock().unwrap().is_some()
+    }
+    /// Records the pane's shell once it has started, so only it and its
+    /// descendants may connect. Retry until `shell_identified`.
+    pub fn identify_shell(&self, shell_pid: u32, expected_creation: u64) {
         let mut shell = self.shared.shell.lock().unwrap();
         if shell.is_none() && shell_pid != 0 && expected_creation != 0 {
             if let Ok(handle) = process(shell_pid) {

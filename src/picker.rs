@@ -30,6 +30,8 @@ pub(crate) struct Picker {
     accept_on_click: bool,
     pub(crate) cursor_row: Option<u32>,
     position: config::Position,
+    pub(crate) scope: config::Scope,
+    anchor_bounds: Option<egui::Rect>,
     pub(crate) generation: Option<u64>,
     pub(crate) from_copy: bool,
     pub(crate) typography: font::Typography,
@@ -329,6 +331,8 @@ impl Picker {
             shared,
             cursor_row: None,
             position: options.position,
+            scope: options.scope,
+            anchor_bounds: None,
             generation,
             from_copy,
             typography: font::Typography::default(),
@@ -430,9 +434,10 @@ impl Picker {
             config::Position::Cursor => nfm_egui::Position::Bottom,
         };
         placement.anchor = self.cursor_row.map(|row| {
+            let anchor_bounds = self.anchor_bounds.unwrap_or(bounds);
             egui::pos2(
-                bounds.center().x,
-                bounds.top() + (row as f32 + 1.0) * self.typography.row_height,
+                anchor_bounds.center().x,
+                anchor_bounds.top() + (row as f32 + 1.0) * self.typography.row_height,
             )
         });
         placement
@@ -443,6 +448,7 @@ impl Picker {
         bounds.max.y -= bottom_margin;
         self.show_in_bounds(ctx, bounds)
     }
+    #[cfg(test)]
     pub(crate) fn show_in_bounds(
         &mut self,
         ctx: &egui::Context,
@@ -450,6 +456,22 @@ impl Picker {
     ) -> Option<Action> {
         self.show_in_bounds_mode(ctx, bounds, true)
     }
+    pub(crate) fn show_scoped(
+        &mut self,
+        ctx: &egui::Context,
+        pane: egui::Rect,
+        workspace: Option<egui::Rect>,
+        interactive: bool,
+    ) -> Option<Action> {
+        self.anchor_bounds = Some(pane);
+        let bounds = if self.scope == config::Scope::Workspace {
+            workspace.unwrap_or(pane)
+        } else {
+            pane
+        };
+        self.show_in_bounds_mode(ctx, bounds, interactive)
+    }
+    #[cfg(test)]
     pub(crate) fn show_background_in_bounds(&mut self, ctx: &egui::Context, bounds: egui::Rect) {
         self.show_in_bounds_mode(ctx, bounds, false);
     }

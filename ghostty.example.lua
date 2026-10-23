@@ -275,7 +275,8 @@ return {
       sort = "Score",
     },
     command_palette = {
-      position = "Cursor",
+      scope = "Workspace",
+      position = "Center",
       preview_visible = false,
     },
     lines = {

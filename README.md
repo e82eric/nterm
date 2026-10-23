@@ -5,6 +5,10 @@ exporting completed textures to egui without a CPU pixel copy.
 
 ## Features
 
+- **[Workspaces and layouts](WORKSPACES.md):** Indexed workspaces
+  with SWM-style tile, monocle, deck, and grid layouts, Lua automation, and a
+  clickable workspace bar. See the [workspace guide](WORKSPACES.md) and
+  [example Lua configuration](workspaces.example.lua).
 - **[Vim Copy Mode](#vim-copy-mode):** Press Ctrl+Shift+M to browse a frozen copy of
   terminal output with Vim-style motions, search, and character, line, or block
   selections. Press `v`, move to select text, then press `y` to copy it to the
@@ -267,15 +271,18 @@ Add these entries to the tables in your config. Named theme pickers also support
 
 ## Multiple floating panes
 
-The command palette includes a restore entry for each retained pane, including
-hidden panes. Entries always show its stable ID, followed by its explicit name
+The command palette includes a restore entry for each of the current workspace's
+floating panes, including hidden ones. Entries always show its stable ID,
+followed by its explicit name
 or current terminal title, and mark the visible pane as active. Labels are
 captured when the palette opens; selecting an entry restores that pane by ID.
 If its shell exits while the palette is open, selection reports that the pane
 has closed.
 
-Each window retains its own floating panes, with one visible at a time. Hidden
-panes keep their shells running. The default shortcuts are:
+Each workspace owns its floating panes, with one visible at a time; see
+[Workspaces and layouts](WORKSPACES.md). The actions below act on the current
+workspace's floats. Hidden panes, and floats of other workspaces, keep their
+shells running. Floats close with their workspace. The default shortcuts are:
 
 | Shortcut | Action |
 | --- | --- |
@@ -316,21 +323,25 @@ keys = {
 },
 ```
 
-`app:create_floating_pane(options)` returns `{id, name, visible, focused}` after
+`app:create_floating_pane(options)` returns `{id, name, workspace, visible, focused}` after
 native creation succeeds. All options are optional; omitted command and working
 directory use the normal terminal defaults. `command` is a Ghostty command
-string. Names must be nonempty and unique among this window's existing panes.
+string. Names must be nonempty and unique among the workspace's floating panes.
 IDs are stable, monotonically increasing within a window, and never reused.
 
-`app:get_floating_pane(id_or_name)` returns a description or `nil`; with no
-argument it returns the last focused floating pane. `app:get_floating_panes()`
-returns descriptions in creation order. Descriptions are snapshots; `focused`
+`app:get_floating_pane(id_or_name, workspace_id?)` returns a description or
+`nil`; with no target it returns the last focused floating pane. It searches the
+current workspace unless given a workspace ID; to search every workspace, loop
+over `app:get_workspaces()`. `app:get_floating_panes(workspace_id?)` returns a
+workspace's descriptions in creation order. Descriptions are snapshots; `focused`
 means the pane is the window's terminal input target, even if the OS window
 itself is unfocused.
 
 `app:restore_floating_pane(id_or_name)`, `app:toggle_floating_pane()`,
 `app:next_floating_pane()`, `app:previous_floating_pane()`, and
-`app:close_floating_pane(id_or_name)` change pane state immediately.
+`app:close_floating_pane(id_or_name)` change pane state immediately and act on
+the current workspace's floats. `app:tile_floating_pane` and `app:float_pane`
+move terminals between floating and tiled; see [WORKSPACES.md](WORKSPACES.md).
 Close without a target closes the last focused pane, including when hidden.
 Restore or explicit close of a missing pane raises a Lua error; lookup returns
 `nil`. Creation errors are synchronous and can be handled with `pcall`.
@@ -576,7 +587,7 @@ Built-in picker presentation can be overridden separately from custom `pickers`:
 ```lua
 builtin_pickers = {
     themes = { position = "Cursor", sort = "Score" },
-    command_palette = { position = "Cursor", preview_visible = false },
+    command_palette = { scope = "Workspace", position = "Center", preview_visible = false },
     lines = { preview_visible = true },
     words = { preview_visible = false },
     line_break = {
@@ -783,6 +794,13 @@ the second picker reports a missing parameter. `git.branches` runs its switch co
 
 ### Picker sources and common options
 
+Every picker accepts `scope = "Pane"` or `"Workspace"`. Pane scope is the default;
+command palettes default to workspace scope. Workspace pickers draw across the
+workspace content while their terminal context and result destination stay with
+the originating pane. Cursor anchors remain pane-relative. Switching workspaces
+or focusing another pane cancels a workspace picker. See the
+[workspace guide](WORKSPACES.md) for configuration examples.
+
 Every picker type accepts `position = "Top"`, `"Center"`, `"Bottom"`, `"FullPane"`, or
 `"Cursor"`; the default is `"Bottom"`. Cursor placement puts the query near
 the live terminal cursor, or the copy cursor when opened from copy mode, and
@@ -796,7 +814,8 @@ Press it again to restore the configured placement. A picker configured as
 FullPane temporarily switches to Center. Custom picker bindings can override
 the shortcut.
 
-`FullPane` covers the active terminal or floating pane. Set `result_rows` (1–256,
+`FullPane` fills the configured scope: the originating terminal or floating pane,
+or the workspace content with `scope = "Workspace"`. Set `result_rows` (1–256,
 default 7) to reserve result rows; the preview uses all remaining complete rows
 after the query, optional header, and padding. Resizing recalculates the preview
 height. `preview_rows` is ignored in this mode. Hiding the preview leaves the

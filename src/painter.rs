@@ -24,6 +24,9 @@ impl OwnedFrame {
 }
 
 pub(crate) struct TerminalPainter {
+    radius: f32,
+    radius_uniform: Option<glow::UniformLocation>,
+    size_uniform: Option<glow::UniformLocation>,
     program: glow::Program,
     texture_uniform: Option<glow::UniformLocation>,
     texture_scale_uniform: Option<glow::UniformLocation>,
@@ -34,6 +37,9 @@ pub(crate) struct TerminalPainter {
 }
 
 impl TerminalPainter {
+    pub(crate) fn set_corner_radius(&mut self, radius: f32) {
+        self.radius = radius;
+    }
     pub(crate) fn new(gl: &glow::Context) -> Result<Self, crate::native_error::FatalError> {
         use crate::native_error::{FatalError, FatalResult};
         unsafe {
@@ -51,7 +57,7 @@ impl TerminalPainter {
                     ),
                     (
                         glow::FRAGMENT_SHADER,
-                        "#version 330\nin vec2 uv;uniform sampler2D terminal_texture;uniform vec2 texture_scale;uniform vec4 background;out vec4 color;void main(){vec2 p=uv*texture_scale;color=(p.x>=1.0||p.y>=1.0)?background:texture(terminal_texture,p);}",
+                        "#version 330\nin vec2 uv;uniform sampler2D terminal_texture;uniform vec2 texture_scale;uniform vec4 background;uniform vec2 pane_size;uniform float radius;out vec4 color;void main(){vec2 q=abs(uv*pane_size-pane_size*0.5)-(pane_size*0.5-vec2(radius));float d=length(max(q,vec2(0)))+min(max(q.x,q.y),0.0)-radius;if(d>0.0)discard;vec2 p=uv*texture_scale;color=(p.x>=1.0||p.y>=1.0)?background:texture(terminal_texture,p);}",
                         "create the terminal fragment shader",
                         "compile the terminal fragment shader",
                     ),
@@ -80,6 +86,9 @@ impl TerminalPainter {
                     .create_vertex_array()
                     .fatal("create the terminal vertex array")?;
                 Ok(Self {
+                    radius: 0.0,
+                    radius_uniform: gl.get_uniform_location(program, "radius"),
+                    size_uniform: gl.get_uniform_location(program, "pane_size"),
                     program,
                     texture_uniform: gl.get_uniform_location(program, "terminal_texture"),
                     texture_scale_uniform: gl.get_uniform_location(program, "texture_scale"),
@@ -157,6 +166,15 @@ impl TerminalPainter {
             // at its original pixel size instead of stretching it during resize.
             let mut viewport = [0; 4];
             gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+            gl.uniform_2_f32(
+                self.size_uniform.as_ref(),
+                viewport[2] as f32,
+                viewport[3] as f32,
+            );
+            gl.uniform_1_f32(
+                self.radius_uniform.as_ref(),
+                self.radius.min(viewport[2].min(viewport[3]) as f32 / 2.0),
+            );
             let size = self.current.as_ref().expect("current frame").size;
             let scale = frame_texture_scale(size, [viewport[2], viewport[3]]);
             gl.uniform_2_f32(self.texture_scale_uniform.as_ref(), scale[0], scale[1]);

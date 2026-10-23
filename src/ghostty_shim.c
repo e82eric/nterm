@@ -360,7 +360,7 @@ bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, c
     // to existing surfaces and becomes the configuration for future surfaces.
     ghostty_app_update_config(host->app, candidate);
     for (GhosttyEguiHost *item = host->shared->hosts; item; item = item->next)
-        report_theme_colors(candidate, ghostty_surface_userdata(item->surface));
+        if (item->surface) report_theme_colors(candidate, ghostty_surface_userdata(item->surface));
     ghostty_config_free(host->shared->base_config);
     host->shared->base_config = inputs;
     ghostty_config_free(candidate);
@@ -369,6 +369,15 @@ bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, c
 
 bool ghostty_egui_host_apply_theme(GhosttyEguiHost *host, const char *name, char *error, size_t capacity) {
     return ghostty_egui_host_apply_settings(host, name, NULL, 0, error, capacity);
+}
+
+// Keep the window's app/configuration owner available to create future panes
+// after the last terminal has closed. The process and renderer are released.
+void ghostty_egui_host_close_process(GhosttyEguiHost *host) {
+    if (!host || !host->surface) return;
+    ghostty_surface_free(host->surface);
+    host->surface = NULL;
+    host->focused = false;
 }
 
 void ghostty_egui_host_destroy(GhosttyEguiHost *host) {

@@ -248,6 +248,73 @@ impl ItemsProvider {
 mod tests {
     use super::*;
 
+    #[test]
+    fn workspace_api_passes_live_ids_and_strict_options_and_expires() {
+        use crate::terminal::{workspace::Request, workspace_ui::HostRequest};
+        let callback = callback(
+            r#"
+            local saved
+            return function(app)
+                if saved then saved:get_workspaces(); return end
+                saved=app
+                local w=app:create_workspace {index=4,layout='deck'}
+                assert(w.id==42)
+                assert(app:ensure_workspace {index=4}.id==42)
+                assert(app:get_workspace().id==42)
+                assert(#app:get_workspaces()==1)
+                app:select_workspace(w.id)
+                app:set_workspace_layout(w.id,'grid')
+                app:set_main_ratio(w.id,0.6)
+                app:set_workspace_style(w.id,{inner_gap=12})
+                local pane=app:create_pane {workspace=w.id,command='cmd.exe',cwd='C:/src'}
+                assert(pane.id==9)
+                app:move_pane(pane.id,w.id)
+                app:focus_pane(pane.id)
+                assert(#app:get_panes()==1)
+                app:close_pane(pane.id)
+                app:remove_workspace(w.id)
+                assert(not pcall(function() app:create_workspace {unknown=true} end))
+                assert(app.rename_workspace == nil)
+                assert(not pcall(function() app:create_workspace {name='build'} end))
+                assert(not pcall(function() app:create_pane {name='build'} end))
+                assert(not pcall(function() app:workspace {op='Rename',args={w.id,'tools'}} end))
+            end
+        "#,
+        );
+        let mut calls = Vec::new();
+        callback
+            .with_host(
+                &mut |request| {
+                    let HostRequest::Workspace(request) = request else {
+                        panic!("wrong dispatcher")
+                    };
+                    let result = match &request {
+                        Request::Create(_) | Request::Ensure(_) | Request::Get(_) => {
+                            serde_json::json!({"id":42})
+                        }
+                        Request::List => serde_json::json!([{"id":42}]),
+                        Request::CreatePane(options) => {
+                            assert_eq!(options.workspace, Some(42));
+                            assert_eq!(options.cwd.as_deref(), Some("C:/src"));
+                            serde_json::json!({"id":9})
+                        }
+                        Request::ListPanes => serde_json::json!([{"id":9}]),
+                        _ => serde_json::Value::Null,
+                    };
+                    calls.push(request);
+                    Ok(result)
+                },
+                || callback.call_action(String::new()),
+            )
+            .unwrap();
+        assert_eq!(calls.len(), 14);
+        let result = callback
+            .with_host(&mut |_| panic!("expired handle reached controller"), || {
+                callback.call_action(String::new())
+            });
+        assert!(result.unwrap_err().contains("action has already returned"));
+    }
+
     fn callback(source: &str) -> Callback {
         let lua = Rc::new(Lua::new());
         let key = lua
@@ -262,8 +329,10 @@ mod tests {
 
     #[test]
     fn floating_api_returns_live_ids_supports_names_and_expires_with_action() {
-        use crate::terminal::floating::{Panes, Request, Target};
+        use crate::terminal::floating::{Floats, Panes, Request, Target};
+        // A one-workspace host: workspace 1 owns every float.
         let mut panes = Panes::default();
+        let mut floats = Floats::default();
         let callback = callback(
             r#"local saved; return function(app)
             if saved then saved:get_floating_panes(); return end
@@ -271,10 +340,13 @@ mod tests {
             assert(app:get_floating_pane('missing') == nil)
             local a=app:create_floating_pane({name='tools',command='pwsh.exe',cwd='C:\\src'})
             local b=app:create_floating_pane()
-            assert(a.id == 1 and a.name == 'tools' and a.visible and a.focused)
+            assert(a.id == 1 and a.name == 'tools' and a.workspace == 1 and a.visible and a.focused)
             assert(b.id == 2)
             assert(#app:get_floating_panes() == 2)
+            assert(#app:get_floating_panes(1) == 2)
             assert(app:get_floating_pane('tools').id == a.id)
+            assert(app:get_floating_pane('tools', 1).id == a.id)
+            assert(app:get_floating_pane('tools', 2) == nil)
             app:restore_floating_pane(a.id)
             assert(app:get_floating_pane().id == a.id)
             app:toggle_floating_pane()
@@ -286,54 +358,73 @@ mod tests {
             app:close_floating_pane('tools')
             assert(app:get_floating_pane('tools') == nil)
             assert(app:get_floating_pane().id == b.id)
+            local tiled=app:tile_floating_pane()
+            assert(tiled.id == 50 and tiled.workspace == 1)
+            local floated=app:float_pane(tiled.id)
+            assert(floated.id == 3 and floated.visible)
             app:close_floating_pane()
             assert(#app:get_floating_panes() == 0)
         end"#,
         );
         let mut dispatch = |request| {
+            let resolve = |panes: &Panes<()>, floats: &Floats, target: Option<Target>| match target
+            {
+                Some(target) => panes.resolve(&target, floats),
+                None => floats.last(),
+            };
             let result = match request {
                 Request::Create(options) => {
-                    panes.validate_create(&options)?;
+                    panes.validate_create(&options, &floats)?;
                     let id = panes.insert(options.name, ());
-                    serde_json::to_value(panes.description(id)).unwrap()
+                    floats.add(id);
+                    serde_json::to_value(panes.description(id, 1, &floats, true)).unwrap()
                 }
-                Request::Get(target) => {
-                    let id = target.as_ref().and_then(|t| panes.resolve(t)).or_else(|| {
-                        if target.is_none() {
-                            panes.last_id()
-                        } else {
-                            None
-                        }
-                    });
-                    serde_json::to_value(id.and_then(|id| panes.description(id))).unwrap()
+                Request::Get { target, workspace } => {
+                    let id = (workspace.unwrap_or(1) == 1)
+                        .then(|| resolve(&panes, &floats, target))
+                        .flatten();
+                    serde_json::to_value(id.and_then(|id| panes.description(id, 1, &floats, true)))
+                        .unwrap()
                 }
-                Request::List => serde_json::to_value(panes.descriptions()).unwrap(),
+                Request::List { workspace } => {
+                    assert_eq!(workspace.unwrap_or(1), 1);
+                    serde_json::to_value(panes.descriptions(1, &floats, true)).unwrap()
+                }
                 Request::Restore(target) => {
-                    let id = panes.resolve(&target).ok_or("missing pane")?;
-                    panes.restore(id);
+                    let id = resolve(&panes, &floats, Some(target)).ok_or("missing pane")?;
+                    floats.show(id);
                     serde_json::Value::Null
                 }
                 Request::Toggle => {
-                    if panes.visible_id().is_some() {
-                        panes.hide();
-                    } else if let Some(id) = panes.last_id() {
-                        panes.restore(id);
+                    if floats.visible().is_some() {
+                        floats.hide();
+                    } else if let Some(id) = floats.last() {
+                        floats.show(id);
                     }
                     serde_json::Value::Null
                 }
                 Request::Next | Request::Previous => {
-                    panes.cycle(matches!(request, Request::Next));
+                    floats.cycle(matches!(request, Request::Next));
                     serde_json::Value::Null
                 }
                 Request::Close(target) => {
-                    let id = target
-                        .as_ref()
-                        .and_then(|t| panes.resolve(t))
-                        .or_else(|| panes.last_id());
-                    if let Some(id) = id {
+                    if let Some(id) = resolve(&panes, &floats, target) {
+                        floats.remove(id);
                         panes.remove(id);
                     }
                     serde_json::Value::Null
+                }
+                Request::Tile(target) => {
+                    let id = resolve(&panes, &floats, target).ok_or("missing pane")?;
+                    floats.remove(id);
+                    panes.remove(id);
+                    serde_json::json!({"id": 50, "workspace": 1})
+                }
+                Request::Float(pane) => {
+                    assert_eq!(pane, 50);
+                    let id = panes.insert(None, ());
+                    floats.add(id);
+                    serde_json::to_value(panes.description(id, 1, &floats, true)).unwrap()
                 }
             };
             Ok(result)
@@ -350,7 +441,7 @@ mod tests {
                 .unwrap_err()
                 .contains("already returned")
         );
-        assert!(panes.resolve(&Target::Id(1)).is_none());
+        assert!(panes.get(1).is_none() && floats.is_empty());
     }
     #[test]
     fn floating_creation_errors_are_synchronous_and_options_are_strict() {
@@ -589,6 +680,56 @@ struct App {
 }
 impl UserData for App {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+        methods.add_method("workspace", |lua, app, request: mlua::Value| {
+            if !app.active.get() {
+                return Err(mlua::Error::external("action has already returned"));
+            }
+            let request: crate::terminal::workspace::Request = lua.from_value(request)?;
+            let handler: mlua::Function = lua.named_registry_value("ghostty.workspace_handler")?;
+            handler.call::<_, mlua::Value>(lua.to_value(&request)?)
+        });
+        for (method, op) in [
+            ("create_workspace", "Create"),
+            ("ensure_workspace", "Ensure"),
+            ("get_workspaces", "List"),
+            ("get_workspace", "Get"),
+            ("select_workspace", "Select"),
+            ("remove_workspace", "Remove"),
+            ("set_workspace_layout", "SetLayout"),
+            ("set_workspace_style", "SetAppearance"),
+            ("set_main_ratio", "MainRatio"),
+            ("create_pane", "CreatePane"),
+            ("move_pane", "MovePane"),
+            ("close_pane", "ClosePane"),
+            ("focus_pane", "FocusPane"),
+            ("get_panes", "ListPanes"),
+            ("set_workspace_appearance", "Appearance"),
+        ] {
+            methods.add_method(method, move |lua, app, args: mlua::MultiValue| {
+                if !app.active.get() {
+                    return Err(mlua::Error::external("action has already returned"));
+                }
+                let request = lua.create_table()?;
+                request.set("op", op)?;
+                let mut args: Vec<_> = args.into_iter().collect();
+                if matches!(op, "SetLayout" | "MovePane" | "SetAppearance" | "MainRatio") {
+                    request.set("args", lua.create_sequence_from(args)?)?;
+                } else if matches!(op, "Create" | "Ensure" | "CreatePane") {
+                    request.set(
+                        "args",
+                        args.pop()
+                            .unwrap_or(mlua::Value::Table(lua.create_table()?)),
+                    )?;
+                } else if let Some(arg) = args.pop() {
+                    request.set("args", arg)?;
+                }
+                let parsed: crate::terminal::workspace::Request =
+                    lua.from_value(mlua::Value::Table(request))?;
+                let handler: mlua::Function =
+                    lua.named_registry_value("ghostty.workspace_handler")?;
+                handler.call::<_, mlua::Value>(lua.to_value(&parsed)?)
+            });
+        }
         use crate::terminal::floating::{CreateOptions, Request, Target};
         methods.add_method(
             "create_floating_pane",
@@ -609,16 +750,31 @@ impl UserData for App {
         });
         methods.add_method(
             "get_floating_pane",
-            |lua, app, target: Option<mlua::Value>| {
+            |lua, app, (target, workspace): (Option<mlua::Value>, Option<u64>)| {
                 app.floating(
                     lua,
-                    Request::Get(target.map(|v| lua.from_value::<Target>(v)).transpose()?),
+                    Request::Get {
+                        target: target.map(|v| lua.from_value::<Target>(v)).transpose()?,
+                        workspace,
+                    },
                 )
             },
         );
-        methods.add_method("get_floating_panes", |lua, app, ()| {
-            app.floating(lua, Request::List)
+        methods.add_method("get_floating_panes", |lua, app, workspace: Option<u64>| {
+            app.floating(lua, Request::List { workspace })
         });
+        methods.add_method("float_pane", |lua, app, pane: u64| {
+            app.floating(lua, Request::Float(pane))
+        });
+        methods.add_method(
+            "tile_floating_pane",
+            |lua, app, target: Option<mlua::Value>| {
+                app.floating(
+                    lua,
+                    Request::Tile(target.map(|v| lua.from_value::<Target>(v)).transpose()?),
+                )
+            },
+        );
         methods.add_method("next_floating_pane", |lua, app, ()| {
             app.floating(lua, Request::Next)
         });
@@ -748,6 +904,56 @@ impl App {
     }
 }
 impl Callback {
+    pub(crate) fn with_host<R>(
+        &self,
+        handler: &mut impl FnMut(
+            crate::terminal::workspace_ui::HostRequest,
+        ) -> Result<serde_json::Value, String>,
+        call: impl FnOnce() -> Result<R, String>,
+    ) -> Result<R, String> {
+        let handler = RefCell::new(handler);
+        self.lua
+            .scope(|scope| {
+                let floating = scope.create_function_mut(|lua, value: mlua::Value| {
+                    let response = (handler.borrow_mut())(
+                        crate::terminal::workspace_ui::HostRequest::Floating(
+                            lua.from_value(value)?,
+                        ),
+                    )
+                    .map_err(mlua::Error::external)?;
+                    if response.is_null() {
+                        Ok(mlua::Value::Nil)
+                    } else {
+                        lua.to_value(&response)
+                    }
+                })?;
+                let workspace = scope.create_function_mut(|lua, value: mlua::Value| {
+                    let response = (handler.borrow_mut())(
+                        crate::terminal::workspace_ui::HostRequest::Workspace(
+                            lua.from_value(value)?,
+                        ),
+                    )
+                    .map_err(mlua::Error::external)?;
+                    if response.is_null() {
+                        Ok(mlua::Value::Nil)
+                    } else {
+                        lua.to_value(&response)
+                    }
+                })?;
+                self.lua
+                    .set_named_registry_value("ghostty.floating_handler", floating)?;
+                self.lua
+                    .set_named_registry_value("ghostty.workspace_handler", workspace)?;
+                let result = call().map_err(mlua::Error::external);
+                self.lua
+                    .unset_named_registry_value("ghostty.floating_handler")?;
+                self.lua
+                    .unset_named_registry_value("ghostty.workspace_handler")?;
+                result
+            })
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(test)]
     pub(crate) fn with_floating<R>(
         &self,
         handler: &mut impl FnMut(

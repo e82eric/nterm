@@ -227,7 +227,7 @@ mod tests {
             let quoted_path =
                 serde_json::to_string(&path.to_string_lossy().replace('\\', "/")).unwrap();
             let source = format!(
-                "local path = {quoted_path} .. '/' .. tostring({{}}):gsub('[^%w]', ''); local f = assert(io.open(path, 'w')); f:write('{generation}'); f:close(); return {{pickers={{x={{preview={{resolve=function() return nil end}}}}}}}}"
+                "local keys=ghostty.workspace_keys('ALT'); assert(#keys>0); local path = {quoted_path} .. '/' .. tostring({{}}):gsub('[^%w]', ''); local f = assert(io.open(path, 'w')); f:write('{generation}'); f:close(); return {{pickers={{x={{preview={{resolve=function() return nil end}}}}}}}}"
             );
             let _worker = Worker::new(
                 ConfigSource(source, "@init-test".into(), String::new()),
@@ -490,6 +490,7 @@ fn install_helpers(lua: &Lua) -> mlua::Result<()> {
     )?;
     lua.globals().set("preview", helpers)?;
     let ghostty = lua.create_table()?;
+    crate::terminal::workspace_ui::install_lua_helpers(lua, &ghostty)?;
     ghostty.set(
         "json_parse",
         lua.create_function(|lua, text: String| {

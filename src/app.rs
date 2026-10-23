@@ -242,14 +242,21 @@ impl NativeWindow {
         })
     }
 
-    fn show(&self) {
+    /// Runs the Lua startup callback, then shows the window for its first frame.
+    fn start(&mut self) -> Result<(), FatalError> {
+        self.gl_window.make_current()?;
+        let shell = self.shell.as_mut().expect("terminal shell");
+        shell.terminal.run_startup(&self.egui.egui_ctx, &self.gl);
         self.gl_window.window().set_visible(true);
         self.gl_window.window().request_redraw();
+        Ok(())
     }
 
     fn redraw(&mut self) -> Result<(), FatalError> {
         self.gl_window.make_current()?;
         let shell = self.shell.as_mut().expect("terminal shell");
+        // The previous frame's paint callbacks have run or been dropped.
+        shell.terminal.before_frame(&self.gl);
         let (output, changed) = self
             .egui
             .run(self.gl_window.window(), |ui| shell.ui(ui, &self.gl));
@@ -380,7 +387,7 @@ impl NativeApp {
             terminal,
             _startup: parent_shell._startup.clone(),
         });
-        window.show();
+        window.start()?;
         self.windows.insert(window.gl_window.window().id(), window);
         self.sync_viewports()?;
         Ok(())
@@ -443,7 +450,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
                 issues,
                 reload,
             )?);
-            window.show();
+            window.start()?;
             self.windows.insert(window.gl_window.window().id(), window);
             self.sync_viewports()?;
             Ok::<_, FatalError>(())

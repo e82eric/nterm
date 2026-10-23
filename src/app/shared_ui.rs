@@ -250,6 +250,8 @@ impl WindowUi {
         // Keep State's transient focus/events, adding the native geometry.
         info.inner_rect = self.info.inner_rect;
         info.outer_rect = self.info.outer_rect;
+        // Panes read window focus from here to drive native terminal focus.
+        info.focused = self.info.focused;
         let mut output = self.egui_ctx.run_ui(input, ui);
         self.changes.output_hook(&self.egui_ctx, &mut output);
         let changed = std::mem::take(&mut self.changes.changed);

@@ -4,16 +4,30 @@ use crate::graphics as glow;
 use std::ffi::c_char;
 
 pub(crate) mod floating;
+mod layout;
 mod pane;
+pub(crate) mod workspace;
+pub(crate) mod workspace_ui;
 use pane::TerminalPane;
 
 pub(crate) struct TerminalView {
     main: TerminalPane,
+    /// Tiled terminals other than pane 0 (`main`), across all workspaces, by
+    /// tiled ID. Which workspace each belongs to is in `Workspace::panes`.
+    tiled: Vec<(u64, TerminalPane)>,
+    closed_panes: Vec<TerminalPane>,
+    close_main_pending: bool,
+    workspaces: Vec<workspace::Workspace>,
+    current: u64,
+    previous: u64,
+    next_workspace: u64,
+    next_pane: u64,
     messages: crate::messages::Messages,
 
     command_label: String,
     reload_source: crate::config::ReloadSource,
-    picker_bindings: crate::picker::config::Bindings,
+    /// Shared so per-frame borrows can clone it cheaply; copy-on-write edits.
+    picker_bindings: std::rc::Rc<crate::picker::config::Bindings>,
     floating_padding: Option<crate::config::FloatingPadding>,
     floating: floating::Panes<FloatingTerminal>,
     new_window_requested: bool,
@@ -21,6 +35,14 @@ pub(crate) struct TerminalView {
 
 struct FloatingTerminal {
     pane: TerminalPane,
+}
+
+/// Window state that a pane's command palette shows: its float and workspace
+/// entries. Built by the window when a picker opens, not kept on each pane.
+#[derive(Default)]
+struct PaletteContext {
+    has_floating: bool,
+    entries: Vec<crate::actions::Entry>,
 }
 
 impl std::ops::Deref for FloatingTerminal {
@@ -47,15 +69,24 @@ impl FloatingTerminal {
     }
 }
 
+/// A terminal in this window. Tiled and floating panes have separate ID
+/// spaces, so a reference says which kind it is; tiled 0 is `main`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneRef {
+    Tiled(u64),
+    Floating(u64),
+}
+
 impl TerminalView {
     pub(crate) fn apply_theme(&mut self, name: &str) -> Result<(), String> {
         self.main.apply_theme(name)
     }
     fn active_pane_ref(&self) -> &TerminalPane {
-        if self.floating.visible().is_some() {
-            &self.floating.visible().expect("visible floating pane").pane
+        if let Some(float) = self.visible_float() {
+            &float.pane
         } else {
-            &self.main
+            self.tiled_ref(self.focused_id().unwrap_or(0))
+                .unwrap_or(&self.main)
         }
     }
 
@@ -74,13 +105,29 @@ impl TerminalView {
     ) -> Result<Self, crate::native_error::FatalError> {
         let main = TerminalPane::create(egui_ctx, gl, proxy, window_id, argc, argv)?;
         issues.extend(main.take_config_issues());
+        #[cfg(any(windows, unix))]
+        main.set_pipe_policy(&picker_bindings.pipe_policy);
         Ok(Self {
             messages: crate::messages::Messages::new(issues),
 
             main,
+            closed_panes: Vec::new(),
+            close_main_pending: false,
+            tiled: Vec::new(),
+            workspaces: vec![{
+                let mut w = workspace::Workspace::new(1, 1);
+                w.layout = picker_bindings.default_layout;
+                w.panes.push(0);
+                w.focused = Some(0);
+                w
+            }],
+            current: 1,
+            previous: 1,
+            next_workspace: 2,
+            next_pane: 1,
             command_label,
             reload_source,
-            picker_bindings,
+            picker_bindings: std::rc::Rc::new(picker_bindings),
             floating_padding,
             floating: Default::default(),
             new_window_requested: false,
@@ -94,9 +141,25 @@ impl TerminalView {
         window_id: egui_winit::winit::window::WindowId,
     ) -> Result<Self, crate::native_error::FatalError> {
         let main = self.main.create_window(egui_ctx, gl, window_id)?;
+        #[cfg(any(windows, unix))]
+        main.set_pipe_policy(&self.picker_bindings.pipe_policy);
         Ok(Self {
             messages: crate::messages::Messages::new(main.take_config_issues()),
             main,
+            closed_panes: Vec::new(),
+            close_main_pending: false,
+            tiled: Vec::new(),
+            workspaces: vec![{
+                let mut w = workspace::Workspace::new(1, 1);
+                w.layout = self.picker_bindings.default_layout;
+                w.panes.push(0);
+                w.focused = Some(0);
+                w
+            }],
+            current: 1,
+            previous: 1,
+            next_workspace: 2,
+            next_pane: 1,
             command_label: self.command_label.clone(),
             reload_source: self.reload_source.clone(),
             picker_bindings: self.picker_bindings.clone(),
@@ -104,6 +167,22 @@ impl TerminalView {
             floating: Default::default(),
             new_window_requested: false,
         })
+    }
+
+    /// Creates a tiled or floating pane's terminal as a child of the window's
+    /// app, with the configured pipe policy applied.
+    fn create_pane(
+        &self,
+        gl: &glow::Context,
+        options: &pane::SpawnOptions,
+    ) -> Result<TerminalPane, String> {
+        let pane = self
+            .main
+            .create_child(gl, options)
+            .map_err(|e| e.to_string())?;
+        #[cfg(any(windows, unix))]
+        pane.set_pipe_policy(&self.picker_bindings.pipe_policy);
+        Ok(pane)
     }
 
     pub(crate) fn take_new_window_request(&mut self) -> bool {
@@ -121,16 +200,27 @@ impl TerminalView {
 
     pub(crate) fn acquire_frames(&mut self) -> bool {
         let mut acquired = self.main.acquire_frame();
+        for (_, pane) in &mut self.tiled {
+            acquired |= pane.acquire_frame();
+        }
         for floating in &mut self.floating.entries {
             acquired |= floating.acquire_frame();
         }
         acquired
     }
 
-    fn pane_mut(&mut self, id: Option<u64>) -> Option<&mut TerminalPane> {
-        match id {
-            None => Some(&mut self.main),
-            Some(id) => self
+    /// The terminal that gets input: the visible float, else the focused
+    /// tiled pane.
+    fn active_pane(&self) -> Option<PaneRef> {
+        self.floats()
+            .visible()
+            .map(PaneRef::Floating)
+            .or_else(|| self.focused_id().map(PaneRef::Tiled))
+    }
+    fn pane_mut(&mut self, pane: PaneRef) -> Option<&mut TerminalPane> {
+        match pane {
+            PaneRef::Tiled(id) => self.tiled_mut(id),
+            PaneRef::Floating(id) => self
                 .floating
                 .entries
                 .iter_mut()
@@ -138,12 +228,7 @@ impl TerminalView {
                 .map(|p| &mut p.value.pane),
         }
     }
-    fn run_picker_callback(
-        &mut self,
-        origin: Option<u64>,
-        gl: &glow::Context,
-        ctx: &egui::Context,
-    ) {
+    fn run_picker_callback(&mut self, origin: PaneRef, gl: &glow::Context, ctx: &egui::Context) {
         let Some(pane) = self.pane_mut(origin) else {
             return;
         };
@@ -154,22 +239,16 @@ impl TerminalView {
         if let crate::picker::Action::Custom(callback, text, filesystem, range, value, params) =
             action
         {
-            let result =
-                callback.with_floating(&mut |request| self.floating_request(request, gl), || {
-                    callback.call_with_selection(
-                        &text, &value, filesystem, generation, range, &params, selection,
-                    )
-                });
+            let result = callback.with_host(&mut |request| self.host_request(request, gl), || {
+                callback.call_with_selection(
+                    &text, &value, filesystem, generation, range, &params, selection,
+                )
+            });
             let bindings = self.picker_bindings.clone();
-            let has_floating = !self.floating.is_empty();
+            let palette = self.palette_context();
             if let Some(pane) = self.pane_mut(origin) {
                 pane.finish_picker_callback(
-                    result,
-                    generation,
-                    from_copy,
-                    ctx,
-                    &bindings,
-                    has_floating,
+                    result, generation, from_copy, ctx, &bindings, &palette,
                 );
             }
         }
@@ -180,63 +259,95 @@ impl TerminalView {
         gl: &glow::Context,
     ) -> Result<serde_json::Value, String> {
         use floating::{CreateOptions, Request};
-        let target_id = |panes: &floating::Panes<FloatingTerminal>,
-                         target: Option<floating::Target>|
-         -> Result<Option<u64>, String> {
-            match target {
-                Some(target) => panes
-                    .resolve(&target)
-                    .map(Some)
-                    .ok_or_else(|| "floating pane does not exist".into()),
-                None => Ok(panes.last_id()),
-            }
+        // Targets resolve among the current workspace's floats; no target
+        // means its most recently focused float.
+        let target_id =
+            |view: &Self, target: Option<floating::Target>| -> Result<Option<u64>, String> {
+                match target {
+                    Some(target) => view
+                        .floating
+                        .resolve(&target, view.floats())
+                        .map(Some)
+                        .ok_or_else(|| "floating pane does not exist".into()),
+                    None => Ok(view.floats().last()),
+                }
+            };
+        let describe = |view: &Self, workspace: u64, id: Option<u64>| {
+            let floats = &view.workspaces.iter().find(|w| w.id == workspace)?.floats;
+            view.floating
+                .description(id?, workspace, floats, workspace == view.current)
         };
         let result = match request {
             Request::Create(options) => {
-                self.floating.validate_create(&options)?;
-                let pane = self
-                    .main
-                    .create_floating(gl, &options)
-                    .map_err(|e| e.to_string())?;
+                self.floating.validate_create(&options, self.floats())?;
+                let pane = self.create_pane(gl, &options.spawn())?;
                 let id = self
                     .floating
                     .insert(options.name, FloatingTerminal { pane });
-                serde_json::to_value(self.floating.description(id)).unwrap()
+                self.floats_mut().add(id);
+                serde_json::to_value(describe(self, self.current, Some(id))).unwrap()
             }
             Request::Toggle => {
-                if self.floating.visible_id().is_some() {
-                    self.floating.hide();
-                } else if let Some(id) = self.floating.last_id() {
-                    self.floating.restore(id);
+                if self.floats().visible().is_some() {
+                    self.floats_mut().hide();
+                } else if let Some(id) = self.floats().last() {
+                    self.floats_mut().show(id);
                 } else {
                     return self.floating_request(Request::Create(CreateOptions::default()), gl);
                 }
                 serde_json::Value::Null
             }
             Request::Restore(target) => {
-                let id = target_id(&self.floating, Some(target))?.unwrap();
-                self.floating.restore(id);
-                serde_json::to_value(self.floating.description(id)).unwrap()
+                let id = target_id(self, Some(target))?.unwrap();
+                self.floats_mut().show(id);
+                serde_json::to_value(describe(self, self.current, Some(id))).unwrap()
             }
-            Request::Get(target) => {
+            Request::Get { target, workspace } => {
+                let workspace = workspace.unwrap_or(self.current);
+                let floats = &self
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id == workspace)
+                    .ok_or("workspace does not exist")?
+                    .floats;
                 let id = match target {
-                    Some(target) => self.floating.resolve(&target),
-                    None => self.floating.last_id(),
+                    Some(target) => self.floating.resolve(&target, floats),
+                    None => floats.last(),
                 };
-                serde_json::to_value(id.and_then(|id| self.floating.description(id))).unwrap()
+                serde_json::to_value(describe(self, workspace, id)).unwrap()
             }
-            Request::List => serde_json::to_value(self.floating.descriptions()).unwrap(),
+            Request::List { workspace } => {
+                let workspace = workspace.unwrap_or(self.current);
+                let w = self
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id == workspace)
+                    .ok_or("workspace does not exist")?;
+                serde_json::to_value(self.floating.descriptions(
+                    workspace,
+                    &w.floats,
+                    workspace == self.current,
+                ))
+                .unwrap()
+            }
             Request::Next | Request::Previous => {
-                self.floating.cycle(matches!(request, Request::Next));
+                self.floats_mut().cycle(matches!(request, Request::Next));
                 serde_json::Value::Null
             }
             Request::Close(target) => {
-                if let Some(id) = target_id(&self.floating, target)? {
-                    if let Some(mut pane) = self.floating.remove(id) {
-                        pane.destroy(gl);
-                    }
+                if let Some(id) = target_id(self, target)? {
+                    self.close_floats([id]);
                 }
                 serde_json::Value::Null
+            }
+            Request::Float(pane) => {
+                let (workspace, id) = self.float_tiled(pane)?;
+                serde_json::to_value(describe(self, workspace, Some(id))).unwrap()
+            }
+            Request::Tile(target) => {
+                let id = target_id(self, target)?.ok_or("floating pane does not exist")?;
+                let pane = self.tile_float(id)?;
+                serde_json::json!({"id": pane, "workspace": self.current})
             }
         };
         self.main.request_repaint();
@@ -250,6 +361,19 @@ impl TerminalView {
         gl: &glow::Context,
     ) {
         match action {
+            AppAction::Workspace(action) => self.workspace_action(action, ctx, gl),
+            AppAction::SelectWorkspaceId(id) => {
+                if let Err(error) = self.select_workspace(id) {
+                    self.main.show_error("Workspace action failed", error);
+                }
+            }
+            AppAction::MovePaneToWorkspaceId { pane, workspace } => {
+                if let Err(error) =
+                    self.workspace_request(workspace::Request::MovePane(pane, workspace), gl)
+                {
+                    self.main.show_error("Workspace action failed", error);
+                }
+            }
             AppAction::ReloadConfig => match self.reload_source.reload() {
                 Ok(config) => {
                     if config.theme.is_some()
@@ -264,11 +388,25 @@ impl TerminalView {
                     }
                     if config.font_family.is_some() || config.font_size.is_some() {
                         self.main.refresh_picker_font(ctx);
+                        for (_, pane) in &mut self.tiled {
+                            pane.refresh_picker_font(ctx);
+                        }
                         for floating in &mut self.floating.entries {
                             floating.refresh_picker_font(ctx);
                         }
                     }
-                    self.picker_bindings = config.bindings;
+                    self.picker_bindings = std::rc::Rc::new(config.bindings);
+                    #[cfg(any(windows, unix))]
+                    {
+                        let policy = &self.picker_bindings.pipe_policy;
+                        self.main.set_pipe_policy(policy);
+                        for (_, pane) in &self.tiled {
+                            pane.set_pipe_policy(policy);
+                        }
+                        for floating in &self.floating.entries {
+                            floating.set_pipe_policy(policy);
+                        }
+                    }
                     self.floating_padding = config.padding;
                     crate::colors::COLORS.reload(ctx, config.colors);
                     self.main.show_notice("", "Configuration reloaded".into());
@@ -282,17 +420,23 @@ impl TerminalView {
                     .picker_bindings
                     .named("builtin.themes")
                     .expect("builtin themes picker");
-                let has_floating = !self.floating.is_empty();
-                let pane = if self.floating.visible().is_some() {
+                let palette = self.palette_context();
+                let bindings = self.picker_bindings.clone();
+                let pane = if self.floats().visible().is_some() {
                     &mut self
-                        .floating
-                        .visible_mut()
+                        .visible_float_mut()
                         .expect("floating action target")
                         .pane
                 } else {
-                    &mut self.main
+                    let Some(id) = self.focused_id() else {
+                        return;
+                    };
+                    let Some(pane) = self.tiled_mut(id) else {
+                        return;
+                    };
+                    pane
                 };
-                pane.open_picker(ctx, entry, None, &self.picker_bindings, has_floating);
+                pane.open_picker(ctx, entry, None, &bindings, &palette);
             }
             AppAction::ApplyTheme(name) => match self.apply_theme(&name) {
                 Ok(()) => self.main.show_notice("Theme applied", name),
@@ -301,18 +445,22 @@ impl TerminalView {
             AppAction::ShowMessages => self.messages.open(),
             AppAction::ShowErrorRecord(record) => self.messages.open_record(*record),
             AppAction::OpenErrorLog => {
-                if let Some(floating) = self.floating.visible_mut() {
+                if let Some(floating) = self.visible_float_mut() {
                     floating.open_error_log(ctx);
                 } else {
-                    self.main.open_error_log(ctx);
+                    if let Some(id) = self.focused_id() {
+                        if let Some(p) = self.tiled_mut(id) {
+                            p.open_error_log(ctx);
+                        }
+                    }
                 }
             }
             AppAction::NewWindow => {
                 self.new_window_requested = true;
             }
             AppAction::RestoreFloatingPane(id) => {
-                if self.floating.description(id).is_some() {
-                    self.floating.restore(id);
+                if self.floats().contains(id) {
+                    self.floats_mut().show(id);
                 } else {
                     self.main.show_notice(
                         "Floating pane closed",
@@ -337,7 +485,6 @@ impl TerminalView {
                 }
             }
             _ => {
-                let has_floating = !self.floating.is_empty();
                 let lua_action = if let AppAction::Lua(name) = &action {
                     self.picker_bindings.lua_action(name)
                 } else {
@@ -349,28 +496,33 @@ impl TerminalView {
                     None
                 };
                 let origin = if floating_target {
-                    self.floating.visible_id()
+                    self.active_pane()
                 } else {
-                    None
+                    self.focused_id().map(PaneRef::Tiled)
                 };
                 if let Some(lua_action) = lua_action {
-                    let selection = self
-                        .pane_mut(origin)
+                    let selection = origin
+                        .and_then(|o| self.pane_mut(o))
                         .map(|p| p.selected_text())
                         .unwrap_or_default();
                     let callback = lua_action.callback.clone();
                     let result = callback
-                        .with_floating(&mut |request| self.floating_request(request, gl), || {
+                        .with_host(&mut |request| self.host_request(request, gl), || {
                             callback.call_action(selection)
                         });
-                    if let Some(pane) = self.pane_mut(origin) {
+                    if let Some(pane) = origin.and_then(|o| self.pane_mut(o)) {
                         pane.finish_lua_action(result, ctx);
                     }
                 } else {
                     let bindings = self.picker_bindings.clone();
-                    if let Some(pane) = self.pane_mut(origin) {
+                    let palette = if entry.is_some() {
+                        self.palette_context()
+                    } else {
+                        PaletteContext::default()
+                    };
+                    if let Some(pane) = origin.and_then(|o| self.pane_mut(o)) {
                         if let Some(entry) = entry {
-                            pane.open_picker(ctx, entry, None, &bindings, has_floating);
+                            pane.open_picker(ctx, entry, None, &bindings, &palette);
                         } else {
                             pane.execute_action(&action, ctx);
                         }
@@ -404,13 +556,20 @@ impl TerminalView {
         egui::Rect::from_center_size(content.center(), size)
     }
 
-    fn show_floating(&self, ui: &egui::Ui, content: egui::Rect, rect: egui::Rect) {
-        let Some(floating) = self.floating.visible() else {
+    fn show_floating(
+        &self,
+        ui: &egui::Ui,
+        content: egui::Rect,
+        rect: egui::Rect,
+        style: &workspace::Appearance,
+    ) {
+        let Some(floating) = self.visible_float() else {
             return;
         };
         let layer_id = egui::LayerId::new(egui::Order::Middle, egui::Id::new("floating-terminal"));
         egui::Area::new(layer_id.id)
             .order(layer_id.order)
+            .fade_in(false)
             .fixed_pos(content.min)
             .interactable(false)
             .show(ui.ctx(), |floating_ui| {
@@ -423,197 +582,28 @@ impl TerminalView {
                         .background
                         .gamma_multiply(90.0 / 255.0),
                 );
-                painter.rect_filled(rect.expand(3.0), 3.0, crate::colors::palette().border);
-                painter.rect_filled(rect, 0.0, crate::colors::palette().background);
-                painter.add(egui::PaintCallback {
+                style.paint_frame(painter, rect, true);
+                painter.rect_filled(
                     rect,
+                    style.corner_radius,
+                    crate::colors::palette().background,
+                );
+                painter.add(egui::PaintCallback {
+                    rect: style.content_rect(rect),
                     callback: floating.paint_callback(),
                 });
             });
         ui.ctx().move_to_top(layer_id);
     }
     pub(crate) fn update(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
-        let entries: Vec<_> = self
-            .floating
-            .entries
-            .iter()
-            .map(|pane| {
-                crate::actions::floating_pane_entry(
-                    pane.id,
-                    pane.name.as_deref(),
-                    &pane.title(),
-                    self.floating.visible_id() == Some(pane.id),
-                )
-            })
-            .collect();
-        self.main.floating_palette_entries = entries.clone();
-        for pane in &mut self.floating.entries {
-            pane.floating_palette_entries = entries.clone();
-        }
-        self.messages.show(ui.ctx());
-        let messages_open = self.messages.is_open();
-        let context = self.active_pane_ref().action_context();
-        let (shortcut, shortcut_consumed) = ui.input_mut(|input| {
-            self.picker_bindings
-                .consume_when(&mut input.events, |action, mods| {
-                    !messages_open && context.allows(action, mods)
-                })
-        });
-        let pane_shortcut = match shortcut {
-            Some(action) if action.is_global() => {
-                self.execute_action(action, false, ui.ctx(), gl);
-                None
-            }
-            action => action,
-        };
-        let exited: Vec<_> = self
-            .floating
-            .entries
-            .iter()
-            .filter(|p| p.should_close())
-            .map(|p| p.id)
-            .collect();
-        for id in exited {
-            if let Some(mut pane) = self.floating.remove(id) {
-                pane.destroy(gl);
-            }
-        }
-        self.main.update_modes(ui.ctx());
-        for floating in &mut self.floating.entries {
-            floating.update_modes(ui.ctx());
-        }
-
-        // Reserve the same status height in every mode. Toggling copy mode
-        // must not resize the terminal and invalidate its frozen snapshot.
-        let available = ui.max_rect();
-        let status_height = 24.0_f32.min((available.height() - 1.0).max(0.0));
-        let rect = egui::Rect::from_min_max(
-            available.min,
-            egui::pos2(available.right(), available.bottom() - status_height),
-        );
-        let status_rect = egui::Rect::from_min_max(rect.left_bottom(), available.max);
-        let scale = ui.ctx().pixels_per_point();
-        let floating_active = self.floating.visible().is_some();
-        let window_focused = ui.input(|input| input.viewport().focused.unwrap_or(false));
-        let resized = self.main.resize(rect, scale);
-        self.main
-            .set_active(ui.ctx(), !floating_active, window_focused);
-        let floating_rect = Self::floating_rect(rect, self.floating_padding);
-        let visible_id = self.floating.visible_id();
-        for floating in &mut self.floating.entries {
-            let visible = Some(floating.id) == visible_id;
-            if visible {
-                floating.resize(floating_rect, scale);
-            }
-            floating.set_active(ui.ctx(), visible, window_focused);
-        }
-        ui.painter().add(egui::PaintCallback {
-            rect,
-            callback: self.main.paint_callback(),
-        });
-
-        // Input is handled by the active pane before unused events reach Ghostty.
-        if floating_active {
-            self.main.show_background_overlays(ui.ctx(), rect);
-        }
-        if resized {
-            self.main.refresh_decorations();
-        }
-        // Snapshot-based actions must observe the resized pane, just like
-        // pane-local input handlers do.
-        if let Some(action) = pane_shortcut {
-            self.execute_action(action, floating_active, ui.ctx(), gl);
-        }
-        // Lua actions can change the active pane synchronously.
-        let visible_id = self.floating.visible_id();
-        let floating_active = visible_id.is_some();
-        self.main
-            .set_active(ui.ctx(), !floating_active, window_focused);
-        for pane in &mut self.floating.entries {
-            let visible = Some(pane.id) == visible_id;
-            if visible {
-                pane.resize(floating_rect, scale);
-            }
-            pane.set_active(ui.ctx(), visible, window_focused);
-        }
-        let active_bounds = if floating_active { floating_rect } else { rect };
-        let has_floating = !self.floating.is_empty();
-        #[cfg(any(windows, unix))]
-        {
-            self.main.handle_pipe_requests(
-                ui.ctx(),
-                &self.picker_bindings,
-                has_floating,
-                !floating_active && !messages_open,
-            );
-            for floating in &mut self.floating.entries {
-                let interactive = Some(floating.id) == visible_id && !messages_open;
-                floating.pane.handle_pipe_requests(
-                    ui.ctx(),
-                    &self.picker_bindings,
-                    has_floating,
-                    interactive,
-                );
-            }
-        }
-        let active_pane = if floating_active {
-            &mut self
-                .floating
-                .visible_mut()
-                .expect("visible floating pane")
-                .pane
-        } else {
-            &mut self.main
-        };
-        let input = if messages_open {
-            pane::PaneInput {
-                keyboard_blocked: true,
-                suppress_forward: true,
-                action: None,
-            }
-        } else {
-            active_pane.handle_input(ui, active_bounds, &mut self.picker_bindings)
-        };
-        active_pane.forward_input(
-            ui,
-            active_bounds,
-            input.keyboard_blocked || shortcut_consumed || messages_open,
-            input.suppress_forward || shortcut_consumed || messages_open,
-        );
-        self.show_mode_status(ui, status_rect);
-
-        self.show_floating(ui, rect, floating_rect);
-        if floating_active {
-            if let Some(floating) = self.floating.visible_mut() {
-                floating.show_search_overlay(ui.ctx(), floating_rect);
-            }
-        } else {
-            self.main.show_search_overlay(ui.ctx(), rect);
-        }
-
-        self.run_picker_callback(visible_id, gl, ui.ctx());
-        if let Some(action) = input.action {
-            self.execute_action(action, floating_active, ui.ctx(), gl);
-        }
-        self.main.drain_clipboard(ui.ctx());
-        for floating in &self.floating.entries {
-            floating.drain_clipboard(ui.ctx());
-        }
-
-        if self.should_close() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        self.main.show_toasts(ui.ctx(), rect);
-        if let Some(floating) = self.floating.visible_mut() {
-            floating.show_toasts(ui.ctx(), floating_rect);
-        }
+        self.update_workspaces(ui, gl);
     }
 
     pub(crate) fn should_close(&self) -> bool {
-        self.main.should_close()
+        self.workspaces.iter().all(|w| w.panes.is_empty())
     }
 
-    fn show_mode_status(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+    fn show_mode_status(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let warning_right = rect.right() - 10.0;
         // Paint the background before the clickable status indicator.
         ui.painter()
@@ -630,16 +620,31 @@ impl TerminalView {
             ],
             egui::Stroke::new(1.5, separator),
         );
-        let font = egui::FontId::monospace(15.0);
-        let label_rect = painter.text(
-            egui::pos2(rect.left() + 10.0, rect.center().y + 1.0),
-            egui::Align2::LEFT_CENTER,
-            status.label,
-            font.clone(),
-            status.accent,
+        let font = egui::FontId::monospace(13.0);
+        let palette = crate::colors::palette();
+        // The label is a chip: filled with the accent while a mode such as
+        // COPY or SEARCH is active, otherwise a subtle tint.
+        let mode_active = status.accent != palette.muted_text;
+        let (chip_fill, chip_text) = if mode_active {
+            (status.accent, palette.background)
+        } else {
+            (egui::Color32::from_white_alpha(14), palette.text)
+        };
+        let label = painter.layout_no_wrap(status.label.to_owned(), font.clone(), chip_text);
+        let label_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.left() + 8.0,
+                rect.center().y + 1.0 - (rect.height() - 8.0).clamp(8.0, 22.0) / 2.0,
+            ),
+            egui::vec2(
+                label.size().x + 16.0,
+                (rect.height() - 8.0).clamp(8.0, 22.0),
+            ),
         );
-        if !self.floating.is_empty() {
-            let color = if self.floating.visible_id().is_some() {
+        painter.rect_filled(label_rect, 4.0, chip_fill);
+        painter.galley(label_rect.center() - label.size() / 2.0, label, chip_text);
+        if self.has_floating() {
+            let color = if self.floats().visible().is_some() {
                 crate::colors::palette().warning
             } else {
                 crate::colors::palette().muted_text
@@ -647,9 +652,8 @@ impl TerminalView {
             let text = painter.layout_no_wrap(
                 format!(
                     "Floating Panes: {}{}",
-                    self.floating.entries.len(),
-                    self.floating
-                        .visible()
+                    self.floats().ids().len(),
+                    self.visible_float()
                         .map(|p| format!(
                             " [{}]",
                             p.name.clone().unwrap_or_else(|| p.id.to_string())
@@ -702,6 +706,14 @@ impl TerminalView {
                 right_edge = left - 12.0;
             }
         }
+        // Reserve workspace controls immediately to the left of the pipe icon.
+        let workspace_width =
+            self.workspace_bar_width(ui, (right_edge - label_rect.right() - 24.0).max(0.0));
+        let workspace_rect = egui::Rect::from_min_max(
+            egui::pos2(right_edge - workspace_width, rect.top()),
+            egui::pos2(right_edge, rect.bottom()),
+        );
+        right_edge = workspace_rect.left() - 12.0;
         if let Some(detail) = status.detail {
             let text = painter.layout_no_wrap(detail, font.clone(), foreground);
             let left = right_edge - text.size().x;
@@ -711,35 +723,15 @@ impl TerminalView {
                     text,
                     foreground,
                 );
-                right_edge = left - 12.0;
             }
         }
-        if let Some(cwd) = status.cwd {
-            // Fill the space between the label and the right-hand items,
-            // dropping the start of a long path so its last directory shows.
-            let left = label_rect.right() + 16.0;
-            let color = crate::colors::palette().muted_text;
-            let layout = |text: String| painter.layout_no_wrap(text, font.clone(), color);
-            let mut text = layout(cwd.clone());
-            let mut start = 0;
-            while text.size().x > right_edge - left {
-                let Some((offset, _)) = cwd[start..].char_indices().nth(1) else {
-                    break;
-                };
-                start += offset;
-                text = layout(format!("…{}", &cwd[start..]));
-            }
-            if text.size().x <= right_edge - left {
-                painter.galley(
-                    egui::pos2(left, rect.center().y + 1.0 - text.size().y / 2.0),
-                    text,
-                    color,
-                );
-            }
-        }
+        self.workspace_bar(ui, workspace_rect);
     }
     pub(crate) fn poll_retired(&self, gl: &glow::Context) {
         self.main.poll_retired(gl);
+        for (_, pane) in &self.tiled {
+            pane.poll_retired(gl);
+        }
         for floating in &self.floating.entries {
             floating.poll_retired(gl);
         }
@@ -747,6 +739,7 @@ impl TerminalView {
 
     pub(crate) fn retired_pending(&self) -> bool {
         self.main.retired_pending()
+            || self.tiled.iter().any(|(_, p)| p.retired_pending())
             || self
                 .floating
                 .entries
@@ -757,6 +750,12 @@ impl TerminalView {
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
         for mut floating in self.floating.entries.drain(..) {
             floating.destroy(gl);
+        }
+        for mut pane in self.closed_panes.drain(..) {
+            pane.destroy(gl);
+        }
+        for (_, mut pane) in self.tiled.drain(..) {
+            pane.destroy(gl);
         }
         self.main.destroy(gl);
     }

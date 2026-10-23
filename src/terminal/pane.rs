@@ -210,7 +210,29 @@ extern "C" fn ghostty_egui_write_clipboard(userdata: *mut c_void, bytes: *const 
     );
 }
 
+/// How to start a pane's shell. Omitted fields use the terminal defaults.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpawnOptions {
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+}
+impl SpawnOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, value) in [("command", &self.command), ("cwd", &self.cwd)] {
+            if value
+                .as_ref()
+                .is_some_and(|v| v.is_empty() || v.contains('\0'))
+            {
+                return Err(format!("pane {label} must be nonempty and contain no NUL"));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct TerminalPane {
+    pub(super) workspace_bounds: Option<egui::Rect>,
+    detached: bool,
     host: *mut Host,
     wake: Box<WakeState>,
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
@@ -233,7 +255,6 @@ pub(super) struct TerminalPane {
     copy_search_refresh: Option<u64>,
     prompt_boundaries: Option<(u64, Vec<u64>)>,
     prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
-    pub(super) floating_palette_entries: Vec<crate::actions::Entry>,
     pub(super) pending_callback: Option<(crate::picker::Action, Option<u64>, bool)>,
 }
 
@@ -387,7 +408,9 @@ impl TerminalPane {
     }
 
     pub(super) fn refresh_picker_font(&mut self, ctx: &egui::Context) {
-        self.picker_font = crate::picker::font::PickerFont::new(ctx, self.host);
+        if !self.detached {
+            self.picker_font = crate::picker::font::PickerFont::new(ctx, self.host);
+        }
     }
     pub(super) fn take_config_issues(&self) -> Vec<String> {
         std::mem::take(&mut *self.wake.config_issues.lock().unwrap())
@@ -414,6 +437,8 @@ impl TerminalPane {
         let picker_font = crate::picker::font::PickerFont::new(&wake.context, host);
         let search_worker = SnapshotSearchAdapter::new(wake.context.clone());
         Ok(Self {
+            detached: false,
+            workspace_bounds: None,
             host,
             wake,
             painter,
@@ -436,12 +461,14 @@ impl TerminalPane {
             copy_search_refresh: None,
             prompt_boundaries: None,
             prompt_patterns: Default::default(),
-            floating_palette_entries: Vec::new(),
             pending_callback: None,
         })
     }
 
     pub(super) fn acquire_frame(&mut self) -> bool {
+        if self.detached {
+            return false;
+        }
         // Clear before taking the mailbox so a concurrent publication cannot
         // lose its notification. The callback always draws the current frame.
         self.wake
@@ -464,13 +491,21 @@ impl TerminalPane {
         self.cancel_quick_select();
         self.close_search();
         self.close_copy_mode();
-        self.painter.lock().destroy(gl);
+        if !self.detached {
+            self.painter.lock().destroy(gl);
+        }
         unsafe { ghostty_ffi::ghostty_egui_host_destroy(self.host) };
         self.host = std::ptr::null_mut();
     }
 
     pub(super) fn set_active(&mut self, ctx: &egui::Context, active: bool, window_focused: bool) {
+        if self.detached {
+            return;
+        }
         if self.active != active {
+            if !active {
+                self.cancel_workspace_picker();
+            }
             if !active && (self.search.active || self.picker.is_some()) {
                 ctx.memory_mut(|memory| {
                     if let Some(id) = memory.focused() {
@@ -486,7 +521,9 @@ impl TerminalPane {
         let focused = active && window_focused;
         if self.focused != focused {
             self.focused = focused;
-            unsafe { ghostty_ffi::ghostty_egui_host_focus(self.host, focused) };
+            unsafe {
+                ghostty_ffi::ghostty_egui_host_focus(self.host, focused);
+            }
         }
     }
 
@@ -602,8 +639,6 @@ pub(super) struct PaneStatus<'a> {
     pub(super) separator: egui::Color32,
     pub(super) detail: Option<String>,
     pub(super) pipe_status: Option<bool>,
-    /// The shell's working directory, when it reports one with OSC 7.
-    pub(super) cwd: Option<String>,
 }
 
 impl TerminalPane {
@@ -667,12 +702,14 @@ impl TerminalPane {
         Self::new(host, wake, gl)
     }
 
-    pub(super) fn create_floating(
+    /// Creates another terminal in this window, as a child of this pane's
+    /// app. The window decides whether it is tiled or floating.
+    pub(super) fn create_child(
         &self,
         gl: &glow::Context,
-        options: &super::floating::CreateOptions,
+        options: &SpawnOptions,
     ) -> Result<Self, crate::native_error::FatalError> {
-        self.create_child(&self.wake.context, gl, self.wake.window_id, false, options)
+        self.spawn(&self.wake.context, gl, self.wake.window_id, false, options)
     }
 
     pub(super) fn create_window(
@@ -681,16 +718,16 @@ impl TerminalPane {
         gl: &glow::Context,
         window_id: egui_winit::winit::window::WindowId,
     ) -> Result<Self, crate::native_error::FatalError> {
-        self.create_child(ctx, gl, window_id, true, &Default::default())
+        self.spawn(ctx, gl, window_id, true, &SpawnOptions::default())
     }
 
-    fn create_child(
+    fn spawn(
         &self,
         ctx: &egui::Context,
         gl: &glow::Context,
         window_id: egui_winit::winit::window::WindowId,
         new_window: bool,
-        options: &super::floating::CreateOptions,
+        options: &SpawnOptions,
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
             #[cfg(any(windows, unix))]
@@ -719,13 +756,13 @@ impl TerminalPane {
             .as_ref()
             .map(|s| std::ffi::CString::new(s.as_str()))
             .transpose()
-            .map_err(|e| crate::native_error::FatalError::new("floating pane command", e))?;
+            .map_err(|e| crate::native_error::FatalError::new("pane command", e))?;
         let cwd = options
             .cwd
             .as_ref()
             .map(|s| std::ffi::CString::new(s.as_str()))
             .transpose()
-            .map_err(|e| crate::native_error::FatalError::new("floating pane directory", e))?;
+            .map_err(|e| crate::native_error::FatalError::new("pane directory", e))?;
         let host = unsafe {
             let native = current_native_context();
             ghostty_ffi::ghostty_egui_host_create_child(
@@ -764,6 +801,29 @@ impl TerminalPane {
 
     pub(super) fn should_close(&self) -> bool {
         self.wake.close.load(Ordering::Acquire)
+    }
+    pub(super) fn set_corner_radius(&self, radius: f32) {
+        self.painter.lock().set_corner_radius(radius);
+    }
+    pub(super) fn close_process(&mut self, gl: &glow::Context) {
+        if self.detached {
+            return;
+        }
+        self.picker = None;
+        self.cancel_quick_select();
+        self.close_search();
+        self.close_copy_mode();
+        #[cfg(any(windows, unix))]
+        {
+            self.wake.pipe.take();
+        }
+        self.painter.lock().destroy(gl);
+        unsafe {
+            ghostty_ffi::ghostty_egui_host_close_process(self.host);
+        }
+        self.detached = true;
+        self.active = false;
+        self.focused = false;
     }
 
     pub(super) fn title(&self) -> String {
@@ -846,14 +906,6 @@ impl TerminalPane {
             accent,
             separator,
             detail,
-            // The core reports C:/dir; show it the Windows way.
-            cwd: self.pwd().map(|pwd| {
-                if cfg!(windows) {
-                    pwd.replace('/', "\\")
-                } else {
-                    pwd
-                }
-            }),
             pipe_status: {
                 #[cfg(any(windows, unix))]
                 {
@@ -875,7 +927,7 @@ impl TerminalPane {
         &mut self,
         ui: &egui::Ui,
         bounds: egui::Rect,
-        bindings: &mut crate::picker::config::Bindings,
+        bindings: &crate::picker::config::Bindings,
     ) -> PaneInput {
         if !std::rc::Rc::ptr_eq(&self.prompt_patterns, &bindings.prompt_patterns) {
             self.prompt_patterns = bindings.prompt_patterns.clone();
@@ -943,10 +995,31 @@ impl TerminalPane {
 }
 
 impl TerminalPane {
+    pub(super) fn workspace_picker_active(&self) -> bool {
+        self.picker
+            .as_ref()
+            .is_some_and(|p| p.scope == crate::picker::config::Scope::Workspace)
+    }
+    pub(super) fn cancel_workspace_picker(&mut self) {
+        if !self.workspace_picker_active() {
+            return;
+        }
+        let picker = self.picker.take().unwrap();
+        let (generation, from_copy) = (picker.generation, picker.from_copy);
+        drop(picker);
+        self.pending_callback = None;
+        self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
+        self.wake.context.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+        self.wake.context.request_repaint();
+    }
     pub(super) fn show_background_overlays(&mut self, ctx: &egui::Context, bounds: egui::Rect) {
         if let Some(picker) = &mut self.picker {
             picker.typography = self.picker_font.typography(ctx, self.host);
-            picker.show_background_in_bounds(ctx, bounds);
+            picker.show_scoped(ctx, bounds, self.workspace_bounds, false);
         }
         if self.search.active {
             self.search
@@ -997,9 +1070,9 @@ impl TerminalPane {
         entry: crate::picker::config::PickerEntry,
         request_params: Option<std::collections::BTreeMap<String, String>>,
         bindings: &crate::picker::config::Bindings,
-        has_floating: bool,
+        palette: &super::PaletteContext,
     ) {
-        self.open_picker_impl(ctx, entry, request_params, bindings, has_floating, false);
+        self.open_picker_impl(ctx, entry, request_params, bindings, palette, false);
     }
 
     fn open_picker_impl(
@@ -1008,7 +1081,7 @@ impl TerminalPane {
         entry: crate::picker::config::PickerEntry,
         request_params: Option<std::collections::BTreeMap<String, String>>,
         bindings: &crate::picker::config::Bindings,
-        has_floating: bool,
+        palette: &super::PaletteContext,
         replace: bool,
     ) {
         let host = self.host;
@@ -1076,8 +1149,8 @@ impl TerminalPane {
             };
             options.source = crate::themes::picker_options(names).source;
         } else if let crate::picker::config::Source::CommandPalette(entries) = &mut options.source {
-            *entries = crate::actions::catalog(bindings, has_floating, self.copying());
-            entries.extend(self.floating_palette_entries.iter().cloned());
+            *entries = crate::actions::catalog(bindings, palette.has_floating, self.copying());
+            entries.extend(palette.entries.iter().cloned());
             // A factory's source is only known after resolving it. Exclude
             // the current factory too, without evaluating other factories.
             if let crate::picker::config::PickerEntry::Factory(factory, _) = &entry {
@@ -1100,6 +1173,7 @@ impl TerminalPane {
         if matches!(
             options.source,
             crate::picker::config::Source::CommandPalette(_)
+                | crate::picker::config::Source::Workspaces(_)
                 | crate::picker::config::Source::FileSystem(_)
                 | crate::picker::config::Source::Items(_)
                 | crate::picker::config::Source::Command(_)
@@ -1110,6 +1184,7 @@ impl TerminalPane {
                 if matches!(
                     options.source,
                     crate::picker::config::Source::CommandPalette(_)
+                        | crate::picker::config::Source::Workspaces(_)
                 ) {
                     None
                 } else {
@@ -1388,18 +1463,25 @@ impl TerminalPane {
         }
         ctx.request_repaint();
     }
+    /// Applies the configured pipe policy. The window calls this when the pane
+    /// is created and when configuration reloads.
+    #[cfg(any(windows, unix))]
+    pub(super) fn set_pipe_policy(&self, policy: &crate::picker::pipe::Policy) {
+        if let Some(pipe) = &self.wake.pipe {
+            pipe.set_policy(policy);
+        }
+    }
     #[cfg(any(windows, unix))]
     pub(super) fn handle_pipe_requests(
         &mut self,
         ctx: &egui::Context,
         bindings: &crate::picker::config::Bindings,
-        has_floating: bool,
         interactive: bool,
     ) {
-        use crate::picker::pipe::{Event, Open};
-        if let Some(pipe) = &self.wake.pipe {
-            pipe.update(
-                &bindings.pipe_policy,
+        use crate::picker::pipe::Event;
+        // The shell may start after the pane; identify it once it exists.
+        if let Some(pipe) = self.wake.pipe.as_ref().filter(|p| !p.shell_identified()) {
+            pipe.identify_shell(
                 unsafe { ghostty_ffi::ghostty_egui_host_shell_pid(self.host) } as u32,
                 unsafe { ghostty_ffi::ghostty_egui_host_shell_creation_time(self.host) },
             );
@@ -1448,44 +1530,7 @@ impl TerminalPane {
                         );
                         continue;
                     }
-                    let (entry, params) = match &request {
-                        Open::Named { name, params } => (
-                            bindings
-                                .named(name)
-                                .ok_or_else(|| "unknown named picker".to_owned()),
-                            Some(params.clone()),
-                        ),
-                        Open::Stream { options } => {
-                            (crate::picker::config::Bindings::pipe_stream(options), None)
-                        }
-                    };
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(message) => {
-                            session.finish(
-                                "error",
-                                serde_json::json!({"code":"invalid_definition","message":message}),
-                            );
-                            continue;
-                        }
-                    };
-                    let mut params = params.unwrap_or_default();
-                    params.insert("__ipc_request".into(), "1".into());
-                    self.open_picker(ctx, entry, Some(params), bindings, has_floating);
-                    if let Some(picker) = &mut self.picker {
-                        picker.attach_pipe(
-                            ctx,
-                            session.clone(),
-                            match &request {
-                                Open::Stream { options } => Some(options),
-                                _ => None,
-                            },
-                        );
-                        picker.bind_pipe_search_wake(self.wake.proxy.clone(), self.wake.window_id);
-                        session.reply(serde_json::json!({"type":"opened","request_id":session.id}));
-                    } else {
-                        session.finish("error",serde_json::json!({"code":"open_failed","message":"unable to open picker"}));
-                    }
+                    self.open_pipe_picker(ctx, bindings, request, session);
                 }
                 other => {
                     if let Some(picker) = &mut self.picker {
@@ -1495,12 +1540,67 @@ impl TerminalPane {
             }
         }
     }
+    /// Opens the picker an accepted pipe request asked for.
+    #[cfg(any(windows, unix))]
+    fn open_pipe_picker(
+        &mut self,
+        ctx: &egui::Context,
+        bindings: &crate::picker::config::Bindings,
+        request: crate::picker::pipe::Open,
+        session: std::sync::Arc<crate::picker::pipe::Session>,
+    ) {
+        use crate::picker::pipe::Open;
+        let (entry, params) = match &request {
+            Open::Named { name, params } => (
+                bindings
+                    .named(name)
+                    .ok_or_else(|| "unknown named picker".to_owned()),
+                Some(params.clone()),
+            ),
+            Open::Stream { options } => {
+                (crate::picker::config::Bindings::pipe_stream(options), None)
+            }
+        };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(message) => {
+                session.finish(
+                    "error",
+                    serde_json::json!({"code":"invalid_definition","message":message}),
+                );
+                return;
+            }
+        };
+        let mut params = params.unwrap_or_default();
+        params.insert("__ipc_request".into(), "1".into());
+        // The pane cannot reach window state here, so a command palette opened
+        // over the pipe lists only built-in actions, without floats or workspaces.
+        let palette = super::PaletteContext::default();
+        self.open_picker(ctx, entry, Some(params), bindings, &palette);
+        if let Some(picker) = &mut self.picker {
+            picker.attach_pipe(
+                ctx,
+                session.clone(),
+                match &request {
+                    Open::Stream { options } => Some(options),
+                    _ => None,
+                },
+            );
+            picker.bind_pipe_search_wake(self.wake.proxy.clone(), self.wake.window_id);
+            session.reply(serde_json::json!({"type":"opened","request_id":session.id}));
+        } else {
+            session.finish(
+                "error",
+                serde_json::json!({"code":"open_failed","message":"unable to open picker"}),
+            );
+        }
+    }
 
     fn handle_picker(
         &mut self,
         ui: &egui::Ui,
         bounds: egui::Rect,
-        bindings: &mut crate::picker::config::Bindings,
+        bindings: &crate::picker::config::Bindings,
     ) -> (bool, Option<crate::actions::AppAction>) {
         let was_active = self.picker.as_ref().is_some();
         let consumed = false;
@@ -1516,7 +1616,7 @@ impl TerminalPane {
         let action = self
             .picker
             .as_mut()
-            .and_then(|picker| picker.show_in_bounds(ui.ctx(), bounds));
+            .and_then(|picker| picker.show_scoped(ui.ctx(), bounds, self.workspace_bounds, true));
         let mut application_action = None;
         if let Some(action) = action {
             if matches!(&action, crate::picker::Action::Custom(..)) {
@@ -1589,7 +1689,7 @@ impl TerminalPane {
         from_copy: bool,
         ctx: &egui::Context,
         bindings: &crate::picker::config::Bindings,
-        has_floating: bool,
+        palette: &super::PaletteContext,
     ) {
         let restore_copy = |pane: &mut Self| {
             if from_copy {
@@ -1626,7 +1726,7 @@ impl TerminalPane {
                                     entry,
                                     Some(params),
                                     bindings,
-                                    has_floating,
+                                    palette,
                                     true,
                                 );
                             } else {

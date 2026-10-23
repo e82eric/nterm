@@ -287,6 +287,9 @@ struct AppConfig {
     colors: ColorConfig,
     theme_colors: std::collections::BTreeMap<String, crate::colors::UiOverrides>,
     floating: FloatingConfig,
+    workspaces: crate::terminal::workspace::Config,
+    #[serde(skip)]
+    startup: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     picker_defaults: crate::picker::config::PickerDefaults,
     builtin_pickers: crate::picker::config::BuiltinPickers,
     cursor_scroll_padding: Option<u32>,
@@ -372,6 +375,8 @@ impl AppConfig {
             modules,
         ));
         let ghostty = lua.create_table().map_err(|error| error.to_string())?;
+        crate::terminal::workspace_ui::install_lua_helpers(&lua, &ghostty)
+            .map_err(|e| e.to_string())?;
         ghostty
             .set(
                 "json_parse",
@@ -405,6 +410,26 @@ impl AppConfig {
         if !matches!(value, mlua::Value::Table(_)) {
             return Err("config must return a table".into());
         }
+        let startup = if let mlua::Value::Table(root) = &value {
+            let function: Option<mlua::Function> =
+                root.get("startup").map_err(|e| e.to_string())?;
+            root.raw_set("startup", mlua::Value::Nil)
+                .map_err(|e| e.to_string())?;
+            function
+                .map(|f| {
+                    lua.create_registry_value(f).map(|key| {
+                        std::rc::Rc::new(crate::lua_callbacks::Callback {
+                            lua: lua.clone(),
+                            key,
+                            name: "startup".into(),
+                        })
+                    })
+                })
+                .transpose()
+                .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
         let mut parsed_keys = None;
         let mut parsed_pickers = None;
         let mut actions = std::collections::BTreeMap::new();
@@ -555,10 +580,12 @@ impl AppConfig {
         config.compiled_prompts =
             std::rc::Rc::new(prompts::Patterns::compile(&config.prompt_patterns)?);
         config.builtin_pickers.validate()?;
+        config.workspaces.appearance.validate()?;
         config.picker_defaults.validate()?;
         config.keys = parsed_keys;
         config.pickers = parsed_pickers;
         config.actions = actions;
+        config.startup = startup;
         Ok(config)
     }
 
@@ -683,6 +710,7 @@ impl ReloadSource {
                     config.picker_defaults,
                     config.actions,
                 )?
+                .with_workspaces(config.workspaces, config.startup)?
                 .with_builtin_pickers(config.builtin_pickers)
                 .with_pipe_policy(config.picker_pipe)
                 .with_prompt_patterns(config.compiled_prompts)
@@ -785,6 +813,7 @@ pub(crate) fn prepare_with_reload(
                             config.picker_defaults,
                             config.actions,
                         )?
+                        .with_workspaces(config.workspaces, config.startup)?
                         .with_builtin_pickers(config.builtin_pickers)
                         .with_pipe_policy(config.picker_pipe)
                         .with_prompt_patterns(config.compiled_prompts)
@@ -868,6 +897,37 @@ fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_configuration_compiles_helpers_startup_and_appearance() {
+        let config = parse(include_str!("../workspaces.example.lua")).unwrap();
+        assert!(config.startup.is_some());
+        assert_eq!(config.workspaces.appearance.inner_gap, 10.0);
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+        assert!(
+            bindings
+                .shortcut_for(&crate::actions::AppAction::Workspace(
+                    crate::terminal::workspace_ui::WorkspaceAction::SetTile
+                ))
+                .is_some()
+        );
+        assert!(parse("return {workspaces={inner_gap=-1}}").is_err());
+        assert!(parse("return {workspaces={inner_gapp=1}}").is_err());
+        assert!(parse("return {workspaces={default_layout='sideways'}}").is_err());
+        let config =
+            parse("return {workspaces={default_layout='horizontal_grid',inner_gap=3}}").unwrap();
+        assert_eq!(
+            config.workspaces.default_layout,
+            crate::terminal::workspace::Layout::HorizontalGrid
+        );
+        assert_eq!(config.workspaces.appearance.inner_gap, 3.0);
+        assert!(parse("return {startup=123}").is_err());
+    }
     #[test]
     fn picker_local_keys_parse_validate_and_keep_lua_functions() {
         let mut config = parse("return { builtin_pickers = { lines = { keys = {{key='Enter',mods='CTRL',action=function(app,item) app:close_picker(); app:paste(item.value) end}} } } }").unwrap();
@@ -1598,6 +1658,66 @@ mod tests {
     }
 
     #[test]
+    fn alt_workspace_bindings_reach_application_dispatch() {
+        let source=std::env::var_os("GHOSTTY_TEST_LUA_CONFIG")
+            .map(|path|std::fs::read_to_string(path).unwrap())
+            .unwrap_or_else(||r#"local keys=ghostty.workspace_keys('ALT'); for _,b in ipairs(keys) do if b.action=='SetDeck' then b.key='d' elseif b.action=='SetGrid' then b.key='g' end end; return {keys=keys}"#.into());
+        let config = parse(&source).unwrap();
+        let mut bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+        if let Some(path) = std::env::var_os("GHOSTTY_TEST_LUA_CONFIG") {
+            let mut issues = Vec::new();
+            let (_, loaded, _, _, _) = super::prepare_with_reload(
+                vec![
+                    "ghostty_egui".into(),
+                    format!("--lua-config={}", std::path::Path::new(&path).display()),
+                ],
+                &mut issues,
+            )
+            .unwrap();
+            assert!(issues.is_empty(), "startup config failed: {issues:?}");
+            bindings = loaded;
+        }
+        for (key, name) in [
+            (egui::Key::H, "FocusLeft"),
+            (egui::Key::J, "FocusDown"),
+            (egui::Key::K, "FocusUp"),
+            (egui::Key::L, "FocusRight"),
+            (egui::Key::D, "SetDeck"),
+            (egui::Key::G, "SetGrid"),
+            (egui::Key::T, "SetTile"),
+            (egui::Key::M, "SetMonocle"),
+            (egui::Key::C, "CreatePane"),
+            (egui::Key::W, "WorkspacePicker"),
+        ] {
+            let expected = crate::actions::AppAction::Workspace(
+                crate::terminal::workspace_ui::WorkspaceAction::parse(name).unwrap(),
+            );
+            let mut events = vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            }];
+            assert_eq!(
+                bindings.consume_when(&mut events, |action, mods| {
+                    crate::actions::ActionContext::default().allows(action, mods)
+                }),
+                (Some(expected), true),
+                "Alt+{}",
+                key.name()
+            );
+            assert!(events.is_empty());
+        }
+    }
+
+    #[test]
     fn config_file_compiles_and_resolves_builtin_pickers() {
         // This also permits validating a migrated user config without launching
         // the application or running command/item providers.
@@ -1612,6 +1732,8 @@ mod tests {
             config.picker_defaults,
             config.actions,
         )
+        .unwrap()
+        .with_workspaces(config.workspaces, config.startup)
         .unwrap()
         .with_builtin_pickers(config.builtin_pickers)
         .with_pipe_policy(config.picker_pipe)

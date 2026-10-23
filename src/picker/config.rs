@@ -20,6 +20,13 @@ pub(crate) enum Position {
     FullPane,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub(crate) enum Scope {
+    #[default]
+    Pane,
+    Workspace,
+}
+
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct BuiltinPresentation {
@@ -198,6 +205,7 @@ impl PickerDefaults {
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct PickerPresentation {
+    pub(crate) scope: Scope,
     pub(crate) position: Position,
     pub(crate) result_rows: usize,
     pub(crate) sort: Sort,
@@ -211,6 +219,7 @@ pub(crate) struct PickerPresentation {
 impl Default for PickerPresentation {
     fn default() -> Self {
         Self {
+            scope: Scope::Pane,
             position: Position::default(),
             result_rows: default_result_rows(),
             sort: Sort::default(),
@@ -235,6 +244,7 @@ impl<'de> Deserialize<'de> for Definition {
         // residual map preserves unknown-field and cross-source validation.
         let mut common = serde_json::Map::new();
         for field in [
+            "scope",
             "position",
             "result_rows",
             "sort",
@@ -261,6 +271,11 @@ impl<'de> Deserialize<'de> for Definition {
             )
         {
             common.insert("preview_visible".into(), false.into());
+        }
+        if !common.contains_key("scope")
+            && source.get("type").and_then(serde_json::Value::as_str) == Some("CommandPalette")
+        {
+            common.insert("scope".into(), "Workspace".into());
         }
         let presentation = serde_json::from_value(common.into()).map_err(D::Error::custom)?;
         let source = serde_json::from_value(source.into()).map_err(D::Error::custom)?;
@@ -373,6 +388,7 @@ impl Definition {
         }
         let (callback, enter_action) = definition.acceptance();
         let position = definition.presentation.position;
+        let scope = definition.presentation.scope;
         let sort = definition.presentation.sort;
         let initial_query = definition.presentation.initial_query.take();
         let mut preview = definition.presentation.preview.take();
@@ -576,6 +592,7 @@ impl Definition {
             }
         };
         let mut options = Options {
+            scope,
             position,
             result_rows,
             sort,
@@ -707,7 +724,7 @@ pub(crate) fn builtin_defaults(name: &str) -> serde_json::Value {
             serde_json::json!({"type":"Themes", "position":"Cursor", "sort":"Score", "preview_visible":false})
         }
         "command_palette" => {
-            serde_json::json!({"type":"CommandPalette", "position":"Cursor", "preview_visible":false})
+            serde_json::json!({"type":"CommandPalette", "scope":"Workspace", "position":"Center", "preview_visible":false})
         }
         "lines" => {
             serde_json::json!({"type":"Scrollback", "enter_action":"Navigate", "preview":{"type":"Scrollback", "rows":12}})
@@ -721,6 +738,7 @@ pub(crate) fn builtin_defaults(name: &str) -> serde_json::Value {
 
 #[derive(Clone)]
 pub(crate) struct Options {
+    pub(crate) scope: Scope,
     pub(crate) result_rows: usize,
     pub(crate) position: Position,
     pub(crate) sort: Sort,
@@ -738,6 +756,7 @@ pub(crate) enum Source {
     Themes,
     ErrorLog,
     CommandPalette(Vec<crate::actions::Entry>),
+    Workspaces(Vec<crate::actions::Entry>),
     Scrollback { regex: Regex, unique: bool },
     FileSystem(FileOptions),
     Items(ItemsOptions),
@@ -819,6 +838,7 @@ impl Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            scope: Scope::Pane,
             result_rows: default_result_rows(),
             position: Position::Bottom,
             sort: Sort::default(),
@@ -862,6 +882,9 @@ impl PickerEntry {
 
 #[derive(Clone)]
 pub(crate) struct Bindings {
+    pub(crate) workspace_appearance: crate::terminal::workspace::Appearance,
+    pub(crate) default_layout: crate::terminal::workspace::Layout,
+    pub(crate) startup: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     pub(crate) pipe_policy: super::pipe::Policy,
     pub(crate) builtin_pickers: BuiltinPickers,
     pub(crate) cursor_scroll_padding: u32,
@@ -871,6 +894,18 @@ pub(crate) struct Bindings {
 }
 
 impl Bindings {
+    pub(crate) fn with_workspaces(
+        mut self,
+        workspaces: crate::terminal::workspace::Config,
+        startup: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
+    ) -> Result<Self, String> {
+        workspaces.appearance.validate()?;
+        self.workspace_appearance = workspaces.appearance;
+        self.default_layout = workspaces.default_layout;
+        self.startup = startup;
+        Ok(self)
+    }
+
     pub(crate) fn with_prompt_patterns(
         mut self,
         patterns: std::rc::Rc<crate::config::prompts::Patterns>,
@@ -1017,6 +1052,9 @@ impl Bindings {
         }
         Ok(Self {
             bindings,
+            workspace_appearance: Default::default(),
+            default_layout: Default::default(),
+            startup: None,
             pipe_policy: super::pipe::Policy::default(),
             model,
             builtin_pickers: BuiltinPickers::default(),
@@ -1141,7 +1179,7 @@ impl Bindings {
                     unreachable!()
                 };
                 consumed = true;
-                if pressed && !repeat {
+                if pressed && (!repeat || binding.action.allows_key_repeat()) {
                     open = Some(binding.action.clone());
                 }
                 if pressed && matches!(incoming.peek(), Some(egui::Event::Text(_))) {
@@ -1164,6 +1202,103 @@ impl Default for Bindings {
 #[cfg(test)]
 mod tests {
     use crate::actions::{ActionContext, AppAction};
+    use crate::terminal::workspace_ui::WorkspaceAction;
+
+    #[test]
+    fn held_workspace_navigation_repeats_but_creation_does_not() {
+        let bindings = super::Bindings::default();
+        let mods = egui::Modifiers::CTRL | egui::Modifiers::ALT;
+        for (key, repeat, expected) in [
+            (
+                egui::Key::J,
+                false,
+                Some(AppAction::Workspace(WorkspaceAction::FocusDown)),
+            ),
+            (
+                egui::Key::J,
+                true,
+                Some(AppAction::Workspace(WorkspaceAction::FocusDown)),
+            ),
+            (
+                egui::Key::J,
+                true,
+                Some(AppAction::Workspace(WorkspaceAction::FocusDown)),
+            ),
+            (egui::Key::C, true, None),
+            (
+                egui::Key::C,
+                false,
+                Some(AppAction::Workspace(WorkspaceAction::CreatePane)),
+            ),
+        ] {
+            let mut events = vec![key_event(key, mods, true, repeat)];
+            assert_eq!(
+                bindings.consume_when(&mut events, |a, m| ActionContext::default().allows(a, m)),
+                (expected, true)
+            );
+            assert!(events.is_empty());
+        }
+        let mut events = vec![key_event(egui::Key::J, mods, false, false)];
+        assert_eq!(bindings.consume(&mut events), (None, true));
+        for (key, action) in [
+            (egui::Key::ArrowLeft, WorkspaceAction::ResizeLeft),
+            (egui::Key::ArrowRight, WorkspaceAction::ResizeRight),
+            (egui::Key::ArrowUp, WorkspaceAction::ResizeUp),
+            (egui::Key::ArrowDown, WorkspaceAction::ResizeDown),
+        ] {
+            for repeat in [false, true] {
+                let mut events = vec![key_event(key, mods | egui::Modifiers::SHIFT, true, repeat)];
+                assert_eq!(
+                    bindings.consume(&mut events),
+                    (Some(AppAction::Workspace(action)), true)
+                );
+                assert!(events.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn picker_scope_defaults_and_overrides_are_strict() {
+        for (value, expected) in [
+            (
+                serde_json::json!({"type":"CommandPalette"}),
+                super::Scope::Workspace,
+            ),
+            (
+                serde_json::json!({"type":"CommandPalette","scope":"Pane"}),
+                super::Scope::Pane,
+            ),
+            (
+                serde_json::json!({"type":"Items","items":[]}),
+                super::Scope::Pane,
+            ),
+            (
+                serde_json::json!({"type":"Items","items":[],"scope":"Workspace"}),
+                super::Scope::Workspace,
+            ),
+        ] {
+            let definition: super::Definition = serde_json::from_value(value).unwrap();
+            let options = definition
+                .resolve("scope-test", Default::default())
+                .unwrap()
+                .resolve(&Default::default())
+                .unwrap();
+            assert_eq!(options.scope, expected);
+        }
+        assert!(
+            serde_json::from_value::<super::Definition>(
+                serde_json::json!({"type":"CommandPalette","scope":"Window"})
+            )
+            .is_err()
+        );
+        let defaults = super::Bindings::default()
+            .named("builtin.command_palette")
+            .unwrap()
+            .resolve(&Default::default())
+            .unwrap();
+        assert_eq!(defaults.scope, super::Scope::Workspace);
+        assert_eq!(defaults.position, super::Position::Center);
+    }
 
     fn key_event(
         key: egui::Key,

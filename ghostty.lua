@@ -67,7 +67,7 @@ return {
   -- },
   builtin_pickers = {
     themes = { position = "Cursor", sort = "Score" },
-    command_palette = { position = "Cursor", preview_visible = false },
+    command_palette = { scope = "Workspace", position = "Center", preview_visible = false },
     lines = {
       keys = {
         { key = "Enter", mods = "CTRL", description = "Paste selected line", action = function(app, item)
