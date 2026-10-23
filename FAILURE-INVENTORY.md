@@ -106,8 +106,8 @@ with a repeat count and move to the newest position. Records include UTC time,
 severity, source, summary, and details. Reporting also writes to stderr.
 
 Use **Error history** in the command palette, `OpenErrorLog`, or a named Lua
-picker of `type = "ErrorLog"`. Search and choose a row to open its details in
-Messages with a copy button. A picker holds a snapshot, so eviction does not
+picker of `type = "ErrorLog"`. Search to preview a row's full details; Enter closes the
+picker. A picker holds a snapshot, so eviction does not
 invalidate a selected record; reopen it to see newer errors. Show Messages also
 includes the history. Persistent configuration issues are held separately and
 are never evicted by runtime failures. History is not written to disk and resets

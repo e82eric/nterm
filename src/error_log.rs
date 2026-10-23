@@ -124,27 +124,42 @@ pub(crate) fn snapshot() -> Vec<Record> {
         .collect()
 }
 
-pub(crate) fn picker_options() -> crate::picker::config::Options {
-    options_from_records(snapshot())
+/// The messages picker: configuration issues, then the error history, newest
+/// first. The preview shows the selected message in full; Enter closes it.
+pub(crate) fn picker_options(config_issues: &[String]) -> crate::picker::config::Options {
+    options_from_records(config_issues, snapshot())
 }
 
-fn options_from_records(records: Vec<Record>) -> crate::picker::config::Options {
+fn options_from_records(
+    config_issues: &[String],
+    records: Vec<Record>,
+) -> crate::picker::config::Options {
+    use crate::picker::{config, wire::Item};
     let mut options = crate::themes::picker_options(Vec::new());
-    options.sort = crate::picker::config::Sort::SourceOrder;
-    options
-        .params
-        .insert("__error_history".into(), "true".into());
-    options.source = crate::picker::config::Source::CommandPalette(
-        records
-            .into_iter()
-            .map(|record| crate::actions::Entry {
-                id: format!("error.{}", record.id),
-                label: record.label(),
-                shortcut: None,
-                action: crate::actions::AppAction::ShowErrorRecord(Box::new(record)),
-            })
-            .collect(),
-    );
+    options.sort = config::Sort::SourceOrder;
+    options.enter_action = config::EnterAction::Close;
+    options.label = Some("MESSAGES");
+    options.preview = Some(config::Preview::Text {
+        text: "{item}".into(),
+        wrap: true,
+    });
+    options.preview_visible = true;
+    let issues = config_issues.iter().enumerate().map(|(index, issue)| Item {
+        text: format!(
+            "Configuration issue {} · {}",
+            index + 1,
+            issue.lines().next().unwrap_or_default()
+        ),
+        value: issue.clone(),
+    });
+    let history = records.into_iter().map(|record| Item {
+        text: record.label(),
+        value: record.text(),
+    });
+    options.source = config::Source::Items(config::ItemsOptions {
+        values: issues.chain(history).collect(),
+        provider: None,
+    });
     options
 }
 
@@ -152,7 +167,7 @@ fn options_from_records(records: Vec<Record>) -> crate::picker::config::Options 
 mod tests {
     use super::*;
     #[test]
-    fn picker_returns_full_record_even_after_history_eviction() {
+    fn picker_keeps_full_record_after_history_eviction_and_enter_closes() {
         let mut history = History::default();
         history.push(
             Severity::Error,
@@ -160,10 +175,14 @@ mod tests {
             "Unique failure",
             "full diagnostic details",
         );
-        let options = options_from_records(history.records.iter().cloned().collect());
+        let options = options_from_records(&[], history.records.iter().cloned().collect());
         for index in 0..CAPACITY {
             history.push(Severity::Error, "test", &index.to_string(), "later");
         }
+        let crate::picker::config::Source::Items(items) = &options.source else {
+            panic!("expected items")
+        };
+        assert!(items.values[0].value.contains("full diagnostic details"));
         let ctx = egui::Context::default();
         let mut picker = crate::picker::Picker::start(
             std::ptr::null_mut(),
@@ -173,7 +192,7 @@ mod tests {
             ctx.clone(),
             options,
         );
-        assert_eq!(picker.label(), "ERROR HISTORY");
+        assert_eq!(picker.label(), "MESSAGES");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut selected = None;
         while selected.is_none() {
@@ -198,9 +217,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        assert!(
-            matches!(selected, Some(crate::picker::Action::Execute(crate::actions::AppAction::ShowErrorRecord(record))) if record.details == "full diagnostic details")
-        );
+        assert!(matches!(selected, Some(crate::picker::Action::Cancel)));
     }
     #[test]
     fn history_is_bounded_and_duplicates_move_to_front() {

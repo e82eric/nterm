@@ -1,5 +1,5 @@
 use super::{
-    PaneRef, TerminalView, floating, pane,
+    PaneRef, TerminalView, floating,
     workspace::{self, Layout, Request, Workspace},
 };
 use crate::{actions::AppAction, graphics as glow};
@@ -426,6 +426,7 @@ impl TerminalView {
         super::PaletteContext {
             has_floating: self.has_floating(),
             entries,
+            config_issues: self.messages.config_issues().to_vec(),
         }
     }
     pub(super) fn visible_float(&self) -> Option<&floating::Entry<super::FloatingTerminal>> {
@@ -1051,12 +1052,10 @@ impl TerminalView {
         if self.should_close() {
             return;
         }
-        self.messages.show(&ctx);
-        let modal = self.messages.is_open();
         let context = self.active_pane_ref().action_context();
         let (shortcut, consumed) = ui.input_mut(|i| {
             self.picker_bindings
-                .consume_when(&mut i.events, |a, m| !modal && context.allows(a, m))
+                .consume_when(&mut i.events, |a, m| context.allows(a, m))
         });
         let shortcut = match shortcut {
             Some(a) if a.is_global() => {
@@ -1101,7 +1100,7 @@ impl TerminalView {
         let scale = ctx.pixels_per_point();
         let floating_active = self.floats().visible().is_some();
         let focused_window = ui.input(|i| i.viewport().focused.unwrap_or(false));
-        if !floating_active && !modal && !self.active_pane_ref().workspace_picker_active() {
+        if !floating_active && !self.active_pane_ref().workspace_picker_active() {
             if let Some(pos) = ui.input(|i| {
                 if i.pointer.any_pressed() {
                     i.pointer.interact_pos()
@@ -1200,7 +1199,7 @@ impl TerminalView {
         let bindings = self.picker_bindings.clone();
         #[cfg(any(windows, unix))]
         {
-            let interactive = |pane| !modal && origin == Some(pane);
+            let interactive = |pane| origin == Some(pane);
             self.main
                 .handle_pipe_requests(&ctx, &bindings, interactive(PaneRef::Tiled(0)));
             for (id, p) in &mut self.tiled {
@@ -1212,29 +1211,35 @@ impl TerminalView {
             }
         }
         let mut action = None;
+        // The main pane shows its toasts over the workspace while another pane
+        // is focused; Escape dismisses those along with the focused pane's.
+        let main_toasts = self.focused_id() != Some(0) && self.main.has_toasts();
+        let mut toasts_dismissed = false;
         if let (Some(origin), Some(bounds)) = (origin, bounds) {
             let bindings = self.picker_bindings.clone();
             if let Some(p) = self.pane_mut(origin) {
-                let input = if modal {
-                    pane::PaneInput {
-                        keyboard_blocked: true,
-                        suppress_forward: true,
-                        action: None,
-                    }
-                } else {
-                    p.handle_input(ui, bounds, &bindings)
-                };
+                toasts_dismissed = !consumed
+                    && (p.has_toasts() || main_toasts)
+                    && p.escape_dismisses_toasts()
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                if toasts_dismissed {
+                    p.dismiss_toasts();
+                }
+                let input = p.handle_input(ui, bounds, &bindings);
                 p.forward_input(
                     ui,
                     bounds,
-                    input.keyboard_blocked || consumed || modal,
-                    input.suppress_forward || consumed || modal,
+                    input.keyboard_blocked || consumed,
+                    input.suppress_forward || consumed,
                 );
                 action = input.action;
                 p.show_search_overlay(&ctx, bounds);
                 p.show_toasts(&ctx, bounds);
             }
             self.run_picker_callback(origin, gl, &ctx);
+        }
+        if toasts_dismissed {
+            self.main.dismiss_toasts();
         }
         if let Some(action) = action {
             self.execute_action(action, self.floats().visible().is_some(), &ctx, gl);

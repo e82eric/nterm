@@ -374,9 +374,11 @@ checkout or machine-specific path override is required.
 Recoverable errors and fallback warnings are retained in a session history
 (200 records, 16 KiB details per record). Repeated failures aggregate. They also
 write to stderr and retain their existing toast or local picker/preview feedback.
-Choose **Error history** in the command palette and select an entry to view and
-copy its details. **Show messages** includes history alongside persistent
-configuration issues. Reopen the history picker to refresh its snapshot.
+Choose **Show messages** or **Error history** in the command palette, or click
+the bar's configuration issue count, to open the messages picker. It lists
+persistent configuration issues, then the history, newest first; the preview
+shows the selected message in full, and Enter closes the picker. To copy a
+message, focus the preview and press Ctrl+Shift+C. Reopen the picker to refresh its snapshot.
 
 You can bind `action = "OpenErrorLog"` or configure a named picker:
 
@@ -433,7 +435,8 @@ accent color above the body; built-in errors use the error color. Both use the
 terminal font at 14 px, with bold headers, additional line spacing, and a maximum
 text width of 420 px. Long notifications are truncated to fit the pane, up to
 seven lines; full built-in error details remain in error history. Repeating the
-same notification refreshes it instead of adding another card. The existing positional form continues
+same notification refreshes it instead of adding another card. Escape dismisses the
+visible toasts, unless a picker or search is open. The existing positional form continues
 to work, with its title displayed as the header; an empty title omits it.
 
 `get_selection_text()` returns the active pane's live selection or copy-mode
@@ -648,7 +651,7 @@ and built-in picker bindings you still want.
 | `Command` | Lines streamed from an executable's stdout. | Paste the selected line by default. |
 | `Themes` | Installed themes. | Apply the selected theme. |
 | `CommandPalette` | Application actions and configured pickers. | Dispatch the selected action. |
-| `ErrorLog` | Session error history. | Show the selected error's details. |
+| `ErrorLog` | Session error history. | Close the picker; the preview shows the full message. |
 
 Named pickers and their shortcuts can also be defined in Lua:
 

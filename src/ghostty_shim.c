@@ -7,6 +7,7 @@
 #include <errno.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <windowsx.h>
 #endif
 
 typedef struct GhosttyEguiHost GhosttyEguiHost;
@@ -30,9 +31,31 @@ struct GhosttyEguiHost {
 
 #ifdef _WIN32
 static const wchar_t host_property[] = L"GhosttyEguiHost.QuickSelect";
+// An undecorated window has no sizing border. Report a thin band along the
+// edges as one so Windows runs its native resize loop, including resize
+// cursors and snapping. Maximized windows have no band.
+static LRESULT host_resize_hit_test(HWND window, LPARAM lparam) {
+    RECT rect;
+    if (IsZoomed(window) || !GetWindowRect(window, &rect))
+        return HTNOWHERE;
+    UINT dpi = GetDpiForWindow(window);
+    int band = MulDiv(6, dpi ? (int)dpi : 96, 96);
+    int x = GET_X_LPARAM(lparam), y = GET_Y_LPARAM(lparam);
+    bool left = x < rect.left + band, right = x >= rect.right - band;
+    bool top = y < rect.top + band, bottom = y >= rect.bottom - band;
+    if (top) return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
+    if (bottom) return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
+    return HTNOWHERE;
+}
 static LRESULT CALLBACK host_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     GhosttyEguiHost *host = (GhosttyEguiHost *)GetPropW(window, host_property);
     if (!host) return DefWindowProcW(window, message, wparam, lparam);
+    if (message == WM_NCHITTEST) {
+        LRESULT edge = host_resize_hit_test(window, lparam);
+        if (edge != HTNOWHERE) return edge;
+    }
     // Winit still receives WM_SYSKEYDOWN. Only prevent the default system-menu
     // action generated for Alt+Space, so the app can own this shortcut.
     if (message == WM_SYSCOMMAND && (wparam & 0xfff0) == SC_KEYMENU && lparam == L' ') return 0;

@@ -8,6 +8,9 @@ pub(crate) enum EnterAction {
     #[default]
     Navigate,
     SendInput,
+    /// Enter only closes the picker, as in the messages picker.
+    #[serde(skip)]
+    Close,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -603,6 +606,7 @@ impl Definition {
             params: BTreeMap::new(),
             preview: None,
             preview_visible,
+            label: None,
         };
         if let Some(query) = initial_query {
             options.params.insert("query".into(), query);
@@ -749,6 +753,8 @@ pub(crate) struct Options {
     pub(crate) params: BTreeMap<String, String>,
     pub(crate) preview: Option<Preview>,
     pub(crate) preview_visible: bool,
+    /// The header label, in place of the one named for the source.
+    pub(crate) label: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -852,6 +858,7 @@ impl Default for Options {
             params: BTreeMap::new(),
             preview: None,
             preview_visible: true,
+            label: None,
         }
     }
 }

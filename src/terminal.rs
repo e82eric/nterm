@@ -31,18 +31,22 @@ pub(crate) struct TerminalView {
     floating_padding: Option<crate::config::FloatingPadding>,
     floating: floating::Panes<FloatingTerminal>,
     new_window_requested: bool,
+    /// Set by the status bar's close button; the app then closes this window.
+    close_requested: bool,
 }
 
 struct FloatingTerminal {
     pane: TerminalPane,
 }
 
-/// Window state that a pane's command palette shows: its float and workspace
-/// entries. Built by the window when a picker opens, not kept on each pane.
+/// Window state that a pane's pickers show: the command palette's float and
+/// workspace entries, and the messages picker's configuration issues. Built by
+/// the window when a picker opens, not kept on each pane.
 #[derive(Default)]
 struct PaletteContext {
     has_floating: bool,
     entries: Vec<crate::actions::Entry>,
+    config_issues: Vec<String>,
 }
 
 impl std::ops::Deref for FloatingTerminal {
@@ -127,6 +131,7 @@ impl TerminalView {
             next_pane: 1,
             command_label,
             reload_source,
+            close_requested: false,
             picker_bindings: std::rc::Rc::new(picker_bindings),
             floating_padding,
             floating: Default::default(),
@@ -162,6 +167,7 @@ impl TerminalView {
             next_pane: 1,
             command_label: self.command_label.clone(),
             reload_source: self.reload_source.clone(),
+            close_requested: false,
             picker_bindings: self.picker_bindings.clone(),
             floating_padding: self.floating_padding,
             floating: Default::default(),
@@ -442,19 +448,7 @@ impl TerminalView {
                 Ok(()) => self.main.show_notice("Theme applied", name),
                 Err(error) => self.main.show_error("Could not apply theme", error),
             },
-            AppAction::ShowMessages => self.messages.open(),
-            AppAction::ShowErrorRecord(record) => self.messages.open_record(*record),
-            AppAction::OpenErrorLog => {
-                if let Some(floating) = self.visible_float_mut() {
-                    floating.open_error_log(ctx);
-                } else {
-                    if let Some(id) = self.focused_id() {
-                        if let Some(p) = self.tiled_mut(id) {
-                            p.open_error_log(ctx);
-                        }
-                    }
-                }
-            }
+            AppAction::ShowMessages | AppAction::OpenErrorLog => self.show_messages(ctx),
             AppAction::NewWindow => {
                 self.new_window_requested = true;
             }
@@ -600,15 +594,47 @@ impl TerminalView {
     }
 
     pub(crate) fn should_close(&self) -> bool {
-        self.workspaces.iter().all(|w| w.panes.is_empty())
+        self.close_requested || self.workspaces.iter().all(|w| w.panes.is_empty())
+    }
+
+    /// Opens the messages picker in the visible float, or else the focused pane.
+    fn show_messages(&mut self, ctx: &egui::Context) {
+        let issues = self.messages.config_issues().to_vec();
+        if issues.is_empty() && crate::error_log::snapshot().is_empty() {
+            self.main.show_notice("Messages", "No messages.".into());
+            return;
+        }
+        if let Some(floating) = self.visible_float_mut() {
+            floating.open_messages(ctx, &issues);
+        } else if let Some(p) = self.focused_id().and_then(|id| self.tiled_mut(id)) {
+            p.open_messages(ctx, &issues);
+        }
     }
 
     fn show_mode_status(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let warning_right = rect.right() - 10.0;
         // Paint the background before the clickable status indicator.
         ui.painter()
             .rect_filled(rect, 0.0, crate::colors::palette().panel_background);
-        let mut right_edge = self.messages.status(ui, rect).min(warning_right);
+        // Empty bar space moves the window; registered first so the bar's own
+        // controls, registered later, take their clicks.
+        let drag = ui.interact(
+            rect,
+            ui.id().with("status-drag"),
+            egui::Sense::click_and_drag(),
+        );
+        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+        if drag.drag_started_by(egui::PointerButton::Primary) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if drag.double_clicked() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
+        let (messages_left, messages_clicked) = self.messages.status(ui, rect);
+        if messages_clicked {
+            self.show_messages(ui.ctx());
+        }
+        let mut right_edge = messages_left;
         let status = self.active_pane_ref().status(&self.command_label);
         let foreground = crate::colors::palette().text;
         let painter = ui.painter().with_clip_rect(rect);
@@ -630,46 +656,109 @@ impl TerminalView {
         } else {
             (egui::Color32::from_white_alpha(14), palette.text)
         };
+        let chip_height = (rect.height() - 8.0).clamp(8.0, 22.0);
+        let chip_top = rect.center().y + 1.0 - chip_height / 2.0;
+        // A menu button at the bar's left end.
+        let menu = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 8.0, chip_top),
+            egui::vec2(chip_height, chip_height),
+        );
+        // CLICK without FOCUSABLE keeps Tab with the terminal.
+        let menu_response = ui.interact(menu, ui.id().with("bar-menu"), egui::Sense::CLICK);
+        let menu_open =
+            egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&menu_response));
+        let menu_color = if menu_response.hovered() || menu_open {
+            painter.rect_filled(menu, 4.0, egui::Color32::from_white_alpha(32));
+            palette.text
+        } else {
+            palette.muted_text
+        };
+        let stroke = egui::Stroke::new(1.5, menu_color);
+        for dy in [-4.0, 0.0, 4.0] {
+            let y = menu.center().y + dy;
+            painter.line_segment(
+                [
+                    egui::pos2(menu.center().x - 5.0, y),
+                    egui::pos2(menu.center().x + 5.0, y),
+                ],
+                stroke,
+            );
+        }
+        let mut close = false;
+        egui::Popup::menu(&menu_response).show(|ui| {
+            if ui.button("Close window").clicked() {
+                close = true;
+                ui.close();
+            }
+        });
         let label = painter.layout_no_wrap(status.label.to_owned(), font.clone(), chip_text);
         let label_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                rect.left() + 8.0,
-                rect.center().y + 1.0 - (rect.height() - 8.0).clamp(8.0, 22.0) / 2.0,
-            ),
-            egui::vec2(
-                label.size().x + 16.0,
-                (rect.height() - 8.0).clamp(8.0, 22.0),
-            ),
+            egui::pos2(menu.right() + 6.0, chip_top),
+            egui::vec2(label.size().x + 16.0, chip_height),
         );
         painter.rect_filled(label_rect, 4.0, chip_fill);
         painter.galley(label_rect.center() - label.size() / 2.0, label, chip_text);
-        if self.has_floating() {
-            let color = if self.floats().visible().is_some() {
-                crate::colors::palette().warning
-            } else {
-                crate::colors::palette().muted_text
+        // The floating panes chip has a fixed width, even at 0 or while a float
+        // is shown, so the controls to its left keep their place. A visible
+        // float fills it; its name is in the tooltip.
+        {
+            let count = self.floats().ids().len();
+            let visible = self
+                .visible_float()
+                .map(|p| p.name.clone().unwrap_or_else(|| p.id.to_string()));
+            let (fill, content) = match (&visible, count) {
+                (Some(_), _) => (palette.warning, palette.background),
+                (None, 0) => (egui::Color32::from_white_alpha(14), palette.muted_text),
+                (None, _) => (egui::Color32::from_white_alpha(14), palette.text),
             };
-            let text = painter.layout_no_wrap(
-                format!(
-                    "Floating Panes: {}{}",
-                    self.floats().ids().len(),
-                    self.visible_float()
-                        .map(|p| format!(
-                            " [{}]",
-                            p.name.clone().unwrap_or_else(|| p.id.to_string())
-                        ))
-                        .unwrap_or_default()
+            const ICON: f32 = 11.0;
+            // Room for two digits keeps the width constant up to 99 floats.
+            let digits = painter
+                .layout_no_wrap("99".to_owned(), font.clone(), content)
+                .size()
+                .x;
+            let chip = egui::Rect::from_min_max(
+                egui::pos2(
+                    right_edge - (8.0 + ICON + 6.0 + digits + 8.0),
+                    label_rect.top(),
                 ),
-                egui::FontId::monospace(13.0),
-                color,
+                egui::pos2(right_edge, label_rect.bottom()),
             );
-            let left = right_edge - text.size().x;
+            painter.rect_filled(chip, 4.0, fill);
+            // Two overlapping windows: a pane floating over another.
+            let stroke = egui::Stroke::new(1.0, content);
+            let icon = egui::Rect::from_min_size(
+                egui::pos2(chip.left() + 8.0, chip.center().y - ICON / 2.0),
+                egui::vec2(ICON, ICON),
+            );
+            let back = egui::Rect::from_min_size(icon.min, egui::vec2(7.0, 7.0));
+            let front = egui::Rect::from_min_size(icon.min + egui::vec2(4.0, 4.0), back.size());
+            painter.line_segment([back.left_top(), back.right_top()], stroke);
+            painter.line_segment([back.left_top(), back.left_bottom()], stroke);
+            painter.line_segment(
+                [back.right_top(), egui::pos2(back.right(), front.top())],
+                stroke,
+            );
+            painter.line_segment(
+                [back.left_bottom(), egui::pos2(front.left(), back.bottom())],
+                stroke,
+            );
+            painter.rect_stroke(front, 0.0, stroke, egui::StrokeKind::Inside);
+            let text = painter.layout_no_wrap(count.to_string(), font.clone(), content);
             painter.galley(
-                egui::pos2(left, rect.center().y + 1.0 - text.size().y / 2.0),
+                egui::pos2(
+                    chip.right() - 8.0 - text.size().x,
+                    chip.center().y - text.size().y / 2.0,
+                ),
                 text,
-                color,
+                content,
             );
-            right_edge = left - 12.0;
+            ui.interact(chip, ui.id().with("floating_status"), egui::Sense::hover())
+                .on_hover_text(match visible {
+                    Some(name) => format!("Floating panes: {count}\nShowing: {name}"),
+                    None => format!("Floating panes: {count}"),
+                });
+            right_edge = chip.left() - 12.0;
         }
         if let Some(connected) = status.pipe_status {
             let palette = crate::colors::palette();
@@ -726,7 +815,10 @@ impl TerminalView {
             }
         }
         self.workspace_bar(ui, workspace_rect);
+        // Applied once `status` no longer borrows the active pane.
+        self.close_requested |= close;
     }
+
     pub(crate) fn poll_retired(&self, gl: &glow::Context) {
         self.main.poll_retired(gl);
         for (_, pane) in &self.tiled {

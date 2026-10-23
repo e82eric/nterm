@@ -14,7 +14,6 @@ pub(crate) enum AppAction {
     NewWindow,
     ShowMessages,
     OpenErrorLog,
-    ShowErrorRecord(Box<crate::error_log::Record>),
     OpenThemePicker,
     ApplyTheme(String),
     RestoreFloatingPane(u64),
@@ -73,7 +72,6 @@ impl AppAction {
                 | Self::ReloadConfig
                 | Self::ShowMessages
                 | Self::OpenErrorLog
-                | Self::ShowErrorRecord(_)
                 | Self::OpenThemePicker
                 | Self::ApplyTheme(_)
                 | Self::RestoreFloatingPane(_)

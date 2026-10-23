@@ -336,8 +336,22 @@ impl TerminalPane {
         self.toasts.push(title.into(), message, 3000);
     }
 
-    pub(super) fn open_error_log(&mut self, ctx: &egui::Context) {
-        let options = crate::error_log::picker_options();
+    pub(super) fn has_toasts(&self) -> bool {
+        !self.toasts.is_empty()
+    }
+
+    /// Whether Escape is free to dismiss toasts: an open picker or search
+    /// closes on Escape first.
+    pub(super) fn escape_dismisses_toasts(&self) -> bool {
+        self.picker.is_none() && !self.search.active
+    }
+
+    pub(super) fn dismiss_toasts(&mut self) {
+        self.toasts.clear();
+    }
+
+    pub(super) fn open_messages(&mut self, ctx: &egui::Context, config_issues: &[String]) {
+        let options = crate::error_log::picker_options(config_issues);
         self.picker = Some(crate::picker::Picker::start(
             self.host,
             None,
@@ -1128,10 +1142,11 @@ impl TerminalPane {
         };
         options.default_cwd(self.pwd());
         if matches!(options.source, crate::picker::config::Source::ErrorLog) {
-            options.source = crate::error_log::picker_options().source;
-            options
-                .params
-                .insert("__error_history".into(), "true".into());
+            let messages = crate::error_log::picker_options(&palette.config_issues);
+            options.source = messages.source;
+            options.preview = options.preview.or(messages.preview);
+            options.enter_action = messages.enter_action;
+            options.label = messages.label;
         } else if matches!(options.source, crate::picker::config::Source::Themes) {
             let names = match crate::themes::installed_themes() {
                 Ok(names) if !names.is_empty() => names,

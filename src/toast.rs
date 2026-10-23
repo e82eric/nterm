@@ -18,6 +18,10 @@ impl Toasts {
         self.entries.is_empty()
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub(crate) fn push(&mut self, title: String, message: String, duration_ms: u64) {
         self.push_kind(title, message, duration_ms, false);
     }

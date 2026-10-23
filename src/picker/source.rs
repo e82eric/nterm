@@ -61,7 +61,6 @@ pub(super) enum PickerSource {
     CommandPalette {
         runtime: Runtime,
         entries: Vec<crate::actions::Entry>,
-        error_history: bool,
     },
     FileSystem(Runtime),
     Scrollback(Runtime),
@@ -485,7 +484,6 @@ impl PickerSource {
                 Self::CommandPalette {
                     runtime,
                     entries: entries.clone(),
-                    error_history: options.params.contains_key("__error_history"),
                 }
             }
             config::Source::FileSystem(_) => Self::FileSystem(runtime),
@@ -559,10 +557,6 @@ impl PickerSource {
             {
                 "GHOSTTY THEMES"
             }
-            Self::CommandPalette {
-                error_history: true,
-                ..
-            } => "ERROR HISTORY",
             Self::CommandPalette { .. } => "COMMAND PALETTE",
         }
     }
@@ -720,11 +714,27 @@ fn read_row(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
     };
     let wraps_to_next = result.wraps_to_next;
     unsafe { ghostty_ffi::ghostty_egui_host_snapshot_text_row_free(&mut result) };
-    Some(TextRow {
+    let mut text = TextRow {
         text: String::from_utf8(text).ok()?,
         columns,
         wraps_to_next,
-    })
+    };
+    trim_trailing_spaces(&mut text);
+    Some(text)
+}
+
+/// Drops the spaces that end a row which does not wrap into the next one.
+/// Programs such as cargo on Windows clear a line by writing spaces up to the
+/// terminal width; kept, they wrap a preview narrower than the terminal into
+/// a blank second row. `push_row` restores trailing cells that have a
+/// background, so only unstyled blanks are lost.
+fn trim_trailing_spaces(row: &mut TextRow) {
+    if row.wraps_to_next {
+        return;
+    }
+    let len = row.text.trim_end_matches(' ').len();
+    row.text.truncate(len);
+    row.columns.truncate(len);
 }
 
 fn read_styles(
@@ -929,6 +939,26 @@ mod document_source_tests {
             .unwrap();
         assert_eq!((range.start.line, range.start.byte), (12, 12));
         assert_eq!((range.end.line, range.end.byte), (13, 2));
+    }
+
+    #[test]
+    fn rows_ending_a_line_drop_trailing_spaces_but_wrapped_rows_keep_them() {
+        let row = |text: &str, wraps_to_next| TextRow {
+            text: text.into(),
+            columns: (0..text.len() as u32).collect(),
+            wraps_to_next,
+        };
+        let mut padded = row("Compiling x   ", false);
+        trim_trailing_spaces(&mut padded);
+        assert_eq!(padded.text, "Compiling x");
+        assert_eq!(padded.columns, (0..11).collect::<Vec<_>>());
+        // A space before a soft wrap separates words of one logical line.
+        let mut wrapped = row("word ", true);
+        trim_trailing_spaces(&mut wrapped);
+        assert_eq!(wrapped.text, "word ");
+        let mut blank = row("   ", false);
+        trim_trailing_spaces(&mut blank);
+        assert!(blank.text.is_empty() && blank.columns.is_empty());
     }
 
     #[test]

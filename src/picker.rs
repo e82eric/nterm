@@ -48,6 +48,8 @@ pub(crate) struct Picker {
     result_rows: usize,
     preview_rows: usize,
     line_split: bool,
+    /// Overrides the source's label; see `config::Options::label`.
+    label: Option<&'static str>,
     prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     host: usize,
     #[cfg(test)]
@@ -167,7 +169,7 @@ impl Picker {
         if self.line_split {
             "LINE SPLIT PICKER"
         } else {
-            self.source.label()
+            self.label.unwrap_or_else(|| self.source.label())
         }
     }
     pub(crate) fn start(
@@ -208,16 +210,17 @@ impl Picker {
             });
         let sort = options.sort.mode();
         let result_rows = options.result_rows;
-        let accept_on_click = matches!(source.label(), "GHOSTTY THEMES" | "ERROR HISTORY");
+        let label = options.label.unwrap_or_else(|| source.label());
+        let accept_on_click = label == "GHOSTTY THEMES";
         let mut shared = nfm_egui::Picker::new(
             ("ghostty-picker", session_id),
             &ctx,
             source.provider(),
             nfm_egui::PickerConfig {
-                title: source.label().into(),
+                title: label.into(),
                 initial_query: initial_query.clone(),
                 result_rows,
-                accept_on_click: matches!(source.label(), "GHOSTTY THEMES" | "ERROR HISTORY"),
+                accept_on_click,
                 preview_rows: options.preview.as_ref().map_or(12, |p| match p {
                     config::Preview::Scrollback { rows } => *rows,
                     _ => 12,
@@ -351,6 +354,7 @@ impl Picker {
             result_rows,
             preview_rows,
             line_split: false,
+            label: options.label,
             prompt_patterns: Default::default(),
             host: host as usize,
             #[cfg(test)]
@@ -752,6 +756,7 @@ impl Picker {
         } {
             config::EnterAction::Navigate => range.map(|r| Action::Navigate(r.start)),
             config::EnterAction::SendInput => Some(Action::SendInput(value)),
+            config::EnterAction::Close => Some(Action::Cancel),
         }
     }
     fn enter_line_split(&mut self, ctx: &egui::Context, source: PickerSource) {

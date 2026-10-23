@@ -252,6 +252,8 @@ impl WindowUi {
         info.outer_rect = self.info.outer_rect;
         // Panes read window focus from here to drive native terminal focus.
         info.focused = self.info.focused;
+        // Double-clicking the status bar toggles maximize from this state.
+        info.maximized = self.info.maximized;
         let mut output = self.egui_ctx.run_ui(input, ui);
         self.changes.output_hook(&self.egui_ctx, &mut output);
         let changed = std::mem::take(&mut self.changes.changed);
