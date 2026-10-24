@@ -2825,7 +2825,8 @@ impl TerminalPane {
                         .copy_cursor_background
                         .unwrap_or(crate::colors::palette().accent),
                 ),
-                flags: 3,
+                // Bit 3 marks the caret so cursor shaders can track it.
+                flags: 3 | 8,
             },
         };
         let selection = self
