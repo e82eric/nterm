@@ -8,7 +8,6 @@ pub(crate) struct Presentation {
     pub(crate) interval: Duration,
     last_present: Option<Instant>,
     pub(crate) repaint_deadline: Option<Instant>,
-    pub(crate) cleanup_deadline: Option<Instant>,
 }
 
 impl Default for Presentation {
@@ -20,7 +19,6 @@ impl Default for Presentation {
             interval: Duration::from_nanos(16_666_667),
             last_present: None,
             repaint_deadline: None,
-            cleanup_deadline: None,
         }
     }
 }
@@ -57,20 +55,10 @@ impl Presentation {
         );
     }
 
-    pub(crate) fn cleanup_pending(&mut self, pending: bool, now: Instant) {
-        if pending {
-            self.cleanup_deadline
-                .get_or_insert(now + Duration::from_millis(1));
-        } else {
-            self.cleanup_deadline = None;
-        }
-    }
-
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
         self.present_deadline(now)
             .into_iter()
             .chain(self.repaint_deadline)
-            .chain(self.cleanup_deadline)
             .min()
     }
 }
@@ -153,21 +141,6 @@ mod tests {
         assert!(state.ready(now + state.interval));
         state.presented(now + state.interval);
         assert_eq!(state.next_deadline(now + state.interval), None);
-    }
-
-    #[test]
-    fn cleanup_never_requests_presentation() {
-        let now = Instant::now();
-        let mut state = Presentation::default();
-        state.presented(now);
-        state.cleanup_pending(true, now);
-        assert_eq!(
-            state.next_deadline(now),
-            Some(now + Duration::from_millis(1))
-        );
-        assert!(!state.ready(now + Duration::from_secs(1)));
-        state.cleanup_pending(false, now);
-        assert_eq!(state.next_deadline(now), None);
     }
 
     #[test]

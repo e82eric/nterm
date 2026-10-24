@@ -519,7 +519,7 @@ impl TerminalView {
         w.focus(pane_id);
         Ok(pane_id)
     }
-    fn close_tiled(&mut self, id: u64, _gl: &glow::Context) -> Result<(), String> {
+    fn close_tiled(&mut self, id: u64) -> Result<(), String> {
         if !self.workspaces.iter().any(|w| w.panes.contains(&id)) {
             return Err("pane does not exist".into());
         }
@@ -663,7 +663,7 @@ impl TerminalView {
                 Ok(Value::Null)
             }
             Request::ClosePane(id) => {
-                self.close_tiled(id, gl)?;
+                self.close_tiled(id)?;
                 Ok(Value::Null)
             }
             Request::FocusPane(id) => {
@@ -769,7 +769,7 @@ impl TerminalView {
                 }
                 ClosePane => {
                     if let Some(id) = self.focused_id() {
-                        self.close_tiled(id, gl)?;
+                        self.close_tiled(id)?;
                     }
                 }
                 FloatOrTilePane => {
@@ -1007,7 +1007,7 @@ impl TerminalView {
         }
     }
     /// Runs the Lua `startup` callback for a newly created window, before its
-    /// first frame. Call with the window's GL context current.
+    /// first frame.
     pub(crate) fn run_startup(&mut self, ctx: &egui::Context, gl: &glow::Context) {
         if let Some(callback) = self.picker_bindings.startup.clone() {
             let result = callback.with_host(&mut |r| self.host_request(r, gl), || {
@@ -1016,17 +1016,17 @@ impl TerminalView {
             self.main.finish_lua_action(result, ctx);
         }
     }
-    /// Pane lifecycle work before building a frame, with the GL context
-    /// current: releases terminals closed during the previous frame, whose
-    /// paint callbacks have run or been dropped by now, then closes panes whose
-    /// shell exited. Those are released before the next frame, like any other close.
-    pub(crate) fn before_frame(&mut self, gl: &glow::Context) {
+    /// Pane lifecycle work before building a frame: releases terminals closed
+    /// during the previous frame, whose paint callbacks have run or been
+    /// dropped by now, then closes panes whose shell exited. Those are released
+    /// before the next frame, like any other close.
+    pub(crate) fn before_frame(&mut self) {
         for mut p in self.closed_panes.drain(..) {
-            p.destroy(gl);
+            p.destroy();
         }
         if self.close_main_pending {
             self.close_main_pending = false;
-            self.main.close_process(gl);
+            self.main.close_process();
         }
         let exited: Vec<_> = self
             .workspaces
@@ -1036,7 +1036,7 @@ impl TerminalView {
             .copied()
             .collect();
         for id in exited {
-            let _ = self.close_tiled(id, gl);
+            let _ = self.close_tiled(id);
         }
         let exited: Vec<_> = self
             .floating

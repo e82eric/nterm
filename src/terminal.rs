@@ -64,8 +64,8 @@ impl std::ops::DerefMut for FloatingTerminal {
 }
 
 impl FloatingTerminal {
-    fn destroy(&mut self, gl: &glow::Context) {
-        self.pane.destroy(gl);
+    fn destroy(&mut self) {
+        self.pane.destroy();
     }
 
     fn acquire_frame(&mut self) -> bool {
@@ -98,7 +98,7 @@ impl TerminalView {
         egui_ctx: &egui::Context,
         gl: &glow::Context,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
-        window_id: egui_winit::winit::window::WindowId,
+        window: crate::graphics::PaneWindow,
         argc: usize,
         argv: *mut *mut c_char,
         command_label: String,
@@ -107,7 +107,7 @@ impl TerminalView {
         mut issues: Vec<String>,
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
-        let main = TerminalPane::create(egui_ctx, gl, proxy, window_id, argc, argv)?;
+        let main = TerminalPane::create(egui_ctx, gl, proxy, window, argc, argv)?;
         issues.extend(main.take_config_issues());
         #[cfg(any(windows, unix))]
         main.set_pipe_policy(&picker_bindings.pipe_policy);
@@ -143,9 +143,9 @@ impl TerminalView {
         &self,
         egui_ctx: &egui::Context,
         gl: &glow::Context,
-        window_id: egui_winit::winit::window::WindowId,
+        window: crate::graphics::PaneWindow,
     ) -> Result<Self, crate::native_error::FatalError> {
-        let main = self.main.create_window(egui_ctx, gl, window_id)?;
+        let main = self.main.create_window(egui_ctx, gl, window)?;
         #[cfg(any(windows, unix))]
         main.set_pipe_policy(&self.picker_bindings.pipe_policy);
         Ok(Self {
@@ -819,37 +819,17 @@ impl TerminalView {
         self.close_requested |= close;
     }
 
-    pub(crate) fn poll_retired(&self, gl: &glow::Context) {
-        self.main.poll_retired(gl);
-        for (_, pane) in &self.tiled {
-            pane.poll_retired(gl);
-        }
-        for floating in &self.floating.entries {
-            floating.poll_retired(gl);
-        }
-    }
-
-    pub(crate) fn retired_pending(&self) -> bool {
-        self.main.retired_pending()
-            || self.tiled.iter().any(|(_, p)| p.retired_pending())
-            || self
-                .floating
-                .entries
-                .iter()
-                .any(|floating| floating.retired_pending())
-    }
-
-    pub(crate) fn destroy(&mut self, gl: &glow::Context) {
+    pub(crate) fn destroy(&mut self) {
         for mut floating in self.floating.entries.drain(..) {
-            floating.destroy(gl);
+            floating.destroy();
         }
         for mut pane in self.closed_panes.drain(..) {
-            pane.destroy(gl);
+            pane.destroy();
         }
         for (_, mut pane) in self.tiled.drain(..) {
-            pane.destroy(gl);
+            pane.destroy();
         }
-        self.main.destroy(gl);
+        self.main.destroy();
     }
 }
 

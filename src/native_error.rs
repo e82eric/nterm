@@ -63,10 +63,10 @@ mod fatal_tests {
             std::io::ErrorKind::PermissionDenied,
             "driver access denied",
         ));
-        let error = result.fatal("create the OpenGL display").unwrap_err();
+        let error = result.fatal("create the graphics device").unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Unable to create the OpenGL display.\n\ndriver access denied"
+            "Unable to create the graphics device.\n\ndriver access denied"
         );
         assert_eq!(
             Ok::<_, std::io::Error>(42)

@@ -58,6 +58,7 @@ pub(crate) struct Appearance {
     pub outer_gap: f32,
     pub padding: f32,
     pub corner_radius: f32,
+    pub border_width: f32,
     pub shadow_size: f32,
     pub shadow_opacity: f32,
     pub shadow_offset: [f32; 2],
@@ -69,6 +70,8 @@ impl Default for Appearance {
             outer_gap: 8.0,
             padding: 4.0,
             corner_radius: 8.0,
+            // Thin curved lines look jagged at 1 px.
+            border_width: 1.5,
             shadow_size: 8.0,
             shadow_opacity: 0.3,
             shadow_offset: [0.0, 2.0],
@@ -103,7 +106,7 @@ impl Appearance {
             rect,
             self.corner_radius,
             egui::Stroke::new(
-                1.0,
+                self.border_width,
                 if active {
                     palette.accent
                 } else {
@@ -119,6 +122,7 @@ impl Appearance {
             self.outer_gap,
             self.padding,
             self.corner_radius,
+            self.border_width,
             self.shadow_size,
             self.shadow_opacity,
             self.shadow_offset[0],
@@ -133,6 +137,7 @@ impl Appearance {
             self.outer_gap,
             self.padding,
             self.corner_radius,
+            self.border_width,
             self.shadow_size,
         ]
         .iter()

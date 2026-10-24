@@ -6,6 +6,7 @@ mod colors;
 mod config;
 mod error_log;
 mod ghostty_ffi;
+mod gpu;
 mod graphics;
 mod input;
 mod lua_callbacks;

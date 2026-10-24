@@ -1,7 +1,4 @@
-thread_local! {
-    // WGL surface.is_current() checks only the context, not its drawable.
-    static CURRENT_GL_WINDOW: std::cell::Cell<Option<winit::window::WindowId>> = const { std::cell::Cell::new(None) };
-}
+use crate::gpu::SharedGpu;
 use crate::native_error::{FatalError, FatalResult};
 use crate::presentation::Presentation;
 use std::cell::RefCell;
@@ -10,15 +7,14 @@ use std::rc::Rc;
 mod shared_ui;
 use crate::graphics as glow;
 use crate::terminal::TerminalView;
+use egui_wgpu::wgpu;
 use egui_winit::winit;
 
-use glow::HasContext as _;
 use shared_ui::{SharedUi, WindowUi};
 
 use std::ffi::c_void;
 use std::ffi::{CString, c_char};
 
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -68,7 +64,7 @@ impl ShellApp {
         egui_ctx: &egui::Context,
         gl: &glow::Context,
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-        window_id: winit::window::WindowId,
+        window: crate::graphics::PaneWindow,
         args: Vec<CString>,
         pickers: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
@@ -82,7 +78,7 @@ impl ShellApp {
                 egui_ctx,
                 gl,
                 proxy,
-                window_id,
+                window,
                 argv.len(),
                 argv.as_mut_ptr(),
                 command_label,
@@ -102,8 +98,8 @@ impl ShellApp {
         self.terminal.update(ui, gl);
     }
 
-    fn destroy(&mut self, gl: &glow::Context) {
-        self.terminal.destroy(gl);
+    fn destroy(&mut self) {
+        self.terminal.destroy();
     }
 }
 
@@ -204,8 +200,7 @@ struct NativeApp {
 }
 
 struct NativeWindow {
-    // Release pane resources with the shared context bound to this surface.
-    gl_window: GlutinWindowSurface,
+    surface: WindowSurface,
     shared_ui: Rc<RefCell<SharedUi>>,
     gl: Arc<glow::Context>,
     egui: WindowUi,
@@ -218,10 +213,10 @@ impl NativeWindow {
         event_loop: &winit::event_loop::ActiveEventLoop,
         shared_ui: Rc<RefCell<SharedUi>>,
     ) -> Result<Self, FatalError> {
-        let graphics = shared_ui.borrow().graphics.clone();
-        let gl_window = unsafe { GlutinWindowSurface::new(event_loop, graphics) }?;
+        let gpu = shared_ui.borrow().gpu.clone();
+        let surface = WindowSurface::new(event_loop, gpu)?;
         let mut presentation = Presentation::default();
-        if let Some(rate) = gl_window
+        if let Some(rate) = surface
             .window()
             .current_monitor()
             .and_then(|monitor| monitor.refresh_rate_millihertz())
@@ -231,9 +226,9 @@ impl NativeWindow {
                 std::time::Duration::from_nanos(1_000_000_000_000 / u64::from(rate));
         }
         let gl = shared_ui.borrow().gl.clone();
-        let egui = WindowUi::new(event_loop, gl_window.window(), &shared_ui.borrow());
+        let egui = WindowUi::new(event_loop, surface.window(), &shared_ui.borrow());
         Ok(Self {
-            gl_window,
+            surface,
             shared_ui,
             gl,
             egui,
@@ -244,22 +239,20 @@ impl NativeWindow {
 
     /// Runs the Lua startup callback, then shows the window for its first frame.
     fn start(&mut self) -> Result<(), FatalError> {
-        self.gl_window.make_current()?;
         let shell = self.shell.as_mut().expect("terminal shell");
         shell.terminal.run_startup(&self.egui.egui_ctx, &self.gl);
-        self.gl_window.window().set_visible(true);
-        self.gl_window.window().request_redraw();
+        self.surface.window().set_visible(true);
+        self.surface.window().request_redraw();
         Ok(())
     }
 
     fn redraw(&mut self) -> Result<(), FatalError> {
-        self.gl_window.make_current()?;
         let shell = self.shell.as_mut().expect("terminal shell");
         // The previous frame's paint callbacks have run or been dropped.
-        shell.terminal.before_frame(&self.gl);
+        shell.terminal.before_frame();
         let (output, changed) = self
             .egui
-            .run(self.gl_window.window(), |ui| shell.ui(ui, &self.gl));
+            .run(self.surface.window(), |ui| shell.ui(ui, &self.gl));
         self.presentation.ui_dirty |= changed;
         let now = Instant::now();
         let paced = self
@@ -270,50 +263,21 @@ impl NativeWindow {
             self.presentation.frame_pending = shell.terminal.acquire_frames();
         }
         let presented = !paced && self.presentation.ready(now);
+        let started = Instant::now();
         if presented {
-            unsafe {
-                let background = crate::colors::palette().background;
-                self.gl.clear_color(
-                    f32::from(background.r()) / 255.0,
-                    f32::from(background.g()) / 255.0,
-                    f32::from(background.b()) / 255.0,
-                    1.0,
-                );
-                self.gl.clear(glow::COLOR_BUFFER_BIT);
-            }
             self.shared_ui
                 .borrow_mut()
-                .finish_output(output, Some(self.gl_window.window().inner_size().into()))?;
+                .finish_output(output, Some(&self.surface))?;
         } else {
             self.shared_ui.borrow_mut().finish_output(output, None)?;
-            shell.terminal.poll_retired(&self.gl);
         }
-        self.presentation
-            .cleanup_pending(shell.terminal.retired_pending(), Instant::now());
         if presented {
-            let started = Instant::now();
-            self.gl_window
-                .swap_buffers()
-                .fatal("present the application frame (swap OpenGL buffers)")?;
             self.presentation.presented(started);
         }
         Ok(())
     }
 
     fn before_wait(&mut self, now: Instant) -> Result<Option<Instant>, FatalError> {
-        if self
-            .presentation
-            .cleanup_deadline
-            .is_some_and(|due| due <= now)
-        {
-            self.gl_window.make_current()?;
-            self.presentation.cleanup_deadline = None;
-            if let Some(shell) = &self.shell {
-                shell.terminal.poll_retired(&self.gl);
-                self.presentation
-                    .cleanup_pending(shell.terminal.retired_pending(), now);
-            }
-        }
         let repaint_due = self
             .presentation
             .repaint_deadline
@@ -322,7 +286,7 @@ impl NativeWindow {
             self.presentation.repaint_deadline = None;
         }
         if repaint_due || self.presentation.ready(now) {
-            self.gl_window.window().request_redraw();
+            self.surface.window().request_redraw();
         }
         Ok(self.presentation.next_deadline(now))
     }
@@ -330,19 +294,8 @@ impl NativeWindow {
 
 impl Drop for NativeWindow {
     fn drop(&mut self) {
-        if let Err(error) = self.gl_window.make_current() {
-            crate::error_log::error(
-                "window.close",
-                "Could not activate graphics context",
-                &error.to_string(),
-            );
-            // Native renderer callbacks still reference the panes. Do not drop
-            // their userdata unless we can safely release the native resources.
-            crate::native_error::show(&error.to_string());
-            std::process::exit(1);
-        }
         if let Some(shell) = &mut self.shell {
-            shell.destroy(&self.gl);
+            shell.destroy();
         }
     }
 }
@@ -381,14 +334,14 @@ impl NativeApp {
         let terminal = parent_shell.terminal.new_window(
             &window.egui.egui_ctx,
             &window.gl,
-            window.gl_window.window().id(),
+            window.surface.pane_window(),
         )?;
         window.shell = Some(ShellApp {
             terminal,
             _startup: parent_shell._startup.clone(),
         });
         window.start()?;
-        self.windows.insert(window.gl_window.window().id(), window);
+        self.windows.insert(window.surface.window().id(), window);
         self.sync_viewports()?;
         Ok(())
     }
@@ -443,7 +396,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
                 &window.egui.egui_ctx,
                 &window.gl,
                 self.proxy.clone(),
-                window.gl_window.window().id(),
+                window.surface.pane_window(),
                 args,
                 pickers,
                 padding,
@@ -451,7 +404,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
                 reload,
             )?);
             window.start()?;
-            self.windows.insert(window.gl_window.window().id(), window);
+            self.windows.insert(window.surface.window().id(), window);
             self.sync_viewports()?;
             Ok::<_, FatalError>(())
         })();
@@ -496,18 +449,14 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
                             .expect("parent terminal")
                             .terminal
                             .window_error(error.to_string());
-                        parent.gl_window.window().request_redraw();
+                        parent.surface.window().request_redraw();
                     }
                 }
             }
             return;
         }
         if let WindowEvent::Resized(size) = event {
-            if let Err(error) = window.gl_window.make_current() {
-                self.fail(event_loop, error);
-                return;
-            }
-            window.gl_window.resize(size);
+            window.surface.resize(size);
             window.presentation.force = true;
         }
         if matches!(
@@ -518,10 +467,10 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         }
         if window
             .egui
-            .on_window_event(window.gl_window.window(), &event)
+            .on_window_event(window.surface.window(), &event)
             .repaint
         {
-            window.gl_window.window().request_redraw();
+            window.surface.window().request_redraw();
         }
     }
 
@@ -533,7 +482,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             UserEvent::PickerWake { window_id } => {
                 if let Some(window) = self.windows.get_mut(&window_id) {
                     // Service queued work immediately; only GPU presentation is paced.
-                    window.gl_window.window().request_redraw();
+                    window.surface.window().request_redraw();
                 }
             }
             UserEvent::GhosttyWake => {
@@ -591,15 +540,6 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
     }
 }
 
-struct GlutinWindowContext {
-    // Release the DC/surface before the hidden native window.
-    surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
-    context: glutin::context::PossiblyCurrentContext,
-    config: glutin::config::Config,
-    display: glutin::display::Display,
-    _window: winit::window::Window,
-}
-
 /// Cosmetic opt-in only: unsupported DWM attributes must not prevent startup.
 #[cfg(windows)]
 fn prefer_rounded_corners(hwnd: *mut std::ffi::c_void) {
@@ -639,243 +579,158 @@ fn prefer_rounded_corners(hwnd: *mut std::ffi::c_void) {
     }
 }
 
-impl GlutinWindowContext {
-    unsafe fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> Result<Self, FatalError> {
-        use glutin::context::NotCurrentGlContext as _;
-        use glutin::display::GlDisplay as _;
-        use glutin::prelude::GlSurface as _;
-        use winit::raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
-
-        let window_attributes = winit::window::WindowAttributes::default()
-            .with_title("Ghostty — egui OpenGL sample")
-            .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 700.0))
-            .with_decorations(false)
-            .with_visible(false);
-        let template = glutin::config::ConfigTemplateBuilder::new()
-            .prefer_hardware_accelerated(None)
-            .with_depth_size(0)
-            .with_stencil_size(0)
-            .with_transparency(false);
-        // WGL needs a native window to enumerate its full configuration set.
-        // Enumerate directly: DisplayBuilder's picker cannot return an error
-        // when the driver supplies no compatible configurations.
-        #[cfg(windows)]
-        let window = Some(
-            event_loop
-                .create_window(window_attributes.clone())
-                .fatal("create the OpenGL window")?,
-        );
-        #[cfg(not(windows))]
-        let window: Option<winit::window::Window> = None;
-        let raw_window = window
-            .as_ref()
-            .map(|window| {
-                window
-                    .window_handle()
-                    .fatal("get the window handle")
-                    .map(|handle| handle.as_raw())
-            })
-            .transpose()?;
-        #[cfg(windows)]
-        if let Some(winit::raw_window_handle::RawWindowHandle::Win32(handle)) = raw_window {
-            prefer_rounded_corners(handle.hwnd.get() as *mut std::ffi::c_void);
-        }
-        let raw_display = event_loop
-            .display_handle()
-            .fatal("get the display handle")?
-            .as_raw();
-        #[cfg(windows)]
-        let preference = glutin::display::DisplayApiPreference::WglThenEgl(raw_window);
-        #[cfg(not(windows))]
-        let preference = glutin::display::DisplayApiPreference::EglThenGlx(Box::new(
-            winit::platform::x11::register_xlib_error_hook,
-        ));
-        let display = unsafe { glutin::display::Display::new(raw_display, preference) }
-            .fatal("create the OpenGL display")?;
-        #[cfg(windows)]
-        let template = if let Some(handle) = raw_window {
-            template.compatible_with_native_window(handle)
-        } else {
-            template
-        };
-        let config = unsafe { display.find_configs(template.build()) }
-            .fatal("enumerate OpenGL configurations")?
-            .next()
-            .ok_or_else(|| {
-                FatalError::new(
-                    "select an OpenGL configuration",
-                    "The graphics driver returned no compatible OpenGL configuration.",
-                )
-            })?;
-        let attributes = glutin::context::ContextAttributesBuilder::new()
-            .with_context_api(glutin::context::ContextApi::OpenGl(Some(
-                glutin::context::Version::new(4, 3),
-            )))
-            .build(raw_window);
-        let not_current = unsafe {
-            display
-                .create_context(&config, &attributes)
-                .fatal("create the OpenGL 4.3 context")?
-        };
-        let window = match window {
-            Some(window) => window,
-            None => glutin_winit::finalize_window(event_loop, window_attributes, &config)
-                .fatal("create the OpenGL window")?,
-        };
-        let size = window.inner_size();
-        let surface_attributes =
-            glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
-                .build(
-                    window
-                        .window_handle()
-                        .fatal("get the window handle")?
-                        .as_raw(),
-                    NonZeroU32::new(size.width).unwrap_or(NonZeroU32::MIN),
-                    NonZeroU32::new(size.height).unwrap_or(NonZeroU32::MIN),
-                );
-        let surface = unsafe {
-            display
-                .create_window_surface(&config, &surface_attributes)
-                .fatal("create the OpenGL window surface")?
-        };
-        let context = not_current
-            .make_current(&surface)
-            .fatal("make the OpenGL context current")?;
-        if let Err(err) =
-            surface.set_swap_interval(&context, glutin::surface::SwapInterval::DontWait)
-        {
-            crate::error_log::warning(
-                "graphics",
-                "Swap interval could not be disabled",
-                &err.to_string(),
-            );
-        }
-
-        Ok(Self {
-            _window: window,
-            context,
-            display,
-            config,
-            surface,
-        })
-    }
-
-    fn make_current(&self) -> Result<(), FatalError> {
-        use glutin::context::PossiblyCurrentGlContext as _;
-        if self.context.is_current()
-            && CURRENT_GL_WINDOW.with(|current| current.get() == Some(self._window.id()))
-        {
-            return Ok(());
-        }
-        self.context
-            .make_current(&self.surface)
-            .fatal("activate the window OpenGL context")?;
-        CURRENT_GL_WINDOW.with(|current| current.set(Some(self._window.id())));
-        Ok(())
-    }
-
-    fn get_proc_address(&self, name: &std::ffi::CStr) -> *const c_void {
-        use glutin::display::GlDisplay as _;
-        self.display.get_proc_address(name)
-    }
+/// A native window and its wgpu swapchain on the shared device.
+pub(super) struct WindowSurface {
+    // The surface presents to the window, so it is dropped first.
+    surface: wgpu::Surface<'static>,
+    config: RefCell<wgpu::SurfaceConfiguration>,
+    window: Arc<winit::window::Window>,
+    gpu: Rc<SharedGpu>,
 }
 
-/// Every window has a drawable surface, all using the same UI GL context.
-
-struct GlutinWindowSurface {
-    surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
-    window: winit::window::Window,
-    graphics: Rc<GlutinWindowContext>,
-}
-
-impl GlutinWindowSurface {
-    unsafe fn new(
+impl WindowSurface {
+    fn new(
         event_loop: &winit::event_loop::ActiveEventLoop,
-        graphics: Rc<GlutinWindowContext>,
+        gpu: Rc<SharedGpu>,
     ) -> Result<Self, FatalError> {
-        use glutin::display::GlDisplay as _;
-        use glutin::surface::GlSurface as _;
-        use winit::raw_window_handle::HasWindowHandle as _;
         let attributes = winit::window::WindowAttributes::default()
-            .with_title("Ghostty shared graphics anchor")
+            .with_title("Ghostty")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 700.0))
             .with_decorations(false)
             .with_visible(false);
-        let window = glutin_winit::finalize_window(event_loop, attributes, &graphics.config)
-            .fatal("create the terminal window")?;
-        let handle = window
-            .window_handle()
-            .fatal("get the terminal window handle")?
-            .as_raw();
+        let window = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .fatal("create the terminal window")?,
+        );
+        let native = native_window(&window);
         #[cfg(windows)]
-        if let winit::raw_window_handle::RawWindowHandle::Win32(handle) = handle {
-            prefer_rounded_corners(handle.hwnd.get() as *mut c_void);
+        if !native.is_null() {
+            prefer_rounded_corners(native);
+        }
+        let surface = gpu
+            .instance
+            .create_surface(window.clone())
+            .fatal("create the window surface")?;
+        let capabilities = surface.get_capabilities(&gpu.adapter);
+        if !capabilities.formats.contains(&shared_ui::SURFACE_FORMAT) {
+            return Err(FatalError::new(
+                "configure window presentation",
+                format!(
+                    "The graphics adapter cannot present {:?} to this window",
+                    shared_ui::SURFACE_FORMAT
+                ),
+            ));
         }
         let size = window.inner_size();
-        let attributes =
-            glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
-                .build(
-                    handle,
-                    NonZeroU32::new(size.width).unwrap_or(NonZeroU32::MIN),
-                    NonZeroU32::new(size.height).unwrap_or(NonZeroU32::MIN),
-                );
-        let surface = unsafe {
-            graphics
-                .display
-                .create_window_surface(&graphics.config, &attributes)
-        }
-        .fatal("create the terminal window surface")?;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: shared_ui::SURFACE_FORMAT,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            // Presentation is paced by the app; mailbox replaces a queued
+            // image instead of blocking, so several windows never wait on
+            // each other's vertical blank.
+            present_mode: if capabilities
+                .present_modes
+                .contains(&wgpu::PresentMode::Mailbox)
+            {
+                wgpu::PresentMode::Mailbox
+            } else {
+                wgpu::PresentMode::AutoNoVsync
+            },
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            view_formats: Vec::new(),
+        };
         let result = Self {
             surface,
+            config: RefCell::new(config),
             window,
-            graphics,
+            gpu,
         };
-        result.make_current()?;
-        if let Err(error) = result.surface.set_swap_interval(
-            &result.graphics.context,
-            glutin::surface::SwapInterval::DontWait,
-        ) {
-            crate::error_log::warning(
-                "graphics",
-                "Swap interval could not be disabled",
-                &error.to_string(),
-            );
-        }
+        result.configure();
         Ok(result)
-    }
-
-    fn make_current(&self) -> Result<(), FatalError> {
-        use glutin::context::PossiblyCurrentGlContext as _;
-        // The context is shared by windows: checking only the context would
-        // incorrectly skip switching the drawable when another window was used.
-        if self.graphics.context.is_current()
-            && CURRENT_GL_WINDOW.with(|current| current.get() == Some(self.window.id()))
-        {
-            return Ok(());
-        }
-        self.graphics
-            .context
-            .make_current(&self.surface)
-            .fatal("activate the shared OpenGL context for this window")?;
-        CURRENT_GL_WINDOW.with(|current| current.set(Some(self.window.id())));
-        Ok(())
     }
 
     fn window(&self) -> &winit::window::Window {
         &self.window
     }
 
-    fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
-        use glutin::surface::GlSurface as _;
-        self.surface.resize(
-            &self.graphics.context,
-            NonZeroU32::new(size.width).unwrap_or(NonZeroU32::MIN),
-            NonZeroU32::new(size.height).unwrap_or(NonZeroU32::MIN),
-        );
+    /// This window, for creating its first terminal.
+    fn pane_window(&self) -> crate::graphics::PaneWindow {
+        crate::graphics::PaneWindow {
+            id: self.window.id(),
+            native: native_window(&self.window),
+        }
     }
 
-    fn swap_buffers(&self) -> glutin::error::Result<()> {
-        use glutin::surface::GlSurface as _;
-        self.surface.swap_buffers(&self.graphics.context)
+    pub(super) fn size(&self) -> [u32; 2] {
+        let config = self.config.borrow();
+        [config.width, config.height]
+    }
+
+    fn configure(&self) {
+        // Reconfiguring replaces the swapchain; keep terminal submissions out.
+        let _submission = self
+            .gpu
+            .submission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.surface
+            .configure(&self.gpu.device, &self.config.borrow());
+    }
+
+    fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        {
+            let mut config = self.config.borrow_mut();
+            if config.width == size.width && config.height == size.height {
+                return;
+            }
+            config.width = size.width;
+            config.height = size.height;
+        }
+        self.configure();
+    }
+
+    /// The next image to present, or None when the window cannot show one
+    /// now (occluded, or the request timed out).
+    pub(super) fn acquire(&self) -> Result<Option<wgpu::SurfaceTexture>, FatalError> {
+        let size = self.window.inner_size();
+        self.resize(size);
+        for attempt in 0..2 {
+            match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(frame)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => return Ok(Some(frame)),
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return Ok(None);
+                }
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost
+                    if attempt == 0 =>
+                {
+                    self.configure();
+                }
+                other => {
+                    return Err(FatalError::new(
+                        "acquire the window image",
+                        format!("{other:?}"),
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The window's native handle: an HWND on Windows, null elsewhere.
+fn native_window(window: &winit::window::Window) -> *mut c_void {
+    use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    match window.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get() as *mut c_void,
+        _ => std::ptr::null_mut(),
     }
 }

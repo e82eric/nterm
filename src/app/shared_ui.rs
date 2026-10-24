@@ -1,7 +1,9 @@
-use super::{GlutinWindowContext, UserEvent};
-use crate::native_error::{FatalError, FatalResult};
+use super::{UserEvent, WindowSurface};
+use crate::gpu::SharedGpu;
+use crate::native_error::FatalError;
 use crate::presentation::UiChanges;
 use egui::Plugin as _;
+use egui_wgpu::wgpu;
 use egui_winit::winit;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -11,30 +13,35 @@ pub(super) fn viewport_id(id: winit::window::WindowId) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(id)
 }
 
-/// One UI context and GPU painter for every native window. The hidden anchor
-/// retains the WGL configuration/DC when the original visible window closes.
+/// The pixel format of every window, and so of egui's pipelines and the
+/// terminal compositor. Windows are presented without sRGB encoding, as egui
+/// expects.
+pub(super) const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+
+/// One UI context, GPU device and egui renderer for every native window.
 pub(super) struct SharedUi {
-    pub graphics: Rc<GlutinWindowContext>,
-    pub gl: Arc<glow::Context>,
+    pub gpu: Rc<SharedGpu>,
+    pub gl: Arc<crate::graphics::Context>,
     pub ctx: egui::Context,
-    painter: egui_glow::Painter,
+    renderer: egui_wgpu::Renderer,
 }
 
 impl SharedUi {
     pub fn new(
-        event_loop: &winit::event_loop::ActiveEventLoop,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     ) -> Result<Self, FatalError> {
-        let graphics = Rc::new(unsafe { GlutinWindowContext::new(event_loop) }?);
-        let gl = Arc::new(unsafe {
-            glow::Context::from_loader_function(|name| {
-                graphics.get_proc_address(
-                    &std::ffi::CString::new(name).expect("OpenGL symbol contains NUL"),
-                )
-            })
-        });
-        let painter = egui_glow::Painter::new(Arc::clone(&gl), "", None, true)
-            .fatal("create the shared egui painter")?;
+        let gpu =
+            SharedGpu::new().map_err(|error| FatalError::new("initialize graphics", error))?;
+        let gl = Arc::new(crate::graphics::Context::new(&gpu));
+        let mut renderer = egui_wgpu::Renderer::new(
+            &gpu.device,
+            SURFACE_FORMAT,
+            egui_wgpu::RendererOptions::default(),
+        );
+        renderer
+            .callback_resources
+            .insert(crate::painter::Compositor::new(&gpu.device, SURFACE_FORMAT));
         let ctx = egui::Context::default();
         ctx.set_embed_viewports(false);
         crate::colors::COLORS.set(&ctx, crate::colors::palette());
@@ -48,15 +55,15 @@ impl SharedUi {
             }
         });
         Ok(Self {
-            graphics,
+            gpu: Rc::new(gpu),
             gl,
             ctx,
-            painter,
+            renderer,
         })
     }
 
     pub fn max_texture_side(&self) -> usize {
-        self.painter.max_texture_side()
+        self.gpu.device.limits().max_texture_dimension_2d as usize
     }
 
     /// The root is logical, with no visible window. Only rerun it when windows
@@ -65,7 +72,6 @@ impl SharedUi {
         &mut self,
         ids: impl IntoIterator<Item = egui::ViewportId>,
     ) -> Result<(), FatalError> {
-        self.graphics.make_current()?;
         let ids: Vec<_> = ids.into_iter().collect();
         let output = register_viewports(&self.ctx, &ids);
         self.finish_output(output, None)?;
@@ -74,35 +80,80 @@ impl SharedUi {
 
     /// Upload shared texture changes even when presentation is paced. Otherwise
     /// a second window could draw glyphs before their atlas updates are uploaded.
+    /// With a window, also draw the output to it and present it.
     pub fn finish_output(
         &mut self,
         mut output: egui::FullOutput,
-        dimensions: Option<[u32; 2]>,
+        window: Option<&WindowSurface>,
     ) -> Result<(), FatalError> {
+        let gpu = self.gpu.clone();
         for (id, deltas) in output.textures_delta.set.drain() {
             for delta in deltas {
-                self.painter.set_texture(id, &delta);
+                self.renderer
+                    .update_texture(&gpu.device, &gpu.queue, id, &delta);
             }
         }
-        if let Some(dimensions) = dimensions {
-            let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
-            self.painter
-                .paint_primitives(dimensions, output.pixels_per_point, &primitives);
+        if let Some(window) = window {
+            match window.acquire()? {
+                Some(frame) => self.present(window, frame, output.shapes, output.pixels_per_point),
+                // Occluded or timed out: try again shortly.
+                None => self
+                    .ctx
+                    .request_repaint_after(std::time::Duration::from_millis(50)),
+            }
         }
         for id in output.textures_delta.free.drain() {
-            self.painter.free_texture(id);
+            self.renderer.free_texture(&id);
         }
         Ok(())
     }
-}
 
-impl Drop for SharedUi {
-    fn drop(&mut self) {
-        if let Err(error) = self.graphics.make_current() {
-            crate::native_error::show(&error.to_string());
-            std::process::exit(1);
+    fn present(
+        &mut self,
+        window: &WindowSurface,
+        frame: wgpu::SurfaceTexture,
+        shapes: Vec<egui::epaint::ClippedShape>,
+        pixels_per_point: f32,
+    ) {
+        let gpu = self.gpu.clone();
+        let view = frame.texture.create_view(&Default::default());
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: window.size(),
+            pixels_per_point,
+        };
+        let jobs = self.ctx.tessellate(shapes, pixels_per_point);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let mut commands =
+            self.renderer
+                .update_buffers(&gpu.device, &gpu.queue, &mut encoder, &jobs, &screen);
+        let background = crate::colors::palette().background;
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Ghostty egui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: f64::from(background.r()) / 255.0,
+                                g: f64::from(background.g()) / 255.0,
+                                b: f64::from(background.b()) / 255.0,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            self.renderer.render(&mut pass, &jobs, &screen);
         }
-        self.painter.destroy();
+        commands.push(encoder.finish());
+        let _submission = gpu.submission.lock().unwrap_or_else(|e| e.into_inner());
+        gpu.queue.submit(commands);
+        gpu.queue.present(frame);
     }
 }
 

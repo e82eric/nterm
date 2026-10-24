@@ -1,7 +1,11 @@
 # Rust egui terminal shell
 
-This example embeds Ghostty terminals in an egui shell. It uses OpenGL,
-exporting completed textures to egui without a CPU pixel copy.
+This example embeds Ghostty terminals in an egui shell. It renders with wgpu:
+Direct3D 12 on Windows and Vulkan on Linux. Ghostty and egui share one GPU
+device, so finished terminal frames are textures that egui draws directly,
+without a copy. Set `WGPU_BACKEND` (for example `vulkan`) to choose another
+backend. Without a hardware adapter, as in a virtual machine, it falls back
+to software rendering (WARP on Windows) and reports that as a warning.
 
 ## Features
 
@@ -41,11 +45,11 @@ view, floating pane, and UI state. Windows share the native Ghostty app and its
 configuration; theme and font changes apply to all windows. Closing a window
 closes its terminals, and the app exits after the last window closes.
 
-Windows also share one egui context, font atlas, and GPU painter. The UI
-context switches between each window's drawing surface, while
-input, focus, DPI, and presentation timing remain per window. Ghostty's terminal
-rendering workers retain their own OpenGL contexts. A hidden graphics window
-keeps shared resources alive independently of whichever terminal window closes.
+Windows also share one egui context, font atlas, and GPU device. Each window
+has its own swapchain, while input, focus, DPI, and presentation timing remain
+per window. Ghostty's terminal rendering workers record their GPU work on the
+same device through a dispatch table (`gpu/bridge.rs`, driven by
+`src/renderer/Wgpu.zig`).
 
 On Windows, run `python example/rust-egui-terminal/tests/multiwindow_smoke.py`
 after building to check the shortcut, multiple windows in one process, floating
@@ -144,10 +148,9 @@ installs to `~/.local/opt/ghostty-egui` (or the folder given as its argument),
 and writes `~/.local/share/applications/ghostty-egui.desktop`. Pass
 `--skip-build` to install the existing build. Running instances are unaffected.
 
-The host uses WGL context sharing on Windows and explicitly selects EGL on
-Linux, including X11 and Wayland. `TerminalView` owns the Ghostty surface,
-input bridge separately from `ShellApp`. Its painter owns the current exported
-frame and frames awaiting GPU completion. That
+`TerminalView` owns the Ghostty surface and input bridge separately from
+`ShellApp`. Its painter owns the current exported frame, which returns to
+Ghostty's texture pool when the next frame replaces it. That
 boundary leaves room for fixed-position overlay terminals without moving
 terminal drawing into egui.
 
@@ -1387,7 +1390,8 @@ pickers; `picker = "lines"` requires a `lines` entry in `pickers`.
 The Rust source is divided by responsibility: `app.rs` owns the native window
 and event loop, `terminal.rs` handles pane layout, `terminal/pane.rs`
 coordinates the embedded surface, `ghostty_ffi.rs`
-contains the C boundary, `painter.rs` presents Ghostty's OpenGL textures,
+contains the C boundary, `painter.rs` composites Ghostty's frames into egui, `gpu.rs` and
+`gpu/bridge.rs` own the shared device and run Ghostty's GPU work,
 `picker.rs` and its `picker/` support modules implement the fuzzy picker,
 `input.rs` translates egui input, and `search.rs` owns search state and
 matching. `presentation.rs` owns presentation pacing and detects changes to

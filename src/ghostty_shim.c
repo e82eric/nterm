@@ -22,7 +22,7 @@ struct GhosttyEguiHost {
     GhosttyEguiShared *shared;
     GhosttyEguiHost *next;
     bool focused;
-    ghostty_platform_opengl_s platform;
+    ghostty_platform_wgpu_s platform;
 #ifdef _WIN32
     HWND window;
     WNDPROC previous_window_proc;
@@ -196,8 +196,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
     char **argv,
     void *userdata,
     void *window,
-    void *display,
-    void *context,
+    const void *driver,
     double scale,
     const char *picker_endpoint,
     const char *picker_token,
@@ -250,10 +249,9 @@ GhosttyEguiHost *ghostty_egui_host_create(
     ghostty_config_free(config);
 
     ghostty_surface_config_s options = ghostty_surface_config_new();
-    options.platform_tag = GHOSTTY_PLATFORM_OPENGL;
-    options.platform.opengl.window = window;
-    options.platform.opengl.display = display;
-    options.platform.opengl.context = context;
+    options.platform_tag = GHOSTTY_PLATFORM_WGPU;
+    options.platform.wgpu.window = window;
+    options.platform.wgpu.driver = driver;
     options.scale_factor = scale;
     options.userdata = userdata;
     ghostty_env_var_s token_env[] = {
@@ -292,7 +290,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
     }
     host->shared->base_config = base_config;
     host->shared->hosts = host;
-    host->platform = options.platform.opengl;
+    host->platform = options.platform.wgpu;
 #ifdef _WIN32
     if (SetPropW((HWND)window, host_property, host)) {
         host->previous_window_proc = (WNDPROC)SetWindowLongPtrW((HWND)window, GWLP_WNDPROC, (LONG_PTR)host_window_proc);
@@ -304,7 +302,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
 }
 
 GhosttyEguiHost *ghostty_egui_host_create_child(
-    GhosttyEguiHost *parent, void *userdata, void *window, void *display, void *context,
+    GhosttyEguiHost *parent, void *userdata, void *window, const void *driver,
     double scale,
     const char *picker_endpoint, const char *picker_token,
     const char *command, const char *cwd,
@@ -321,13 +319,10 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
         return NULL;
     }
     ghostty_surface_config_s options = ghostty_surface_config_new();
-    options.platform_tag = GHOSTTY_PLATFORM_OPENGL;
-    options.platform.opengl = parent->platform;
-    if (window) {
-        options.platform.opengl.window = window;
-        options.platform.opengl.display = display;
-        options.platform.opengl.context = context;
-    }
+    options.platform_tag = GHOSTTY_PLATFORM_WGPU;
+    options.platform.wgpu = parent->platform;
+    if (window) options.platform.wgpu.window = window;
+    if (driver) options.platform.wgpu.driver = driver;
     options.scale_factor = scale;
     options.userdata = userdata;
     options.command = command;
@@ -339,7 +334,7 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
     options.env_vars = token_env;
     options.env_var_count = 2;
     host->app = parent->app;
-    host->platform = options.platform.opengl;
+    host->platform = options.platform.wgpu;
     host->surface = ghostty_surface_new(host->app, &options);
     if (!host->surface) {
         startup_error(error_buffer, error_capacity, "create an additional terminal surface", NULL);
@@ -454,12 +449,11 @@ void ghostty_egui_host_focus(GhosttyEguiHost *host, bool focused) {
     runtime_error(host, "set terminal app focus");
     ghostty_surface_set_focus(host->surface, focused);
  runtime_error(host, "ghostty_egui_host_focus"); }
-bool ghostty_egui_host_take_frame(GhosttyEguiHost *host, ghostty_gl_frame_s *frame) {
-    bool succeeded = ghostty_surface_take_gl_frame(host->surface, frame);
+bool ghostty_egui_host_take_frame(GhosttyEguiHost *host, ghostty_gpu_frame_s *frame) {
+    bool succeeded = ghostty_surface_take_gpu_frame(host->surface, frame);
     runtime_error(host, "acquire terminal frame");
     return succeeded;
 }
-void ghostty_egui_host_release_frame(ghostty_gl_frame_t frame) { ghostty_gl_frame_release(frame); }
 bool ghostty_egui_host_key(
     GhosttyEguiHost *host,
     int action_value,

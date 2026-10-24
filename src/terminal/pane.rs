@@ -3,7 +3,7 @@ use crate::app::UserEvent;
 mod snapshot_resize;
 
 use crate::ghostty_ffi::{
-    self, GlFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
+    self, GpuFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
     SnapshotDecorationStyle, SnapshotTextRow, SnapshotView, SnapshotViewportOptions,
 };
 use crate::graphics as glow;
@@ -429,28 +429,14 @@ impl TerminalPane {
     pub(super) fn take_config_issues(&self) -> Vec<String> {
         std::mem::take(&mut *self.wake.config_issues.lock().unwrap())
     }
-    fn new(
-        host: *mut Host,
-        wake: Box<WakeState>,
-        gl: &glow::Context,
-    ) -> Result<Self, crate::native_error::FatalError> {
-        let painter = match TerminalPainter::new(gl) {
-            Ok(painter) => painter,
-            Err(error) => {
-                // Keep callback userdata alive until the native host is freed.
-                unsafe { ghostty_ffi::ghostty_egui_host_destroy(host) };
-                return Err(error);
-            }
-        };
-        let painter = Arc::new(egui::mutex::Mutex::new(painter));
+    fn new(host: *mut Host, wake: Box<WakeState>, gl: &glow::Context) -> Self {
+        let painter = Arc::new(egui::mutex::Mutex::new(TerminalPainter::new(gl)));
         let callback_painter = Arc::clone(&painter);
 
-        let paint_callback = Arc::new(egui_glow::CallbackFn::new(move |_info, glow_painter| {
-            callback_painter.lock().paint(glow_painter.gl());
-        }));
+        let paint_callback = crate::painter::callback(callback_painter);
         let picker_font = crate::picker::font::PickerFont::new(&wake.context, host);
         let search_worker = SnapshotSearchAdapter::new(wake.context.clone());
-        Ok(Self {
+        Self {
             detached: false,
             workspace_bounds: None,
             host,
@@ -476,7 +462,7 @@ impl TerminalPane {
             prompt_boundaries: None,
             prompt_patterns: Default::default(),
             pending_callback: None,
-        })
+        }
     }
 
     pub(super) fn acquire_frame(&mut self) -> bool {
@@ -488,7 +474,7 @@ impl TerminalPane {
         self.wake
             .frame_ready_pending
             .store(false, Ordering::Release);
-        let mut frame = GlFrame::default();
+        let mut frame = GpuFrame::default();
         if !unsafe { ghostty_ffi::ghostty_egui_host_take_frame(self.host, &mut frame) } {
             return false;
         }
@@ -496,7 +482,7 @@ impl TerminalPane {
         true
     }
 
-    pub(super) fn destroy(&mut self, gl: &glow::Context) {
+    pub(super) fn destroy(&mut self) {
         self.picker = None;
         #[cfg(any(windows, unix))]
         {
@@ -506,7 +492,7 @@ impl TerminalPane {
         self.close_search();
         self.close_copy_mode();
         if !self.detached {
-            self.painter.lock().destroy(gl);
+            self.painter.lock().destroy();
         }
         unsafe { ghostty_ffi::ghostty_egui_host_destroy(self.host) };
         self.host = std::ptr::null_mut();
@@ -660,7 +646,7 @@ impl TerminalPane {
         egui_ctx: &egui::Context,
         gl: &glow::Context,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
-        window_id: egui_winit::winit::window::WindowId,
+        window: crate::graphics::PaneWindow,
         argc: usize,
         argv: *mut *mut c_char,
     ) -> Result<Self, crate::native_error::FatalError> {
@@ -673,7 +659,7 @@ impl TerminalPane {
             ),
             context: egui_ctx.clone(),
             proxy,
-            window_id,
+            window_id: window.id,
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             title: std::sync::Mutex::new(String::new()),
@@ -686,7 +672,6 @@ impl TerminalPane {
         if let Some(pipe) = &wake.pipe {
             pipe.bind_window(wake.proxy.clone(), wake.window_id);
         }
-        let native = current_native_context();
         let (picker_endpoint, picker_token) = wake.picker_environment();
         let mut error_buffer = [0 as c_char; 2048];
         let host = unsafe {
@@ -694,9 +679,8 @@ impl TerminalPane {
                 argc,
                 argv,
                 (&mut *wake as *mut WakeState).cast(),
-                native.window,
-                native.display,
-                native.context,
+                window.native,
+                gl.driver(),
                 egui_ctx.pixels_per_point() as f64,
                 picker_endpoint.as_ptr(),
                 picker_token.as_ptr(),
@@ -713,7 +697,7 @@ impl TerminalPane {
             ));
         }
 
-        Self::new(host, wake, gl)
+        Ok(Self::new(host, wake, gl))
     }
 
     /// Creates another terminal in this window, as a child of this pane's
@@ -723,24 +707,32 @@ impl TerminalPane {
         gl: &glow::Context,
         options: &SpawnOptions,
     ) -> Result<Self, crate::native_error::FatalError> {
-        self.spawn(&self.wake.context, gl, self.wake.window_id, false, options)
+        self.spawn(&self.wake.context, gl, self.wake.window_id, None, options)
     }
 
     pub(super) fn create_window(
         &self,
         ctx: &egui::Context,
         gl: &glow::Context,
-        window_id: egui_winit::winit::window::WindowId,
+        window: crate::graphics::PaneWindow,
     ) -> Result<Self, crate::native_error::FatalError> {
-        self.spawn(ctx, gl, window_id, true, &SpawnOptions::default())
+        self.spawn(
+            ctx,
+            gl,
+            window.id,
+            Some(window.native),
+            &SpawnOptions::default(),
+        )
     }
 
+    /// `native` is the handle of a new window this terminal is the first in;
+    /// terminals added to an existing window pass `None`.
     fn spawn(
         &self,
         ctx: &egui::Context,
         gl: &glow::Context,
         window_id: egui_winit::winit::window::WindowId,
-        new_window: bool,
+        native: Option<*mut c_void>,
         options: &SpawnOptions,
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
@@ -778,17 +770,11 @@ impl TerminalPane {
             .transpose()
             .map_err(|e| crate::native_error::FatalError::new("pane directory", e))?;
         let host = unsafe {
-            let native = current_native_context();
             ghostty_ffi::ghostty_egui_host_create_child(
                 self.host,
                 (&mut *wake as *mut WakeState).cast(),
-                if new_window {
-                    native.window
-                } else {
-                    std::ptr::null_mut()
-                },
-                native.display,
-                native.context,
+                native.unwrap_or(std::ptr::null_mut()),
+                gl.driver(),
                 ctx.pixels_per_point() as f64,
                 picker_endpoint.as_ptr(),
                 picker_token.as_ptr(),
@@ -806,7 +792,7 @@ impl TerminalPane {
                 detail,
             ));
         }
-        Self::new(host, wake, gl)
+        Ok(Self::new(host, wake, gl))
     }
 
     pub(super) fn tick(&mut self) {
@@ -819,7 +805,7 @@ impl TerminalPane {
     pub(super) fn set_corner_radius(&self, radius: f32) {
         self.painter.lock().set_corner_radius(radius);
     }
-    pub(super) fn close_process(&mut self, gl: &glow::Context) {
+    pub(super) fn close_process(&mut self) {
         if self.detached {
             return;
         }
@@ -831,7 +817,7 @@ impl TerminalPane {
         {
             self.wake.pipe.take();
         }
-        self.painter.lock().destroy(gl);
+        self.painter.lock().destroy();
         unsafe {
             ghostty_ffi::ghostty_egui_host_close_process(self.host);
         }
@@ -853,14 +839,6 @@ impl TerminalPane {
 
     pub(super) fn paint_callback(&self) -> crate::painter::PaintCallback {
         self.paint_callback.clone()
-    }
-
-    pub(super) fn poll_retired(&self, gl: &glow::Context) {
-        self.painter.lock().poll_retired(gl);
-    }
-
-    pub(super) fn retired_pending(&self) -> bool {
-        self.painter.lock().has_retired_frames()
     }
 }
 
@@ -3466,43 +3444,5 @@ mod copy_shortcut_tests {
             copy_motion_with_prefix(&mut mode, egui::Key::E, shift),
             Some(Motion::PreviousBigWordEnd)
         );
-    }
-}
-
-struct NativeContext {
-    window: *mut c_void,
-    display: *mut c_void,
-    context: *mut c_void,
-}
-
-#[cfg(target_os = "windows")]
-fn current_native_context() -> NativeContext {
-    unsafe extern "system" {
-        fn wglGetCurrentContext() -> *mut c_void;
-        fn wglGetCurrentDC() -> *mut c_void;
-        fn WindowFromDC(dc: *mut c_void) -> *mut c_void;
-    }
-    unsafe {
-        NativeContext {
-            window: WindowFromDC(wglGetCurrentDC()),
-            display: std::ptr::null_mut(),
-            context: wglGetCurrentContext(),
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-fn current_native_context() -> NativeContext {
-    #[link(name = "EGL")]
-    unsafe extern "C" {
-        fn eglGetCurrentDisplay() -> *mut c_void;
-        fn eglGetCurrentContext() -> *mut c_void;
-    }
-    unsafe {
-        NativeContext {
-            window: std::ptr::null_mut(),
-            display: eglGetCurrentDisplay(),
-            context: eglGetCurrentContext(),
-        }
     }
 }

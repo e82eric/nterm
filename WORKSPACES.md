@@ -150,7 +150,7 @@ and picker callbacks. Retained `app` handles expire when the callback returns.
 return {
   workspaces = {
     default_layout="horizontal_grid",
-    inner_gap=10, outer_gap=10, padding=4, corner_radius=8,
+    inner_gap=10, outer_gap=10, padding=4, corner_radius=8, border_width=1.5,
     shadow_size=10, shadow_opacity=0.3, shadow_offset={0,2},
   },
   startup = function(app)

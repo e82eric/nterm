@@ -8,7 +8,7 @@ return {
   keys = keys,
   workspaces = {
     inner_gap = 10, outer_gap = 10, padding = 4,
-    corner_radius = 8,
+    corner_radius = 8, border_width = 1.5,
     shadow_size = 10, shadow_opacity = 0.3, shadow_offset = {0, 2},
   },
   -- Runs once after each native window is ready. Reloading does not rerun it.

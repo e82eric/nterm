@@ -64,14 +64,14 @@ pub(crate) struct SurfaceSize {
     pub(crate) cell_height_px: u32,
 }
 
+/// A finished terminal frame. `texture` is an exported frame of our own
+/// dispatch table (gpu::bridge), which we release there.
 #[repr(C)]
 #[derive(Default)]
-pub(crate) struct GlFrame {
-    pub(crate) handle: *mut c_void,
-    pub(crate) texture: u32,
+pub(crate) struct GpuFrame {
+    pub(crate) texture: usize,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) frame_generation: u64,
 }
 
 // Shared copy-mode types have a C layout matching the native snapshot ABI.
@@ -381,8 +381,7 @@ unsafe extern "C" {
         argv: *mut *mut c_char,
         userdata: *mut c_void,
         window: *mut c_void,
-        display: *mut c_void,
-        context: *mut c_void,
+        driver: *const c_void,
         scale: f64,
         picker_endpoint: *const c_char,
         picker_token: *const c_char,
@@ -395,8 +394,7 @@ unsafe extern "C" {
         parent: *mut Host,
         userdata: *mut c_void,
         window: *mut c_void,
-        display: *mut c_void,
-        context: *mut c_void,
+        driver: *const c_void,
         scale: f64,
         picker_endpoint: *const c_char,
         picker_token: *const c_char,
@@ -410,8 +408,7 @@ unsafe extern "C" {
     pub(crate) fn ghostty_egui_host_shell_creation_time(host: *mut Host) -> u64;
     pub(crate) fn ghostty_egui_host_resize(host: *mut Host, width: u32, height: u32, scale: f64);
     pub(crate) fn ghostty_egui_host_focus(host: *mut Host, focused: bool);
-    pub(crate) fn ghostty_egui_host_take_frame(host: *mut Host, frame: *mut GlFrame) -> bool;
-    pub(crate) fn ghostty_egui_host_release_frame(frame: *mut c_void);
+    pub(crate) fn ghostty_egui_host_take_frame(host: *mut Host, frame: *mut GpuFrame) -> bool;
     pub(crate) fn ghostty_egui_host_key(
         host: *mut Host,
         action: i32,

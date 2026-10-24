@@ -31,19 +31,19 @@ Addressed paths:
 
 - **C01, C02:** configuration fallback with persistent status and Messages.
 - **S01:** event-loop creation and execution use the shared fatal-error path.
-- **S02:** graphics display, window/handles, configuration selection, context,
-  surface, and making the context current use the shared fatal-error path.
-- **S03:** terminal GL object creation and shader compilation/linking use that
-  path during main startup, preserving driver logs and cleaning partial resources.
-  Floating renderer failures instead show a toast in the working main UI.
+- **S02:** graphics adapter and device selection, the window, and its surface
+  use the shared fatal-error path.
+- **S03:** terminal render operations that fail report to the error history and
+  stderr; Ghostty marks that renderer unhealthy and the app keeps running.
 - **S05:** main-terminal initialization preserves the native failed stage and
   error name, cleans partial resources, and uses the shared fatal-error path.
   Recoverable configuration diagnostics still use the existing fallback.
 - **S04:** secure token generation errors stop main startup through the shared
   fatal-error path. Floating creation is canceled with a toast instead. No
   predictable token fallback is used.
-- **R01:** buffer-swap failure stops further rendering, exits the event loop,
-  and reports the failed step and underlying error through the native dialog.
+- **R01:** a lost or outdated window surface is reconfigured once; a failure
+  that persists stops further rendering, exits the event loop, and reports the
+  failed step and underlying error through the native dialog.
 - **C03, I04:** invalid startup arguments fail before terminal startup, with
   a native dialog and exit status 1.
 - **O07, O08, O10:** command, preview, and search workers report active-operation
@@ -70,8 +70,8 @@ Related propagation sites are grouped rather than counted as separate failures.
 | C02 | `src/ghostty_shim.c`: config load/finalize | Native diagnostics copied into Messages before config is freed | Configuration / fix and restart | Implemented; preserve original diagnostic and accurately describe partial application |
 | C03 | `src/config.rs`: prepare argument parsing; `src/main.rs` | Invalid invocation returns FatalError before graphics/terminal startup | Invalid invocation / correct arguments | Implemented: native startup dialog, stderr, exit status 1 |
 | S01 | `src/app.rs`: run | Event-loop creation/run errors return to main | Fatal startup or runtime / environment-dependent | Implemented: Windows native error dialog, stderr fallback, exit status 1 |
-| S02 | `src/app.rs`: GlutinWindowContext::new | No compatible GL config, display/window/handle/context/surface/current-context failures return a shared FatalError | Fatal startup / graphics environment | Implemented: exit event loop, Windows native dialog identifying failed step and underlying error, exit status 1 |
-| S03 | `src/painter.rs`: TerminalPainter::new | GL object creation and shader compile/link failures return FatalError; partial GL resources and native host are freed | Fatal main startup / driver/resource failure, possibly internal shader bug | Implemented: native startup dialog with failed step and shader/driver log; floating renderer failure uses a toast in the working main UI |
+| S02 | `src/gpu.rs`: SharedGpu::new; `src/app.rs`: WindowSurface::new | No adapter, an adapter without immediate data, device creation, window/surface creation, and an unsupported surface format return a shared FatalError | Fatal startup / graphics environment | Implemented: exit event loop, Windows native dialog identifying failed step and underlying error, exit status 1 |
+| S03 | `src/gpu/bridge.rs`: dispatch; `src/gpu.rs`: uncaptured device errors | A panicking render operation returns failure to Ghostty, which marks the renderer unhealthy; wgpu validation errors, including custom shader compile failures, are logged | Degraded runtime / driver failure or internal bug | Implemented: error history and stderr; the app and other panes keep running |
 | S04 | `src/picker/protocol.rs`: new_token | Randomness acquisition returns FatalError, preserving the RNG error; no fallback token | Fatal main startup; floating operation failure / environment | Implemented: native startup dialog and exit status 1 for main; floating creation canceled with a toast, existing terminal keeps running |
 | S05 | `src/terminal/pane.rs`: TerminalPane::create; `src/ghostty_shim.c`: ghostty_egui_host_create | Fatal init/config/app/surface/allocation failures return stage and native cause; Rust returns FatalError | Fatal main startup / restart or correct underlying cause | Implemented: shared native dialog, stderr, exit status 1; partial resources freed; recoverable config diagnostics retain fallback |
 | S06 | `../../src/apprt/embedded.zig`: ghostty_app_new, ghostty_surface_new; `../../src/termio/Exec.zig`: command setup/start | Caught synchronous embedded errors preserve native error names; app/surface creation preserves causes and runtime operations report to history/toasts | Operational / command, cwd, PTY, resources | Implemented for caught synchronous operations; deep asynchronous Zig renderer/PTY logs and external worker failures still require auditing |
@@ -89,8 +89,8 @@ Related propagation sites are grouped rather than counted as separate failures.
 | O12 | `src/terminal/pane.rs`: quick select, paging, copy movement/decorations, prompt navigation; shim snapshot APIs | Invalid/expired snapshot failures cancel affected overlays/navigation and preserve diagnostics; native caught errors cross the shim | Mixed operational and expected boundary/no-match cases | Implemented for app-owned operations; normal boundary/no-match results remain quiet, and unexposed shared-core failures remain an audit limit |
 | O13 | `src/terminal/pane.rs`: protocol callback and OSC request handling | Rejected protocol and unknown-picker requests enter history/stderr; authentication token not logged; busy-overlay requests remain stderr only | Invalid external input or busy state / caller-dependent | Partially addressed: repeat aggregation implemented; normal overlay contention is excluded; oversized/null payloads are still dropped |
 | D01 | `src/picker/font.rs`: terminal font export | Terminal font export failure retains monospace fallback and records warning in history/stderr | Degraded / continues | Implemented: identical fallback warnings aggregate across regular/bold fonts |
-| D02 | `src/app.rs`: swap interval configuration | Swap-interval failure retains rendering and records warning in history/stderr | Degraded / continues | Implemented: identical warnings aggregate |
-| R01 | `src/app.rs`: redraw swap_buffers | Records FatalError, stops rendering, and exits the event loop | Fatal runtime graphics failure / restart | Implemented: shared Windows native dialog with failed step and underlying error, stderr, exit status 1; no automatic retry |
+| D02 | `src/app.rs`: WindowSurface::new present mode | Mailbox presentation falls back to AutoNoVsync when the surface lacks it | Degraded / continues | Implemented: no failure path |
+| R01 | `src/app.rs`: WindowSurface::acquire | Timeout or occlusion skips the frame; a lost or outdated surface is reconfigured once; other failures record a FatalError, stop rendering, and exit the event loop | Fatal runtime graphics failure / restart | Implemented: shared Windows native dialog with failed step and underlying error, stderr, exit status 1 |
 | I01 | `src/app.rs`, `src/terminal.rs`, `src/terminal/pane.rs`, `src/painter.rs`, `src/picker.rs` | Assertions remain; unexpected UI panics use controlled native fatal reporting | Internal invariant / bug | Implemented boundary handling; diagnostic message retained, unknown UI state is not reused |
 | I02 | Shared mutexes in pane/picker/source/command code | All sample Rust C callbacks catch panics before returning across C; optional workers catch and report failure; diagnostic-only mutexes recover their bounded state | Internal / bug | Implemented: UI/shared-state poisoning is fatal rather than silently reused; aborts/access violations cannot be caught as Rust panics |
 | I03 | `src/actions.rs`, `src/input.rs`, `src/quick_select.rs`, `src/copy_mode.rs`, `src/picker/source.rs` | Justified internal assertions remain; UI/worker/C callback boundaries handle unwinding panics | Internal / bug | Implemented boundary handling; assertions are not indiscriminately converted into fallback results |
