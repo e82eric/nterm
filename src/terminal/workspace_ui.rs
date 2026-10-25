@@ -13,7 +13,7 @@ pub(crate) enum HostRequest {
 pub(crate) fn workspace_picker_options(
     workspaces: &[Workspace],
     current: u64,
-    pane: Option<u64>,
+    pane: Option<PaneRef>,
 ) -> crate::picker::config::Options {
     use crate::picker::config::*;
     Options {
@@ -52,6 +52,8 @@ pub(crate) enum WorkspaceAction {
     RemoveWorkspace,
     WorkspacePicker,
     MovePaneToWorkspacePicker,
+    /// Moves the focused pane, or the visible float, into a new workspace.
+    MovePaneToNewWorkspace,
     NextWorkspace,
     PreviousWorkspace,
     LastWorkspace,
@@ -91,6 +93,7 @@ impl WorkspaceAction {
         Self::RemoveWorkspace,
         Self::WorkspacePicker,
         Self::MovePaneToWorkspacePicker,
+        Self::MovePaneToNewWorkspace,
         Self::NextWorkspace,
         Self::PreviousWorkspace,
         Self::LastWorkspace,
@@ -148,6 +151,7 @@ impl WorkspaceAction {
             RemoveWorkspace => "RemoveWorkspace".into(),
             WorkspacePicker => "WorkspacePicker".into(),
             MovePaneToWorkspacePicker => "MovePaneToWorkspacePicker".into(),
+            MovePaneToNewWorkspace => "MovePaneToNewWorkspace".into(),
             NextWorkspace => "NextWorkspace".into(),
             PreviousWorkspace => "PreviousWorkspace".into(),
             LastWorkspace => "LastWorkspace".into(),
@@ -204,6 +208,7 @@ impl WorkspaceAction {
             | RemoveWorkspace
             | WorkspacePicker
             | MovePaneToWorkspacePicker
+            | MovePaneToNewWorkspace
             | NextWorkspace
             | PreviousWorkspace
             | LastWorkspace
@@ -318,7 +323,7 @@ pub(crate) fn install_lua_helpers(lua: &mlua::Lua, ghostty: &mlua::Table) -> mlu
 }
 impl TerminalView {
     fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
-        let pane = if moving { self.focused_id() } else { None };
+        let pane = if moving { self.active_pane() } else { None };
         if moving && pane.is_none() {
             return;
         }
@@ -519,6 +524,59 @@ impl TerminalView {
         w.focus(pane_id);
         Ok(pane_id)
     }
+    /// The lowest workspace index not in use.
+    fn free_index(&self) -> usize {
+        (1..)
+            .find(|i| !self.workspaces.iter().any(|w| w.index == *i))
+            .unwrap()
+    }
+    /// Adds a workspace without panes. The caller gives it a tiled pane
+    /// before the next prune removes it.
+    fn push_workspace(&mut self, index: usize, layout: Option<Layout>) -> &mut Workspace {
+        let id = self.next_workspace;
+        self.next_workspace += 1;
+        let mut w = Workspace::new(id, index);
+        w.set_layout(layout.unwrap_or(self.picker_bindings.default_layout));
+        self.workspaces.push(w);
+        self.workspaces.sort_by_key(|w| w.index);
+        self.workspaces.iter_mut().find(|w| w.id == id).unwrap()
+    }
+    pub(super) fn move_pane_to_workspace(
+        &mut self,
+        pane: PaneRef,
+        workspace: u64,
+        gl: &glow::Context,
+    ) -> Result<(), String> {
+        let request = match pane {
+            PaneRef::Tiled(id) => Request::MovePane(id, workspace),
+            PaneRef::Floating(id) => Request::MoveFloat(id, workspace),
+        };
+        self.workspace_request(request, gl).map(|_| ())
+    }
+    /// Moves a pane into a new workspace at the lowest free index without
+    /// selecting it. A float becomes the new workspace's tiled pane, because a
+    /// workspace needs at least one.
+    fn move_pane_to_new_workspace(
+        &mut self,
+        pane: PaneRef,
+        gl: &glow::Context,
+    ) -> Result<(), String> {
+        // Check before creating so a failure leaves no empty workspace.
+        let exists = match pane {
+            PaneRef::Tiled(id) => self.workspaces.iter().any(|w| w.panes.contains(&id)),
+            PaneRef::Floating(id) => self.workspaces.iter().any(|w| w.floats.contains(id)),
+        };
+        if !exists {
+            return Err("pane does not exist".into());
+        }
+        let index = self.free_index();
+        let workspace = self.push_workspace(index, None).id;
+        self.move_pane_to_workspace(pane, workspace, gl)?;
+        if let PaneRef::Floating(id) = pane {
+            self.tile_float(id)?;
+        }
+        Ok(())
+    }
     fn close_tiled(&mut self, id: u64) -> Result<(), String> {
         if !self.workspaces.iter().any(|w| w.panes.contains(&id)) {
             return Err("pane does not exist".into());
@@ -563,11 +621,7 @@ impl TerminalView {
                 if o.index == Some(0) {
                     return Err("workspace index must be positive".into());
                 }
-                let index = o.index.unwrap_or_else(|| {
-                    (1..)
-                        .find(|i| !self.workspaces.iter().any(|w| w.index == *i))
-                        .unwrap()
-                });
+                let index = o.index.unwrap_or_else(|| self.free_index());
                 if self.workspaces.iter().any(|w| w.index == index) {
                     return Err("workspace index already exists".into());
                 }
@@ -577,14 +631,10 @@ impl TerminalView {
                 let pane_id = self.next_pane;
                 self.next_pane += 1;
                 self.tiled.push((pane_id, pane));
-                let mut w = Workspace::new(self.next_workspace, index);
-                self.next_workspace += 1;
-                w.set_layout(o.layout.unwrap_or(self.picker_bindings.default_layout));
+                let w = self.push_workspace(index, o.layout);
                 w.panes.push(pane_id);
                 w.focus(pane_id);
                 let result = json!(w);
-                self.workspaces.push(w);
-                self.workspaces.sort_by_key(|w| w.index);
                 self.prune_workspaces();
                 Ok(result)
             }
@@ -662,6 +712,22 @@ impl TerminalView {
                 self.prune_workspaces();
                 Ok(Value::Null)
             }
+            Request::MoveFloat(id, target) => {
+                if !self.workspaces.iter().any(|w| w.id == target) {
+                    return Err("workspace does not exist".into());
+                }
+                let source = self
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.floats.contains(id))
+                    .ok_or("floating pane does not exist")?;
+                // The source shows its next float, if any; the destination
+                // shows the moved float when it is next selected.
+                source.floats.remove(id);
+                let w = self.workspaces.iter_mut().find(|w| w.id == target).unwrap();
+                w.floats.add(id);
+                Ok(Value::Null)
+            }
             Request::ClosePane(id) => {
                 self.close_tiled(id)?;
                 Ok(Value::Null)
@@ -729,8 +795,8 @@ impl TerminalView {
                         .map(|w| w.id)
                         .ok_or("workspace index does not exist")?;
                     if let MoveToWorkspace(_) = action {
-                        if let Some(p) = self.focused_id() {
-                            self.workspace_request(Request::MovePane(p, id), gl)?;
+                        if let Some(pane) = self.active_pane() {
+                            self.move_pane_to_workspace(pane, id, gl)?;
                         }
                     } else {
                         self.select_workspace(id)?;
@@ -739,6 +805,11 @@ impl TerminalView {
                 CreateWorkspace => {
                     let w = self.workspace_request(Request::Create(Default::default()), gl)?;
                     self.select_workspace(w["id"].as_u64().unwrap())?;
+                }
+                MovePaneToNewWorkspace => {
+                    if let Some(pane) = self.active_pane() {
+                        self.move_pane_to_new_workspace(pane, gl)?;
+                    }
                 }
                 WorkspacePicker | MovePaneToWorkspacePicker => {
                     self.open_workspace_picker(ctx, action == MovePaneToWorkspacePicker);
@@ -763,9 +834,13 @@ impl TerminalView {
                 LastWorkspace => {
                     self.select_workspace(self.previous)?;
                 }
+                // Creates in the layer that has focus: a float while one is shown.
                 CreatePane => {
-                    self.workspace_request(Request::CreatePane(Default::default()), gl)?;
-                    self.floats_mut().hide();
+                    if self.floats().visible().is_some() {
+                        self.floating_request(floating::Request::Create(Default::default()), gl)?;
+                    } else {
+                        self.workspace_request(Request::CreatePane(Default::default()), gl)?;
+                    }
                 }
                 ClosePane => {
                     if let Some(id) = self.focused_id() {

@@ -32,7 +32,7 @@ impl Messages {
             .layout_no_wrap(text, egui::FontId::monospace(13.0), color);
         let left = (right - galley.size().x).max(rect.left());
         let hit = egui::Rect::from_min_max(egui::pos2(left, rect.top()), rect.right_bottom());
-        let response = ui.interact(hit, ui.id().with("config-messages"), egui::Sense::click());
+        let response = ui.interact(hit, ui.id().with("config-messages"), egui::Sense::CLICK);
         let clicked = response.clicked();
         response.on_hover_text(
             "View configuration messages. Fix the configuration and restart to clear these issues.",

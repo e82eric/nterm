@@ -348,6 +348,8 @@ pub(crate) enum DefinitionSource {
         #[serde(default)]
         directories_only: bool,
         #[serde(default)]
+        relative: bool,
+        #[serde(default)]
         enter_action: Option<EnterAction>,
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
@@ -562,6 +564,7 @@ impl Definition {
                 max_depth,
                 files_only,
                 directories_only,
+                relative,
                 ..
             } => {
                 if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
@@ -589,6 +592,7 @@ impl Definition {
                         max_depth: max_depth.unwrap_or(i32::MAX),
                         files_only,
                         directories_only,
+                        relative,
                     }),
                     EnterAction::SendInput,
                 )
@@ -799,6 +803,9 @@ pub(crate) struct FileOptions {
     pub(crate) max_depth: i32,
     pub(crate) files_only: bool,
     pub(crate) directories_only: bool,
+    /// Show paths relative to their root. With several roots the same
+    /// relative path can come from more than one of them.
+    pub(crate) relative: bool,
 }
 
 impl Options {
@@ -835,6 +842,11 @@ impl Options {
                     return Err("invalid picker roots".into());
                 }
                 files.roots = roots.into_iter().map(std::path::PathBuf::from).collect();
+            }
+            if let Some(relative) = params.get("relative") {
+                files.relative = relative
+                    .parse()
+                    .map_err(|_| format!("invalid picker relative: {relative}"))?;
             }
         }
         self.params.extend(params);

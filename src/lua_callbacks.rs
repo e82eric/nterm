@@ -269,6 +269,7 @@ mod tests {
                 local pane=app:create_pane {workspace=w.id,command='cmd.exe',cwd='C:/src'}
                 assert(pane.id==9)
                 app:move_pane(pane.id,w.id)
+                app:move_float(3,w.id)
                 app:focus_pane(pane.id)
                 assert(#app:get_panes()==1)
                 app:close_pane(pane.id)
@@ -307,7 +308,7 @@ mod tests {
                 || callback.call_action(String::new()),
             )
             .unwrap();
-        assert_eq!(calls.len(), 14);
+        assert_eq!(calls.len(), 15);
         let result = callback
             .with_host(&mut |_| panic!("expired handle reached controller"), || {
                 callback.call_action(String::new())
@@ -700,6 +701,7 @@ impl UserData for App {
             ("set_main_ratio", "MainRatio"),
             ("create_pane", "CreatePane"),
             ("move_pane", "MovePane"),
+            ("move_float", "MoveFloat"),
             ("close_pane", "ClosePane"),
             ("focus_pane", "FocusPane"),
             ("get_panes", "ListPanes"),
@@ -712,7 +714,10 @@ impl UserData for App {
                 let request = lua.create_table()?;
                 request.set("op", op)?;
                 let mut args: Vec<_> = args.into_iter().collect();
-                if matches!(op, "SetLayout" | "MovePane" | "SetAppearance" | "MainRatio") {
+                if matches!(
+                    op,
+                    "SetLayout" | "MovePane" | "MoveFloat" | "SetAppearance" | "MainRatio"
+                ) {
                     request.set("args", lua.create_sequence_from(args)?)?;
                 } else if matches!(op, "Create" | "Ensure" | "CreatePane") {
                     request.set(

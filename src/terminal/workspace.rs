@@ -339,6 +339,9 @@ pub(crate) enum Request {
     SetLayout(u64, Layout),
     CreatePane(CreatePaneOptions),
     MovePane(u64, u64),
+    /// Moves a float to another workspace and makes it that workspace's
+    /// visible float.
+    MoveFloat(u64, u64),
     ClosePane(u64),
     FocusPane(u64),
     ListPanes,
@@ -572,6 +575,26 @@ mod tests {
         // The window is closing; its last workspace keeps its floats for teardown.
         assert!(prune_empty(&mut workspaces, &mut current, &mut previous).is_empty());
         assert_eq!(workspaces[0].floats.ids(), &[100]);
+    }
+    #[test]
+    fn moving_visible_float_shows_next_and_shows_it_in_destination() {
+        let mut source = Workspace::new(1, 1);
+        source.floats.add(100);
+        source.floats.add(101);
+        let mut shown = Workspace::new(2, 2);
+        shown.floats.add(200);
+        let mut hidden = Workspace::new(3, 3);
+        hidden.floats.add(300);
+        hidden.floats.hide();
+        // The same steps as `Request::MoveFloat`.
+        source.floats.remove(101);
+        shown.floats.add(101);
+        assert_eq!(source.floats.visible(), Some(100));
+        assert_eq!(shown.floats.visible(), Some(101));
+        source.floats.remove(100);
+        hidden.floats.add(100);
+        assert_eq!(source.floats.visible(), None);
+        assert_eq!(hidden.floats.visible(), Some(100));
     }
     #[test]
     fn removing_background_workspace_keeps_focus_and_indexes() {

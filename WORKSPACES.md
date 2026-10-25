@@ -31,10 +31,10 @@ floating panes, copy mode, and pickers remain available.
 | Keys | Action |
 | --- | --- |
 | Ctrl+Alt+1…9,0 | Select workspace index 1…10 |
-| Ctrl+Alt+Shift+1…9,0 | Move focused pane to an existing workspace |
+| Ctrl+Alt+Shift+1…9,0 | Move focused pane, or the visible float, to an existing workspace |
 | Ctrl+Alt+W | Workspace picker; type an index, arrows and Enter to select |
 | Ctrl+Alt+Shift+W | Create a workspace |
-| Ctrl+Alt+C | Create terminal pane |
+| Ctrl+Alt+C | Create terminal pane (a float while a float is visible) |
 | Ctrl+Alt+Shift+C | Close focused terminal pane |
 | Ctrl+Alt+H/J/K/L | Focus left/down/up/right |
 | Ctrl+Alt+Shift+H/J/K/L | Move pane left/down/up/right |
@@ -55,6 +55,23 @@ While a floating pane is visible, the focus keys cycle through the workspace's
 floating panes instead of the tiled ones: H/K go to the previous float, J/L
 to the next, in creation order and wrapping around. Hide the float to return to tiled focus.
 
+A workspace's floats act as a layer over its tiled panes. While a float is
+visible, the layer has focus: `CreatePane` (Ctrl+Alt+C) creates a new float
+instead of a tiled pane. Closing or moving away the visible float shows the
+workspace's most recently focused remaining float, and the layer hides only
+when no floats remain. Tiling the visible float hides the layer, because the
+new tiled pane takes focus.
+
+The move-pane shortcuts and picker act on the visible float when one is shown,
+otherwise on the focused tiled pane. A float moved to an existing workspace
+stays floating and becomes the destination's visible float, so it is showing
+when you select that workspace; you stay on the current workspace.
+`MovePaneToNewWorkspace` moves the pane into a new workspace at the
+lowest free index; you stay on the current workspace. A float moved this way becomes the new
+workspace's tiled pane, since every workspace needs one. As with other moves,
+moving a workspace's last tiled pane removes that workspace and closes its
+floats.
+
 The bar shows a clickable button per workspace index next to the status text.
 The active workspace is filled with the accent color, workspaces containing
 panes get a subtle fill, and empty ones are outlined. The status text after the buttons shows `layout · focused/total` panes
@@ -64,11 +81,11 @@ connection indicator. Index 10 is displayed as `0`, matching its shortcut.
 workspaces through the shortcut or palette.
 
 The command palette also exposes remove, creation, previous/next/
-last workspace, move-pane workspace picker, tile-reversed, and
-horizontal-grid. Bind their action names in Lua:
+last workspace, move-pane workspace picker, move pane to new workspace,
+tile-reversed, and horizontal-grid. Bind their action names in Lua:
 `RemoveWorkspace`, `CreateWorkspace`, `NextWorkspace`,
 `PreviousWorkspace`, `LastWorkspace`,
-`MovePaneToWorkspacePicker`,
+`MovePaneToWorkspacePicker`, `MovePaneToNewWorkspace`,
 `SetTileReversed`, and `SetHorizontalGrid`.
 
 `ResizeLeft`, `ResizeRight`, `ResizeUp`, and `ResizeDown` move a shared divider
@@ -189,6 +206,7 @@ workspace and of workspaces created without an explicit `layout`, including
 | `app:get_panes()` | Pane IDs, workspace IDs, and remembered focus flags |
 | `app:focus_pane(id)` | Switch workspace and focus pane |
 | `app:move_pane(id,workspace_id)` | Move without restarting; stay on current workspace |
+| `app:move_float(id,workspace_id)` | Move a floating pane; it becomes the destination's visible float; stay on current workspace |
 | `app:close_pane(id)` | Close terminal; remove empty workspace, or close window if it was the final pane |
 | `app:float_pane(id)` | Turn a tiled pane into a floating pane in its workspace; returns the float's description |
 | `app:tile_floating_pane(id_or_name?)` | Turn the current workspace's float (default: last focused) into a tiled pane after the focused pane; returns `{id,workspace}` |

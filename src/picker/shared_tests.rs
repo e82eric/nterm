@@ -1276,7 +1276,8 @@ fn workspace_picker_uses_workspace_bottom_and_returns_stable_targets() {
     use crate::terminal::{workspace::Workspace, workspace_ui::workspace_picker_options};
     let first = Workspace::new(41, 1);
     let second = Workspace::new(97, 2);
-    for pane in [None, Some(123)] {
+    use crate::terminal::PaneRef;
+    for pane in [None, Some(PaneRef::Tiled(123)), Some(PaneRef::Floating(5))] {
         let ctx = egui::Context::default();
         let mut options = workspace_picker_options(&[first.clone(), second.clone()], 41, pane);
         assert_eq!(options.scope, config::Scope::Workspace);
@@ -1961,6 +1962,7 @@ fn filesystem_picker_accepts_path_without_terminal_snapshot() {
                 max_depth: 1,
                 files_only: true,
                 directories_only: false,
+                relative: false,
             }),
             params: [("query".into(), "file with spaces".into())].into(),
             enter_action: config::EnterAction::SendInput,

@@ -259,6 +259,7 @@ impl PickerSource {
                         max_depth: files.max_depth,
                         files_only: files.files_only,
                         directories_only: files.directories_only,
+                        relative: files.relative,
                     },
                     shared.clone(),
                 );

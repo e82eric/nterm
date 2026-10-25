@@ -309,6 +309,16 @@ mod tests {
         assert!(floats.is_empty());
     }
     #[test]
+    fn removing_visible_float_shows_next_until_none_remain() {
+        let mut floats = Floats::default();
+        floats.add(1);
+        floats.add(2);
+        assert!(floats.remove(2));
+        assert_eq!(floats.visible(), Some(1));
+        assert!(floats.remove(1));
+        assert_eq!(floats.visible(), None);
+    }
+    #[test]
     fn ids_stay_unique_across_removal() {
         let mut panes = Panes::default();
         let a = panes.insert(None, ());

@@ -2014,6 +2014,45 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_relative_is_configurable_and_overridable_per_request() {
+        let config = parse(
+            r#"return { pickers = {
+                files = { type = 'FileSystem', roots = { '.' } },
+                relative = { type = 'FileSystem', roots = { '.' }, relative = true },
+            } }"#,
+        )
+        .unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+        let relative = |name: &str, params: &[(&str, &str)]| {
+            let params = params
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            bindings
+                .named(name)
+                .unwrap()
+                .resolve(&PickerContext::default())
+                .unwrap()
+                .with_request(params)
+                .map(|options| match options.source {
+                    crate::picker::config::Source::FileSystem(files) => files.relative,
+                    _ => panic!("expected filesystem picker"),
+                })
+        };
+        assert_eq!(relative("files", &[]), Ok(false));
+        assert_eq!(relative("relative", &[]), Ok(true));
+        assert_eq!(relative("files", &[("relative", "true")]), Ok(true));
+        assert_eq!(relative("relative", &[("relative", "false")]), Ok(false));
+        assert!(relative("files", &[("relative", "yes")]).is_err());
+    }
+
+    #[test]
     fn lua_items_provider_rereads_file_each_time() {
         let path =
             std::env::temp_dir().join(format!("ghostty-picker-items-{}.json", std::process::id()));

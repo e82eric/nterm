@@ -7,7 +7,7 @@ pub(crate) enum AppAction {
     /// Picker results that refer to window-local IDs, not config indexes.
     SelectWorkspaceId(u64),
     MovePaneToWorkspaceId {
-        pane: u64,
+        pane: crate::terminal::PaneRef,
         workspace: u64,
     },
     ReloadConfig,

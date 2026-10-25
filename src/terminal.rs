@@ -76,7 +76,7 @@ impl FloatingTerminal {
 /// A terminal in this window. Tiled and floating panes have separate ID
 /// spaces, so a reference says which kind it is; tiled 0 is `main`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PaneRef {
+pub(crate) enum PaneRef {
     Tiled(u64),
     Floating(u64),
 }
@@ -374,9 +374,7 @@ impl TerminalView {
                 }
             }
             AppAction::MovePaneToWorkspaceId { pane, workspace } => {
-                if let Err(error) =
-                    self.workspace_request(workspace::Request::MovePane(pane, workspace), gl)
-                {
+                if let Err(error) = self.move_pane_to_workspace(pane, workspace, gl) {
                     self.main.show_error("Workspace action failed", error);
                 }
             }
@@ -616,11 +614,12 @@ impl TerminalView {
         ui.painter()
             .rect_filled(rect, 0.0, crate::colors::palette().panel_background);
         // Empty bar space moves the window; registered first so the bar's own
-        // controls, registered later, take their clicks.
+        // controls, registered later, take their clicks. Not focusable: Tab
+        // would focus it and egui would then keep keys from the terminal.
         let drag = ui.interact(
             rect,
             ui.id().with("status-drag"),
-            egui::Sense::click_and_drag(),
+            egui::Sense::CLICK | egui::Sense::DRAG,
         );
         let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
         if drag.drag_started_by(egui::PointerButton::Primary) {
