@@ -288,10 +288,19 @@ impl CreatePaneOptions {
     }
 }
 
-/// Removes workspaces without tiled panes and returns the floats they owned,
-/// which close with them. Keep the final empty workspace as a teardown
-/// sentinel until the host closes the native window; callbacks in the current
-/// frame may still inspect it.
+/// Numbers workspaces 1…n in their current order, closing gaps left by
+/// removed ones, like tmux's `renumber-windows`. IDs do not change.
+pub(super) fn renumber(workspaces: &mut [Workspace]) {
+    workspaces.sort_by_key(|w| w.index);
+    for (index, w) in (1..).zip(workspaces.iter_mut()) {
+        w.index = index;
+    }
+}
+
+/// Removes workspaces without tiled panes, renumbers the rest, and returns
+/// the floats they owned, which close with them. Keep the final empty
+/// workspace as a teardown sentinel until the host closes the native window;
+/// callbacks in the current frame may still inspect it.
 #[must_use = "floats of removed workspaces must be closed"]
 pub(super) fn prune_empty(
     workspaces: &mut Vec<Workspace>,
@@ -306,6 +315,7 @@ pub(super) fn prune_empty(
         .collect();
     if sentinel {
         workspaces.retain(|w| w.id == *current);
+        renumber(workspaces);
         *previous = *current;
         return orphaned;
     }
@@ -325,6 +335,7 @@ pub(super) fn prune_empty(
     if !workspaces.iter().any(|w| w.id == *previous) {
         *previous = *current;
     }
+    renumber(workspaces);
     orphaned
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -595,6 +606,22 @@ mod tests {
         hidden.floats.add(100);
         assert_eq!(source.floats.visible(), None);
         assert_eq!(hidden.floats.visible(), Some(100));
+    }
+    #[test]
+    fn removing_a_workspace_renumbers_the_rest_and_keeps_ids() {
+        let mut workspaces: Vec<_> = (1..=3)
+            .map(|i| {
+                let mut w = Workspace::new(i * 10, i as usize);
+                w.panes = vec![i];
+                w
+            })
+            .collect();
+        let (mut current, mut previous) = (30, 20);
+        workspaces[0].remove(1);
+        assert!(prune_empty(&mut workspaces, &mut current, &mut previous).is_empty());
+        let numbered: Vec<_> = workspaces.iter().map(|w| (w.id, w.index)).collect();
+        assert_eq!(numbered, vec![(20, 1), (30, 2)]);
+        assert_eq!((current, previous), (30, 20));
     }
     #[test]
     fn removing_background_workspace_keeps_focus_and_indexes() {

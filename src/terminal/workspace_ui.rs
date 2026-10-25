@@ -625,6 +625,13 @@ impl TerminalView {
                 if self.workspaces.iter().any(|w| w.index == index) {
                     return Err("workspace index already exists".into());
                 }
+                // Indexes stay contiguous, so only the next one can be new.
+                if index > self.workspaces.len() + 1 {
+                    return Err(format!(
+                        "workspace index {index} would leave a gap; the next index is {}",
+                        self.workspaces.len() + 1
+                    ));
+                }
                 // Spawn before publishing the workspace so failures leave the
                 // workspace collection and focus untouched.
                 let pane = self.create_pane(gl, &Default::default())?;
@@ -662,6 +669,7 @@ impl TerminalView {
                 }
                 let floats = w.floats.ids().to_vec();
                 self.workspaces.retain(|w| w.id != id);
+                workspace::renumber(&mut self.workspaces);
                 if self.current == id {
                     self.current = self.workspaces[0].id;
                 }

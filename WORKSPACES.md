@@ -9,8 +9,11 @@ workspace remembers which of its floats was visible. Switching away hides the
 overlay; returning shows that workspace's float again without restarting the
 terminal.
 
-Indexes start at 1 and do not change when another workspace is removed. Creation
-uses the lowest available index unless Lua supplies one. Use stable IDs for
+Indexes are positions: workspaces are always numbered 1…n, and removing one
+renumbers the workspaces after it, like tmux's `renumber-windows`. New
+workspaces take the next index, n+1. A Lua `index` above n+1 would leave a gap
+and is an error. Selecting or moving to an index past the last workspace does
+nothing but report an error. Indexes can change, so use stable IDs for
 automation. New workspaces automatically
 start with one terminal pane. Closing or moving their last tiled pane removes the
 workspace, closing its floating panes, and selects the last-used remaining
@@ -66,8 +69,8 @@ The move-pane shortcuts and picker act on the visible float when one is shown,
 otherwise on the focused tiled pane. A float moved to an existing workspace
 stays floating and becomes the destination's visible float, so it is showing
 when you select that workspace; you stay on the current workspace.
-`MovePaneToNewWorkspace` moves the pane into a new workspace at the
-lowest free index; you stay on the current workspace. A float moved this way becomes the new
+`MovePaneToNewWorkspace` moves the pane into a new last workspace; you stay on
+the current workspace. A float moved this way becomes the new
 workspace's tiled pane, since every workspace needs one. As with other moves,
 moving a workspace's last tiled pane removes that workspace and closes its
 floats.
@@ -213,5 +216,6 @@ workspace and of workspaces created without an explicit `layout`, including
 
 Workspace descriptions include `id`, `index`, ordered `panes`, `focused`, `layout`,
 `main_ratio`, optional `appearance`, ordered `floats`, and `visible_float`. IDs are window-local and valid for
-that window's lifetime. Workspace indexes are display metadata; Lua operations
+that window's lifetime. Workspace indexes are positions that change when an
+earlier workspace is removed; Lua operations
 take IDs unless a method explicitly accepts an options table.
