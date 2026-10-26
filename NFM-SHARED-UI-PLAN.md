@@ -168,5 +168,5 @@ only supported build configuration.
 - `src/colors.rs`: application palette to replace with explicit shared inputs.
 - `build.rs`, `Cargo.toml`, and root `build.zig`: dependency/build integration.
 
-Paths in this section are relative to `example/rust-egui-terminal`, except
-the root `build.zig`.
+Paths in this section are relative to this repository, except `build.zig`,
+which is in the `ghostty` submodule.

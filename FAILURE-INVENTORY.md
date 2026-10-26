@@ -61,7 +61,8 @@ to prevent unwinding across C. Other platforms currently use stderr. No automati
 graphics retry or context recovery is implemented. The table identifies partial
 coverage and the deeper shared-core and external-worker audit limits.
 
-Paths below are relative to this example unless they start with `../../`.
+Paths below are relative to this repository. Paths starting with `../../`
+refer to the `ghostty` submodule; read `../../` as `ghostty/`.
 Related propagation sites are grouped rather than counted as separate failures.
 
 | ID | Source / operation | Current behavior | Class / recovery | Status and follow-up |

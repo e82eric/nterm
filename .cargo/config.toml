@@ -1,0 +1,6 @@
+# Direct cargo builds use the ghostty submodule and the libraries build.ps1 or
+# build.sh installed into out/.
+[env]
+GHOSTTY_ROOT = { value = "ghostty", relative = true }
+GHOSTTY_LIB_DIR = { value = "out/lib", relative = true }
+NFM_GHOSTTY_VT_LIB_DIR = { value = "out/lib", relative = true }

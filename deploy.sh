@@ -27,11 +27,11 @@ for arg in "$@"; do
 done
 destination=$(realpath -m "${destination:-$HOME/.local/opt/ghostty-egui}")
 
-repository=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-output="$repository/zig-out"
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+output="$root/out"
 
 if ! $skip_build; then
-    (cd "$repository" && zig build egui-sample -Dapp-runtime=none -Doptimize=ReleaseFast)
+    "$root/build.sh"
 fi
 
 # The binary loads libghostty.so from $ORIGIN/../lib, and Ghostty finds its
@@ -63,7 +63,7 @@ cp "$output/$icon" "$stage/$icon"
 # picker for bash (source it from ~/.bashrc).
 mkdir -p "$stage/share/ghostty-egui"
 cp -R "$output/share/ghostty-egui/lua" "$stage/share/ghostty-egui/"
-cp "$repository/example/rust-egui-terminal/npick-completion.bash" "$stage/share/ghostty-egui/"
+cp "$root/npick-completion.bash" "$stage/share/ghostty-egui/"
 
 if [[ -e $destination ]]; then
     previous="$stage.previous"

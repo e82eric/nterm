@@ -70,7 +70,7 @@ Commands and command previews must be defined in an allowlisted Lua picker;
 clients cannot submit executable definitions or command previews. Lua factories
 and providers in allowlisted named pickers are trusted executable configuration.
 
-Build with `zig build egui-sample -Doptimize=ReleaseFast`.
+Build with `.\build.ps1`.
 Restart Ghostty, then dot-source the helper **inside the new shell**:
 
 ```powershell

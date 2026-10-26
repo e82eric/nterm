@@ -1,4 +1,4 @@
-"""Windows GUI smoke test. Build egui-sample first; briefly takes input focus."""
+"""Windows GUI smoke test. Run build.ps1 first; briefly takes input focus."""
 import ctypes as c
 from ctypes import wintypes as w
 import os
@@ -12,7 +12,7 @@ import statistics
 options = argparse.ArgumentParser(description=__doc__)
 options.add_argument('--memory-report', type=Path)
 options.add_argument('--shell', default='cmd.exe')
-options.add_argument('--executable', default='zig-out/bin/ghostty_egui.exe')
+options.add_argument('--executable', default='out/bin/ghostty_egui.exe')
 options.add_argument('--terminal-arg', action='append', default=[])
 options = options.parse_args()
 memory_samples = {}
@@ -117,7 +117,7 @@ callback_type = c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
 u.EnumWindows.argtypes = [callback_type, w.LPARAM]
 previous = u.GetForegroundWindow()
 env = dict(os.environ, GHOSTTY_LOG='stderr')
-os.chdir(Path(__file__).resolve().parents[3])
+os.chdir(Path(__file__).resolve().parents[1])
 log = tempfile.TemporaryFile()
 startup = subprocess.STARTUPINFO()
 startup.dwFlags = subprocess.STARTF_USESHOWWINDOW

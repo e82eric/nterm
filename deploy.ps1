@@ -8,26 +8,16 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$repository = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
-$source = Join-Path $repository 'zig-out\bin'
-$resourceSource = Join-Path $repository 'zig-out\share'
+$source = Join-Path $PSScriptRoot 'out\bin'
+$resourceSource = Join-Path $PSScriptRoot 'out\share'
 $destinationPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
 
 if (-not $SkipBuild) {
-    Push-Location -LiteralPath $repository
-    try {
-        & zig build egui-sample -Doptimize=ReleaseFast
-        if ($LASTEXITCODE -ne 0) {
-            throw "egui sample build failed with exit code $LASTEXITCODE"
-        }
-    }
-    finally {
-        Pop-Location
-    }
+    & (Join-Path $PSScriptRoot 'build.ps1')
 }
 
 # Use the same pinned ConPTY package as zig build, including with -SkipBuild.
-$conpty = & (Join-Path $PSScriptRoot 'conpty.ps1')
+$conpty = & (Join-Path $PSScriptRoot 'ghostty\dist\windows\conpty.ps1')
 $conptyVersion = $conpty.Version
 $architecture = $conpty.Architecture
 $conptyDll = $conpty.Dll
