@@ -374,10 +374,10 @@ impl AppConfig {
             format!("@{}", path.display()),
             modules,
         ));
-        let ghostty = lua.create_table().map_err(|error| error.to_string())?;
-        crate::terminal::workspace_ui::install_lua_helpers(&lua, &ghostty)
+        let nterm = lua.create_table().map_err(|error| error.to_string())?;
+        crate::terminal::workspace_ui::install_lua_helpers(&lua, &nterm)
             .map_err(|e| e.to_string())?;
-        ghostty
+        nterm
             .set(
                 "json_parse",
                 lua.create_function(|lua, source: String| {
@@ -388,7 +388,7 @@ impl AppConfig {
                 .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
-        ghostty
+        nterm
             .set(
                 "json_encode_pretty",
                 lua.create_function(|lua, value: mlua::Value| {
@@ -399,7 +399,7 @@ impl AppConfig {
             )
             .map_err(|e| e.to_string())?;
         lua.globals()
-            .set("ghostty", ghostty)
+            .set("nterm", nterm)
             .map_err(|error| error.to_string())?;
         let name = format!("@{}", path.display());
         let value: mlua::Value = lua
@@ -633,11 +633,11 @@ fn default_paths() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME");
     let mut paths = Vec::new();
     if let Some(home) = home {
-        paths.push(PathBuf::from(home).join("ghostty.lua"));
+        paths.push(PathBuf::from(home).join("nterm.lua"));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(directory) = exe.parent() {
-            paths.push(directory.join("ghostty.lua"));
+            paths.push(directory.join("nterm.lua"));
         }
     }
     paths
@@ -765,7 +765,7 @@ pub(crate) fn prepare_with_reload(
     String,
 > {
     let mut incoming = args.into_iter();
-    let program = incoming.next().unwrap_or_else(|| "ghostty_egui".into());
+    let program = incoming.next().unwrap_or_else(|| "nterm".into());
     let mut remaining = Vec::new();
     let mut explicit = None;
     while let Some(arg) = incoming.next() {
@@ -987,7 +987,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&directory).unwrap();
-        let path = directory.join("ghostty.lua");
+        let path = directory.join("nterm.lua");
         std::fs::write(&path, "return {font={family='Consolas', size=19}}").unwrap();
         for (tail, family, size) in [
             (vec![], Some("Consolas"), Some(19.0)),
@@ -1020,7 +1020,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&directory).unwrap();
-        let path = directory.join("ghostty.lua");
+        let path = directory.join("nterm.lua");
         std::fs::write(
             &path,
             "return { actions = { Old = function(app) app:paste('old') end } }",
@@ -1203,7 +1203,7 @@ mod tests {
             r#"{"snippets":[{"input":"old","extra":42}],"metadata":{"keep":true},"empty":[]}"#,
         )
         .unwrap();
-        let sample = include_str!("../ghostty.lua");
+        let sample = include_str!("../nterm.lua");
         let begin = sample.find("local snippets_path = ").unwrap();
         let end = begin + sample[begin..].find('\n').unwrap();
         let source = format!(
@@ -1428,7 +1428,7 @@ mod tests {
 
     #[test]
     fn sample_completion_callback_sends_edit_sequence_then_pastes_value() {
-        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let config = parse(include_str!("../nterm.lua")).unwrap();
         let callback = config.pickers.as_ref().unwrap()["PowerShellCompletion"]
             .callback()
             .unwrap();
@@ -1449,7 +1449,7 @@ mod tests {
 
     #[test]
     fn sample_codex_picker_uses_terminal_context_and_replaces_unicode_input() {
-        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let config = parse(include_str!("../nterm.lua")).unwrap();
         let bindings = crate::picker::config::Bindings::compile_with_actions(
             config.pickers,
             config.keys,
@@ -1515,7 +1515,7 @@ mod tests {
 
     #[test]
     fn sample_ripgrep_callback_replaces_prompt_and_opens_match() {
-        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let config = parse(include_str!("../nterm.lua")).unwrap();
         let callback = config.pickers.as_ref().unwrap()["Ripgrep"]
             .callback()
             .unwrap();
@@ -1661,7 +1661,7 @@ mod tests {
     fn alt_workspace_bindings_reach_application_dispatch() {
         let source=std::env::var_os("GHOSTTY_TEST_LUA_CONFIG")
             .map(|path|std::fs::read_to_string(path).unwrap())
-            .unwrap_or_else(||r#"local keys=ghostty.workspace_keys('ALT'); for _,b in ipairs(keys) do if b.action=='SetDeck' then b.key='d' elseif b.action=='SetGrid' then b.key='g' end end; return {keys=keys}"#.into());
+            .unwrap_or_else(||r#"local keys=nterm.workspace_keys('ALT'); for _,b in ipairs(keys) do if b.action=='SetDeck' then b.key='d' elseif b.action=='SetGrid' then b.key='g' end end; return {keys=keys}"#.into());
         let config = parse(&source).unwrap();
         let mut bindings = crate::picker::config::Bindings::compile_with_actions(
             config.pickers,
@@ -1674,7 +1674,7 @@ mod tests {
             let mut issues = Vec::new();
             let (_, loaded, _, _, _) = super::prepare_with_reload(
                 vec![
-                    "ghostty_egui".into(),
+                    "nterm".into(),
                     format!("--lua-config={}", std::path::Path::new(&path).display()),
                 ],
                 &mut issues,
@@ -1723,7 +1723,7 @@ mod tests {
         // the application or running command/item providers.
         let source = match std::env::var_os("GHOSTTY_TEST_LUA_CONFIG") {
             Some(path) => std::fs::read_to_string(path).unwrap(),
-            None => include_str!("../ghostty.lua").into(),
+            None => include_str!("../nterm.lua").into(),
         };
         let config = parse(&source).unwrap();
         let bindings = crate::picker::config::Bindings::compile_with_actions(
@@ -1765,7 +1765,7 @@ mod tests {
 
     #[test]
     fn sample_config_includes_multiple_floating_pane_shortcuts() {
-        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let config = parse(include_str!("../nterm.lua")).unwrap();
         let bindings = crate::picker::config::Bindings::compile_with_actions(
             config.pickers,
             config.keys,
@@ -1786,7 +1786,7 @@ mod tests {
     }
     #[test]
     fn named_pickers_compile_and_reject_bad_bindings_and_regexes() {
-        let example = parse(include_str!("../ghostty.lua")).unwrap();
+        let example = parse(include_str!("../nterm.lua")).unwrap();
         assert!(
             crate::picker::config::Bindings::compile_with_actions(
                 example.pickers,
@@ -1948,7 +1948,7 @@ mod tests {
 
     #[test]
     fn ripgrep_pipe_parameters_resolve_to_command_picker() {
-        let config = parse(include_str!("../ghostty.lua")).unwrap();
+        let config = parse(include_str!("../nterm.lua")).unwrap();
         let bindings = crate::picker::config::Bindings::compile_with_actions(
             config.pickers,
             config.keys,
@@ -2060,7 +2060,7 @@ mod tests {
         let source = format!(
             r#"return {{ pickers = {{ snippets = {{ type = 'Items', items = function()
                 local file = assert(io.open([[{}]], 'rb'))
-                local data = ghostty.json_parse(file:read('*a'))
+                local data = nterm.json_parse(file:read('*a'))
                 file:close()
                 local items = {{}}
                 for _, snippet in ipairs(data.snippets or {{}}) do
@@ -2355,7 +2355,7 @@ mod tests {
                 "ImageBytes",
             ),
         ] {
-            let config = parse(&format!("return {{picker_defaults={{preview_max_bytes=2048}},pickers={{x={{type='Items',items=ghostty.json_parse('[]'),preview={{type='Dynamic',resolve=function(item,params) assert(item.text=='display');return {result} end}}}}}}}}" )).unwrap();
+            let config = parse(&format!("return {{picker_defaults={{preview_max_bytes=2048}},pickers={{x={{type='Items',items=nterm.json_parse('[]'),preview={{type='Dynamic',resolve=function(item,params) assert(item.text=='display');return {result} end}}}}}}}}" )).unwrap();
             let defaults = config.picker_defaults;
             let bindings = Bindings::compile_with_actions(
                 config.pickers,
@@ -2480,7 +2480,7 @@ mod tests {
     fn preview_helpers_can_be_captured_during_config_loading_and_extended_sample_compiles() {
         let config = parse("local run = preview.run; return {pickers={x={type='Items',items={{text='x',value='x'}},preview={type='Dynamic',resolve=function(item) return {type='Text',text=run{args={'cmd.exe','/c','echo text'}}.stdout} end}}}}").unwrap();
         crate::picker::config::Bindings::compile(config.pickers, config.keys).unwrap();
-        let config = parse(include_str!("../ghostty.example.lua")).unwrap();
+        let config = parse(include_str!("../nterm.example.lua")).unwrap();
         crate::picker::config::Bindings::compile_with_actions(
             config.pickers,
             config.keys,
@@ -2497,7 +2497,7 @@ mod tests {
         }
         .validate()
         .unwrap();
-        let source = include_str!("../ghostty.example.lua");
+        let source = include_str!("../nterm.example.lua");
         let start = source.find("local function rg_preview()").unwrap();
         let end = source.find("local pipe_help_preview =").unwrap();
         let lua = mlua::Lua::new();
@@ -2537,7 +2537,7 @@ mod tests {
     }
     #[test]
     fn lua_file_preview_samples_binary_files_and_preserves_utf8_boundaries() {
-        let source = include_str!("../ghostty.example.lua");
+        let source = include_str!("../nterm.example.lua");
         let start = source.find("local function preview_path(").unwrap();
         let end = source[start..]
             .find("local function preview_directory(")
@@ -2604,7 +2604,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn lua_directory_items_preview_preserves_unicode_and_shell_characters() {
-        let source = include_str!("../ghostty.example.lua");
+        let source = include_str!("../nterm.example.lua");
         let path_start = source.find("local function preview_path(").unwrap();
         let path_end = source.find("local function preview_read_bytes(").unwrap();
         let start = source.find("local function preview_directory(").unwrap();
@@ -2973,8 +2973,8 @@ mod tests {
     fn config_discovery_uses_first_file_and_only_falls_back_when_missing() {
         let explicit = Path::new("argument.lua");
         let defaults = vec![
-            PathBuf::from("home/ghostty.lua"),
-            PathBuf::from("exe/ghostty.lua"),
+            PathBuf::from("home/nterm.lua"),
+            PathBuf::from("exe/nterm.lua"),
         ];
         let loaded = read_config(Some(explicit), &defaults, |path| {
             Ok(path.display().to_string())
@@ -3112,7 +3112,7 @@ mod tests {
     #[test]
     fn explicit_path_is_removed_and_cli_overrides_precede_child_arguments() {
         let path =
-            std::env::temp_dir().join(format!("ghostty-egui-config-{}.lua", std::process::id()));
+            std::env::temp_dir().join(format!("nterm-config-{}.lua", std::process::id()));
         std::fs::write(&path, "return {font = {family = 'Lua Font', size = 12}}").unwrap();
         let result = prepare_args(vec![
             "app".into(),
@@ -3186,7 +3186,7 @@ mod tests {
 
     #[test]
     fn lua_modules_load_only_from_absolute_directories() {
-        let config = std::env::temp_dir().join("ghostty.lua");
+        let config = std::env::temp_dir().join("nterm.lua");
         let path = crate::preview_worker::module_path(&config);
         let templates: Vec<_> = path.split(';').collect();
         // The config's own directory comes first, so it can override bundled modules.
@@ -3217,7 +3217,7 @@ mod tests {
         .unwrap();
         let config = AppConfig::parse(
             "return { pickers = { extra = require('extra').picker } }",
-            &directory.join("ghostty.lua"),
+            &directory.join("nterm.lua"),
         );
         std::fs::remove_dir_all(&directory).unwrap();
         let bindings = compile(config.unwrap());
@@ -3230,7 +3230,7 @@ mod tests {
     fn bundled_git_module_quotes_and_parses_and_builds_pickers() {
         let config = parse(
             r#"
-            local git = require('ghostty.git')
+            local git = require('nterm.git')
             local posix = { quote = git.quote.posix }
             assert(git.quote.posix('feature/x') == 'feature/x')
             assert(git.quote.posix('$(touch${IFS}x)') == "'$(touch${IFS}x)'")

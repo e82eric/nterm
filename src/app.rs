@@ -594,7 +594,7 @@ impl WindowSurface {
         gpu: Rc<SharedGpu>,
     ) -> Result<Self, FatalError> {
         let attributes = winit::window::WindowAttributes::default()
-            .with_title("Ghostty")
+            .with_title("nterm")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 700.0))
             .with_decorations(false)
             .with_visible(false);

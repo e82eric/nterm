@@ -1,9 +1,9 @@
--- Git pickers for ghostty-egui, for the repository in the shell's current
+-- Git pickers for nterm, for the repository in the shell's current
 -- directory. They run git directly, without a shell, so they work the same on
 -- Linux and Windows; commands typed at the prompt use bash or PowerShell 7
 -- quoting.
 --
---   local git = require("ghostty.git")
+--   local git = require("nterm.git")
 --   local prompt = "^%[[^%]]*%][$#] "
 --   return {
 --     pickers = {

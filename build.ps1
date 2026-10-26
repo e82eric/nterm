@@ -33,9 +33,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $target = Join-Path $PSScriptRoot 'target\release'
-Copy-Item -LiteralPath (Join-Path $target 'ghostty_egui.exe') -Destination (Join-Path $prefix 'bin') -Force
-# Lua modules a config can require, e.g. require("ghostty.git").
-$share = Join-Path $prefix 'share\ghostty-egui'
+Copy-Item -LiteralPath (Join-Path $target 'nterm.exe') -Destination (Join-Path $prefix 'bin') -Force
+# Lua modules a config can require, e.g. require("nterm.git").
+$share = Join-Path $prefix 'share\nterm'
 $lua = Join-Path $share 'lua'
 if (Test-Path -LiteralPath $lua) {
     Remove-Item -LiteralPath $lua -Recurse -Force
@@ -43,4 +43,4 @@ if (Test-Path -LiteralPath $lua) {
 New-Item -ItemType Directory -Path $share -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'lua') -Destination $share -Recurse
 
-Write-Host "Built $(Join-Path $prefix 'bin\ghostty_egui.exe')"
+Write-Host "Built $(Join-Path $prefix 'bin\nterm.exe')"

@@ -1,11 +1,11 @@
 [package]
-name = "ghostty-egui"
+name = "nterm"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [[bin]]
-name = "ghostty_egui"
+name = "nterm"
 path = "src/main.rs"
 
 [[bin]]

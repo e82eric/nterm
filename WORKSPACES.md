@@ -104,7 +104,7 @@ resizing the tile stack does not change grid rows. `ResetLayout` restores the
 default main ratio and equal pane sizes in the current layout. The layout reserves a
 48-pixel minimum per pane along each split when space permits.
 
-The copied `ghostty.workspaces.lua` binds **Alt+Shift+arrows** to these commands.
+The copied `nterm.workspaces.lua` binds **Alt+Shift+arrows** to these commands.
 To use other keys or modifiers, add bindings such as:
 
 ```lua
@@ -112,7 +112,7 @@ To use other keys or modifiers, add bindings such as:
 {key="Down", mods="ALT|CTRL", action="ResizeDown"},
 ```
 
-`ghostty.workspace_keys("ALT")` generates the SWM-style bindings with a
+`nterm.workspace_keys("ALT")` generates the SWM-style bindings with a
 different modifier. Supplying `keys` replaces default bindings, so append the
 other application shortcuts you want. See [workspaces.example.lua](workspaces.example.lua).
 

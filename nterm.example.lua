@@ -8,7 +8,7 @@
 -- CodexSuggestions invokes codex exec and sends the current terminal context.
 -- profile.example.ps1 uses ProfileFiles/ProfileDirectories and streamed requests.
 
--- Config lookup: --lua-config=PATH, then ~/ghostty.lua, then ghostty.lua beside
+-- Config lookup: --lua-config=PATH, then ~/nterm.lua, then nterm.lua beside
 -- the executable. Only the first available file is loaded.
 local snippets_path = os.getenv("GHOSTTY_SNIPPETS_FILE")
   or ((os.getenv("USERPROFILE") or os.getenv("HOME") or ".") .. "/ghostty-snippets.json")
@@ -216,14 +216,14 @@ return {
         end
         local content = file:read("*a")
         file:close()
-        local parsed, data = pcall(ghostty.json_parse, content)
+        local parsed, data = pcall(nterm.json_parse, content)
         if not parsed or type(data) ~= "table" then
           app:show_toast("Could not save snippet", "Unable to parse snippets JSON: " .. tostring(data), 5000)
           return
         end
         if type(data.snippets) ~= "table" then data.snippets = {} end
         table.insert(data.snippets, { input = selection })
-        local encoded, json = pcall(ghostty.json_encode_pretty, data)
+        local encoded, json = pcall(nterm.json_encode_pretty, data)
         if not encoded then
           app:show_toast("Could not save snippet", "Unable to encode snippets JSON: " .. tostring(json), 5000)
           return
@@ -345,7 +345,7 @@ return {
       preview = profile_preview([==[$args[0] | & bat.exe --color=always --paging=never --wrap=never --style=plain --language=ps1 --theme="Visual Studio Dark+"]==]),
     },
     ProfileCompletions = {
-      type="Items",items=ghostty.json_parse("[]"),position="Cursor",preview_visible=true,
+      type="Items",items=nterm.json_parse("[]"),position="Cursor",preview_visible=true,
       preview=profile_preview(pipe_help_preview,"commandName"),
     },
 
@@ -410,7 +410,7 @@ return {
           local file = assert(io.open(snippets_path, "rb"))
           local content = file:read("*a")
           file:close()
-          local data = ghostty.json_parse(content)
+          local data = nterm.json_parse(content)
           local items = {}
           for _, snippet in ipairs(data.snippets or {}) do
             if type(snippet.input) == "string" then

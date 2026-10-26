@@ -686,7 +686,7 @@ impl UserData for App {
                 return Err(mlua::Error::external("action has already returned"));
             }
             let request: crate::terminal::workspace::Request = lua.from_value(request)?;
-            let handler: mlua::Function = lua.named_registry_value("ghostty.workspace_handler")?;
+            let handler: mlua::Function = lua.named_registry_value("nterm.workspace_handler")?;
             handler.call::<_, mlua::Value>(lua.to_value(&request)?)
         });
         for (method, op) in [
@@ -731,7 +731,7 @@ impl UserData for App {
                 let parsed: crate::terminal::workspace::Request =
                     lua.from_value(mlua::Value::Table(request))?;
                 let handler: mlua::Function =
-                    lua.named_registry_value("ghostty.workspace_handler")?;
+                    lua.named_registry_value("nterm.workspace_handler")?;
                 handler.call::<_, mlua::Value>(lua.to_value(&parsed)?)
             });
         }
@@ -893,7 +893,7 @@ impl App {
         if !self.active.get() {
             return Err(mlua::Error::external("action has already returned"));
         }
-        let handler: mlua::Function = lua.named_registry_value("ghostty.floating_handler")?;
+        let handler: mlua::Function = lua.named_registry_value("nterm.floating_handler")?;
         handler.call(lua.to_value(&request)?)
     }
     fn push(&self, command: Command) -> mlua::Result<()> {
@@ -946,14 +946,14 @@ impl Callback {
                     }
                 })?;
                 self.lua
-                    .set_named_registry_value("ghostty.floating_handler", floating)?;
+                    .set_named_registry_value("nterm.floating_handler", floating)?;
                 self.lua
-                    .set_named_registry_value("ghostty.workspace_handler", workspace)?;
+                    .set_named_registry_value("nterm.workspace_handler", workspace)?;
                 let result = call().map_err(mlua::Error::external);
                 self.lua
-                    .unset_named_registry_value("ghostty.floating_handler")?;
+                    .unset_named_registry_value("nterm.floating_handler")?;
                 self.lua
-                    .unset_named_registry_value("ghostty.workspace_handler")?;
+                    .unset_named_registry_value("nterm.workspace_handler")?;
                 result
             })
             .map_err(|e| e.to_string())
@@ -979,10 +979,10 @@ impl Callback {
                     }
                 })?;
                 self.lua
-                    .set_named_registry_value("ghostty.floating_handler", function)?;
+                    .set_named_registry_value("nterm.floating_handler", function)?;
                 let result = call().map_err(mlua::Error::external);
                 self.lua
-                    .unset_named_registry_value("ghostty.floating_handler")?;
+                    .unset_named_registry_value("nterm.floating_handler")?;
                 result
             })
             .map_err(|e| e.to_string())

@@ -892,38 +892,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghostty-egui"
-version = "0.1.0"
-dependencies = [
- "cc",
- "crossbeam-channel",
- "csv",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "getrandom 0.3.4",
- "hmac",
- "libc",
- "mlua",
- "nfm-egui",
- "nfm-picker-sources",
- "nfm-preview-command",
- "nfm-preview-file",
- "nfm_file_system",
- "nfm_search_core",
- "pollster",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "unicode-segmentation",
- "unicode-width",
- "wgpu",
- "windows-sys 0.61.2",
- "winit",
-]
-
-[[package]]
 name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1509,6 +1477,38 @@ name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
+name = "nterm"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "crossbeam-channel",
+ "csv",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "getrandom 0.3.4",
+ "hmac",
+ "libc",
+ "mlua",
+ "nfm-egui",
+ "nfm-picker-sources",
+ "nfm-preview-command",
+ "nfm-preview-file",
+ "nfm_file_system",
+ "nfm_search_core",
+ "pollster",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "unicode-segmentation",
+ "unicode-width",
+ "wgpu",
+ "windows-sys 0.61.2",
+ "winit",
+]
 
 [[package]]
 name = "num-traits"

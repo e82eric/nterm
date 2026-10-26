@@ -1,6 +1,6 @@
 # PowerShell 7.3+. Dot-source this file from your $PROFILE.
 # Ghostty Lua: allow streaming and the ProfileFiles/ProfileDirectories named
-# FileSystem pickers. See PICKER-PIPE.md or ghostty.example.lua.
+# FileSystem pickers. See PICKER-PIPE.md or nterm.example.lua.
 # Outside Ghostty, install fzf on PATH for the same bindings.
 param([string[]]$PickerRoots = @((Get-Location).Path))
 

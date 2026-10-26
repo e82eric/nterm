@@ -8,7 +8,7 @@ protocol below. On Linux, use the `npick` client; see
 ## Enable and test
 
 For a portable set of PowerShell bindings, see [profile.example.ps1](profile.example.ps1).
-Use `ghostty.example.lua`, or merge these entries into your Lua configuration
+Use `nterm.example.lua`, or merge these entries into your Lua configuration
 (preserving any existing pickers and permissions):
 
 ```lua
@@ -48,7 +48,7 @@ bindings use Ghostty's builtin FileWalker through the named FileSystem pickers,
 passing the selected roots and current directory. Outside Ghostty they enumerate
 with `Get-ChildItem`; no `fd` or custom history-reader executable is required.
 History, text search, and completions use streamed requests and collect candidates
-before opening the picker. Command previews are optional in `ghostty.example.lua`.
+before opening the picker. Command previews are optional in `nterm.example.lua`.
 Fresh connections avoid retaining the pane's connection slot between requests;
 profile initialization still connects until the first request completes. Run
 `Disconnect-GhosttyPicker` before starting another PowerShell process in that pane.

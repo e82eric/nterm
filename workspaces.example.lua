@@ -1,6 +1,6 @@
 -- Launch with --lua-config=workspaces.example.lua.
 -- Each native window gets an independent set of workspaces.
-local keys = ghostty.workspace_keys("CTRL|ALT")
+local keys = nterm.workspace_keys("CTRL|ALT")
 keys[#keys + 1] = {key="n",mods="CTRL|SHIFT",action="NewWindow"}
 keys[#keys + 1] = {key="e",mods="CTRL|SHIFT",action="ToggleFloatingPane"}
 

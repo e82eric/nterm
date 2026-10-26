@@ -1,6 +1,6 @@
-//! npick: open a ghostty-egui picker from the shell and print the selection.
+//! npick: open an nterm picker from the shell and print the selection.
 //!
-//!   npick [OPTIONS] NAME [KEY=VALUE...]   open a named picker from ghostty.lua
+//!   npick [OPTIONS] NAME [KEY=VALUE...]   open a named picker from nterm.lua
 //!   COMMAND | npick [OPTIONS]             pick one of the lines on stdin
 //!
 //! Exits 0 with the selected value on stdout, 130 when cancelled, and 2 on
@@ -43,8 +43,8 @@ mod unix {
 Usage: npick [OPTIONS] NAME [KEY=VALUE...]
        COMMAND | npick [OPTIONS]
 
-Opens a picker in the ghostty-egui pane this shell runs in and prints the
-selected value. NAME opens a picker from ghostty.lua; it must be listed in
+Opens a picker in the nterm pane this shell runs in and prints the
+selected value. NAME opens a picker from nterm.lua; it must be listed in
 picker_pipe.named. Without NAME, each line of stdin is a candidate
 (picker_pipe.allow_stream must be true).
 
@@ -223,7 +223,7 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         let endpoint = std::env::var("GHOSTTY_PICKER_ENDPOINT")
             .ok()
             .filter(|v| !v.is_empty())
-            .ok_or("not running in a ghostty-egui pane (GHOSTTY_PICKER_ENDPOINT is not set)")?;
+            .ok_or("not running in an nterm pane (GHOSTTY_PICKER_ENDPOINT is not set)")?;
         let token = std::env::var("GHOSTTY_PICKER_TOKEN")
             .ok()
             .filter(|v| !v.is_empty())

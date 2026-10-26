@@ -1,4 +1,4 @@
--- Config lookup: --lua-config=PATH, then ~/ghostty.lua, then ghostty.lua beside
+-- Config lookup: --lua-config=PATH, then ~/nterm.lua, then nterm.lua beside
 -- the executable. Only the first available file is loaded.
 local snippets_path = (os.getenv("USERPROFILE") or os.getenv("HOME")) .. "/.wtd/.wt.json"
 return {
@@ -24,14 +24,14 @@ return {
         end
         local content = file:read("*a")
         file:close()
-        local parsed, data = pcall(ghostty.json_parse, content)
+        local parsed, data = pcall(nterm.json_parse, content)
         if not parsed or type(data) ~= "table" then
           app:show_toast("Could not save snippet", "Unable to parse snippets JSON: " .. tostring(data), 5000)
           return
         end
         if type(data.snippets) ~= "table" then data.snippets = {} end
         table.insert(data.snippets, { input = selection })
-        local encoded, json = pcall(ghostty.json_encode_pretty, data)
+        local encoded, json = pcall(nterm.json_encode_pretty, data)
         if not encoded then
           app:show_toast("Could not save snippet", "Unable to encode snippets JSON: " .. tostring(json), 5000)
           return

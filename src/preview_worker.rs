@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, sync::mpsc, time::Duration};
 pub(crate) struct ConfigSource(pub String, pub String, pub String);
 
 /// The `package.path` for a config file: modules beside it, then those
-/// installed with the app (`share/ghostty-egui/lua`, beside or above the
+/// installed with the app (`share/nterm/lua`, beside or above the
 /// executable). Absolute only: the current directory is never searched, so a
 /// file in whatever directory the app was started from cannot replace a module.
 pub(crate) fn module_path(config: &std::path::Path) -> String {
@@ -29,7 +29,7 @@ pub(crate) fn module_path(config: &std::path::Path) -> String {
             .into_iter()
             .flatten()
         {
-            directories.push(root.join("share").join("ghostty-egui").join("lua"));
+            directories.push(root.join("share").join("nterm").join("lua"));
         }
     }
     if cfg!(test) {
@@ -227,7 +227,7 @@ mod tests {
             let quoted_path =
                 serde_json::to_string(&path.to_string_lossy().replace('\\', "/")).unwrap();
             let source = format!(
-                "local keys=ghostty.workspace_keys('ALT'); assert(#keys>0); local path = {quoted_path} .. '/' .. tostring({{}}):gsub('[^%w]', ''); local f = assert(io.open(path, 'w')); f:write('{generation}'); f:close(); return {{pickers={{x={{preview={{resolve=function() return nil end}}}}}}}}"
+                "local keys=nterm.workspace_keys('ALT'); assert(#keys>0); local path = {quoted_path} .. '/' .. tostring({{}}):gsub('[^%w]', ''); local f = assert(io.open(path, 'w')); f:write('{generation}'); f:close(); return {{pickers={{x={{preview={{resolve=function() return nil end}}}}}}}}"
             );
             let _worker = Worker::new(
                 ConfigSource(source, "@init-test".into(), String::new()),
@@ -489,9 +489,9 @@ fn install_helpers(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
     lua.globals().set("preview", helpers)?;
-    let ghostty = lua.create_table()?;
-    crate::terminal::workspace_ui::install_lua_helpers(lua, &ghostty)?;
-    ghostty.set(
+    let nterm = lua.create_table()?;
+    crate::terminal::workspace_ui::install_lua_helpers(lua, &nterm)?;
+    nterm.set(
         "json_parse",
         lua.create_function(|lua, text: String| {
             let value: serde_json::Value =
@@ -499,13 +499,13 @@ fn install_helpers(lua: &Lua) -> mlua::Result<()> {
             lua.to_value(&value)
         })?,
     )?;
-    ghostty.set(
+    nterm.set(
         "json_encode_pretty",
         lua.create_function(|lua, value: mlua::Value| {
             let value: serde_json::Value = lua.from_value(value)?;
             serde_json::to_string_pretty(&value).map_err(mlua::Error::external)
         })?,
     )?;
-    lua.globals().set("ghostty", ghostty)?;
+    lua.globals().set("nterm", nterm)?;
     lua.set_named_registry_value("preview.helpers", true)
 }

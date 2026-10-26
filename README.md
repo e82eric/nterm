@@ -39,7 +39,7 @@ Cargo, plus the .NET SDK on Windows (see ConPTY below).
 
 ```powershell
 .\build.ps1
-.\out\bin\ghostty_egui.exe --command=pwsh.exe
+.\out\bin\nterm.exe --command=pwsh.exe
 ```
 
 `build.ps1` runs `zig build host-lib` in the submodule, which installs the
@@ -132,26 +132,26 @@ A mismatch stops installation. The helper also requires the .NET SDK and runs
 Microsoft signing certificate and valid package signatures. Updating ConPTY
 requires reviewing the version, hashes, and signing certificate together.
 
-The script copies `ghostty_egui.exe`, its required `ghostty.dll`, and the matched
+The script copies `nterm.exe`, its required `ghostty.dll`, and the matched
 ConPTY `1.25.260710002-preview` DLL and console host. It downloads the pinned
 Microsoft NuGet package on first use and caches it under `ghostty/.zig-cache/conpty`.
 Use `-SkipBuild` to copy an existing build; the pinned ConPTY components are
 still deployed. Close running instances before replacing their binaries.
-It leaves any `ghostty.lua` in the
+It leaves any `nterm.lua` in the
 destination untouched; the app also checks the home directory for that file.
 
 On Linux, use `build.sh`:
 
 ```sh
 ./build.sh
-./out/bin/ghostty_egui --command="$SHELL"
+./out/bin/nterm --command="$SHELL"
 ```
 
 To install it with a desktop entry for application launchers (such as
 awesome's menubar), and link `npick` into `~/.local/bin`, run
 `deploy.sh`. It builds,
-installs to `~/.local/opt/ghostty-egui` (or the folder given as its argument),
-and writes `~/.local/share/applications/ghostty-egui.desktop`. Pass
+installs to `~/.local/opt/nterm` (or the folder given as its argument),
+and writes `~/.local/share/applications/nterm.desktop`. Pass
 `--skip-build` to install the existing build. Running instances are unaffected.
 
 `TerminalView` owns the Ghostty surface and input bridge separately from
@@ -170,25 +170,25 @@ options can override these defaults.
 Lua settings are loaded at startup from the first available location:
 
 1. An explicit `--lua-config=PATH` argument.
-2. `ghostty.lua` in the home directory (`%USERPROFILE%` on Windows, `$HOME` on Linux).
-3. `ghostty.lua` beside the executable, regardless of the current working directory.
+2. `nterm.lua` in the home directory (`%USERPROFILE%` on Windows, `$HOME` on Linux).
+3. `nterm.lua` beside the executable, regardless of the current working directory.
 
 Only one file is loaded. Missing default files preserve the existing configuration.
 An explicit missing file, unreadable file, or invalid configuration reports the
 filename in Messages and starts with defaults for Lua settings, without falling
 back to another file. A persistent configuration indicator remains until restart.
-See `ghostty.lua` in this repository for a starting configuration:
+See `nterm.lua` in this repository for a starting configuration:
 
-[ghostty.example.lua](ghostty.example.lua) is an extended Windows sample with
+[nterm.example.lua](nterm.example.lua) is an extended Windows sample with
 custom picker callbacks, command previews, snippets, and a Codex suggestion
 picker. Its filesystem roots default to `.` and tools are resolved from `PATH`.
 Read its header for dependencies and optional integrations. Snippets use
 `GHOSTTY_SNIPPETS_FILE` or `~/ghostty-snippets.json`; initialize the file with
 `{"snippets": []}`. The Codex picker sends terminal context to `codex exec`.
-Run it with `--lua-config=ghostty.example.lua`.
+Run it with `--lua-config=nterm.example.lua`.
 
 ```powershell
-.\out\bin\ghostty_egui.exe --lua-config=ghostty.lua
+.\out\bin\nterm.exe --lua-config=nterm.lua
 ```
 
 The file returns a table with optional `font.family`, `font.size` (points),
@@ -459,7 +459,7 @@ available in picker action callbacks. App handles expire when the callback retur
 The sample binds **Ctrl+Shift+S** to save the selection in `~/.wtd/.wt.json`,
 matching WezTerm's shortcut and file format. It preserves other JSON fields and
 leaves the text selected after saving. The file must already exist. Success and errors are
-shown as toasts. `ghostty.json_encode_pretty(value)` encodes JSON. The action
+shown as toasts. `nterm.json_encode_pretty(value)` encodes JSON. The action
 writes directly using Lua's `io.open(path, "wb")`, matching the WezTerm config.
 
 ## Codex suggestions
@@ -647,7 +647,7 @@ Unmodified arrow and page keys continue to navigate the results.
 ### Custom pickers in Lua
 
 Add definitions to the `pickers` table returned by your
-[Lua configuration](ghostty.lua), then bind them with `picker = "name"`.
+[Lua configuration](nterm.lua), then bind them with `picker = "name"`.
 Merge examples into your existing tables rather than creating duplicate fields.
 Providing `keys` replaces the complete shortcut list; retain any application
 and built-in picker bindings you still want.
@@ -744,17 +744,17 @@ printed and the picker stays closed.
 
 `require("name")` loads `name.lua` (or `name/init.lua`) from the config file's
 directory, then from the modules installed with the app in
-`share/ghostty-egui/lua`. Dots become directories: `require("ghostty.git")`
-loads `ghostty/git.lua`. A module beside the config replaces a bundled one of
+`share/nterm/lua`. Dots become directories: `require("nterm.git")`
+loads `nterm/git.lua`. A module beside the config replaces a bundled one of
 the same name. The current directory is never searched, and native (C) modules
 cannot be loaded. The config is evaluated again in each preview worker, so
 modules load there too.
 
-The app bundles `ghostty.git`, with commit and branch pickers that run git
+The app bundles `nterm.git`, with commit and branch pickers that run git
 directly and work in bash and PowerShell 7 on Linux and Windows:
 
 ```lua
-local git = require("ghostty.git")
+local git = require("nterm.git")
 return {
   pickers = {
     -- Commits of all branches, remote branches and tags, newest first, in
@@ -894,7 +894,7 @@ An optional preview can show the selected path's contents.
 array of `{ "text": "display label", "value": "text to insert" }`, or from an
 `items = function() ... end` Lua provider. The provider runs each time the picker
 opens, so it can read a file that changes during the session. Lua has
-the standard `io` and `os` libraries and a `ghostty.json_parse(string)` helper.
+the standard `io` and `os` libraries and a `nterm.json_parse(string)` helper.
 It has no filesystem scan or terminal snapshot. Without an action callback,
 Enter pastes the chosen value. Item lists are limited to 2,000 entries.
 
@@ -1070,7 +1070,7 @@ the current result. Errors appear in the preview. Pipe clients must use an
 allowlisted named picker for Dynamic previews; inline stream previews remain
 restricted to Text/Ansi.
 
-`ghostty.example.lua` demonstrates host-owned image/video extension routing and
+`nterm.example.lua` demonstrates host-owned image/video extension routing and
 configurable FFmpeg/FFprobe paths. SimpleWindowManager's Rust configuration uses
 `file_preview_resolver`, a worker closure returning the same typed `PreviewPlan`;
 its `file_preview::MediaPreviewSettings` helper owns media routing and video probes.
@@ -1274,7 +1274,7 @@ capture or read terminal snapshots, and cancellation leaves existing copy mode i
 
 Shells open allowlisted named pickers through the authenticated local named pipe
 (Windows) or Unix socket (Linux). On Linux, use `npick`, installed beside
-`ghostty_egui`; see [npick on Linux](#npick-on-linux). On Windows, the supplied
+`nterm`; see [npick on Linux](#npick-on-linux). On Windows, the supplied
 helper requires PowerShell 7.3+.
 Pipe access is disabled by default. Add this to your returned Lua table, restart
 the application, then load the helper inside its newly launched shell:
@@ -1343,7 +1343,7 @@ With `picker_pipe` enabled as above, `npick` opens pickers from the shell
 running in a pane and prints the selected value:
 
 ```sh
-npick files                        # a named picker from ghostty.lua
+npick files                        # a named picker from nterm.lua
 git branch --format='%(refname:short)' | npick --query main
 ```
 
@@ -1365,8 +1365,8 @@ __npick_file() {
 
 [npick-completion.bash](npick-completion.bash) is the bash counterpart of the
 PowerShell profile's completion picker. Source it from `~/.bashrc`
-(`deploy.sh` installs it to `share/ghostty-egui/` beside the app). In
-ghostty-egui panes, Ctrl+Space lists what Tab would complete for the word at
+(`deploy.sh` installs it to `share/nterm/` beside the app). In
+nterm panes, Ctrl+Space lists what Tab would complete for the word at
 the cursor, using bash-completion when it is installed; Enter replaces that
 word, quoting file names. A key binding cannot enable readline's unquoting, so
 for words containing quotes, backslashes or `~` it falls back to bash's own

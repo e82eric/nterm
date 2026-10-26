@@ -12,7 +12,7 @@ import statistics
 options = argparse.ArgumentParser(description=__doc__)
 options.add_argument('--memory-report', type=Path)
 options.add_argument('--shell', default='cmd.exe')
-options.add_argument('--executable', default='out/bin/ghostty_egui.exe')
+options.add_argument('--executable', default='out/bin/nterm.exe')
 options.add_argument('--terminal-arg', action='append', default=[])
 options = options.parse_args()
 memory_samples = {}

@@ -290,8 +290,8 @@ pub(crate) fn default_bindings() -> Vec<crate::picker::config::KeyBinding> {
     }
     keys
 }
-pub(crate) fn install_lua_helpers(lua: &mlua::Lua, ghostty: &mlua::Table) -> mlua::Result<()> {
-    ghostty.set(
+pub(crate) fn install_lua_helpers(lua: &mlua::Lua, nterm: &mlua::Table) -> mlua::Result<()> {
+    nterm.set(
         "workspace_keys",
         lua.create_function(|lua, mods: String| {
             crate::config::keybindings::parse_modifiers(&mods)

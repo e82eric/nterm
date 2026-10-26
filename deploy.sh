@@ -4,7 +4,7 @@
 # Linux counterpart of deploy.ps1.
 #
 # Usage: deploy.sh [--skip-build] [DESTINATION]
-#   DESTINATION defaults to ~/.local/opt/ghostty-egui.
+#   DESTINATION defaults to ~/.local/opt/nterm.
 set -euo pipefail
 
 usage() {
@@ -25,7 +25,7 @@ for arg in "$@"; do
             ;;
     esac
 done
-destination=$(realpath -m "${destination:-$HOME/.local/opt/ghostty-egui}")
+destination=$(realpath -m "${destination:-$HOME/.local/opt/nterm}")
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 output="$root/out"
@@ -37,8 +37,8 @@ fi
 # The binary loads libghostty.so from $ORIGIN/../lib, and Ghostty finds its
 # resources (share/ghostty) beside the terminfo sentinel in share/terminfo.
 icon=share/icons/hicolor/128x128/apps/com.mitchellh.ghostty.png
-for required in bin/ghostty_egui bin/npick lib/libghostty.so share/ghostty/themes \
-    share/ghostty-egui/lua/ghostty/git.lua \
+for required in bin/nterm bin/npick lib/libghostty.so share/ghostty/themes \
+    share/nterm/lua/nterm/git.lua \
     share/ghostty/shell-integration share/terminfo/x/xterm-ghostty "$icon"; do
     if [[ ! -e $output/$required ]]; then
         echo "Missing build output: $output/$required" >&2
@@ -51,19 +51,19 @@ done
 # installation untouched.
 parent=$(dirname "$destination")
 mkdir -p "$parent"
-stage=$(mktemp -d "$parent/.ghostty-egui.XXXXXX")
+stage=$(mktemp -d "$parent/.nterm.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 chmod 755 "$stage"
 mkdir -p "$stage/bin" "$stage/lib" "$stage/share" "$stage/$(dirname "$icon")"
-cp "$output/bin/ghostty_egui" "$output/bin/npick" "$stage/bin/"
+cp "$output/bin/nterm" "$output/bin/npick" "$stage/bin/"
 cp "$output/lib/libghostty.so" "$stage/lib/"
 cp -R "$output/share/ghostty" "$output/share/terminfo" "$stage/share/"
 cp "$output/$icon" "$stage/$icon"
-# Lua modules for require() in ghostty.lua, and the Ctrl+Space completion
+# Lua modules for require() in nterm.lua, and the Ctrl+Space completion
 # picker for bash (source it from ~/.bashrc).
-mkdir -p "$stage/share/ghostty-egui"
-cp -R "$output/share/ghostty-egui/lua" "$stage/share/ghostty-egui/"
-cp "$root/npick-completion.bash" "$stage/share/ghostty-egui/"
+mkdir -p "$stage/share/nterm"
+cp -R "$output/share/nterm/lua" "$stage/share/nterm/"
+cp "$root/npick-completion.bash" "$stage/share/nterm/"
 
 if [[ -e $destination ]]; then
     previous="$stage.previous"
@@ -77,14 +77,14 @@ trap - EXIT
 
 # Desktop entry for application launchers.
 applications="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-entry="$applications/ghostty-egui.desktop"
+entry="$applications/nterm.desktop"
 mkdir -p "$applications"
 cat >"$entry.tmp" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Ghostty egui
-Comment=Ghostty terminal in an egui shell
-Exec="$destination/bin/ghostty_egui"
+Name=nterm
+Comment=Terminal built on libghostty
+Exec="$destination/bin/nterm"
 Icon=$destination/$icon
 Terminal=false
 Categories=System;TerminalEmulator;

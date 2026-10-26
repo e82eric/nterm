@@ -1,9 +1,9 @@
 # shellcheck shell=bash
 # Completion picker for bash: the Linux counterpart of profile.example.ps1's
 # Ctrl+Space binding. Ctrl+Space lists what Tab would complete for the word at
-# the cursor in a ghostty-egui picker; Enter replaces that word.
+# the cursor in an nterm picker; Enter replaces that word.
 #
-# Source it from ~/.bashrc. It binds Ctrl+Space only in ghostty-egui panes,
+# Source it from ~/.bashrc. It binds Ctrl+Space only in nterm panes,
 # where npick can reach the terminal. Uses bash-completion when it is loaded.
 
 # Split the current command, up to the cursor, into words the way readline does

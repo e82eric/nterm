@@ -24,10 +24,10 @@ $conptyDll = $conpty.Dll
 $conptyHost = $conpty.Host
 
 # Ghostty loads conpty.dll and its matching OpenConsole.exe beside the app.
-$files = @('ghostty.dll', 'ghostty_egui.exe', 'conpty.dll', 'OpenConsole.exe')
+$files = @('ghostty.dll', 'nterm.exe', 'conpty.dll', 'OpenConsole.exe')
 $fileSources = @{
     'ghostty.dll' = Join-Path $source 'ghostty.dll'
-    'ghostty_egui.exe' = Join-Path $source 'ghostty_egui.exe'
+    'nterm.exe' = Join-Path $source 'nterm.exe'
     'conpty.dll' = $conptyDll
     'OpenConsole.exe' = $conptyHost
 }
@@ -66,8 +66,8 @@ foreach ($file in $files) {
 # finds both its terminfo sentinel and the bundled themes.
 $resourceDestination = Join-Path $destinationPath 'share'
 New-Item -ItemType Directory -Path $resourceDestination -Force | Out-Null
-# ghostty-egui holds the Lua modules a config can require.
-foreach ($directory in @('ghostty', 'terminfo', 'ghostty-egui')) {
+# nterm holds the Lua modules a config can require.
+foreach ($directory in @('ghostty', 'terminfo', 'nterm')) {
     Copy-Item -LiteralPath (Join-Path $resourceSource $directory) -Destination $resourceDestination -Recurse -Force
 }
 

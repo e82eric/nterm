@@ -227,7 +227,7 @@ fn worker_resolver(callback: &str) -> std::rc::Rc<crate::lua_callbacks::PreviewR
     })
 }
 
-/// The rendered preview of `value` in the bundled `ghostty.git` picker built
+/// The rendered preview of `value` in the bundled `nterm.git` picker built
 /// by the Lua expression `picker` (e.g. `branches()`), in a scratch repository
 /// prepared by `setup`, once its first line is `first_line`. None when git is
 /// not installed.
@@ -265,9 +265,9 @@ fn git_module_preview(
         name: "test".into(),
         worker: Some(crate::preview_worker::Worker::new(
             crate::preview_worker::ConfigSource(
-                format!("return {{ pickers = {{ test = require('ghostty.git').{picker} }} }}"),
+                format!("return {{ pickers = {{ test = require('nterm.git').{picker} }} }}"),
                 "@git-module-test".into(),
-                crate::preview_worker::module_path(&root.join("ghostty.lua")),
+                crate::preview_worker::module_path(&root.join("nterm.lua")),
             ),
             "test".into(),
             Some(crate::preview_worker::FactoryContext(
