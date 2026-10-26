@@ -270,7 +270,7 @@ impl SearchDocument for SnapshotSearchDocument {
         if cancelled() {
             return Err("Search cancelled".into());
         }
-        if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_cursor_reset(*cursor as *mut _) } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_cursor_reset(*cursor as *mut _) } {
             return Err(ghostty_ffi::native_error(
                 "Unable to reset search snapshot cursor",
             ));
@@ -281,7 +281,7 @@ impl SearchDocument for SnapshotSearchDocument {
             }
             let mut chunk = SnapshotTextChunk::default();
             match unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_cursor_next(*cursor as *mut _, &mut chunk)
+                ghostty_ffi::nterm_host_snapshot_cursor_next(*cursor as *mut _, &mut chunk)
             } {
                 0 => return Ok(()),
                 1 => {}

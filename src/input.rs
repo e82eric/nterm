@@ -1,6 +1,6 @@
 use crate::ghostty_ffi::{
-    Host, ghostty_egui_host_key, ghostty_egui_host_mouse_button, ghostty_egui_host_mouse_pos,
-    ghostty_egui_host_mouse_scroll, ghostty_egui_host_preedit, ghostty_egui_host_text,
+    Host, nterm_host_key, nterm_host_mouse_button, nterm_host_mouse_pos, nterm_host_mouse_scroll,
+    nterm_host_preedit, nterm_host_text,
 };
 use std::ffi::CString;
 
@@ -24,7 +24,7 @@ pub(crate) fn forward(
                 // can emit a Key event. In the terminal it must reach the PTY.
                 let (usb, unshifted) = key_to_usb(egui::Key::C).expect("C has a USB keycode");
                 unsafe {
-                    ghostty_egui_host_key(
+                    nterm_host_key(
                         host,
                         1,
                         mods(egui::Modifiers::CTRL),
@@ -32,7 +32,7 @@ pub(crate) fn forward(
                         unshifted,
                         std::ptr::null(),
                     );
-                    ghostty_egui_host_key(
+                    nterm_host_key(
                         host,
                         0,
                         mods(egui::Modifiers::CTRL),
@@ -65,7 +65,7 @@ pub(crate) fn forward(
                     // Ctrl+Shift for PSReadLine, which asks for mode 9001; the
                     // legacy Ctrl+G byte loses Shift before it reaches it.
                     unsafe {
-                        ghostty_egui_host_key(host, 1, 0, 0, 0, sequence.as_ptr());
+                        nterm_host_key(host, 1, 0, 0, 0, sequence.as_ptr());
                     }
                     continue;
                 }
@@ -82,7 +82,7 @@ pub(crate) fn forward(
                     1
                 };
                 unsafe {
-                    ghostty_egui_host_key(
+                    nterm_host_key(
                         host,
                         action,
                         mods(modifiers),
@@ -95,7 +95,7 @@ pub(crate) fn forward(
             egui::Event::Text(text) if !keyboard_owned && !text_follows_key(&events, index) => {
                 if let Ok(text) = CString::new(text.as_str()) {
                     unsafe {
-                        ghostty_egui_host_key(
+                        nterm_host_key(
                             host,
                             1,
                             mods(ui.input(|input| input.modifiers)),
@@ -107,22 +107,22 @@ pub(crate) fn forward(
                 }
             }
             egui::Event::Paste(text) if !keyboard_owned => unsafe {
-                ghostty_egui_host_text(host, text.as_ptr().cast(), text.len());
+                nterm_host_text(host, text.as_ptr().cast(), text.len());
             },
             egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !keyboard_owned => unsafe {
-                ghostty_egui_host_preedit(host, text.as_ptr().cast(), text.len());
+                nterm_host_preedit(host, text.as_ptr().cast(), text.len());
             },
             egui::Event::Ime(egui::ImeEvent::Commit(text)) if !keyboard_owned => {
-                unsafe { ghostty_egui_host_preedit(host, "".as_ptr().cast(), 0) };
+                unsafe { nterm_host_preedit(host, "".as_ptr().cast(), 0) };
                 if let Ok(text) = CString::new(text.as_str()) {
-                    unsafe { ghostty_egui_host_key(host, 1, 0, 0, 0, text.as_ptr()) };
+                    unsafe { nterm_host_key(host, 1, 0, 0, 0, text.as_ptr()) };
                 }
             }
             egui::Event::PointerMoved(pos)
                 if !pointer_owned && !modal_input_blocked && rect.contains(pos) =>
             unsafe {
                 let (x, y) = surface_pointer_position(pos, rect);
-                ghostty_egui_host_mouse_pos(host, x, y, mods(ui.input(|i| i.modifiers)));
+                nterm_host_mouse_pos(host, x, y, mods(ui.input(|i| i.modifiers)));
             },
             egui::Event::PointerButton {
                 pos,
@@ -138,8 +138,8 @@ pub(crate) fn forward(
                 };
                 unsafe {
                     let (x, y) = surface_pointer_position(pos, rect);
-                    ghostty_egui_host_mouse_pos(host, x, y, mods(modifiers));
-                    ghostty_egui_host_mouse_button(
+                    nterm_host_mouse_pos(host, x, y, mods(modifiers));
+                    nterm_host_mouse_button(
                         host,
                         if pressed { 1 } else { 0 },
                         button,
@@ -162,7 +162,7 @@ pub(crate) fn forward(
                     egui::MouseWheelUnit::Page => (terminal_size[1] as f64, 1),
                 };
                 unsafe {
-                    ghostty_egui_host_mouse_scroll(
+                    nterm_host_mouse_scroll(
                         host,
                         delta.x as f64 * factor,
                         delta.y as f64 * factor,

@@ -129,7 +129,7 @@ impl PickerSource {
             .with_source_origin(start as usize);
         let mut origin = ghostty_ffi::SnapshotLogicalPosition::default();
         if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_logical_position(
+            ghostty_ffi::nterm_host_snapshot_logical_position(
                 host,
                 generation,
                 SnapshotCell { x: 0, y: start },
@@ -698,9 +698,7 @@ fn read_row(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
     static ROW_READ: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _read = ROW_READ.lock().unwrap_or_else(|error| error.into_inner());
     let mut result = ghostty_ffi::SnapshotTextRow::default();
-    if !unsafe {
-        ghostty_ffi::ghostty_egui_host_snapshot_text_row(host, generation, row, &mut result)
-    } {
+    if !unsafe { ghostty_ffi::nterm_host_snapshot_text_row(host, generation, row, &mut result) } {
         return None;
     }
     let (text, columns) = if result.len == 0 {
@@ -714,7 +712,7 @@ fn read_row(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
         }
     };
     let wraps_to_next = result.wraps_to_next;
-    unsafe { ghostty_ffi::ghostty_egui_host_snapshot_text_row_free(&mut result) };
+    unsafe { ghostty_ffi::nterm_host_snapshot_text_row_free(&mut result) };
     let mut text = TextRow {
         text: String::from_utf8(text).ok()?,
         columns,
@@ -745,9 +743,7 @@ fn read_styles(
 ) -> Result<Vec<nfm_egui::styled_document::ColumnStyleRun>, String> {
     use nfm_egui::styled_document::{ColumnStyleRun, Style};
     let mut result = ghostty_ffi::SnapshotStyleRuns::default();
-    if !unsafe {
-        ghostty_ffi::ghostty_egui_host_snapshot_style_runs(host, generation, row, &mut result)
-    } {
+    if !unsafe { ghostty_ffi::nterm_host_snapshot_style_runs(host, generation, row, &mut result) } {
         return Err("Unable to read snapshot styles".into());
     }
     let color = |value: u32| {

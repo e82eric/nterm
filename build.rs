@@ -6,10 +6,10 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ghostty"));
 
     let mut shim = cc::Build::new();
-    shim.file("src/ghostty_shim.c")
+    shim.file("src/host_shim.c")
         .include(root.join("include"))
         .warnings(true)
-        .compile("ghostty_egui_shim");
+        .compile("nterm_shim");
 
     let library_dir = env::var_os("GHOSTTY_LIB_DIR")
         .map(PathBuf::from)
@@ -20,7 +20,7 @@ fn main() {
     if cfg!(target_family = "unix") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
     }
-    println!("cargo:rerun-if-changed=src/ghostty_shim.c");
+    println!("cargo:rerun-if-changed=src/host_shim.c");
     println!(
         "cargo:rerun-if-changed={}",
         root.join("include/ghostty.h").display()

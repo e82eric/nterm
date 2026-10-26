@@ -28,7 +28,7 @@ impl PickerFont {
         let mut definitions = egui::FontDefinitions::default();
         let mut load = |bold, name: &str| {
             let mut data = ghostty_ffi::FontData::default();
-            if !unsafe { ghostty_ffi::ghostty_egui_host_read_font(host, bold, &mut data) } {
+            if !unsafe { ghostty_ffi::nterm_host_read_font(host, bold, &mut data) } {
                 crate::error_log::warning(
                     "picker font",
                     "Terminal font export failed",
@@ -61,7 +61,7 @@ impl PickerFont {
     }
 
     pub(crate) fn typography(&mut self, ctx: &egui::Context, host: *mut Host) -> Typography {
-        let size = unsafe { ghostty_ffi::ghostty_egui_host_surface_size(host) };
+        let size = unsafe { ghostty_ffi::nterm_host_surface_size(host) };
         self.for_cells(ctx, size.cell_width_px, size.cell_height_px)
     }
 

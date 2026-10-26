@@ -165,7 +165,7 @@ static APP_WAKE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 // The shared native app outlives any particular pane's callback userdata.
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_app_wakeup() {
+extern "C" fn nterm_app_wakeup() {
     crate::native_error::ffi_boundary("wake the shared terminal app", || {
         if let Some(proxy) = APP_PROXY.get() {
             if !APP_WAKE_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel)

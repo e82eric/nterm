@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_void};
 
 unsafe extern "C" {
-    pub(crate) fn ghostty_egui_host_apply_settings(
+    pub(crate) fn nterm_host_apply_settings(
         host: *mut Host,
         name: *const c_char,
         family: *const c_char,
@@ -14,7 +14,7 @@ unsafe extern "C" {
         userdata: *mut c_void,
         callback: extern "C" fn(*mut c_void, *const c_char),
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_apply_theme(
+    pub(crate) fn nterm_host_apply_theme(
         host: *mut Host,
         name: *const c_char,
         error: *mut c_char,
@@ -369,14 +369,10 @@ pub(crate) struct LiveCursorPosition {
 }
 
 unsafe extern "C" {
-    pub(crate) fn ghostty_egui_host_read_font(
-        host: *mut Host,
-        bold: bool,
-        result: *mut FontData,
-    ) -> bool;
+    pub(crate) fn nterm_host_read_font(host: *mut Host, bold: bool, result: *mut FontData) -> bool;
     pub(crate) fn ghostty_font_data_free(result: *mut FontData);
-    pub(crate) fn ghostty_egui_host_surface_size(host: *mut Host) -> SurfaceSize;
-    pub(crate) fn ghostty_egui_host_create(
+    pub(crate) fn nterm_host_surface_size(host: *mut Host) -> SurfaceSize;
+    pub(crate) fn nterm_host_create(
         argc: usize,
         argv: *mut *mut c_char,
         userdata: *mut c_void,
@@ -388,9 +384,9 @@ unsafe extern "C" {
         error_buffer: *mut c_char,
         error_capacity: usize,
     ) -> *mut Host;
-    pub(crate) fn ghostty_egui_host_destroy(host: *mut Host);
-    pub(crate) fn ghostty_egui_host_close_process(host: *mut Host);
-    pub(crate) fn ghostty_egui_host_create_child(
+    pub(crate) fn nterm_host_destroy(host: *mut Host);
+    pub(crate) fn nterm_host_close_process(host: *mut Host);
+    pub(crate) fn nterm_host_create_child(
         parent: *mut Host,
         userdata: *mut c_void,
         window: *mut c_void,
@@ -403,13 +399,13 @@ unsafe extern "C" {
         error_buffer: *mut c_char,
         error_capacity: usize,
     ) -> *mut Host;
-    pub(crate) fn ghostty_egui_host_tick(host: *mut Host);
-    pub(crate) fn ghostty_egui_host_shell_pid(host: *mut Host) -> u64;
-    pub(crate) fn ghostty_egui_host_shell_creation_time(host: *mut Host) -> u64;
-    pub(crate) fn ghostty_egui_host_resize(host: *mut Host, width: u32, height: u32, scale: f64);
-    pub(crate) fn ghostty_egui_host_focus(host: *mut Host, focused: bool);
-    pub(crate) fn ghostty_egui_host_take_frame(host: *mut Host, frame: *mut GpuFrame) -> bool;
-    pub(crate) fn ghostty_egui_host_key(
+    pub(crate) fn nterm_host_tick(host: *mut Host);
+    pub(crate) fn nterm_host_shell_pid(host: *mut Host) -> u64;
+    pub(crate) fn nterm_host_shell_creation_time(host: *mut Host) -> u64;
+    pub(crate) fn nterm_host_resize(host: *mut Host, width: u32, height: u32, scale: f64);
+    pub(crate) fn nterm_host_focus(host: *mut Host, focused: bool);
+    pub(crate) fn nterm_host_take_frame(host: *mut Host, frame: *mut GpuFrame) -> bool;
+    pub(crate) fn nterm_host_key(
         host: *mut Host,
         action: i32,
         mods: i32,
@@ -417,35 +413,32 @@ unsafe extern "C" {
         unshifted: u32,
         text: *const c_char,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_begin(
-        host: *mut Host,
-        snapshot_generation: *mut u64,
-    ) -> bool;
-    pub(crate) fn ghostty_egui_host_selection_text(
+    pub(crate) fn nterm_host_snapshot_begin(host: *mut Host, snapshot_generation: *mut u64)
+    -> bool;
+    pub(crate) fn nterm_host_selection_text(
         host: *mut Host,
         result: *mut SnapshotSelectionText,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_selection_text_free(result: *mut SnapshotSelectionText);
-    pub(crate) fn ghostty_egui_host_snapshot_end(host: *mut Host, snapshot_generation: u64)
-    -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_view(
+    pub(crate) fn nterm_host_selection_text_free(result: *mut SnapshotSelectionText);
+    pub(crate) fn nterm_host_snapshot_end(host: *mut Host, snapshot_generation: u64) -> bool;
+    pub(crate) fn nterm_host_snapshot_view(
         host: *mut Host,
         generation: u64,
         view: *mut SnapshotView,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_resolve_cell(
+    pub(crate) fn nterm_host_snapshot_resolve_cell(
         host: *mut Host,
         generation: u64,
         requested: SnapshotCell,
         snap_right: bool,
         actual: *mut SnapshotCell,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_resize(
+    pub(crate) fn nterm_host_snapshot_resize(
         host: *mut Host,
         generation: u64,
         result: *mut SnapshotReflowMap,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_selection_text(
+    pub(crate) fn nterm_host_snapshot_selection_text(
         host: *mut Host,
         generation: u64,
         range: SnapshotCellRange,
@@ -453,66 +446,59 @@ unsafe extern "C" {
         rectangle: bool,
         result: *mut SnapshotSelectionText,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_selection_text_free(
-        result: *mut SnapshotSelectionText,
-    );
-    pub(crate) fn ghostty_egui_host_snapshot_cursor_new(
-        host: *mut Host,
-        generation: u64,
-    ) -> *mut c_void;
-    pub(crate) fn ghostty_egui_host_snapshot_cursor_free(cursor: *mut c_void);
-    pub(crate) fn ghostty_egui_host_snapshot_cursor_reset(cursor: *mut c_void) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_cursor_next(
+    pub(crate) fn nterm_host_snapshot_selection_text_free(result: *mut SnapshotSelectionText);
+    pub(crate) fn nterm_host_snapshot_cursor_new(host: *mut Host, generation: u64) -> *mut c_void;
+    pub(crate) fn nterm_host_snapshot_cursor_free(cursor: *mut c_void);
+    pub(crate) fn nterm_host_snapshot_cursor_reset(cursor: *mut c_void) -> bool;
+    pub(crate) fn nterm_host_snapshot_cursor_next(
         cursor: *mut c_void,
         chunk: *mut SnapshotTextChunk,
     ) -> i32;
-    pub(crate) fn ghostty_egui_host_snapshot_text_row(
+    pub(crate) fn nterm_host_snapshot_text_row(
         host: *mut Host,
         generation: u64,
         row: u64,
         result: *mut SnapshotTextRow,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_text_row_free(result: *mut SnapshotTextRow);
-    pub(crate) fn ghostty_egui_host_snapshot_style_runs(
+    pub(crate) fn nterm_host_snapshot_text_row_free(result: *mut SnapshotTextRow);
+    pub(crate) fn nterm_host_snapshot_style_runs(
         host: *mut Host,
         generation: u64,
         row: u64,
         result: *mut SnapshotStyleRuns,
     ) -> bool;
     pub(crate) fn ghostty_snapshot_style_runs_free(result: *mut SnapshotStyleRuns);
-    pub(crate) fn ghostty_egui_host_snapshot_logical_position(
+    pub(crate) fn nterm_host_snapshot_logical_position(
         host: *mut Host,
         generation: u64,
         cell: SnapshotCell,
         result: *mut SnapshotLogicalPosition,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_resolve_logical_range(
+    pub(crate) fn nterm_host_snapshot_resolve_logical_range(
         host: *mut Host,
         generation: u64,
         range: SnapshotLogicalRange,
         result: *mut SnapshotCellRange,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_live_cursor_line(
-        host: *mut Host,
-        result: *mut LiveCursorLine,
-    ) -> bool;
-    pub(crate) fn ghostty_egui_host_live_cursor_line_free(result: *mut LiveCursorLine);
-    pub(crate) fn ghostty_egui_host_live_cursor_position(
+    pub(crate) fn nterm_host_live_cursor_line(host: *mut Host, result: *mut LiveCursorLine)
+    -> bool;
+    pub(crate) fn nterm_host_live_cursor_line_free(result: *mut LiveCursorLine);
+    pub(crate) fn nterm_host_live_cursor_position(
         host: *mut Host,
         result: *mut LiveCursorPosition,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_apply_decorations(
+    pub(crate) fn nterm_host_snapshot_apply_decorations(
         host: *mut Host,
         generation: u64,
         layers: *const SnapshotDecorationLayer,
         count: usize,
         viewport: *const SnapshotViewportOptions,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_decorations_need_refresh(
+    pub(crate) fn nterm_host_snapshot_decorations_need_refresh(
         host: *mut Host,
         generation: u64,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_snapshot_apply_cell_text(
+    pub(crate) fn nterm_host_snapshot_apply_cell_text(
         host: *mut Host,
         generation: u64,
         layers: *const SnapshotDecorationLayer,
@@ -521,14 +507,9 @@ unsafe extern "C" {
         text_count: usize,
         viewport: *const SnapshotViewportOptions,
     ) -> bool;
-    pub(crate) fn ghostty_egui_host_text(host: *mut Host, text: *const c_char, len: usize);
-    pub(crate) fn ghostty_egui_host_preedit(host: *mut Host, text: *const c_char, len: usize);
-    pub(crate) fn ghostty_egui_host_mouse_pos(host: *mut Host, x: f64, y: f64, mods: i32);
-    pub(crate) fn ghostty_egui_host_mouse_button(
-        host: *mut Host,
-        state: i32,
-        button: i32,
-        mods: i32,
-    );
-    pub(crate) fn ghostty_egui_host_mouse_scroll(host: *mut Host, x: f64, y: f64, mods: i32);
+    pub(crate) fn nterm_host_text(host: *mut Host, text: *const c_char, len: usize);
+    pub(crate) fn nterm_host_preedit(host: *mut Host, text: *const c_char, len: usize);
+    pub(crate) fn nterm_host_mouse_pos(host: *mut Host, x: f64, y: f64, mods: i32);
+    pub(crate) fn nterm_host_mouse_button(host: *mut Host, state: i32, button: i32, mods: i32);
+    pub(crate) fn nterm_host_mouse_scroll(host: *mut Host, x: f64, y: f64, mods: i32);
 }

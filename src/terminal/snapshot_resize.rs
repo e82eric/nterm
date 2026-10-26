@@ -118,11 +118,9 @@ impl TerminalPane {
         let Some(generation) = generation else {
             return Ok(());
         };
-        let size = unsafe { ghostty_ffi::ghostty_egui_host_surface_size(self.host) };
+        let size = unsafe { ghostty_ffi::nterm_host_surface_size(self.host) };
         let mut before = SnapshotView::default();
-        if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut before)
-        } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut before) } {
             return Err("Snapshot unavailable during resize".into());
         }
         if before.columns == u32::from(size.columns) && before.viewport_rows == u32::from(size.rows)
@@ -145,7 +143,7 @@ impl TerminalPane {
         self.search_worker.cancel_and_wait();
         for cursor in [&mut self.search.cursor, &mut self.copy_search_cursor] {
             if *cursor != 0 {
-                unsafe { ghostty_ffi::ghostty_egui_host_snapshot_cursor_free(*cursor as *mut _) };
+                unsafe { ghostty_ffi::nterm_host_snapshot_cursor_free(*cursor as *mut _) };
                 *cursor = 0;
             }
         }
@@ -181,9 +179,7 @@ impl TerminalPane {
             })
             .flatten();
         let mut map = ghostty_ffi::SnapshotReflowMap::default();
-        if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_resize(self.host, generation, &mut map)
-        } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_resize(self.host, generation, &mut map) } {
             return Err("Unable to reflow snapshot".into());
         }
         for cell in &mut cells {
@@ -195,9 +191,7 @@ impl TerminalPane {
         // per-position FFI calls are needed. Release it before rebuilding UI.
         drop(map);
         let mut view = SnapshotView::default();
-        if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
-        } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view) } {
             return Err("Resized snapshot unavailable".into());
         }
         let document = SnapshotNavigationDocument {
@@ -233,9 +227,9 @@ impl TerminalPane {
         self.search.selected = None;
         self.search.accept_requested = false;
         if self.search.active {
-            self.search.cursor = unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_cursor_new(self.host, generation)
-            } as usize;
+            self.search.cursor =
+                unsafe { ghostty_ffi::nterm_host_snapshot_cursor_new(self.host, generation) }
+                    as usize;
             if self.search.cursor == 0 {
                 return Err("Unable to restart snapshot search".into());
             }
@@ -266,8 +260,7 @@ impl TerminalPane {
         generation: u64,
     ) -> Result<(), String> {
         self.copy_search_cursor =
-            unsafe { ghostty_ffi::ghostty_egui_host_snapshot_cursor_new(self.host, generation) }
-                as usize;
+            unsafe { ghostty_ffi::nterm_host_snapshot_cursor_new(self.host, generation) } as usize;
         if self.copy_search_cursor == 0 {
             return Err("Unable to restart copy search".into());
         }

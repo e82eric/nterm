@@ -10,17 +10,17 @@
 #include <windowsx.h>
 #endif
 
-typedef struct GhosttyEguiHost GhosttyEguiHost;
+typedef struct NtermHost NtermHost;
 typedef struct {
     ghostty_config_t base_config;
-    GhosttyEguiHost *hosts;
-} GhosttyEguiShared;
+    NtermHost *hosts;
+} NtermShared;
 
-struct GhosttyEguiHost {
+struct NtermHost {
     ghostty_app_t app;
     ghostty_surface_t surface;
-    GhosttyEguiShared *shared;
-    GhosttyEguiHost *next;
+    NtermShared *shared;
+    NtermHost *next;
     bool focused;
     ghostty_platform_wgpu_s platform;
 #ifdef _WIN32
@@ -30,7 +30,7 @@ struct GhosttyEguiHost {
 };
 
 #ifdef _WIN32
-static const wchar_t host_property[] = L"GhosttyEguiHost.QuickSelect";
+static const wchar_t host_property[] = L"NtermHost.QuickSelect";
 // An undecorated window has no sizing border. Report a thin band along the
 // edges as one so Windows runs its native resize loop, including resize
 // cursors and snapping. Maximized windows have no band.
@@ -50,7 +50,7 @@ static LRESULT host_resize_hit_test(HWND window, LPARAM lparam) {
     return HTNOWHERE;
 }
 static LRESULT CALLBACK host_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    GhosttyEguiHost *host = (GhosttyEguiHost *)GetPropW(window, host_property);
+    NtermHost *host = (NtermHost *)GetPropW(window, host_property);
     if (!host) return DefWindowProcW(window, message, wparam, lparam);
     if (message == WM_NCHITTEST) {
         LRESULT edge = host_resize_hit_test(window, lparam);
@@ -69,31 +69,31 @@ static LRESULT CALLBACK host_window_proc(HWND window, UINT message, WPARAM wpara
 }
 #endif
 
-extern void ghostty_egui_frame_ready(void *userdata);
-extern void ghostty_egui_close(void *userdata);
-extern void ghostty_egui_write_clipboard(void *userdata, const uint8_t *bytes, size_t len);
-extern void ghostty_egui_config_issue(void *userdata, const char *message);
-extern void ghostty_egui_runtime_issue(void *userdata, const char *operation, const char *cause);
+extern void nterm_frame_ready(void *userdata);
+extern void nterm_close(void *userdata);
+extern void nterm_write_clipboard(void *userdata, const uint8_t *bytes, size_t len);
+extern void nterm_config_issue(void *userdata, const char *message);
+extern void nterm_runtime_issue(void *userdata, const char *operation, const char *cause);
 
-static void runtime_error(GhosttyEguiHost *host, const char *operation) {
+static void runtime_error(NtermHost *host, const char *operation) {
     const char *cause = ghostty_last_error();
     if (cause && host && host->surface)
-        ghostty_egui_runtime_issue(ghostty_surface_userdata(host->surface), operation, cause);
+        nterm_runtime_issue(ghostty_surface_userdata(host->surface), operation, cause);
 }
 
 typedef struct {
     uint32_t background, foreground, selection_background, selection_foreground;
     uint32_t selection_flags;
     uint32_t ansi[16];
-} GhosttyEguiThemeColors;
-extern void ghostty_egui_theme_colors(void *userdata, const GhosttyEguiThemeColors *colors, const char *name, size_t name_len);
+} NtermThemeColors;
+extern void nterm_theme_colors(void *userdata, const NtermThemeColors *colors, const char *name, size_t name_len);
 
 static uint32_t pack_color(ghostty_config_color_s color) {
     return ((uint32_t)color.r << 16) | ((uint32_t)color.g << 8) | color.b;
 }
 
 static void report_theme_colors(ghostty_config_t config, void *userdata) {
-    GhosttyEguiThemeColors colors = {0};
+    NtermThemeColors colors = {0};
     ghostty_config_color_s color;
     ghostty_config_palette_s palette;
     if (!ghostty_config_get(config, &color, "background", strlen("background"))) return;
@@ -112,27 +112,27 @@ static void report_theme_colors(ghostty_config_t config, void *userdata) {
     }
     ghostty_config_theme_name_s name = {0};
     ghostty_config_get(config, &name, "theme", strlen("theme"));
-    ghostty_egui_theme_colors(userdata, &colors, name.ptr, name.len);
+    nterm_theme_colors(userdata, &colors, name.ptr, name.len);
 }
 
-extern void ghostty_egui_title(void *userdata, const char *title);
-extern void ghostty_egui_pwd(void *userdata, const char *pwd);
-extern void ghostty_egui_app_wakeup(void);
-static void wake(void *userdata) { (void)userdata; ghostty_egui_app_wakeup(); }
+extern void nterm_title(void *userdata, const char *title);
+extern void nterm_pwd(void *userdata, const char *pwd);
+extern void nterm_app_wakeup(void);
+static void wake(void *userdata) { (void)userdata; nterm_app_wakeup(); }
 static bool action(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action_value) {
     if (target.tag != GHOSTTY_TARGET_SURFACE) return false;
 
     void *userdata = ghostty_surface_userdata(target.target.surface);
     switch (action_value.tag) {
     case GHOSTTY_ACTION_SET_TITLE:
-        ghostty_egui_title(userdata, action_value.action.set_title.title);
+        nterm_title(userdata, action_value.action.set_title.title);
         return true;
     case GHOSTTY_ACTION_PWD:
         // Ghostty validates OSC 7 (local host only) and decodes the path.
-        ghostty_egui_pwd(userdata, action_value.action.pwd.pwd);
+        nterm_pwd(userdata, action_value.action.pwd.pwd);
         return true;
     case GHOSTTY_ACTION_RENDER:
-        ghostty_egui_frame_ready(userdata);
+        nterm_frame_ready(userdata);
         return true;
     default:
         return false;
@@ -176,14 +176,14 @@ static void write_clipboard(
     for (size_t i = 0; i < count; ++i) {
         if (contents[i].mime && strncmp(contents[i].mime, "text/plain", 10) == 0 &&
             contents[i].data) {
-            ghostty_egui_write_clipboard(userdata, (const uint8_t *)contents[i].data, contents[i].len);
+            nterm_write_clipboard(userdata, (const uint8_t *)contents[i].data, contents[i].len);
             return;
         }
     }
 }
 static void close_surface(void *userdata, bool process_alive) {
     (void)process_alive;
-    ghostty_egui_close(userdata);
+    nterm_close(userdata);
 }
 
 static void startup_error(char *buffer, size_t capacity, const char *stage, const char *cause) {
@@ -191,7 +191,7 @@ static void startup_error(char *buffer, size_t capacity, const char *stage, cons
         cause ? cause : "The native API returned failure without additional details.");
 }
 
-GhosttyEguiHost *ghostty_egui_host_create(
+NtermHost *nterm_host_create(
     size_t argc,
     char **argv,
     void *userdata,
@@ -228,7 +228,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
     report_theme_colors(config, userdata);
     for (uint32_t i = 0; i < ghostty_config_diagnostics_count(config); ++i) {
         ghostty_diagnostic_s diagnostic = ghostty_config_get_diagnostic(config, i);
-        ghostty_egui_config_issue(userdata, diagnostic.message);
+        nterm_config_issue(userdata, diagnostic.message);
     }
 
     ghostty_runtime_config_s runtime = {
@@ -269,7 +269,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
         return NULL;
     }
 
-    GhosttyEguiHost *host = calloc(1, sizeof(*host));
+    NtermHost *host = calloc(1, sizeof(*host));
     if (!host) {
         startup_error(error_buffer, error_capacity, "allocate the main terminal host", strerror(errno));
         ghostty_config_free(base_config);
@@ -301,8 +301,8 @@ GhosttyEguiHost *ghostty_egui_host_create(
     return host;
 }
 
-GhosttyEguiHost *ghostty_egui_host_create_child(
-    GhosttyEguiHost *parent, void *userdata, void *window, const void *driver,
+NtermHost *nterm_host_create_child(
+    NtermHost *parent, void *userdata, void *window, const void *driver,
     double scale,
     const char *picker_endpoint, const char *picker_token,
     const char *command, const char *cwd,
@@ -313,7 +313,7 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
         startup_error(error_buffer, error_capacity, "create an additional terminal", "No parent terminal is available");
         return NULL;
     }
-    GhosttyEguiHost *host = calloc(1, sizeof(*host));
+    NtermHost *host = calloc(1, sizeof(*host));
     if (!host) {
         startup_error(error_buffer, error_capacity, "allocate an additional terminal host", strerror(errno));
         return NULL;
@@ -354,7 +354,7 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
     return host;
 }
 
-bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, const char *family, float size, char *error, size_t capacity) {
+bool nterm_host_apply_settings(NtermHost *host, const char *name, const char *family, float size, char *error, size_t capacity) {
     if (!host || !host->shared->base_config) return false;
     ghostty_clear_error();
     ghostty_config_t candidate = ghostty_config_clone(host->shared->base_config);
@@ -377,7 +377,7 @@ bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, c
     // One app owns all window and floating surfaces. The update propagates
     // to existing surfaces and becomes the configuration for future surfaces.
     ghostty_app_update_config(host->app, candidate);
-    for (GhosttyEguiHost *item = host->shared->hosts; item; item = item->next)
+    for (NtermHost *item = host->shared->hosts; item; item = item->next)
         if (item->surface) report_theme_colors(candidate, ghostty_surface_userdata(item->surface));
     ghostty_config_free(host->shared->base_config);
     host->shared->base_config = inputs;
@@ -385,20 +385,20 @@ bool ghostty_egui_host_apply_settings(GhosttyEguiHost *host, const char *name, c
     return true;
 }
 
-bool ghostty_egui_host_apply_theme(GhosttyEguiHost *host, const char *name, char *error, size_t capacity) {
-    return ghostty_egui_host_apply_settings(host, name, NULL, 0, error, capacity);
+bool nterm_host_apply_theme(NtermHost *host, const char *name, char *error, size_t capacity) {
+    return nterm_host_apply_settings(host, name, NULL, 0, error, capacity);
 }
 
 // Keep the window's app/configuration owner available to create future panes
 // after the last terminal has closed. The process and renderer are released.
-void ghostty_egui_host_close_process(GhosttyEguiHost *host) {
+void nterm_host_close_process(NtermHost *host) {
     if (!host || !host->surface) return;
     ghostty_surface_free(host->surface);
     host->surface = NULL;
     host->focused = false;
 }
 
-void ghostty_egui_host_destroy(GhosttyEguiHost *host) {
+void nterm_host_destroy(NtermHost *host) {
     if (!host) return;
 #ifdef _WIN32
     if (host->window) {
@@ -408,7 +408,7 @@ void ghostty_egui_host_destroy(GhosttyEguiHost *host) {
     }
 #endif
     if (host->surface) ghostty_surface_free(host->surface);
-    GhosttyEguiHost **link = &host->shared->hosts;
+    NtermHost **link = &host->shared->hosts;
     while (*link && *link != host) link = &(*link)->next;
     if (*link) *link = host->next;
     if (!host->shared->hosts) {
@@ -417,45 +417,45 @@ void ghostty_egui_host_destroy(GhosttyEguiHost *host) {
         free(host->shared);
     } else {
         bool focused = false;
-        for (GhosttyEguiHost *item = host->shared->hosts; item; item = item->next)
+        for (NtermHost *item = host->shared->hosts; item; item = item->next)
             focused |= item->focused;
         ghostty_app_set_focus(host->app, focused);
     }
     free(host);
 }
 
-bool ghostty_egui_host_read_font(GhosttyEguiHost *host, bool bold, ghostty_font_data_s *result) {
+bool nterm_host_read_font(NtermHost *host, bool bold, ghostty_font_data_s *result) {
     ghostty_clear_error();
-    bool succeeded = ghostty_surface_read_font(host->surface, bold, result); runtime_error(host, "ghostty_egui_host_read_font"); return succeeded;
+    bool succeeded = ghostty_surface_read_font(host->surface, bold, result); runtime_error(host, "nterm_host_read_font"); return succeeded;
 }
-ghostty_surface_size_s ghostty_egui_host_surface_size(GhosttyEguiHost *host) {
+ghostty_surface_size_s nterm_host_surface_size(NtermHost *host) {
     return ghostty_surface_size(host->surface);
 }
-void ghostty_egui_host_tick(GhosttyEguiHost *host) {
-    ghostty_clear_error(); ghostty_app_tick(host->app);  runtime_error(host, "ghostty_egui_host_tick"); }
-void ghostty_egui_host_resize(GhosttyEguiHost *host, uint32_t width, uint32_t height, double scale) {
+void nterm_host_tick(NtermHost *host) {
+    ghostty_clear_error(); ghostty_app_tick(host->app);  runtime_error(host, "nterm_host_tick"); }
+void nterm_host_resize(NtermHost *host, uint32_t width, uint32_t height, double scale) {
     ghostty_clear_error();
     ghostty_surface_set_content_scale(host->surface, scale, scale);
     runtime_error(host, "set terminal content scale");
     ghostty_surface_set_size(host->surface, width, height);
- runtime_error(host, "ghostty_egui_host_resize"); }
-void ghostty_egui_host_focus(GhosttyEguiHost *host, bool focused) {
+ runtime_error(host, "nterm_host_resize"); }
+void nterm_host_focus(NtermHost *host, bool focused) {
     ghostty_clear_error();
     host->focused = focused;
     bool app_focused = false;
-    for (GhosttyEguiHost *item = host->shared->hosts; item; item = item->next)
+    for (NtermHost *item = host->shared->hosts; item; item = item->next)
         app_focused |= item->focused;
     ghostty_app_set_focus(host->app, app_focused);
     runtime_error(host, "set terminal app focus");
     ghostty_surface_set_focus(host->surface, focused);
- runtime_error(host, "ghostty_egui_host_focus"); }
-bool ghostty_egui_host_take_frame(GhosttyEguiHost *host, ghostty_gpu_frame_s *frame) {
+ runtime_error(host, "nterm_host_focus"); }
+bool nterm_host_take_frame(NtermHost *host, ghostty_gpu_frame_s *frame) {
     bool succeeded = ghostty_surface_take_gpu_frame(host->surface, frame);
     runtime_error(host, "acquire terminal frame");
     return succeeded;
 }
-bool ghostty_egui_host_key(
-    GhosttyEguiHost *host,
+bool nterm_host_key(
+    NtermHost *host,
     int action_value,
     int mods,
     uint32_t usb,
@@ -463,13 +463,13 @@ bool ghostty_egui_host_key(
     const char *text
 ) {
     ghostty_clear_error();
-    bool succeeded = ghostty_surface_key_usb(host->surface, action_value, mods, usb, unshifted, text); runtime_error(host, "ghostty_egui_host_key"); return succeeded;
+    bool succeeded = ghostty_surface_key_usb(host->surface, action_value, mods, usb, unshifted, text); runtime_error(host, "nterm_host_key"); return succeeded;
 }
-bool ghostty_egui_host_snapshot_begin(GhosttyEguiHost *host, uint64_t *snapshot_generation) {
+bool nterm_host_snapshot_begin(NtermHost *host, uint64_t *snapshot_generation) {
     ghostty_clear_error();
-    bool succeeded = ghostty_surface_snapshot_begin(host->surface, snapshot_generation); runtime_error(host, "ghostty_egui_host_snapshot_begin"); return succeeded;
+    bool succeeded = ghostty_surface_snapshot_begin(host->surface, snapshot_generation); runtime_error(host, "nterm_host_snapshot_begin"); return succeeded;
 }
-bool ghostty_egui_host_selection_text(GhosttyEguiHost *host, ghostty_snapshot_selection_text_s *result) {
+bool nterm_host_selection_text(NtermHost *host, ghostty_snapshot_selection_text_s *result) {
     ghostty_clear_error();
     ghostty_text_s text = {0};
     memset(result, 0, sizeof(*result));
@@ -478,7 +478,7 @@ bool ghostty_egui_host_selection_text(GhosttyEguiHost *host, ghostty_snapshot_se
         return false;
     }
     char *copy = malloc(text.text_len + 1);
-    if (!copy) ghostty_egui_runtime_issue(ghostty_surface_userdata(host->surface), "copy terminal selection", strerror(errno));
+    if (!copy) nterm_runtime_issue(ghostty_surface_userdata(host->surface), "copy terminal selection", strerror(errno));
     if (copy) {
         if (text.text_len) memcpy(copy, text.text, text.text_len);
         copy[text.text_len] = 0;
@@ -488,123 +488,123 @@ bool ghostty_egui_host_selection_text(GhosttyEguiHost *host, ghostty_snapshot_se
     ghostty_surface_free_text(host->surface, &text);
     return copy != NULL;
 }
-void ghostty_egui_host_selection_text_free(ghostty_snapshot_selection_text_s *result) {
+void nterm_host_selection_text_free(ghostty_snapshot_selection_text_s *result) {
     free((void *)result->text);
     memset(result, 0, sizeof(*result));
 }
-bool ghostty_egui_host_snapshot_end(GhosttyEguiHost *host, uint64_t snapshot_generation) {
+bool nterm_host_snapshot_end(NtermHost *host, uint64_t snapshot_generation) {
     return ghostty_surface_snapshot_end(host->surface, snapshot_generation);
 }
-bool ghostty_egui_host_snapshot_view(
-    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_view_s *view
+bool nterm_host_snapshot_view(
+    NtermHost *host, uint64_t generation, ghostty_snapshot_view_s *view
 ) {
-    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_view(host->surface, generation, view); runtime_error(host, "ghostty_egui_host_snapshot_view"); return succeeded; }
-bool ghostty_egui_host_snapshot_resolve_cell(
-    GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_cell_s requested,
+    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_view(host->surface, generation, view); runtime_error(host, "nterm_host_snapshot_view"); return succeeded; }
+bool nterm_host_snapshot_resolve_cell(
+    NtermHost *host, uint64_t generation, ghostty_snapshot_cell_s requested,
     bool snap_right, ghostty_snapshot_cell_s *actual
 ) {
     ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_resolve_cell(
     host->surface, generation, requested, snap_right, actual
-); runtime_error(host, "ghostty_egui_host_snapshot_resolve_cell"); return succeeded; }
-bool ghostty_egui_host_snapshot_resize(GhosttyEguiHost *host, uint64_t generation,
+); runtime_error(host, "nterm_host_snapshot_resolve_cell"); return succeeded; }
+bool nterm_host_snapshot_resize(NtermHost *host, uint64_t generation,
     ghostty_snapshot_reflow_map_s *result) {
     ghostty_clear_error();
     return ghostty_surface_snapshot_resize(host->surface, generation, result);
 }
-bool ghostty_egui_host_snapshot_selection_text(
-    GhosttyEguiHost *host, uint64_t generation,
+bool nterm_host_snapshot_selection_text(
+    NtermHost *host, uint64_t generation,
     ghostty_snapshot_cell_range_s range, bool trim, bool rectangle,
     ghostty_snapshot_selection_text_s *result
 ) {
-    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_selection_text(host->surface, generation, range, trim, rectangle, result); runtime_error(host, "ghostty_egui_host_snapshot_selection_text"); return succeeded; }
-void ghostty_egui_host_snapshot_selection_text_free(
+    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_selection_text(host->surface, generation, range, trim, rectangle, result); runtime_error(host, "nterm_host_snapshot_selection_text"); return succeeded; }
+void nterm_host_snapshot_selection_text_free(
     ghostty_snapshot_selection_text_s *result
 ) { ghostty_surface_snapshot_selection_text_free(result); }
-ghostty_snapshot_text_cursor_t ghostty_egui_host_snapshot_cursor_new(
-    GhosttyEguiHost *host, uint64_t generation
+ghostty_snapshot_text_cursor_t nterm_host_snapshot_cursor_new(
+    NtermHost *host, uint64_t generation
 ) { return ghostty_surface_snapshot_text_cursor_new(host->surface, generation); }
-void ghostty_egui_host_snapshot_cursor_free(ghostty_snapshot_text_cursor_t cursor) {
+void nterm_host_snapshot_cursor_free(ghostty_snapshot_text_cursor_t cursor) {
     ghostty_surface_snapshot_text_cursor_free(cursor);
 }
-bool ghostty_egui_host_snapshot_cursor_reset(ghostty_snapshot_text_cursor_t cursor) {
+bool nterm_host_snapshot_cursor_reset(ghostty_snapshot_text_cursor_t cursor) {
     return ghostty_surface_snapshot_text_cursor_reset(cursor);
 }
-int ghostty_egui_host_snapshot_cursor_next(
+int nterm_host_snapshot_cursor_next(
     ghostty_snapshot_text_cursor_t cursor, ghostty_snapshot_text_chunk_s *chunk
 ) { return ghostty_surface_snapshot_text_cursor_next(cursor, chunk); }
-bool ghostty_egui_host_snapshot_text_row(
-    GhosttyEguiHost *host, uint64_t generation, uint64_t row,
+bool nterm_host_snapshot_text_row(
+    NtermHost *host, uint64_t generation, uint64_t row,
     ghostty_snapshot_text_row_s *result
 ) {
-    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_text_row(host->surface, generation, row, result); runtime_error(host, "ghostty_egui_host_snapshot_text_row"); return succeeded; }
-void ghostty_egui_host_snapshot_text_row_free(ghostty_snapshot_text_row_s *result) {
+    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_text_row(host->surface, generation, row, result); runtime_error(host, "nterm_host_snapshot_text_row"); return succeeded; }
+void nterm_host_snapshot_text_row_free(ghostty_snapshot_text_row_s *result) {
     ghostty_surface_snapshot_text_row_free(result);
 }
-bool ghostty_egui_host_snapshot_style_runs(GhosttyEguiHost *host, uint64_t generation, uint64_t row, ghostty_snapshot_style_runs_s *result) {
+bool nterm_host_snapshot_style_runs(NtermHost *host, uint64_t generation, uint64_t row, ghostty_snapshot_style_runs_s *result) {
     return ghostty_surface_snapshot_style_runs(host->surface, generation, row, result);
 }
 
-bool ghostty_egui_host_snapshot_logical_position(GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_cell_s cell, ghostty_snapshot_logical_position_s *result) {
+bool nterm_host_snapshot_logical_position(NtermHost *host, uint64_t generation, ghostty_snapshot_cell_s cell, ghostty_snapshot_logical_position_s *result) {
     return ghostty_surface_snapshot_logical_position(host->surface, generation, cell, result);
 }
-bool ghostty_egui_host_snapshot_resolve_logical_range(GhosttyEguiHost *host, uint64_t generation, ghostty_snapshot_logical_range_s range, ghostty_snapshot_resolved_range_s *result) {
+bool nterm_host_snapshot_resolve_logical_range(NtermHost *host, uint64_t generation, ghostty_snapshot_logical_range_s range, ghostty_snapshot_resolved_range_s *result) {
     return ghostty_surface_snapshot_resolve_logical_range(host->surface, generation, range, result);
 }
-bool ghostty_egui_host_live_cursor_line(GhosttyEguiHost *host, ghostty_live_cursor_line_s *result) {
+bool nterm_host_live_cursor_line(NtermHost *host, ghostty_live_cursor_line_s *result) {
     ghostty_clear_error();
-    bool succeeded = ghostty_surface_live_cursor_line(host->surface, result); runtime_error(host, "ghostty_egui_host_live_cursor_line"); return succeeded;
+    bool succeeded = ghostty_surface_live_cursor_line(host->surface, result); runtime_error(host, "nterm_host_live_cursor_line"); return succeeded;
 }
-bool ghostty_egui_host_live_cursor_position(GhosttyEguiHost *host, ghostty_live_cursor_position_s *result) {
+bool nterm_host_live_cursor_position(NtermHost *host, ghostty_live_cursor_position_s *result) {
     ghostty_clear_error();
-    bool succeeded = ghostty_surface_live_cursor_position(host->surface, result); runtime_error(host, "ghostty_egui_host_live_cursor_position"); return succeeded;
+    bool succeeded = ghostty_surface_live_cursor_position(host->surface, result); runtime_error(host, "nterm_host_live_cursor_position"); return succeeded;
 }
-void ghostty_egui_host_live_cursor_line_free(ghostty_live_cursor_line_s *result) {
+void nterm_host_live_cursor_line_free(ghostty_live_cursor_line_s *result) {
     ghostty_surface_live_cursor_line_free(result);
 }
-bool ghostty_egui_host_snapshot_apply_decorations(
-    GhosttyEguiHost *host, uint64_t generation,
+bool nterm_host_snapshot_apply_decorations(
+    NtermHost *host, uint64_t generation,
     const ghostty_snapshot_decoration_layer_s *layers, size_t count,
     const ghostty_snapshot_viewport_options_s *viewport
 ) {
     ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_apply_decorations(
     host->surface, generation, layers, count, NULL, 0, viewport
-); runtime_error(host, "ghostty_egui_host_snapshot_apply_decorations"); return succeeded; }
-bool ghostty_egui_host_snapshot_apply_cell_text(
-    GhosttyEguiHost *host, uint64_t generation,
+); runtime_error(host, "nterm_host_snapshot_apply_decorations"); return succeeded; }
+bool nterm_host_snapshot_apply_cell_text(
+    NtermHost *host, uint64_t generation,
     const ghostty_snapshot_decoration_layer_s *layers, size_t count,
     const ghostty_snapshot_cell_text_s *text, size_t text_count,
     const ghostty_snapshot_viewport_options_s *viewport
 ) {
     ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_apply_decorations(
     host->surface, generation, layers, count, text, text_count, viewport
-); runtime_error(host, "ghostty_egui_host_snapshot_apply_cell_text"); return succeeded; }
-bool ghostty_egui_host_snapshot_decorations_need_refresh(
-    GhosttyEguiHost *host, uint64_t generation
+); runtime_error(host, "nterm_host_snapshot_apply_cell_text"); return succeeded; }
+bool nterm_host_snapshot_decorations_need_refresh(
+    NtermHost *host, uint64_t generation
 ) {
-    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_decorations_need_refresh(host->surface, generation); runtime_error(host, "ghostty_egui_host_snapshot_decorations_need_refresh"); return succeeded; }
-void ghostty_egui_host_text(GhosttyEguiHost *host, const char *text, size_t len) {
+    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_decorations_need_refresh(host->surface, generation); runtime_error(host, "nterm_host_snapshot_decorations_need_refresh"); return succeeded; }
+void nterm_host_text(NtermHost *host, const char *text, size_t len) {
     ghostty_clear_error();
     ghostty_surface_text(host->surface, text, len);
- runtime_error(host, "ghostty_egui_host_text"); }
-void ghostty_egui_host_preedit(GhosttyEguiHost *host, const char *text, size_t len) {
+ runtime_error(host, "nterm_host_text"); }
+void nterm_host_preedit(NtermHost *host, const char *text, size_t len) {
     ghostty_clear_error();
     ghostty_surface_preedit(host->surface, text, len);
- runtime_error(host, "ghostty_egui_host_preedit"); }
-void ghostty_egui_host_mouse_pos(GhosttyEguiHost *host, double x, double y, int mods) {
+ runtime_error(host, "nterm_host_preedit"); }
+void nterm_host_mouse_pos(NtermHost *host, double x, double y, int mods) {
     ghostty_clear_error();
     ghostty_surface_mouse_pos(host->surface, x, y, (ghostty_input_mods_e)mods);
- runtime_error(host, "ghostty_egui_host_mouse_pos"); }
-void ghostty_egui_host_mouse_button(GhosttyEguiHost *host, int state, int button, int mods) {
+ runtime_error(host, "nterm_host_mouse_pos"); }
+void nterm_host_mouse_button(NtermHost *host, int state, int button, int mods) {
     ghostty_clear_error();
     ghostty_surface_mouse_button(host->surface,
         (ghostty_input_mouse_state_e)state,
         (ghostty_input_mouse_button_e)button,
         (ghostty_input_mods_e)mods);
- runtime_error(host, "ghostty_egui_host_mouse_button"); }
-void ghostty_egui_host_mouse_scroll(GhosttyEguiHost *host, double x, double y, int mods) {
+ runtime_error(host, "nterm_host_mouse_button"); }
+void nterm_host_mouse_scroll(NtermHost *host, double x, double y, int mods) {
     ghostty_clear_error();
     ghostty_surface_mouse_scroll(host->surface, x, y, mods);
- runtime_error(host, "ghostty_egui_host_mouse_scroll"); }
+ runtime_error(host, "nterm_host_mouse_scroll"); }
 
-uint64_t ghostty_egui_host_shell_pid(GhosttyEguiHost *host) { return ghostty_surface_shell_pid(host->surface); }
-uint64_t ghostty_egui_host_shell_creation_time(GhosttyEguiHost *host) { return ghostty_surface_shell_creation_time(host->surface); }
+uint64_t nterm_host_shell_pid(NtermHost *host) { return ghostty_surface_shell_pid(host->surface); }
+uint64_t nterm_host_shell_creation_time(NtermHost *host) { return ghostty_surface_shell_creation_time(host->surface); }

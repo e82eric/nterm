@@ -119,7 +119,7 @@ recognize the terminal without a PowerShell override.
 To build and deploy the Windows sample to another directory:
 
 ```powershell
-.\deploy.ps1 C:\Apps\GhosttyEgui
+.\deploy.ps1 C:\Apps\Nterm
 ```
 
 `build.ps1` also installs the matched ConPTY DLL and console host into

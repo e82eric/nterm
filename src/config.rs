@@ -3111,8 +3111,7 @@ mod tests {
 
     #[test]
     fn explicit_path_is_removed_and_cli_overrides_precede_child_arguments() {
-        let path =
-            std::env::temp_dir().join(format!("nterm-config-{}.lua", std::process::id()));
+        let path = std::env::temp_dir().join(format!("nterm-config-{}.lua", std::process::id()));
         std::fs::write(&path, "return {font = {family = 'Lua Font', size = 12}}").unwrap();
         let result = prepare_args(vec![
             "app".into(),

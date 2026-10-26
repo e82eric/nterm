@@ -488,7 +488,7 @@ impl Picker {
             };
             let mut resolved = SnapshotCellRange::default();
             if unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_resolve_logical_range(
+                ghostty_ffi::nterm_host_snapshot_resolve_logical_range(
                     self.host as *mut Host,
                     self.generation?,
                     logical,
@@ -567,7 +567,7 @@ impl Picker {
                     {
                         let mut view = ghostty_ffi::SnapshotView::default();
                         if !unsafe {
-                            ghostty_ffi::ghostty_egui_host_snapshot_view(
+                            ghostty_ffi::nterm_host_snapshot_view(
                                 self.host as *mut Host,
                                 generation,
                                 &mut view,

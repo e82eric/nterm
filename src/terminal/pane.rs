@@ -46,7 +46,7 @@ impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDoc
     fn resolve_cell(&self, cell: SnapshotCell, right: bool) -> Result<SnapshotCell, String> {
         let mut actual = SnapshotCell::default();
         if unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_resolve_cell(
+            ghostty_ffi::nterm_host_snapshot_resolve_cell(
                 self.host,
                 self.generation,
                 cell,
@@ -62,7 +62,7 @@ impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDoc
     fn selection_text(&self, selection: &CopySelection) -> Result<String, String> {
         let mut result = ghostty_ffi::SnapshotSelectionText::default();
         if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_selection_text(
+            ghostty_ffi::nterm_host_snapshot_selection_text(
                 self.host,
                 self.generation,
                 selection.range,
@@ -83,7 +83,7 @@ impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDoc
                 .map(str::to_owned)
                 .map_err(|error| error.to_string())
         };
-        unsafe { ghostty_ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result) };
+        unsafe { ghostty_ffi::nterm_host_snapshot_selection_text_free(&mut result) };
         let mut text = text?;
         if selection.linewise {
             text.push('\n');
@@ -127,7 +127,7 @@ impl WakeState {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_title(userdata: *mut c_void, title: *const c_char) {
+extern "C" fn nterm_title(userdata: *mut c_void, title: *const c_char) {
     crate::native_error::ffi_boundary("handle terminal title", || {
         if userdata.is_null() || title.is_null() {
             return;
@@ -140,7 +140,7 @@ extern "C" fn ghostty_egui_title(userdata: *mut c_void, title: *const c_char) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_pwd(userdata: *mut c_void, pwd: *const c_char) {
+extern "C" fn nterm_pwd(userdata: *mut c_void, pwd: *const c_char) {
     crate::native_error::ffi_boundary("handle terminal pwd", || {
         if userdata.is_null() || pwd.is_null() {
             return;
@@ -170,8 +170,8 @@ fn shell_path(pwd: &str) -> &str {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_frame_ready(userdata: *mut c_void) {
-    crate::native_error::ffi_boundary("handle native callback ghostty_egui_frame_ready", || {
+extern "C" fn nterm_frame_ready(userdata: *mut c_void) {
+    crate::native_error::ffi_boundary("handle native callback nterm_frame_ready", || {
         let state = unsafe { &*(userdata.cast::<WakeState>()) };
         if !state.frame_ready_pending.swap(true, Ordering::AcqRel)
             && state
@@ -185,8 +185,8 @@ extern "C" fn ghostty_egui_frame_ready(userdata: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_close(userdata: *mut c_void) {
-    crate::native_error::ffi_boundary("handle native callback ghostty_egui_close", || {
+extern "C" fn nterm_close(userdata: *mut c_void) {
+    crate::native_error::ffi_boundary("handle native callback nterm_close", || {
         let state = unsafe { &*(userdata.cast::<WakeState>()) };
         state.close.store(true, Ordering::Release);
         state.context.request_repaint();
@@ -194,20 +194,17 @@ extern "C" fn ghostty_egui_close(userdata: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_write_clipboard(userdata: *mut c_void, bytes: *const u8, len: usize) {
-    crate::native_error::ffi_boundary(
-        "handle native callback ghostty_egui_write_clipboard",
-        || {
-            if bytes.is_null() {
-                return;
-            }
-            let state = unsafe { &*(userdata.cast::<WakeState>()) };
-            let text = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(bytes, len) })
-                .into_owned();
-            *state.clipboard_text.lock().unwrap() = Some(text);
-            state.context.request_repaint();
-        },
-    );
+extern "C" fn nterm_write_clipboard(userdata: *mut c_void, bytes: *const u8, len: usize) {
+    crate::native_error::ffi_boundary("handle native callback nterm_write_clipboard", || {
+        if bytes.is_null() {
+            return;
+        }
+        let state = unsafe { &*(userdata.cast::<WakeState>()) };
+        let text =
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(bytes, len) }).into_owned();
+        *state.clipboard_text.lock().unwrap() = Some(text);
+        state.context.request_repaint();
+    });
 }
 
 /// How to start a pane's shell. Omitted fields use the terminal defaults.
@@ -259,8 +256,8 @@ pub(super) struct TerminalPane {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_config_issue(userdata: *mut c_void, message: *const c_char) {
-    crate::native_error::ffi_boundary("handle native callback ghostty_egui_config_issue", || {
+extern "C" fn nterm_config_issue(userdata: *mut c_void, message: *const c_char) {
+    crate::native_error::ffi_boundary("handle native callback nterm_config_issue", || {
         if message.is_null() {
             return;
         }
@@ -273,7 +270,7 @@ extern "C" fn ghostty_egui_config_issue(userdata: *mut c_void, message: *const c
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_runtime_issue(
+extern "C" fn nterm_runtime_issue(
     userdata: *mut c_void,
     operation: *const c_char,
     cause: *const c_char,
@@ -306,13 +303,13 @@ extern "C" fn ghostty_egui_runtime_issue(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ghostty_egui_theme_colors(
+extern "C" fn nterm_theme_colors(
     userdata: *mut c_void,
     colors: *const crate::colors::ThemeColors,
     name: *const u8,
     name_len: usize,
 ) {
-    crate::native_error::ffi_boundary("handle native callback ghostty_egui_theme_colors", || {
+    crate::native_error::ffi_boundary("handle native callback nterm_theme_colors", || {
         if colors.is_null() {
             return;
         }
@@ -365,7 +362,7 @@ impl TerminalPane {
         let name = std::ffi::CString::new(name).map_err(|_| "Theme name contains NUL")?;
         let mut error = [0u8; 4096];
         if unsafe {
-            ghostty_ffi::ghostty_egui_host_apply_theme(
+            ghostty_ffi::nterm_host_apply_theme(
                 self.host,
                 name.as_ptr(),
                 error.as_mut_ptr().cast(),
@@ -399,7 +396,7 @@ impl TerminalPane {
             .map_err(|_| "Font contains NUL")?;
         let mut error = [0u8; 4096];
         if unsafe {
-            ghostty_ffi::ghostty_egui_host_apply_settings(
+            ghostty_ffi::nterm_host_apply_settings(
                 self.host,
                 theme
                     .as_ref()
@@ -475,7 +472,7 @@ impl TerminalPane {
             .frame_ready_pending
             .store(false, Ordering::Release);
         let mut frame = GpuFrame::default();
-        if !unsafe { ghostty_ffi::ghostty_egui_host_take_frame(self.host, &mut frame) } {
+        if !unsafe { ghostty_ffi::nterm_host_take_frame(self.host, &mut frame) } {
             return false;
         }
         self.painter.lock().replace_frame(frame);
@@ -494,7 +491,7 @@ impl TerminalPane {
         if !self.detached {
             self.painter.lock().destroy();
         }
-        unsafe { ghostty_ffi::ghostty_egui_host_destroy(self.host) };
+        unsafe { ghostty_ffi::nterm_host_destroy(self.host) };
         self.host = std::ptr::null_mut();
     }
 
@@ -522,7 +519,7 @@ impl TerminalPane {
         if self.focused != focused {
             self.focused = focused;
             unsafe {
-                ghostty_ffi::ghostty_egui_host_focus(self.host, focused);
+                ghostty_ffi::nterm_host_focus(self.host, focused);
             }
         }
     }
@@ -539,7 +536,7 @@ impl TerminalPane {
         // Readers are stopped before any frozen pages change.
         self.size = size;
         self.scale = scale;
-        unsafe { ghostty_ffi::ghostty_egui_host_resize(self.host, size[0], size[1], scale as f64) };
+        unsafe { ghostty_ffi::nterm_host_resize(self.host, size[0], size[1], scale as f64) };
         if let Err(error) = self.resize_snapshot() {
             self.picker = None;
             self.quick_select = None;
@@ -585,9 +582,7 @@ impl TerminalPane {
             self.search.snapshot_generation,
             self.copy_mode.generation,
             |generation| unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_decorations_need_refresh(
-                    self.host, generation,
-                )
+                ghostty_ffi::nterm_host_snapshot_decorations_need_refresh(self.host, generation)
             },
         );
         match refresh {
@@ -675,7 +670,7 @@ impl TerminalPane {
         let (picker_endpoint, picker_token) = wake.picker_environment();
         let mut error_buffer = [0 as c_char; 2048];
         let host = unsafe {
-            ghostty_ffi::ghostty_egui_host_create(
+            ghostty_ffi::nterm_host_create(
                 argc,
                 argv,
                 (&mut *wake as *mut WakeState).cast(),
@@ -770,7 +765,7 @@ impl TerminalPane {
             .transpose()
             .map_err(|e| crate::native_error::FatalError::new("pane directory", e))?;
         let host = unsafe {
-            ghostty_ffi::ghostty_egui_host_create_child(
+            ghostty_ffi::nterm_host_create_child(
                 self.host,
                 (&mut *wake as *mut WakeState).cast(),
                 native.unwrap_or(std::ptr::null_mut()),
@@ -796,7 +791,7 @@ impl TerminalPane {
     }
 
     pub(super) fn tick(&mut self) {
-        unsafe { ghostty_ffi::ghostty_egui_host_tick(self.host) };
+        unsafe { ghostty_ffi::nterm_host_tick(self.host) };
     }
 
     pub(super) fn should_close(&self) -> bool {
@@ -819,7 +814,7 @@ impl TerminalPane {
         }
         self.painter.lock().destroy();
         unsafe {
-            ghostty_ffi::ghostty_egui_host_close_process(self.host);
+            ghostty_ffi::nterm_host_close_process(self.host);
         }
         self.detached = true;
         self.active = false;
@@ -1028,14 +1023,14 @@ impl TerminalPane {
         for (index, chunk) in normalized.split('\n').enumerate() {
             if index > 0 {
                 unsafe {
-                    ghostty_ffi::ghostty_egui_host_key(host, 1, 0, enter_usb, 0, std::ptr::null());
-                    ghostty_ffi::ghostty_egui_host_key(host, 0, 0, enter_usb, 0, std::ptr::null());
+                    ghostty_ffi::nterm_host_key(host, 1, 0, enter_usb, 0, std::ptr::null());
+                    ghostty_ffi::nterm_host_key(host, 0, 0, enter_usb, 0, std::ptr::null());
                 }
             }
             if !chunk.is_empty() {
                 if let Ok(text) = std::ffi::CString::new(chunk) {
                     unsafe {
-                        ghostty_ffi::ghostty_egui_host_key(host, 1, 0, 0, 0, text.as_ptr());
+                        ghostty_ffi::nterm_host_key(host, 1, 0, 0, 0, text.as_ptr());
                     }
                 }
             }
@@ -1049,12 +1044,12 @@ impl TerminalPane {
                 .0;
             for _ in 0..count {
                 unsafe {
-                    ghostty_ffi::ghostty_egui_host_key(host, 1, 0, usb, 0, std::ptr::null());
-                    ghostty_ffi::ghostty_egui_host_key(host, 0, 0, usb, 0, std::ptr::null());
+                    ghostty_ffi::nterm_host_key(host, 1, 0, usb, 0, std::ptr::null());
+                    ghostty_ffi::nterm_host_key(host, 0, 0, usb, 0, std::ptr::null());
                 }
             }
         }
-        unsafe { ghostty_ffi::ghostty_egui_host_text(host, text.as_ptr().cast(), text.len()) };
+        unsafe { ghostty_ffi::nterm_host_text(host, text.as_ptr().cast(), text.len()) };
     }
     pub(super) fn open_picker(
         &mut self,
@@ -1079,7 +1074,7 @@ impl TerminalPane {
         let host = self.host;
         let context = if entry.needs_context() {
             let mut row = ghostty_ffi::LiveCursorLine::default();
-            if !unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line(host, &mut row) } {
+            if !unsafe { ghostty_ffi::nterm_host_live_cursor_line(host, &mut row) } {
                 self.show_error(
                     "Could not open picker",
                     "Unable to read live cursor line".into(),
@@ -1101,7 +1096,7 @@ impl TerminalPane {
                 recent_lines: self.recent_picker_lines(),
                 cwd: self.pwd(),
             };
-            unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_line_free(&mut row) };
+            unsafe { ghostty_ffi::nterm_host_live_cursor_line_free(&mut row) };
             context
         } else {
             crate::config::PickerContext::default()
@@ -1194,8 +1189,7 @@ impl TerminalPane {
                 generation
             } else {
                 let mut generation = 0;
-                if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(host, &mut generation) }
-                {
+                if !unsafe { ghostty_ffi::nterm_host_snapshot_begin(host, &mut generation) } {
                     self.show_error(
                         "Picker unavailable",
                         "Unable to create the scrollback snapshot".into(),
@@ -1205,10 +1199,9 @@ impl TerminalPane {
                 generation
             };
             let mut view = SnapshotView::default();
-            if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view) }
-            {
+            if !unsafe { ghostty_ffi::nterm_host_snapshot_view(host, generation, &mut view) } {
                 if !from_copy {
-                    unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(host, generation) };
+                    unsafe { ghostty_ffi::nterm_host_snapshot_end(host, generation) };
                 }
                 if from_copy {
                     self.close_copy_mode();
@@ -1278,7 +1271,7 @@ impl TerminalPane {
             return;
         }
         let cursor_row = self.picker_cursor_row();
-        let size = unsafe { ghostty_ffi::ghostty_egui_host_surface_size(self.host) };
+        let size = unsafe { ghostty_ffi::nterm_host_surface_size(self.host) };
         let row_height = (size.cell_height_px as f32 / ctx.pixels_per_point()).max(1.0);
         self.toasts.show(
             ctx,
@@ -1292,9 +1285,7 @@ impl TerminalPane {
     fn picker_cursor_row(&self) -> Option<u32> {
         if let Some(generation) = self.copy_mode.generation {
             let mut view = SnapshotView::default();
-            if !unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
-            } {
+            if !unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view) } {
                 return None;
             }
             self.copy_mode
@@ -1305,7 +1296,7 @@ impl TerminalPane {
                 .and_then(|row| u32::try_from(row).ok())
         } else {
             let mut cursor = ghostty_ffi::LiveCursorPosition::default();
-            unsafe { ghostty_ffi::ghostty_egui_host_live_cursor_position(self.host, &mut cursor) }
+            unsafe { ghostty_ffi::nterm_host_live_cursor_position(self.host, &mut cursor) }
                 .then_some(cursor.row)
         }
     }
@@ -1332,8 +1323,7 @@ impl TerminalPane {
                 .unwrap_or_default();
         }
         let mut result = ghostty_ffi::SnapshotSelectionText::default();
-        let copied =
-            unsafe { ghostty_ffi::ghostty_egui_host_selection_text(self.host, &mut result) };
+        let copied = unsafe { ghostty_ffi::nterm_host_selection_text(self.host, &mut result) };
         if !copied {
             return String::new();
         }
@@ -1345,9 +1335,9 @@ impl TerminalPane {
         };
         unsafe {
             if self.copy_mode.generation.is_some() {
-                ghostty_ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result);
+                ghostty_ffi::nterm_host_snapshot_selection_text_free(&mut result);
             } else {
-                ghostty_ffi::ghostty_egui_host_selection_text_free(&mut result);
+                ghostty_ffi::nterm_host_selection_text_free(&mut result);
             }
         }
         text
@@ -1370,7 +1360,7 @@ impl TerminalPane {
                         crate::lua_callbacks::Command::Paste(text) => {
                             self.close_copy_mode();
                             unsafe {
-                                ghostty_ffi::ghostty_egui_host_text(
+                                ghostty_ffi::nterm_host_text(
                                     self.host,
                                     text.as_ptr().cast(),
                                     text.len(),
@@ -1475,8 +1465,8 @@ impl TerminalPane {
         // The shell may start after the pane; identify it once it exists.
         if let Some(pipe) = self.wake.pipe.as_ref().filter(|p| !p.shell_identified()) {
             pipe.identify_shell(
-                unsafe { ghostty_ffi::ghostty_egui_host_shell_pid(self.host) } as u32,
-                unsafe { ghostty_ffi::ghostty_egui_host_shell_creation_time(self.host) },
+                unsafe { ghostty_ffi::nterm_host_shell_pid(self.host) } as u32,
+                unsafe { ghostty_ffi::nterm_host_shell_creation_time(self.host) },
             );
         }
         if self.picker.as_ref().is_some_and(|p| p.pipe_cancelled()) {
@@ -1665,7 +1655,7 @@ impl TerminalPane {
             crate::picker::Action::SendInput(text) => {
                 self.close_copy_mode();
                 unsafe {
-                    ghostty_ffi::ghostty_egui_host_text(self.host, text.as_ptr().cast(), text.len())
+                    ghostty_ffi::nterm_host_text(self.host, text.as_ptr().cast(), text.len())
                 };
             }
             action @ crate::picker::Action::Custom(..) => {
@@ -1765,7 +1755,7 @@ impl TerminalPane {
                             }
                             sent = true;
                             unsafe {
-                                ghostty_ffi::ghostty_egui_host_text(
+                                ghostty_ffi::nterm_host_text(
                                     self.host,
                                     text.as_ptr().cast(),
                                     text.len(),
@@ -1840,7 +1830,7 @@ impl TerminalPane {
             generation
         } else {
             let mut generation = 0;
-            if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(host, &mut generation) } {
+            if !unsafe { ghostty_ffi::nterm_host_snapshot_begin(host, &mut generation) } {
                 self.show_error(
                     "Quick select unavailable",
                     "Unable to create the terminal snapshot".into(),
@@ -1850,9 +1840,9 @@ impl TerminalPane {
             generation
         };
         let mut view = SnapshotView::default();
-        if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view) } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_view(host, generation, &mut view) } {
             if !from_copy {
-                unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(host, generation) };
+                unsafe { ghostty_ffi::nterm_host_snapshot_end(host, generation) };
             }
             self.show_error(
                 "Quick select unavailable",
@@ -1903,7 +1893,7 @@ impl TerminalPane {
         let (generation, from_copy, purpose) = (quick.generation, quick.from_copy, quick.purpose);
         let host = self.quick_host();
         let mut view = SnapshotView::default();
-        if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view) } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_view(host, generation, &mut view) } {
             self.cancel_quick_select();
             self.show_error(
                 "Quick select failed",
@@ -1958,7 +1948,7 @@ impl TerminalPane {
             style,
         };
         unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_apply_cell_text(
+            ghostty_ffi::nterm_host_snapshot_apply_cell_text(
                 self.quick_host(),
                 quick.generation,
                 &layer,
@@ -1987,9 +1977,8 @@ impl TerminalPane {
             return;
         };
         let mut view = SnapshotView::default();
-        if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, quick.generation, &mut view)
-        } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, quick.generation, &mut view) }
+        {
             self.copy_controller_error("Quick-select snapshot expired".into());
             return;
         }
@@ -2019,7 +2008,7 @@ impl TerminalPane {
         let mut result = ghostty_ffi::SnapshotSelectionText::default();
         let host = self.quick_host();
         if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_selection_text(
+            ghostty_ffi::nterm_host_snapshot_selection_text(
                 host,
                 quick.generation,
                 hint.range,
@@ -2042,10 +2031,10 @@ impl TerminalPane {
         } else {
             unsafe { std::slice::from_raw_parts(result.text, result.len) }.to_vec()
         };
-        unsafe { ghostty_ffi::ghostty_egui_host_snapshot_selection_text_free(&mut result) };
+        unsafe { ghostty_ffi::nterm_host_snapshot_selection_text_free(&mut result) };
         self.quick_select = None;
         self.close_quick_copy_mode();
-        unsafe { ghostty_ffi::ghostty_egui_host_text(host, text.as_ptr().cast(), text.len()) };
+        unsafe { ghostty_ffi::nterm_host_text(host, text.as_ptr().cast(), text.len()) };
         self.wake.context.request_repaint();
     }
 
@@ -2081,8 +2070,7 @@ impl TerminalPane {
         let cursor = if self.copy_search_cursor != 0 {
             self.copy_search_cursor
         } else {
-            (unsafe { ghostty_ffi::ghostty_egui_host_snapshot_cursor_new(self.host, generation) })
-                as usize
+            (unsafe { ghostty_ffi::nterm_host_snapshot_cursor_new(self.host, generation) }) as usize
         };
         if cursor == 0 {
             self.show_error(
@@ -2134,8 +2122,7 @@ impl TerminalPane {
         self.pending_search_snapshot = None;
         let host = self.search_host();
         let mut snapshot_generation = 0;
-        if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(host, &mut snapshot_generation) }
-        {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_begin(host, &mut snapshot_generation) } {
             self.close_search();
             self.show_error(
                 "Search unavailable",
@@ -2144,11 +2131,10 @@ impl TerminalPane {
             return;
         }
 
-        let cursor = unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_cursor_new(host, snapshot_generation)
-        };
+        let cursor =
+            unsafe { ghostty_ffi::nterm_host_snapshot_cursor_new(host, snapshot_generation) };
         if cursor.is_null() {
-            unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(host, snapshot_generation) };
+            unsafe { ghostty_ffi::nterm_host_snapshot_end(host, snapshot_generation) };
             self.close_search();
             self.show_error(
                 "Search unavailable",
@@ -2167,14 +2153,12 @@ impl TerminalPane {
         let host = self.search_host();
         if self.search.cursor != 0 {
             self.search_worker.cancel_and_wait();
-            unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_cursor_free(self.search.cursor as *mut _)
-            };
+            unsafe { ghostty_ffi::nterm_host_snapshot_cursor_free(self.search.cursor as *mut _) };
         } else {
             self.search_worker.cancel();
         }
         if let Some(snapshot_generation) = self.search.snapshot_generation.take() {
-            unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(host, snapshot_generation) };
+            unsafe { ghostty_ffi::nterm_host_snapshot_end(host, snapshot_generation) };
         }
         self.search = SearchUi::default();
     }
@@ -2186,7 +2170,7 @@ impl TerminalPane {
     fn open_copy_mode(&mut self) {
         self.close_search();
         let mut generation = 0;
-        if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_begin(self.host, &mut generation) } {
             self.show_error(
                 "Copy mode failed",
                 "Could not capture the terminal contents. Try again.".into(),
@@ -2196,8 +2180,8 @@ impl TerminalPane {
         let mut state = SnapshotView::default();
         let mut actual = SnapshotCell::default();
         let ready = unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut state)
-                && ghostty_ffi::ghostty_egui_host_snapshot_resolve_cell(
+            ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut state)
+                && ghostty_ffi::nterm_host_snapshot_resolve_cell(
                     self.host,
                     generation,
                     state.cursor,
@@ -2206,7 +2190,7 @@ impl TerminalPane {
                 )
         };
         if !ready || !self.publish_copy_decoration(generation, actual, true) {
-            unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+            unsafe { ghostty_ffi::nterm_host_snapshot_end(self.host, generation) };
             self.show_error(
                 "Copy mode failed",
                 "Could not locate the cursor in the saved terminal view. Try again.".into(),
@@ -2237,7 +2221,7 @@ impl TerminalPane {
         };
         let host = self.search_host();
         let mut view = SnapshotView::default();
-        if !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(host, generation, &mut view) } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_view(host, generation, &mut view) } {
             self.close_search();
             self.show_error(
                 "Search navigation failed",
@@ -2247,7 +2231,7 @@ impl TerminalPane {
         }
         let mut actual = SnapshotCell::default();
         if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_resolve_cell(
+            ghostty_ffi::nterm_host_snapshot_resolve_cell(
                 host,
                 generation,
                 target,
@@ -2299,12 +2283,10 @@ impl TerminalPane {
             if self.copy_search_cursor != 0 {
                 self.search_worker.cancel_and_wait();
                 unsafe {
-                    ghostty_ffi::ghostty_egui_host_snapshot_cursor_free(
-                        self.copy_search_cursor as *mut _,
-                    )
+                    ghostty_ffi::nterm_host_snapshot_cursor_free(self.copy_search_cursor as *mut _)
                 };
             }
-            unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+            unsafe { ghostty_ffi::nterm_host_snapshot_end(self.host, generation) };
             let padding = self.copy_mode.scroll_padding();
             self.copy_mode = CopyMode::default();
             self.copy_mode.set_scroll_padding(padding);
@@ -2334,9 +2316,7 @@ impl TerminalPane {
             let action = self.copy_mode.input(event);
             let generation = self.copy_mode.generation.expect("copy mode is active");
             let mut view = SnapshotView::default();
-            if !unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
-            } {
+            if !unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view) } {
                 self.copy_controller_error("The copy-mode snapshot is no longer available".into());
                 break;
             }
@@ -2482,9 +2462,7 @@ impl TerminalPane {
                     };
                     let mut view = SnapshotView::default();
                     let picker = if unsafe {
-                        ghostty_ffi::ghostty_egui_host_snapshot_view(
-                            self.host, generation, &mut view,
-                        )
+                        ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view)
                     } {
                         crate::picker::Picker::start_line_split(
                             self.host,
@@ -2543,7 +2521,7 @@ impl TerminalPane {
     ) -> Option<SnapshotCell> {
         let mut actual = SnapshotCell::default();
         unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_resolve_cell(
+            ghostty_ffi::nterm_host_snapshot_resolve_cell(
                 self.host,
                 generation,
                 requested,
@@ -2558,14 +2536,13 @@ impl TerminalPane {
         let mut generation = self.copy_mode.generation.unwrap_or_default();
         let temporary = self.copy_mode.generation.is_none();
         if temporary
-            && !unsafe { ghostty_ffi::ghostty_egui_host_snapshot_begin(self.host, &mut generation) }
+            && !unsafe { ghostty_ffi::nterm_host_snapshot_begin(self.host, &mut generation) }
         {
             return Vec::new();
         }
         let mut view = SnapshotView::default();
         let mut lines = Vec::new();
-        if unsafe { ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view) }
-        {
+        if unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view) } {
             // Bound the synchronous read even when the terminal has huge scrollback.
             for row in (view.total_rows.saturating_sub(256)..view.total_rows).rev() {
                 if let Some(row) = self.read_snapshot_row(generation, row) {
@@ -2581,7 +2558,7 @@ impl TerminalPane {
             lines.reverse();
         }
         if temporary {
-            unsafe { ghostty_ffi::ghostty_egui_host_snapshot_end(self.host, generation) };
+            unsafe { ghostty_ffi::nterm_host_snapshot_end(self.host, generation) };
         }
         lines
     }
@@ -2592,9 +2569,8 @@ impl TerminalPane {
 
     fn read_snapshot_row_from(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
         let mut result = SnapshotTextRow::default();
-        if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_text_row(host, generation, row, &mut result)
-        } {
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_text_row(host, generation, row, &mut result) }
+        {
             return None;
         }
         let (text, columns) = if result.len == 0 {
@@ -2606,7 +2582,7 @@ impl TerminalPane {
             )
         };
         let wraps_to_next = result.wraps_to_next;
-        unsafe { ghostty_ffi::ghostty_egui_host_snapshot_text_row_free(&mut result) };
+        unsafe { ghostty_ffi::nterm_host_snapshot_text_row_free(&mut result) };
         Some(TextRow {
             text: String::from_utf8(text).ok()?,
             columns,
@@ -2733,11 +2709,7 @@ impl TerminalPane {
         }
         let mut view = SnapshotView::default();
         if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_view(
-                self.host,
-                result.document_revision,
-                &mut view,
-            )
+            ghostty_ffi::nterm_host_snapshot_view(self.host, result.document_revision, &mut view)
         } {
             self.copy_controller_error("Copy-search snapshot expired".into());
             return;
@@ -2772,9 +2744,8 @@ impl TerminalPane {
             return;
         };
         if self.copy_search_cursor == 0 {
-            let cursor = unsafe {
-                ghostty_ffi::ghostty_egui_host_snapshot_cursor_new(self.host, generation)
-            };
+            let cursor =
+                unsafe { ghostty_ffi::nterm_host_snapshot_cursor_new(self.host, generation) };
             if cursor.is_null() {
                 return;
             }
@@ -2891,7 +2862,7 @@ impl TerminalPane {
             layers.insert(index, active_search_layer(range));
         }
         unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_apply_decorations(
+            ghostty_ffi::nterm_host_snapshot_apply_decorations(
                 self.host,
                 generation,
                 layers.as_ptr(),
@@ -2915,9 +2886,8 @@ impl TerminalPane {
             return vec![range];
         }
         let mut view = SnapshotView::default();
-        if !unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_view(self.host, generation, &mut view)
-        } || view.viewport_rows == 0
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view) }
+            || view.viewport_rows == 0
         {
             return Vec::new();
         }
@@ -2971,7 +2941,7 @@ impl TerminalPane {
         }
         layers.push(matches_layer);
         unsafe {
-            ghostty_ffi::ghostty_egui_host_snapshot_apply_decorations(
+            ghostty_ffi::nterm_host_snapshot_apply_decorations(
                 self.search_host(),
                 snapshot_generation,
                 layers.as_ptr(),
