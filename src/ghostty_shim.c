@@ -205,7 +205,7 @@ GhosttyEguiHost *ghostty_egui_host_create(
 ) {
     if (error_buffer && error_capacity) error_buffer[0] = '\0';
     if (ghostty_init_utf8(argc, argv) != 0) {
-        startup_error(error_buffer, error_capacity, "initialize libghostty", ghostty_last_init_error());
+        startup_error(error_buffer, error_capacity, "initialize libghostty", ghostty_last_error());
         return NULL;
     }
 
