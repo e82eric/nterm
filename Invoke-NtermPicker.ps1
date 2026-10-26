@@ -3,27 +3,27 @@
 # current shell environment; they are never written to stdout or disk.
 param([switch]$BackgroundInitialize, [switch]$FreshConnection)
 
-$script:GhosttyPickerFreshConnection = [bool]$FreshConnection
+$script:NtermPickerFreshConnection = [bool]$FreshConnection
 
-if (-not ($ExecutionContext.SessionState.PSVariable.Get('script:GhosttyPickerInitialization'))) {
-    $script:GhosttyPickerInitialization = $null
+if (-not ($ExecutionContext.SessionState.PSVariable.Get('script:NtermPickerInitialization'))) {
+    $script:NtermPickerInitialization = $null
 }
 
-if (-not ($ExecutionContext.SessionState.PSVariable.Get('script:GhosttyPickerConnection'))) {
-    $script:GhosttyPickerConnection = $null
+if (-not ($ExecutionContext.SessionState.PSVariable.Get('script:NtermPickerConnection'))) {
+    $script:NtermPickerConnection = $null
 }
 
-function Disconnect-GhosttyPicker {
+function Disconnect-NtermPicker {
     [CmdletBinding()]
     param()
-    if ($null -ne $script:GhosttyPickerInitialization) { Initialize-GhosttyPickerClient }
-    if ($null -ne $script:GhosttyPickerConnection) {
-        $script:GhosttyPickerConnection.Client.Dispose()
-        $script:GhosttyPickerConnection = $null
+    if ($null -ne $script:NtermPickerInitialization) { Initialize-NtermPickerClient }
+    if ($null -ne $script:NtermPickerConnection) {
+        $script:NtermPickerConnection.Client.Dispose()
+        $script:NtermPickerConnection = $null
     }
 }
 
-$script:GhosttyPickerClientSource = @'
+$script:NtermPickerClientSource = @'
 using System;
 using System.IO;
 using System.Text;
@@ -34,7 +34,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class GhosttyPickerPipeV2 : IDisposable {
+public sealed class NtermPickerPipeV2 : IDisposable {
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern SafeFileHandle CreateFile(string name, uint access, uint share,
         IntPtr attributes, uint disposition, uint flags, IntPtr template);
@@ -66,10 +66,10 @@ public sealed class GhosttyPickerPipeV2 : IDisposable {
     }
     int disposed;
 
-    public GhosttyPickerPipeV2(string endpoint) {
-        if (String.IsNullOrEmpty(endpoint) || !endpoint.StartsWith("ghostty-picker-") ||
+    public NtermPickerPipeV2(string endpoint) {
+        if (String.IsNullOrEmpty(endpoint) || !endpoint.StartsWith("nterm-picker-") ||
             endpoint.IndexOf('\\') >= 0 || endpoint.IndexOf('/') >= 0)
-            throw new ArgumentException("Invalid Ghostty picker endpoint");
+            throw new ArgumentException("Invalid nterm picker endpoint");
         string path = @"\\.\pipe\" + endpoint;
         SafeFileHandle handle = null;
         var deadline = DateTime.UtcNow.AddSeconds(5);
@@ -80,7 +80,7 @@ public sealed class GhosttyPickerPipeV2 : IDisposable {
             if (!handle.IsInvalid) break;
             int error = Marshal.GetLastWin32Error(); handle.Dispose();
             if ((error != 231 && error != 2) || DateTime.UtcNow >= deadline)
-                throw new IOException("Cannot connect to Ghostty picker pipe (Win32 " + error + ")");
+                throw new IOException("Cannot connect to nterm picker pipe (Win32 " + error + ")");
             WaitNamedPipe(path, 100); Thread.Sleep(20);
         }
         uint flags;
@@ -104,7 +104,7 @@ public sealed class GhosttyPickerPipeV2 : IDisposable {
         var bytes = new byte[length]; int offset = 0;
         while (offset < length) {
             int count = stream.ReadAsync(bytes, offset, length-offset, stop.Token).GetAwaiter().GetResult();
-            if (count == 0) throw new EndOfStreamException("Ghostty picker disconnected");
+            if (count == 0) throw new EndOfStreamException("nterm picker disconnected");
             offset += count;
         }
         return bytes;
@@ -126,13 +126,13 @@ public sealed class GhosttyPickerPipeV2 : IDisposable {
     public string Next(int milliseconds) {
         string value;
         if (incoming.TryTake(out value, milliseconds)) return value;
-        if (failure != null) throw new IOException("Ghostty picker connection ended", failure);
+        if (failure != null) throw new IOException("nterm picker connection ended", failure);
         return null;
     }
     public static string Nonce() { return Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant(); }
     public static string Proof(string token, string endpoint, string server, string client, string role) {
         using (var data = new MemoryStream()) {
-            foreach (string part in new [] { "ghostty-picker/1", endpoint, server, client, role }) {
+            foreach (string part in new [] { "nterm-picker/1", endpoint, server, client, role }) {
                 var bytes = Encoding.UTF8.GetBytes(part);
                 data.Write(BitConverter.GetBytes((uint)bytes.Length)); data.Write(bytes);
             }
@@ -165,10 +165,10 @@ public sealed class GhosttyPickerPipeV2 : IDisposable {
 
 # This script runs either here or in the background runspace. It returns the
 # authenticated client object, which stays in this process and is never delegated.
-$script:GhosttyPickerConnectScript = {
+$script:NtermPickerConnectScript = {
     param([string]$Source, [string]$Endpoint, [string]$Token)
     $ErrorActionPreference = 'Stop'
-    if (-not ('GhosttyPickerPipeV2' -as [type])) {
+    if (-not ('NtermPickerPipeV2' -as [type])) {
         Add-Type -TypeDefinition $Source -ErrorAction Stop
     }
     if (-not $Endpoint -or -not $Token) { return }
@@ -181,26 +181,26 @@ $script:GhosttyPickerConnectScript = {
                 $message = ConvertFrom-Json -InputObject $raw -AsHashtable
                 if ($message.type -eq 'error') {
                     $client.Send((ConvertTo-Json -Compress @{type='received';request_id=$message.request_id}))
-                    throw "Ghostty picker rejected the connection ($($message.code)): $($message.message)"
+                    throw "nterm picker rejected the connection ($($message.code)): $($message.message)"
                 }
                 return $message
             }
         }
-        throw 'Timed out authenticating Ghostty picker connection.'
+        throw 'Timed out authenticating nterm picker connection.'
     }
     try {
-        $client = [GhosttyPickerPipeV2]::new($Endpoint)
+        $client = [NtermPickerPipeV2]::new($Endpoint)
         $challenge = Receive-AuthenticationMessage
         if ($challenge.type -ne 'challenge' -or $challenge.version -ne 1 -or $challenge.nonce -notmatch '^[0-9a-f]{64}$') {
             throw 'Invalid picker authentication challenge.'
         }
-        $nonce = [GhosttyPickerPipeV2]::Nonce()
-        $proof = [GhosttyPickerPipeV2]::Proof($Token, $Endpoint, $challenge.nonce, $nonce, 'client')
+        $nonce = [NtermPickerPipeV2]::Nonce()
+        $proof = [NtermPickerPipeV2]::Proof($Token, $Endpoint, $challenge.nonce, $nonce, 'client')
         $client.Send((ConvertTo-Json -Compress @{type='authenticate';version=1;client_nonce=$nonce;proof=$proof}))
         $ready = Receive-AuthenticationMessage
         if ($ready.type -ne 'ready') { throw 'Picker pipe is disabled or authentication was rejected.' }
-        $expected = [GhosttyPickerPipeV2]::Proof($Token, $Endpoint, $challenge.nonce, $nonce, 'server')
-        if (-not [GhosttyPickerPipeV2]::Verify($expected, $ready.proof)) { throw 'Picker server authentication failed.' }
+        $expected = [NtermPickerPipeV2]::Proof($Token, $Endpoint, $challenge.nonce, $nonce, 'server')
+        if (-not [NtermPickerPipeV2]::Verify($expected, $ready.proof)) { throw 'Picker server authentication failed.' }
         @{
             Client=$client; Endpoint=$Endpoint; Token=$Token
             Persistent=($ready.ContainsKey('persistent') -and $ready.persistent -eq $true)
@@ -209,20 +209,20 @@ $script:GhosttyPickerConnectScript = {
     } finally { if ($null -ne $client) { $client.Dispose() } }
 }
 
-function Save-GhosttyPickerInitialConnection($Connection) {
+function Save-NtermPickerInitialConnection($Connection) {
     if ($null -eq $Connection) { return }
-    if (-not $script:GhosttyPickerFreshConnection -and $Connection.Persistent -and $Connection.Endpoint -eq $env:GHOSTTY_PICKER_ENDPOINT -and
-        $Connection.Token -eq $env:GHOSTTY_PICKER_TOKEN -and $Connection.Client.IsAlive) {
-        $script:GhosttyPickerConnection = $Connection
+    if (-not $script:NtermPickerFreshConnection -and $Connection.Persistent -and $Connection.Endpoint -eq $env:NTERM_PICKER_ENDPOINT -and
+        $Connection.Token -eq $env:NTERM_PICKER_TOKEN -and $Connection.Client.IsAlive) {
+        $script:NtermPickerConnection = $Connection
     } else { $Connection.Client.Dispose() }
 }
 
-function Initialize-GhosttyPickerClient {
-    if ($null -ne $script:GhosttyPickerInitialization) {
-        $initialization = $script:GhosttyPickerInitialization
+function Initialize-NtermPickerClient {
+    if ($null -ne $script:NtermPickerInitialization) {
+        $initialization = $script:NtermPickerInitialization
         try {
             $connections = $initialization.PowerShell.EndInvoke($initialization.Pending)
-            foreach ($connection in $connections) { Save-GhosttyPickerInitialConnection $connection }
+            foreach ($connection in $connections) { Save-NtermPickerInitialConnection $connection }
             if ($initialization.PowerShell.HadErrors) {
                 Write-Verbose 'Picker background initialization did not connect; the next request will try again.'
             }
@@ -230,42 +230,42 @@ function Initialize-GhosttyPickerClient {
             Write-Verbose 'Picker background initialization did not complete; the next request will try again.'
         } finally {
             $initialization.PowerShell.Dispose()
-            $script:GhosttyPickerInitialization = $null
+            $script:NtermPickerInitialization = $null
         }
     }
-    if (-not ('GhosttyPickerPipeV2' -as [type])) {
-        Add-Type -TypeDefinition $script:GhosttyPickerClientSource -ErrorAction Stop
+    if (-not ('NtermPickerPipeV2' -as [type])) {
+        Add-Type -TypeDefinition $script:NtermPickerClientSource -ErrorAction Stop
     }
 }
 
-# Loading outside Ghostty still defines the function and compiles its client.
+# Loading outside nterm still defines the function and compiles its client.
 # Startup connection errors must not break the user's PowerShell profile.
-$cached = $script:GhosttyPickerConnection
-$alreadyConnected = $null -ne $cached -and $cached.Endpoint -eq $env:GHOSTTY_PICKER_ENDPOINT -and
-    $cached.Token -eq $env:GHOSTTY_PICKER_TOKEN -and $cached.Client.IsAlive
-if (($FreshConnection -or -not $alreadyConnected) -and $null -eq $script:GhosttyPickerInitialization) {
-    Disconnect-GhosttyPicker
+$cached = $script:NtermPickerConnection
+$alreadyConnected = $null -ne $cached -and $cached.Endpoint -eq $env:NTERM_PICKER_ENDPOINT -and
+    $cached.Token -eq $env:NTERM_PICKER_TOKEN -and $cached.Client.IsAlive
+if (($FreshConnection -or -not $alreadyConnected) -and $null -eq $script:NtermPickerInitialization) {
+    Disconnect-NtermPicker
     if ($BackgroundInitialize) {
         $loader = [PowerShell]::Create()
         try {
             if ($FreshConnection) {
-                [void]$loader.AddScript('param($source); if (-not ("GhosttyPickerPipeV2" -as [type])) { Add-Type -TypeDefinition $source -ErrorAction Stop }').AddArgument($script:GhosttyPickerClientSource)
+                [void]$loader.AddScript('param($source); if (-not ("NtermPickerPipeV2" -as [type])) { Add-Type -TypeDefinition $source -ErrorAction Stop }').AddArgument($script:NtermPickerClientSource)
             } else {
-                [void]$loader.AddScript($script:GhosttyPickerConnectScript.ToString()).AddArgument($script:GhosttyPickerClientSource).AddArgument($env:GHOSTTY_PICKER_ENDPOINT).AddArgument($env:GHOSTTY_PICKER_TOKEN)
+                [void]$loader.AddScript($script:NtermPickerConnectScript.ToString()).AddArgument($script:NtermPickerClientSource).AddArgument($env:NTERM_PICKER_ENDPOINT).AddArgument($env:NTERM_PICKER_TOKEN)
             }
-            $script:GhosttyPickerInitialization = @{PowerShell=$loader; Pending=$loader.BeginInvoke()}
+            $script:NtermPickerInitialization = @{PowerShell=$loader; Pending=$loader.BeginInvoke()}
         } catch { $loader.Dispose(); throw }
     } elseif ($FreshConnection) {
-        Initialize-GhosttyPickerClient
+        Initialize-NtermPickerClient
     } else {
         try {
-            $connection = & $script:GhosttyPickerConnectScript $script:GhosttyPickerClientSource $env:GHOSTTY_PICKER_ENDPOINT $env:GHOSTTY_PICKER_TOKEN
-            Save-GhosttyPickerInitialConnection $connection
+            $connection = & $script:NtermPickerConnectScript $script:NtermPickerClientSource $env:NTERM_PICKER_ENDPOINT $env:NTERM_PICKER_TOKEN
+            Save-NtermPickerInitialConnection $connection
         } catch { Write-Verbose 'Picker startup connection did not complete; the next request will try again.' }
     }
 }
 
-function Invoke-GhosttyPicker {
+function Invoke-NtermPicker {
     [CmdletBinding(DefaultParameterSetName='Stream')]
     param(
         [Parameter(Mandatory, ParameterSetName='Named')][string] $Name,
@@ -275,7 +275,7 @@ function Invoke-GhosttyPicker {
         [Parameter(ParameterSetName='Stream')][string] $DisplayProperty,
         [Parameter(ParameterSetName='Stream')][string] $ValueProperty,
         [switch] $PassThruResult,
-        [switch] $FreshConnection = $script:GhosttyPickerFreshConnection,
+        [switch] $FreshConnection = $script:NtermPickerFreshConnection,
         [ValidateRange(0, 86400)][int] $CancelAfterSeconds = 0
     )
     begin {
@@ -288,9 +288,9 @@ function Invoke-GhosttyPicker {
         $nextId = 0L
         $originals = [System.Collections.Generic.Dictionary[string,object]]::new()
         $requestId = [guid]::NewGuid().ToString('N')
-        $endpoint = $env:GHOSTTY_PICKER_ENDPOINT
-        if (-not $endpoint -or -not $env:GHOSTTY_PICKER_TOKEN) {
-            throw 'Run this function inside a newly launched Ghostty shell with picker pipe support.'
+        $endpoint = $env:NTERM_PICKER_ENDPOINT
+        if (-not $endpoint -or -not $env:NTERM_PICKER_TOKEN) {
+            throw 'Run this function inside a newly launched nterm shell with picker pipe support.'
         }
         function Send-PickerMessage($message) {
             $client.Send((ConvertTo-Json -InputObject $message -Depth 32 -Compress))
@@ -303,7 +303,7 @@ function Invoke-GhosttyPicker {
                     $message = ConvertFrom-Json -InputObject $raw -AsHashtable
                     if ($message.type -eq 'error') {
                         Send-PickerMessage @{ type='received'; request_id=$message.request_id }
-                        throw "Ghostty picker rejected the connection ($($message.code)): $($message.message)"
+                        throw "nterm picker rejected the connection ($($message.code)): $($message.message)"
                     }
                     if ($message.type -in @('opened', 'ack', 'input_complete', 'result', 'idle') -and $message.request_id -ne $requestId) {
                         throw 'Picker response belongs to a different request.'
@@ -315,7 +315,7 @@ function Invoke-GhosttyPicker {
                     return $message
                 }
             }
-            throw 'Timed out waiting for Ghostty picker response.'
+            throw 'Timed out waiting for nterm picker response.'
         }
         function Flush-PickerItems {
             if ($batch.Count -eq 0 -or $null -ne $result) { return }
@@ -326,19 +326,19 @@ function Invoke-GhosttyPicker {
             $batch.Clear()
         }
         try {
-            Initialize-GhosttyPickerClient
-            if ($FreshConnection) { Disconnect-GhosttyPicker }
-            $cached = $script:GhosttyPickerConnection
+            Initialize-NtermPickerClient
+            if ($FreshConnection) { Disconnect-NtermPicker }
+            $cached = $script:NtermPickerConnection
             if ($null -ne $cached -and $cached.Endpoint -eq $endpoint -and
-                $cached.Token -eq $env:GHOSTTY_PICKER_TOKEN -and $cached.Client.IsAlive) {
+                $cached.Token -eq $env:NTERM_PICKER_TOKEN -and $cached.Client.IsAlive) {
                 $client = $cached.Client
                 $persistent = $true
             } else {
-                Disconnect-GhosttyPicker
-                $connection = & $script:GhosttyPickerConnectScript $script:GhosttyPickerClientSource $endpoint $env:GHOSTTY_PICKER_TOKEN
+                Disconnect-NtermPicker
+                $connection = & $script:NtermPickerConnectScript $script:NtermPickerClientSource $endpoint $env:NTERM_PICKER_TOKEN
                 $client = $connection.Client
                 $persistent = $connection.Persistent
-                if ($persistent -and -not $FreshConnection) { $script:GhosttyPickerConnection = $connection }
+                if ($persistent -and -not $FreshConnection) { $script:NtermPickerConnection = $connection }
             }
             $client.BeginRequest($requestId)
             $request = switch ($PSCmdlet.ParameterSetName) {

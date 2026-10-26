@@ -17,7 +17,7 @@ mod client;
 
 #[cfg(not(unix))]
 fn main() {
-    eprintln!("npick: only supported on Unix; use Invoke-GhosttyPicker on Windows");
+    eprintln!("npick: only supported on Unix; use Invoke-NtermPicker on Windows");
     std::process::exit(2);
 }
 
@@ -220,14 +220,14 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
             println!("{USAGE}");
             return Ok(0);
         }
-        let endpoint = std::env::var("GHOSTTY_PICKER_ENDPOINT")
+        let endpoint = std::env::var("NTERM_PICKER_ENDPOINT")
             .ok()
             .filter(|v| !v.is_empty())
-            .ok_or("not running in an nterm pane (GHOSTTY_PICKER_ENDPOINT is not set)")?;
-        let token = std::env::var("GHOSTTY_PICKER_TOKEN")
+            .ok_or("not running in an nterm pane (NTERM_PICKER_ENDPOINT is not set)")?;
+        let token = std::env::var("NTERM_PICKER_TOKEN")
             .ok()
             .filter(|v| !v.is_empty())
-            .ok_or("GHOSTTY_PICKER_TOKEN is not set")?;
+            .ok_or("NTERM_PICKER_TOKEN is not set")?;
         let request = request(&args);
         let items = if args.name.is_some() {
             None

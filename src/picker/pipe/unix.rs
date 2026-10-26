@@ -142,12 +142,12 @@ fn sweep_stale(base: &Path) {
     }
 }
 
-/// `$XDG_RUNTIME_DIR/ghostty-egui/<pid>`, falling back to a per-user directory
+/// `$XDG_RUNTIME_DIR/nterm/<pid>`, falling back to a per-user directory
 /// under the temporary directory when no runtime directory is set.
 fn socket_dir() -> Result<PathBuf, String> {
     let base = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("ghostty-egui"),
-        _ => std::env::temp_dir().join(format!("ghostty-egui-{}", effective_uid())),
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("nterm"),
+        _ => std::env::temp_dir().join(format!("nterm-{}", effective_uid())),
     };
     private_dir(&base)?;
     static SWEEP: std::sync::Once = std::sync::Once::new();
@@ -158,7 +158,7 @@ fn socket_dir() -> Result<PathBuf, String> {
 }
 
 pub(crate) struct Service {
-    /// The socket path, exported to the shell as GHOSTTY_PICKER_ENDPOINT.
+    /// The socket path, exported to the shell as NTERM_PICKER_ENDPOINT.
     pub endpoint: String,
     pub token: String,
     pub events: Receiver<Event>,

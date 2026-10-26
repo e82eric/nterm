@@ -361,7 +361,7 @@ expire when their callback returns.
 
 ## Lua actions and toasts
 
-All Ghostty pickers now embed the shared `nfm-egui` control used by
+All nterm pickers now embed the shared `nfm-egui` control used by
 SimpleWindowManager. It owns result rows, query input, streaming search, structured
 headers, `/` completion, keybinding help, and preview drawing. Ghostty supplies
 its existing Lua sources/actions, owned scrollback cell ranges, preview documents,
@@ -849,7 +849,7 @@ Details = {
 PowerShell stream requests use the same placement and row settings:
 
 ```powershell
-'Example' | Invoke-GhosttyPicker -Options @{
+'Example' | Invoke-NtermPicker -Options @{
     position = 'FullPane'
     result_rows = 7
     preview_visible = $true
@@ -1085,7 +1085,7 @@ at the pane width by character: `preview = { type = "Text", text = "{item}", wra
 Omitting `wrap` or setting it to `false` clips long lines. Copying preserves the
 original line breaks, including with wide and combining Unicode characters.
 PowerShell uses the same option through
-`Invoke-GhosttyPicker -Options @{ preview_visible = $true; preview = @{ type = 'Text'; text = 'A long line'; wrap = $true } }`.
+`Invoke-NtermPicker -Options @{ preview_visible = $true; preview = @{ type = 'Text'; text = 'A long line'; wrap = $true } }`.
 This option applies to literal `Text` previews; ANSI, command, dynamic, and
 scrollback previews retain their existing layout behavior.
 Commands run without a shell and are cancelled when selection changes or the
@@ -1294,13 +1294,13 @@ directly from the shell.
 #### Open a configured picker by name
 
 ```powershell
-. C:\src\ghostty2\example\rust-egui-terminal\Invoke-GhosttyPicker.ps1
+. C:\src\nterm\Invoke-NtermPicker.ps1
 
-$path = Invoke-GhosttyPicker -Name files
-$line = Invoke-GhosttyPicker -Name builtin.lines
+$path = Invoke-NtermPicker -Name files
+$line = Invoke-NtermPicker -Name builtin.lines
 
 # For a configured Command picker such as Ripgrep in the sample Lua file:
-$match = Invoke-GhosttyPicker -Name Ripgrep -Parameters @{ pattern = 'TODO'; cwd = $PWD.Path }
+$match = Invoke-NtermPicker -Name Ripgrep -Parameters @{ pattern = 'TODO'; cwd = $PWD.Path }
 ```
 
 Allowlist `Ripgrep` as well to run that example. Named requests use the source,
@@ -1321,19 +1321,19 @@ with `-ValueProperty`:
 
 ```powershell
 # Return the selected FileInfo object.
-$file = Get-ChildItem -File | Invoke-GhosttyPicker -DisplayProperty Name
+$file = Get-ChildItem -File | Invoke-NtermPicker -DisplayProperty Name
 
 # Return its FullName string instead.
 $path = Get-ChildItem -File |
-    Invoke-GhosttyPicker -DisplayProperty Name -ValueProperty FullName
+    Invoke-NtermPicker -DisplayProperty Name -ValueProperty FullName
 
 # Inspect status, query, and selection.
-'first', 'second', 'third' | Invoke-GhosttyPicker -PassThruResult
+'first', 'second', 'third' | Invoke-NtermPicker -PassThruResult
 ```
 
 Enter accepts; Escape cancels. Ctrl+C disconnects the client and cancels its
 picker. Ordinary completion keeps the authenticated connection for the next
-request. Use `Disconnect-GhosttyPicker` to release it before connecting from
+request. Use `Disconnect-NtermPicker` to release it before connecting from
 another process in the same pane. Another active overlay can return `busy`;
 requests are not queued. Returned paths are not automatically shell-quoted.
 
@@ -1360,7 +1360,7 @@ __npick_file() {
   READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}$file${READLINE_LINE:READLINE_POINT}"
   READLINE_POINT=$((READLINE_POINT + ${#file}))
 }
-[[ -n $GHOSTTY_PICKER_ENDPOINT ]] && bind -x '"\C-t": __npick_file'
+[[ -n $NTERM_PICKER_ENDPOINT ]] && bind -x '"\C-t": __npick_file'
 ```
 
 [npick-completion.bash](npick-completion.bash) is the bash counterpart of the
@@ -1373,7 +1373,7 @@ for words containing quotes, backslashes or `~` it falls back to bash's own
 file, directory and `$variable` completion.
 
 See [PICKER-PIPE.md](PICKER-PIPE.md) and
-[Invoke-GhosttyPicker.ps1](Invoke-GhosttyPicker.ps1) for PSReadLine bindings,
+[Invoke-NtermPicker.ps1](Invoke-NtermPicker.ps1) for PSReadLine bindings,
 stream options, protocol limits, authentication and cancellation.
 For a portable PowerShell profile with file, directory, history, text-search,
 and completion bindings, see [profile.example.ps1](profile.example.ps1).
@@ -1725,7 +1725,7 @@ joined continuation records are limited to 4 MiB, and retained stderr to 16 KiB.
 Windows shells can invoke named Lua pickers, submit picker definitions, or stream
 items through an opt-in authenticated named pipe and receive a selection response.
 See [PICKER-PIPE.md](PICKER-PIPE.md) for the security policy, wire protocol, and
-[Invoke-GhosttyPicker.ps1](Invoke-GhosttyPicker.ps1) for the PowerShell client.
+[Invoke-NtermPicker.ps1](Invoke-NtermPicker.ps1) for the PowerShell client.
 
 Snapshot resize is coordinated by Rust. The pane retains a single frozen
 terminal: live output stays independent, while that terminal reflows in place.

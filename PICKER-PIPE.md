@@ -32,7 +32,7 @@ pickers = {
 Then add this to your PowerShell `$PROFILE`, replacing the path:
 
 ```powershell
-. 'C:\path\to\ghostty2\example\rust-egui-terminal\profile.example.ps1' -PickerRoots @('C:\your\projects')
+. 'C:\src\nterm\profile.example.ps1' -PickerRoots @('C:\your\projects')
 ```
 
 The helper is loaded relative to the example script. Omit `-PickerRoots` to use
@@ -43,17 +43,17 @@ command for review, and Ctrl+Space opens PowerShell completions. Customize the
 editor command and shortcuts as needed; dot-sourcing replaces those bindings.
 
 PowerShell 7.3+ and PSReadLine are required. Ripgrep is optional for text search,
-and `fzf` on `PATH` enables the fallback outside Ghostty. File and directory
-bindings use Ghostty's builtin FileWalker through the named FileSystem pickers,
-passing the selected roots and current directory. Outside Ghostty they enumerate
+and `fzf` on `PATH` enables the fallback outside nterm. File and directory
+bindings use nterm's builtin FileWalker through the named FileSystem pickers,
+passing the selected roots and current directory. Outside nterm they enumerate
 with `Get-ChildItem`; no `fd` or custom history-reader executable is required.
 History, text search, and completions use streamed requests and collect candidates
 before opening the picker. Command previews are optional in `nterm.example.lua`.
 Fresh connections avoid retaining the pane's connection slot between requests;
 profile initialization still connects until the first request completes. Run
-`Disconnect-GhosttyPicker` before starting another PowerShell process in that pane.
+`Disconnect-NtermPicker` before starting another PowerShell process in that pane.
 
-Add this to the table returned by your Ghostty Lua configuration:
+Add this to the table returned by your nterm Lua configuration:
 
 ```lua
 picker_pipe = {
@@ -71,25 +71,25 @@ clients cannot submit executable definitions or command previews. Lua factories
 and providers in allowlisted named pickers are trusted executable configuration.
 
 Build with `.\build.ps1`.
-Restart Ghostty, then dot-source the helper **inside the new shell**:
+Restart nterm, then dot-source the helper **inside the new shell**:
 
 ```powershell
-. C:\src\ghostty2\example\rust-egui-terminal\Invoke-GhosttyPicker.ps1
+. C:\src\nterm\Invoke-NtermPicker.ps1
 
 # Named picker; values return to PowerShell, normal accept callbacks do not run.
-Invoke-GhosttyPicker -Name files -Parameters @{ cwd = $PWD.Path }
+Invoke-NtermPicker -Name files -Parameters @{ cwd = $PWD.Path }
 
 # Stream objects; return the selected original PowerShell object.
-Get-ChildItem | Invoke-GhosttyPicker -DisplayProperty Name
+Get-ChildItem | Invoke-NtermPicker -DisplayProperty Name
 
 # Stream display/value pairs; return the selected FullName property.
-Get-ChildItem | Invoke-GhosttyPicker -DisplayProperty Name -ValueProperty FullName
+Get-ChildItem | Invoke-NtermPicker -DisplayProperty Name -ValueProperty FullName
 
 # Inspect the complete result, including status and selected IDs.
-'first', 'second', 'third' | Invoke-GhosttyPicker -PassThruResult
+'first', 'second', 'third' | Invoke-NtermPicker -PassThruResult
 
 # Exercise client cancellation while the picker is open.
-'first', 'second' | Invoke-GhosttyPicker -CancelAfterSeconds 2 -PassThruResult
+'first', 'second' | Invoke-NtermPicker -CancelAfterSeconds 2 -PassThruResult
 ```
 
 PowerShell 7.3+ is required. Escape cancels from the picker. Ctrl+C closes the
@@ -103,7 +103,7 @@ To compile the C# pipe client and connect/authenticate asynchronously during
 profile loading, use:
 
 ```powershell
-. C:\src\ghostty2\example\rust-egui-terminal\Invoke-GhosttyPicker.ps1 -BackgroundInitialize
+. C:\src\nterm\Invoke-NtermPicker.ps1 -BackgroundInitialize
 ```
 
 The function is defined immediately. The background runspace compiles the client,
@@ -114,9 +114,9 @@ then disposes the background runspace. Compilation happens once per PowerShell
 process. Without this switch, compilation and connection complete synchronously
 during script load. Reloading the script preserves a healthy connection.
 
-Loading outside Ghostty defines the helper without attempting a pipe connection.
+Loading outside nterm defines the helper without attempting a pipe connection.
 Startup connection failures do not interrupt the profile; a later picker call
-tries again and reports any failure. `Disconnect-GhosttyPicker` also collects and
+tries again and reports any failure. `Disconnect-NtermPicker` also collects and
 closes a pending background connection.
 
 The helper opens one authenticated connection per PowerShell session during
@@ -130,7 +130,7 @@ an authenticated client, including between requests, and `Pipe: disconnected`
 otherwise. To explicitly release the pane's connection slot:
 
 ```powershell
-Disconnect-GhosttyPicker
+Disconnect-NtermPicker
 ```
 
 Example PSReadLine binding (append to your profile after dot-sourcing):
@@ -138,7 +138,7 @@ Example PSReadLine binding (append to your profile after dot-sourcing):
 ```powershell
 Set-PSReadLineKeyHandler -Chord Alt+f -ScriptBlock {
     $path = Get-ChildItem -File |
-        Invoke-GhosttyPicker -DisplayProperty Name -ValueProperty FullName
+        Invoke-NtermPicker -DisplayProperty Name -ValueProperty FullName
     if ($null -ne $path) {
         [Microsoft.PowerShell.PSConsoleReadLine]::Insert("'" + $path.Replace("'", "''") + "'")
     }
@@ -158,8 +158,8 @@ versions, invalid IDs, and invalid message ordering are rejected.
 The pane's shell launch environment contains:
 
 ```
-GHOSTTY_PICKER_ENDPOINT=ghostty-picker-<random 256-bit identifier>
-GHOSTTY_PICKER_TOKEN=<independent random 256-bit token encoded as hex>
+NTERM_PICKER_ENDPOINT=nterm-picker-<random 256-bit identifier>
+NTERM_PICKER_TOKEN=<independent random 256-bit token encoded as hex>
 ```
 
 On Windows the endpoint is a basename; the client connects to
@@ -178,7 +178,7 @@ Handshake:
 5. Client verifies the server proof before sending a picker request.
 
 Each proof uses HMAC-SHA256 over five fields, each encoded as a little-endian
-u32 byte length followed by UTF-8 bytes: `ghostty-picker/1`, endpoint basename,
+u32 byte length followed by UTF-8 bytes: `nterm-picker/1`, endpoint basename,
 server nonce, client nonce, and role (`client` or `server`). There are five
 fields total. Different roles prevent reflection. Fresh challenges prevent
 replaying authentication proofs. Proof comparisons are constant-time for valid
@@ -208,7 +208,7 @@ Server sends `opened` after UI creation, or a terminal error result. Another
 active overlay returns `busy`. There is one pipe connection slot per pane;
 another client waits at most five seconds to connect and fails if it remains
 occupied. A persistent client retains that slot until it disconnects; use
-`Disconnect-GhosttyPicker` before invoking a helper from a different process in
+`Disconnect-NtermPicker` before invoking a helper from a different process in
 the same pane. There is no request queue or automatic request replay.
 
 ## Streaming and results
@@ -287,8 +287,8 @@ shell closes idle connections; pane closure stops the service.
 
 ## Linux transport
 
-Each pane listens on `$XDG_RUNTIME_DIR/ghostty-egui/<pid>/pane-<id>.sock`, or a
-`ghostty-egui-<uid>` directory under the temporary directory when no runtime
+Each pane listens on `$XDG_RUNTIME_DIR/nterm/<pid>/pane-<id>.sock`, or a
+`nterm-<uid>` directory under the temporary directory when no runtime
 directory is set. Both directories must be owned by the user and mode `0700`;
 the socket is `0600`. On startup, directories of terminals that are no longer
 running are removed; closing a pane removes its socket.
@@ -374,13 +374,13 @@ GPU presentation keeps its existing pacing.
 To compare a new authenticated connection per request with connection reuse:
 
 ```powershell
-'one', 'two' | Invoke-GhosttyPicker -FreshConnection
+'one', 'two' | Invoke-NtermPicker -FreshConnection
 ```
 
 For every request to use a new connection, dot-source the helper with:
 
 ```powershell
-. C:\src\ghostty2\example\rust-egui-terminal\Invoke-GhosttyPicker.ps1 -FreshConnection -BackgroundInitialize
+. C:\src\nterm\Invoke-NtermPicker.ps1 -FreshConnection -BackgroundInitialize
 ```
 
 This compiles the helper in the background without opening a startup connection.

@@ -315,7 +315,7 @@ pub(crate) struct Service {
 impl Service {
     pub fn new(context: egui::Context) -> Result<Self, String> {
         let endpoint = format!(
-            "ghostty-picker-{}",
+            "nterm-picker-{}",
             super::super::wire::new_token().map_err(|e| e.to_string())?
         );
         let token = super::super::wire::new_token().map_err(|e| e.to_string())?;
@@ -484,7 +484,7 @@ mod tests {
         background: bool,
     ) -> std::process::Child {
         let script =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Invoke-GhosttyPicker.ps1");
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Invoke-NtermPicker.ps1");
         std::process::Command::new("pwsh")
             .args([
                 "-NoLogo",
@@ -501,8 +501,8 @@ mod tests {
                     }
                 ),
             ])
-            .env("GHOSTTY_PICKER_ENDPOINT", &service.endpoint)
-            .env("GHOSTTY_PICKER_TOKEN", token)
+            .env("NTERM_PICKER_ENDPOINT", &service.endpoint)
+            .env("NTERM_PICKER_TOKEN", token)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -524,9 +524,9 @@ mod tests {
             let mut child = run_client(
                 &service,
                 if cancel {
-                    "'one' | Invoke-GhosttyPicker -CancelAfterSeconds 1 -PassThruResult | ConvertTo-Json -Depth 16 -Compress"
+                    "'one' | Invoke-NtermPicker -CancelAfterSeconds 1 -PassThruResult | ConvertTo-Json -Depth 16 -Compress"
                 } else {
-                    "1..20 | ForEach-Object { [pscustomobject]@{ Name=\"item$_\"; Path=\"value$_\" } } | Invoke-GhosttyPicker -DisplayProperty Name -ValueProperty Path -Options @{initial_query=$null;preview_visible=$true;preview=@{type='Text';text='preview'}} -PassThruResult | ConvertTo-Json -Depth 8 -Compress"
+                    "1..20 | ForEach-Object { [pscustomobject]@{ Name=\"item$_\"; Path=\"value$_\" } } | Invoke-NtermPicker -DisplayProperty Name -ValueProperty Path -Options @{initial_query=$null;preview_visible=$true;preview=@{type='Text';text='preview'}} -PassThruResult | ConvertTo-Json -Depth 8 -Compress"
                 },
                 &service.token,
             );
@@ -603,15 +603,15 @@ mod tests {
                 &service,
                 r#"
                 $deadline = [datetime]::UtcNow.AddSeconds(15)
-                while ($null -ne $script:GhosttyPickerInitialization -and -not $script:GhosttyPickerInitialization.Pending.IsCompleted) {
+                while ($null -ne $script:NtermPickerInitialization -and -not $script:NtermPickerInitialization.Pending.IsCompleted) {
                     if ([datetime]::UtcNow -ge $deadline) { throw 'Startup connection stalled' }
                     Start-Sleep -Milliseconds 20
                 }
                 Start-Sleep -Milliseconds 200
-                Initialize-GhosttyPickerClient
-                $original = $script:GhosttyPickerConnection.Client
-                'warm' | Invoke-GhosttyPicker -PassThruResult | Out-Null
-                [object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client) | ConvertTo-Json -Depth 16 -Compress
+                Initialize-NtermPickerClient
+                $original = $script:NtermPickerConnection.Client
+                'warm' | Invoke-NtermPicker -PassThruResult | Out-Null
+                [object]::ReferenceEquals($original, $script:NtermPickerConnection.Client) | ConvertTo-Json -Depth 16 -Compress
             "#,
                 &service.token,
                 background,
@@ -682,38 +682,38 @@ mod tests {
             &service,
             r#"
             $results = [System.Collections.Generic.List[object]]::new()
-            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
-            $r = 1..20 | Invoke-GhosttyPicker -PassThruResult
-            $original = $script:GhosttyPickerConnection.Client
-            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
+            $before = if ($null -ne $script:NtermPickerConnection) { $script:NtermPickerConnection.Client } else { $null }
+            $r = 1..20 | Invoke-NtermPicker -PassThruResult
+            $original = $script:NtermPickerConnection.Client
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:NtermPickerConnection.Client))})
             Start-Sleep -Milliseconds 200
-            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
-            $r = 'cancel' | Invoke-GhosttyPicker -CancelAfterSeconds 1 -PassThruResult
-            if (-not [object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client)) { throw 'Connection changed after acceptance' }
-            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
-            try { 'denied' | Invoke-GhosttyPicker -Options @{preview_rows=0}; throw 'Invalid options accepted' }
+            $before = if ($null -ne $script:NtermPickerConnection) { $script:NtermPickerConnection.Client } else { $null }
+            $r = 'cancel' | Invoke-NtermPicker -CancelAfterSeconds 1 -PassThruResult
+            if (-not [object]::ReferenceEquals($original, $script:NtermPickerConnection.Client)) { throw 'Connection changed after acceptance' }
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:NtermPickerConnection.Client))})
+            try { 'denied' | Invoke-NtermPicker -Options @{preview_rows=0}; throw 'Invalid options accepted' }
             catch { if ($_ -notmatch 'capability_denied') { throw } }
-            if (-not [object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client)) { throw 'Connection changed after cancellation/denial' }
-            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
-            $r = Invoke-GhosttyPicker -Name demo -PassThruResult
-            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
-            Disconnect-GhosttyPicker
-            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
-            $r = 'reconnect' | Invoke-GhosttyPicker -PassThruResult
-            if ([object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client)) { throw 'Disconnected client was reused' }
-            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
+            if (-not [object]::ReferenceEquals($original, $script:NtermPickerConnection.Client)) { throw 'Connection changed after cancellation/denial' }
+            $before = if ($null -ne $script:NtermPickerConnection) { $script:NtermPickerConnection.Client } else { $null }
+            $r = Invoke-NtermPicker -Name demo -PassThruResult
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:NtermPickerConnection.Client))})
+            Disconnect-NtermPicker
+            $before = if ($null -ne $script:NtermPickerConnection) { $script:NtermPickerConnection.Client } else { $null }
+            $r = 'reconnect' | Invoke-NtermPicker -PassThruResult
+            if ([object]::ReferenceEquals($original, $script:NtermPickerConnection.Client)) { throw 'Disconnected client was reused' }
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:NtermPickerConnection.Client))})
             foreach ($i in 1..2) {
-            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
-                $r = 'fresh' | Invoke-GhosttyPicker -FreshConnection -PassThruResult
-                if ($null -ne $script:GhosttyPickerConnection) { throw 'Fresh connection was cached' }
-                $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
+            $before = if ($null -ne $script:NtermPickerConnection) { $script:NtermPickerConnection.Client } else { $null }
+                $r = 'fresh' | Invoke-NtermPicker -FreshConnection -PassThruResult
+                if ($null -ne $script:NtermPickerConnection) { throw 'Fresh connection was cached' }
+                $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:NtermPickerConnection.Client))})
             }
-            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
-            $r = 'persistent-again' | Invoke-GhosttyPicker -PassThruResult
-            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
-            $before = if ($null -ne $script:GhosttyPickerConnection) { $script:GhosttyPickerConnection.Client } else { $null }
-            $r = 'reuse-again' | Invoke-GhosttyPicker -PassThruResult
-            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:GhosttyPickerConnection.Client))})
+            $before = if ($null -ne $script:NtermPickerConnection) { $script:NtermPickerConnection.Client } else { $null }
+            $r = 'persistent-again' | Invoke-NtermPicker -PassThruResult
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:NtermPickerConnection.Client))})
+            $before = if ($null -ne $script:NtermPickerConnection) { $script:NtermPickerConnection.Client } else { $null }
+            $r = 'reuse-again' | Invoke-NtermPicker -PassThruResult
+            $results.Add(@{status=$r.status;reused=($null -ne $before -and [object]::ReferenceEquals($before, $script:NtermPickerConnection.Client))})
             ConvertTo-Json -InputObject $results.ToArray() -Compress
         "#,
             &service.token,
@@ -798,11 +798,11 @@ mod tests {
         let mut child = run_client(
             &service,
             r#"
-            $original = $script:GhosttyPickerConnection.Client
-            'first' | Invoke-GhosttyPicker -PassThruResult | Out-Null
+            $original = $script:NtermPickerConnection.Client
+            'first' | Invoke-NtermPicker -PassThruResult | Out-Null
             Start-Sleep -Milliseconds 800
-            'second' | Invoke-GhosttyPicker -PassThruResult | Out-Null
-            [object]::ReferenceEquals($original, $script:GhosttyPickerConnection.Client) | ConvertTo-Json -Depth 16 -Compress
+            'second' | Invoke-NtermPicker -PassThruResult | Out-Null
+            [object]::ReferenceEquals($original, $script:NtermPickerConnection.Client) | ConvertTo-Json -Depth 16 -Compress
         "#,
             &service.token,
         );
@@ -868,7 +868,7 @@ mod tests {
             unsafe { GetCurrentProcessId() },
             creation(unsafe { GetCurrentProcess() }).unwrap(),
         );
-        let child = run_client(&service, "'one' | Invoke-GhosttyPicker", "wrong-token");
+        let child = run_client(&service, "'one' | Invoke-NtermPicker", "wrong-token");
         let output = child.wait_with_output().unwrap();
         assert!(!output.status.success());
         assert!(service.events.try_recv().is_err());
@@ -982,7 +982,7 @@ mod tests {
             other.id(),
             creation(handle.0).unwrap(),
         );
-        let output = run_client(&service, "'one' | Invoke-GhosttyPicker", &service.token)
+        let output = run_client(&service, "'one' | Invoke-NtermPicker", &service.token)
             .wait_with_output()
             .unwrap();
         let _ = other.kill();
@@ -994,16 +994,16 @@ mod tests {
     fn powershell_named_requests_and_capability_denial() {
         for (command, permitted) in [
             (
-                "Invoke-GhosttyPicker -Name demo -Parameters @{query='needle'} -PassThruResult | ConvertTo-Json -Depth 16 -Compress",
+                "Invoke-NtermPicker -Name demo -Parameters @{query='needle'} -PassThruResult | ConvertTo-Json -Depth 16 -Compress",
                 true,
             ),
             (
-                "Invoke-GhosttyPicker -Definition @{type='Command';args=@('rg','--files')}",
+                "Invoke-NtermPicker -Definition @{type='Command';args=@('rg','--files')}",
                 false,
             ),
-            ("Invoke-GhosttyPicker -Name private", false),
+            ("Invoke-NtermPicker -Name private", false),
             (
-                "'one' | Invoke-GhosttyPicker -Options @{preview=@{type='Command';args=@('pwsh.exe')}}",
+                "'one' | Invoke-NtermPicker -Options @{preview=@{type='Command';args=@('pwsh.exe')}}",
                 false,
             ),
         ] {
@@ -1072,9 +1072,9 @@ mod tests {
                 creation(unsafe { GetCurrentProcess() }).unwrap(),
             );
             let command = if disconnect {
-                "'first' | Invoke-GhosttyPicker"
+                "'first' | Invoke-NtermPicker"
             } else {
-                "1..100 | Invoke-GhosttyPicker -PassThruResult | ConvertTo-Json -Depth 16 -Compress"
+                "1..100 | Invoke-NtermPicker -PassThruResult | ConvertTo-Json -Depth 16 -Compress"
             };
             let mut child = run_client(&service, command, &service.token);
             let Event::Open { session, .. } = service
@@ -1131,7 +1131,7 @@ mod tests {
         );
         let mut child = run_client(
             &service,
-            "Invoke-GhosttyPicker -PassThruResult | ConvertTo-Json -Depth 16 -Compress",
+            "Invoke-NtermPicker -PassThruResult | ConvertTo-Json -Depth 16 -Compress",
             &service.token,
         );
         let Event::Open { session, .. } = service

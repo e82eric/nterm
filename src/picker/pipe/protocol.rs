@@ -29,7 +29,7 @@ fn transcript_mac(
     let mut mac =
         Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("HMAC accepts any key size");
     // Length-prefixed transcript avoids ambiguous concatenation.
-    for part in ["ghostty-picker/1", endpoint, server, client, role] {
+    for part in ["nterm-picker/1", endpoint, server, client, role] {
         mac.update(&(part.len() as u32).to_le_bytes());
         mac.update(part.as_bytes());
     }

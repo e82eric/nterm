@@ -29,7 +29,7 @@ fn workspace_scope_expands_picker_without_changing_cursor_origin() {
             output.textures_delta.clear();
         }
         let panel = ctx
-            .memory(|m| m.area_rect(egui::Id::new(("ghostty-picker", picker.session_id))))
+            .memory(|m| m.area_rect(egui::Id::new(("nterm-picker", picker.session_id))))
             .unwrap();
         let expected = if scope == config::Scope::Workspace {
             workspace
@@ -1892,10 +1892,10 @@ fn background_picker_does_not_consume_foreground_typing_or_focus() {
     assert_eq!(background.shared.query(), "café");
     assert_eq!(foreground.shared.query(), "caféx");
     assert!(ctx.memory(|m| {
-        m.has_focus(egui::Id::new(("ghostty-picker", foreground.session_id)).with("query"))
+        m.has_focus(egui::Id::new(("nterm-picker", foreground.session_id)).with("query"))
     }));
     let panel = ctx
-        .memory(|m| m.area_rect(egui::Id::new(("ghostty-picker", foreground.session_id))))
+        .memory(|m| m.area_rect(egui::Id::new(("nterm-picker", foreground.session_id))))
         .unwrap();
     assert!(floating.contains_rect(panel));
 }
@@ -1937,7 +1937,7 @@ fn pane_picker_focus_returns_after_floating_pane_is_shown_and_hidden() {
         output.drop_without_applying_deltas();
         let active = if floating_active { &floating } else { &main };
         assert!(ctx.memory(|m| {
-            m.has_focus(egui::Id::new(("ghostty-picker", active.session_id)).with("query"))
+            m.has_focus(egui::Id::new(("nterm-picker", active.session_id)).with("query"))
         }));
     }
     assert_eq!(main.shared.query(), "caféace");
@@ -2000,7 +2000,7 @@ fn picker_double_click_override_receives_item_and_stays_open() {
         }
         wait_selection(&ctx, &mut picker);
         frame(&ctx, &mut picker, vec![]);
-        let row = egui::Id::new(("ghostty-picker", picker.session_id)).with(("row", 0usize));
+        let row = egui::Id::new(("nterm-picker", picker.session_id)).with(("row", 0usize));
         let pos = ctx.read_response(row).expect("result row").rect.center();
         frame(&ctx, &mut picker, vec![egui::Event::PointerMoved(pos)]);
         let mut accepted = None;

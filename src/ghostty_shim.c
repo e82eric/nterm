@@ -255,8 +255,8 @@ GhosttyEguiHost *ghostty_egui_host_create(
     options.scale_factor = scale;
     options.userdata = userdata;
     ghostty_env_var_s token_env[] = {
-        { .key = "GHOSTTY_PICKER_ENDPOINT", .value = picker_endpoint },
-        { .key = "GHOSTTY_PICKER_TOKEN", .value = picker_token },
+        { .key = "NTERM_PICKER_ENDPOINT", .value = picker_endpoint },
+        { .key = "NTERM_PICKER_TOKEN", .value = picker_token },
     };
     options.env_vars = token_env;
     options.env_var_count = 2;
@@ -328,8 +328,8 @@ GhosttyEguiHost *ghostty_egui_host_create_child(
     options.command = command;
     options.working_directory = cwd;
     ghostty_env_var_s token_env[] = {
-        { .key = "GHOSTTY_PICKER_ENDPOINT", .value = picker_endpoint },
-        { .key = "GHOSTTY_PICKER_TOKEN", .value = picker_token },
+        { .key = "NTERM_PICKER_ENDPOINT", .value = picker_endpoint },
+        { .key = "NTERM_PICKER_TOKEN", .value = picker_token },
     };
     options.env_vars = token_env;
     options.env_var_count = 2;

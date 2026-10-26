@@ -2,7 +2,7 @@
 -- the executable. Only the first available file is loaded.
 local snippets_path = (os.getenv("USERPROFILE") or os.getenv("HOME")) .. "/.wtd/.wt.json"
 return {
-  -- Local picker IPC is opt-in. See PICKER-PIPE.md and Invoke-GhosttyPicker.ps1.
+  -- Local picker IPC is opt-in. See PICKER-PIPE.md and Invoke-NtermPicker.ps1.
   picker_pipe = {
     enabled = false,
     allow_stream = false,

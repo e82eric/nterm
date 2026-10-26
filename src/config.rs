@@ -2055,7 +2055,7 @@ mod tests {
     #[test]
     fn lua_items_provider_rereads_file_each_time() {
         let path =
-            std::env::temp_dir().join(format!("ghostty-picker-items-{}.json", std::process::id()));
+            std::env::temp_dir().join(format!("nterm-picker-items-{}.json", std::process::id()));
         std::fs::write(&path, r#"{"snippets":[{"input":"first"}]}"#).unwrap();
         let source = format!(
             r#"return {{ pickers = {{ snippets = {{ type = 'Items', items = function()

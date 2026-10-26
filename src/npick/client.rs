@@ -99,7 +99,7 @@ fn nonce() -> Result<String, String> {
 }
 
 /// Connect and authenticate. `endpoint` is the socket path from
-/// GHOSTTY_PICKER_ENDPOINT, which is also part of the HMAC transcript.
+/// NTERM_PICKER_ENDPOINT, which is also part of the HMAC transcript.
 fn connect(endpoint: &str, token: &str) -> Result<Connection, String> {
     let stream = UnixStream::connect(endpoint)
         .map_err(|e| format!("unable to connect to {endpoint}: {e}"))?;
@@ -130,7 +130,7 @@ fn connect(endpoint: &str, token: &str) -> Result<Connection, String> {
             let _ = connection.send(&json!({"type":"received","request_id":ready["request_id"]}));
             return Err(error_message(&ready));
         }
-        _ => return Err("authentication failed; check GHOSTTY_PICKER_TOKEN".into()),
+        _ => return Err("authentication failed; check NTERM_PICKER_TOKEN".into()),
     }
     let expected = hex(&proof(
         token,

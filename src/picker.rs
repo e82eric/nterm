@@ -213,7 +213,7 @@ impl Picker {
         let label = options.label.unwrap_or_else(|| source.label());
         let accept_on_click = label == "GHOSTTY THEMES";
         let mut shared = nfm_egui::Picker::new(
-            ("ghostty-picker", session_id),
+            ("nterm-picker", session_id),
             &ctx,
             source.provider(),
             nfm_egui::PickerConfig {

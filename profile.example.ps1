@@ -1,11 +1,11 @@
 # PowerShell 7.3+. Dot-source this file from your $PROFILE.
-# Ghostty Lua: allow streaming and the ProfileFiles/ProfileDirectories named
+# nterm Lua: allow streaming and the ProfileFiles/ProfileDirectories named
 # FileSystem pickers. See PICKER-PIPE.md or nterm.example.lua.
-# Outside Ghostty, install fzf on PATH for the same bindings.
+# Outside nterm, install fzf on PATH for the same bindings.
 param([string[]]$PickerRoots = @((Get-Location).Path))
 
-$script:GhosttyProfilePickerRoots = $PickerRoots
-. (Join-Path $PSScriptRoot 'Invoke-GhosttyPicker.ps1') -BackgroundInitialize -FreshConnection
+$script:NtermProfilePickerRoots = $PickerRoots
+. (Join-Path $PSScriptRoot 'Invoke-NtermPicker.ps1') -BackgroundInitialize -FreshConnection
 
 function Invoke-ProfilePicker {
     param(
@@ -15,14 +15,14 @@ function Invoke-ProfilePicker {
         [string]$ValueProperty
     )
     if (-not $Items -or $Items.Count -eq 0) { return }
-    if ($env:GHOSTTY_PICKER_ENDPOINT -and $env:GHOSTTY_PICKER_TOKEN) {
-        $Items | Invoke-GhosttyPicker -DisplayProperty $DisplayProperty -ValueProperty $ValueProperty `
+    if ($env:NTERM_PICKER_ENDPOINT -and $env:NTERM_PICKER_TOKEN) {
+        $Items | Invoke-NtermPicker -DisplayProperty $DisplayProperty -ValueProperty $ValueProperty `
             -Options @{ initial_query = $Query }
         return
     }
 
     $fzf = Get-Command fzf -CommandType Application -ErrorAction SilentlyContinue
-    if (-not $fzf) { throw 'Run inside Ghostty with the picker pipe enabled, or install fzf on PATH.' }
+    if (-not $fzf) { throw 'Run inside nterm with the picker pipe enabled, or install fzf on PATH.' }
     # IDs preserve multiline values and completion quoting independently of display.
     $rows = for ($i = 0; $i -lt $Items.Count; $i++) {
         $text = if ($DisplayProperty) { [string]$Items[$i].$DisplayProperty } else { [string]$Items[$i] }
@@ -72,10 +72,10 @@ function Get-ProfilePickerPaths {
 }
 
 function Invoke-ProfilePathPicker {
-    param([string[]]$Roots = $script:GhosttyProfilePickerRoots, [switch]$Directories)
-    if ($env:GHOSTTY_PICKER_ENDPOINT -and $env:GHOSTTY_PICKER_TOKEN) {
+    param([string[]]$Roots = $script:NtermProfilePickerRoots, [switch]$Directories)
+    if ($env:NTERM_PICKER_ENDPOINT -and $env:NTERM_PICKER_TOKEN) {
         $name = if ($Directories) { 'ProfileDirectories' } else { 'ProfileFiles' }
-        return Invoke-GhosttyPicker -Name $name -Parameters @{
+        return Invoke-NtermPicker -Name $name -Parameters @{
             roots = (ConvertTo-Json -InputObject @($Roots) -Compress)
             cwd = $PWD.Path
         }
@@ -85,7 +85,7 @@ function Invoke-ProfilePathPicker {
 }
 
 function Insert-FilePickerResult {
-    param([string[]]$Roots = $script:GhosttyProfilePickerRoots)
+    param([string[]]$Roots = $script:NtermProfilePickerRoots)
     $result = Invoke-ProfilePathPicker -Roots $Roots
     if ($null -ne $result) {
         # Quote paths containing spaces or apostrophes for PowerShell.
@@ -95,7 +95,7 @@ function Insert-FilePickerResult {
 }
 
 function Set-LocationFromPicker {
-    param([string[]]$Roots = $script:GhosttyProfilePickerRoots)
+    param([string[]]$Roots = $script:NtermProfilePickerRoots)
     $result = Invoke-ProfilePathPicker -Roots $Roots -Directories
     if ($null -ne $result) {
         $quoted = "'" + ([string]$result).Replace("'", "''") + "'"
