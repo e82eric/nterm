@@ -182,6 +182,8 @@ impl TerminalPane {
         if !unsafe { ghostty_ffi::nterm_host_snapshot_resize(self.host, generation, &mut map) } {
             return Err("Unable to reflow snapshot".into());
         }
+        // Resizing clears every decoration.
+        self.decorated_viewport.set(None);
         for cell in &mut cells {
             *cell = map
                 .translate(*cell)

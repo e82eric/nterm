@@ -205,7 +205,25 @@ mod copy_mode_abi_tests {
         assert_eq!(offset_of!(SnapshotView, columns), 36);
         assert_eq!(size_of::<super::SnapshotStyleRun>(), 24);
         assert_eq!(offset_of!(super::SnapshotStyleRun, flags), 20);
-        assert_eq!(size_of::<super::SnapshotStyleRuns>(), 16);
+        assert_eq!(size_of::<super::SnapshotRow>(), 64);
+        assert_eq!(offset_of!(super::SnapshotRow, widths), 24);
+        assert_eq!(offset_of!(super::SnapshotRow, cell_count), 32);
+        assert_eq!(offset_of!(super::SnapshotRow, style_runs), 40);
+        assert_eq!(offset_of!(super::SnapshotRow, wraps_to_next), 56);
+        assert_eq!(size_of::<super::LiveCursor>(), 40);
+        assert_eq!(offset_of!(super::LiveCursor, in_viewport), 32);
+    }
+
+    #[test]
+    fn resolve_cell_snaps_off_the_second_half_of_wide_characters() {
+        use super::resolve_cell_in_row;
+        let widths = [1, 2, 0, 1];
+        let cell = |x| SnapshotCell { x, y: 4 };
+        assert_eq!(resolve_cell_in_row(&widths, cell(0), false), Some(cell(0)));
+        assert_eq!(resolve_cell_in_row(&widths, cell(2), false), Some(cell(1)));
+        assert_eq!(resolve_cell_in_row(&widths, cell(2), true), Some(cell(3)));
+        assert_eq!(resolve_cell_in_row(&widths, cell(4), false), None);
+        assert_eq!(resolve_cell_in_row(&[2, 0], cell(1), true), Some(cell(0)));
     }
 
     #[test]
@@ -325,15 +343,6 @@ pub(crate) struct SnapshotTextChunk {
 }
 
 #[repr(C)]
-#[derive(Default)]
-pub(crate) struct SnapshotTextRow {
-    pub(crate) text: *const u8,
-    pub(crate) columns: *const u32,
-    pub(crate) len: usize,
-    pub(crate) wraps_to_next: bool,
-}
-
-#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct SnapshotStyleRun {
     pub start: u32,
@@ -345,27 +354,125 @@ pub(crate) struct SnapshotStyleRun {
     pub underline: u8,
     pub reserved: u16,
 }
+
 #[repr(C)]
-#[derive(Default)]
-pub(crate) struct SnapshotStyleRuns {
-    pub runs: *mut SnapshotStyleRun,
-    pub len: usize,
+pub(crate) struct SnapshotRow {
+    pub(crate) text: *const u8,
+    pub(crate) columns: *const u32,
+    pub(crate) len: usize,
+    pub(crate) widths: *const u8,
+    pub(crate) cell_count: u32,
+    pub(crate) style_runs: *const SnapshotStyleRun,
+    pub(crate) style_run_count: usize,
+    pub(crate) wraps_to_next: bool,
+}
+
+impl Default for SnapshotRow {
+    fn default() -> Self {
+        Self {
+            text: std::ptr::null(),
+            columns: std::ptr::null(),
+            len: 0,
+            widths: std::ptr::null(),
+            cell_count: 0,
+            style_runs: std::ptr::null(),
+            style_run_count: 0,
+            wraps_to_next: false,
+        }
+    }
+}
+
+/// An owned copy of one frozen snapshot row.
+pub(crate) struct SnapshotRowData {
+    pub(crate) text: Vec<u8>,
+    pub(crate) columns: Vec<u32>,
+    /// Display width of each cell: 2 for a wide character, 0 for the cell it
+    /// covers, and 1 otherwise.
+    pub(crate) widths: Vec<u8>,
+    pub(crate) style_runs: Vec<SnapshotStyleRun>,
+    pub(crate) wraps_to_next: bool,
+}
+
+/// Read one row of a frozen snapshot, optionally with its style runs.
+pub(crate) fn read_snapshot_row(
+    host: *mut Host,
+    generation: u64,
+    row: u64,
+    styles: bool,
+) -> Option<SnapshotRowData> {
+    let mut result = SnapshotRow::default();
+    if !unsafe { nterm_host_snapshot_row(host, generation, row, styles, &mut result) } {
+        return None;
+    }
+    // Every buffer is owned by the native result until it is freed below.
+    let copy = |ptr: *const u8, len: usize| {
+        if len == 0 || ptr.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+        }
+    };
+    let data = SnapshotRowData {
+        text: copy(result.text, result.len),
+        columns: if result.len == 0 || result.columns.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(result.columns, result.len) }.to_vec()
+        },
+        widths: copy(result.widths, result.cell_count as usize),
+        style_runs: if result.style_run_count == 0 || result.style_runs.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(result.style_runs, result.style_run_count) }
+                .to_vec()
+        },
+        wraps_to_next: result.wraps_to_next,
+    };
+    unsafe { nterm_host_snapshot_row_free(&mut result) };
+    Some(data)
+}
+
+/// Move a cell that lands on the second half of a wide character to the
+/// character's first cell, or to the cell after it when moving right.
+pub(crate) fn resolve_snapshot_cell(
+    host: *mut Host,
+    generation: u64,
+    cell: SnapshotCell,
+    snap_right: bool,
+) -> Option<SnapshotCell> {
+    let row = read_snapshot_row(host, generation, cell.y, false)?;
+    resolve_cell_in_row(&row.widths, cell, snap_right)
+}
+
+fn resolve_cell_in_row(
+    widths: &[u8],
+    cell: SnapshotCell,
+    snap_right: bool,
+) -> Option<SnapshotCell> {
+    let x = usize::try_from(cell.x).ok()?;
+    if *widths.get(x)? != 0 {
+        return Some(cell);
+    }
+    let x = if snap_right && x + 1 < widths.len() {
+        x + 1
+    } else {
+        x.saturating_sub(1)
+    };
+    Some(SnapshotCell {
+        x: x as u32,
+        y: cell.y,
+    })
 }
 
 #[repr(C)]
 #[derive(Default)]
-pub(crate) struct LiveCursorLine {
+pub(crate) struct LiveCursor {
     pub(crate) text: *const u8,
     pub(crate) len: usize,
     pub(crate) cursor_byte: usize,
-    pub(crate) cursor_column: u32,
-}
-
-#[repr(C)]
-#[derive(Default)]
-pub(crate) struct LiveCursorPosition {
     pub(crate) column: u32,
     pub(crate) row: u32,
+    pub(crate) in_viewport: bool,
 }
 
 unsafe extern "C" {
@@ -426,13 +533,6 @@ unsafe extern "C" {
         generation: u64,
         view: *mut SnapshotView,
     ) -> bool;
-    pub(crate) fn nterm_host_snapshot_resolve_cell(
-        host: *mut Host,
-        generation: u64,
-        requested: SnapshotCell,
-        snap_right: bool,
-        actual: *mut SnapshotCell,
-    ) -> bool;
     pub(crate) fn nterm_host_snapshot_resize(
         host: *mut Host,
         generation: u64,
@@ -454,20 +554,14 @@ unsafe extern "C" {
         cursor: *mut c_void,
         chunk: *mut SnapshotTextChunk,
     ) -> i32;
-    pub(crate) fn nterm_host_snapshot_text_row(
+    fn nterm_host_snapshot_row(
         host: *mut Host,
         generation: u64,
         row: u64,
-        result: *mut SnapshotTextRow,
+        styles: bool,
+        result: *mut SnapshotRow,
     ) -> bool;
-    pub(crate) fn nterm_host_snapshot_text_row_free(result: *mut SnapshotTextRow);
-    pub(crate) fn nterm_host_snapshot_style_runs(
-        host: *mut Host,
-        generation: u64,
-        row: u64,
-        result: *mut SnapshotStyleRuns,
-    ) -> bool;
-    pub(crate) fn ghostty_snapshot_style_runs_free(result: *mut SnapshotStyleRuns);
+    fn nterm_host_snapshot_row_free(result: *mut SnapshotRow);
     pub(crate) fn nterm_host_snapshot_logical_position(
         host: *mut Host,
         generation: u64,
@@ -480,23 +574,18 @@ unsafe extern "C" {
         range: SnapshotLogicalRange,
         result: *mut SnapshotCellRange,
     ) -> bool;
-    pub(crate) fn nterm_host_live_cursor_line(host: *mut Host, result: *mut LiveCursorLine)
-    -> bool;
-    pub(crate) fn nterm_host_live_cursor_line_free(result: *mut LiveCursorLine);
-    pub(crate) fn nterm_host_live_cursor_position(
+    pub(crate) fn nterm_host_live_cursor(
         host: *mut Host,
-        result: *mut LiveCursorPosition,
+        line: bool,
+        result: *mut LiveCursor,
     ) -> bool;
+    pub(crate) fn nterm_host_live_cursor_free(result: *mut LiveCursor);
     pub(crate) fn nterm_host_snapshot_apply_decorations(
         host: *mut Host,
         generation: u64,
         layers: *const SnapshotDecorationLayer,
         count: usize,
         viewport: *const SnapshotViewportOptions,
-    ) -> bool;
-    pub(crate) fn nterm_host_snapshot_decorations_need_refresh(
-        host: *mut Host,
-        generation: u64,
     ) -> bool;
     pub(crate) fn nterm_host_snapshot_apply_cell_text(
         host: *mut Host,

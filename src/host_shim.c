@@ -499,13 +499,6 @@ bool nterm_host_snapshot_view(
     NtermHost *host, uint64_t generation, ghostty_snapshot_view_s *view
 ) {
     ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_view(host->surface, generation, view); runtime_error(host, "nterm_host_snapshot_view"); return succeeded; }
-bool nterm_host_snapshot_resolve_cell(
-    NtermHost *host, uint64_t generation, ghostty_snapshot_cell_s requested,
-    bool snap_right, ghostty_snapshot_cell_s *actual
-) {
-    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_resolve_cell(
-    host->surface, generation, requested, snap_right, actual
-); runtime_error(host, "nterm_host_snapshot_resolve_cell"); return succeeded; }
 bool nterm_host_snapshot_resize(NtermHost *host, uint64_t generation,
     ghostty_snapshot_reflow_map_s *result) {
     ghostty_clear_error();
@@ -532,16 +525,13 @@ bool nterm_host_snapshot_cursor_reset(ghostty_snapshot_text_cursor_t cursor) {
 int nterm_host_snapshot_cursor_next(
     ghostty_snapshot_text_cursor_t cursor, ghostty_snapshot_text_chunk_s *chunk
 ) { return ghostty_surface_snapshot_text_cursor_next(cursor, chunk); }
-bool nterm_host_snapshot_text_row(
-    NtermHost *host, uint64_t generation, uint64_t row,
-    ghostty_snapshot_text_row_s *result
+bool nterm_host_snapshot_row(
+    NtermHost *host, uint64_t generation, uint64_t row, bool styles,
+    ghostty_snapshot_row_s *result
 ) {
-    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_text_row(host->surface, generation, row, result); runtime_error(host, "nterm_host_snapshot_text_row"); return succeeded; }
-void nterm_host_snapshot_text_row_free(ghostty_snapshot_text_row_s *result) {
-    ghostty_surface_snapshot_text_row_free(result);
-}
-bool nterm_host_snapshot_style_runs(NtermHost *host, uint64_t generation, uint64_t row, ghostty_snapshot_style_runs_s *result) {
-    return ghostty_surface_snapshot_style_runs(host->surface, generation, row, result);
+    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_row(host->surface, generation, row, styles, result); runtime_error(host, "nterm_host_snapshot_row"); return succeeded; }
+void nterm_host_snapshot_row_free(ghostty_snapshot_row_s *result) {
+    ghostty_surface_snapshot_row_free(result);
 }
 
 bool nterm_host_snapshot_logical_position(NtermHost *host, uint64_t generation, ghostty_snapshot_cell_s cell, ghostty_snapshot_logical_position_s *result) {
@@ -550,16 +540,12 @@ bool nterm_host_snapshot_logical_position(NtermHost *host, uint64_t generation, 
 bool nterm_host_snapshot_resolve_logical_range(NtermHost *host, uint64_t generation, ghostty_snapshot_logical_range_s range, ghostty_snapshot_resolved_range_s *result) {
     return ghostty_surface_snapshot_resolve_logical_range(host->surface, generation, range, result);
 }
-bool nterm_host_live_cursor_line(NtermHost *host, ghostty_live_cursor_line_s *result) {
+bool nterm_host_live_cursor(NtermHost *host, bool line, ghostty_live_cursor_s *result) {
     ghostty_clear_error();
-    bool succeeded = ghostty_surface_live_cursor_line(host->surface, result); runtime_error(host, "nterm_host_live_cursor_line"); return succeeded;
+    bool succeeded = ghostty_surface_live_cursor(host->surface, line, result); runtime_error(host, "nterm_host_live_cursor"); return succeeded;
 }
-bool nterm_host_live_cursor_position(NtermHost *host, ghostty_live_cursor_position_s *result) {
-    ghostty_clear_error();
-    bool succeeded = ghostty_surface_live_cursor_position(host->surface, result); runtime_error(host, "nterm_host_live_cursor_position"); return succeeded;
-}
-void nterm_host_live_cursor_line_free(ghostty_live_cursor_line_s *result) {
-    ghostty_surface_live_cursor_line_free(result);
+void nterm_host_live_cursor_free(ghostty_live_cursor_s *result) {
+    ghostty_surface_live_cursor_free(result);
 }
 bool nterm_host_snapshot_apply_decorations(
     NtermHost *host, uint64_t generation,
@@ -578,10 +564,6 @@ bool nterm_host_snapshot_apply_cell_text(
     ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_apply_decorations(
     host->surface, generation, layers, count, text, text_count, viewport
 ); runtime_error(host, "nterm_host_snapshot_apply_cell_text"); return succeeded; }
-bool nterm_host_snapshot_decorations_need_refresh(
-    NtermHost *host, uint64_t generation
-) {
-    ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_decorations_need_refresh(host->surface, generation); runtime_error(host, "nterm_host_snapshot_decorations_need_refresh"); return succeeded; }
 void nterm_host_text(NtermHost *host, const char *text, size_t len) {
     ghostty_clear_error();
     ghostty_surface_text(host->surface, text, len);

@@ -4,7 +4,7 @@ mod snapshot_resize;
 
 use crate::ghostty_ffi::{
     self, GpuFrame, Host, SnapshotCell, SnapshotCellRange, SnapshotDecorationLayer,
-    SnapshotDecorationStyle, SnapshotTextRow, SnapshotView, SnapshotViewportOptions,
+    SnapshotDecorationStyle, SnapshotView, SnapshotViewportOptions,
 };
 use crate::graphics as glow;
 use crate::input;
@@ -44,20 +44,8 @@ impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDoc
             .ok_or_else(|| "Unable to read copy-mode snapshot row".into())
     }
     fn resolve_cell(&self, cell: SnapshotCell, right: bool) -> Result<SnapshotCell, String> {
-        let mut actual = SnapshotCell::default();
-        if unsafe {
-            ghostty_ffi::nterm_host_snapshot_resolve_cell(
-                self.host,
-                self.generation,
-                cell,
-                right,
-                &mut actual,
-            )
-        } {
-            Ok(actual)
-        } else {
-            Err("Unable to resolve copy-mode snapshot cell".into())
-        }
+        ghostty_ffi::resolve_snapshot_cell(self.host, self.generation, cell, right)
+            .ok_or_else(|| "Unable to resolve copy-mode snapshot cell".into())
     }
     fn selection_text(&self, selection: &CopySelection) -> Result<String, String> {
         let mut result = ghostty_ffi::SnapshotSelectionText::default();
@@ -251,6 +239,10 @@ pub(super) struct TerminalPane {
     copy_search_query: Option<(String, bool)>,
     copy_search_refresh: Option<u64>,
     prompt_boundaries: Option<(u64, Vec<u64>)>,
+    /// Snapshot generation, viewport top and viewport rows when decorations
+    /// were last applied. Decorations only cover that viewport, so they must
+    /// be reapplied once it scrolls.
+    decorated_viewport: std::cell::Cell<Option<(u64, u64, u32)>>,
     prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     pub(super) pending_callback: Option<(crate::picker::Action, Option<u64>, bool)>,
 }
@@ -457,6 +449,7 @@ impl TerminalPane {
             copy_search_query: None,
             copy_search_refresh: None,
             prompt_boundaries: None,
+            decorated_viewport: std::cell::Cell::new(None),
             prompt_patterns: Default::default(),
             pending_callback: None,
         }
@@ -581,8 +574,9 @@ impl TerminalPane {
             self.quick_select.as_ref().map(|quick| quick.generation),
             self.search.snapshot_generation,
             self.copy_mode.generation,
-            |generation| unsafe {
-                ghostty_ffi::nterm_host_snapshot_decorations_need_refresh(self.host, generation)
+            |generation| {
+                self.snapshot_viewport(generation)
+                    .is_some_and(|viewport| self.decorated_viewport.get() != Some(viewport))
             },
         );
         match refresh {
@@ -597,6 +591,21 @@ impl TerminalPane {
             }
             None => {}
         }
+    }
+
+    fn snapshot_viewport(&self, generation: u64) -> Option<(u64, u64, u32)> {
+        let mut view = SnapshotView::default();
+        unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view) }
+            .then_some((generation, view.viewport_top, view.viewport_rows))
+    }
+
+    /// Record the viewport that successfully applied decorations cover.
+    fn decorations_applied(&self, generation: u64, applied: bool) -> bool {
+        if applied {
+            self.decorated_viewport
+                .set(self.snapshot_viewport(generation));
+        }
+        applied
     }
 
     pub(super) fn forward_input(
@@ -1073,8 +1082,8 @@ impl TerminalPane {
     ) {
         let host = self.host;
         let context = if entry.needs_context() {
-            let mut row = ghostty_ffi::LiveCursorLine::default();
-            if !unsafe { ghostty_ffi::nterm_host_live_cursor_line(host, &mut row) } {
+            let mut row = ghostty_ffi::LiveCursor::default();
+            if !unsafe { ghostty_ffi::nterm_host_live_cursor(host, true, &mut row) } {
                 self.show_error(
                     "Could not open picker",
                     "Unable to read live cursor line".into(),
@@ -1092,11 +1101,11 @@ impl TerminalPane {
             let context = crate::config::PickerContext {
                 line,
                 line_before_cursor: before,
-                cursor_column: row.cursor_column,
+                cursor_column: row.column,
                 recent_lines: self.recent_picker_lines(),
                 cwd: self.pwd(),
             };
-            unsafe { ghostty_ffi::nterm_host_live_cursor_line_free(&mut row) };
+            unsafe { ghostty_ffi::nterm_host_live_cursor_free(&mut row) };
             context
         } else {
             crate::config::PickerContext::default()
@@ -1296,8 +1305,9 @@ impl TerminalPane {
                 .filter(|row| *row < u64::from(view.viewport_rows))
                 .and_then(|row| u32::try_from(row).ok())
         } else {
-            let mut cursor = ghostty_ffi::LiveCursorPosition::default();
-            unsafe { ghostty_ffi::nterm_host_live_cursor_position(self.host, &mut cursor) }
+            let mut cursor = ghostty_ffi::LiveCursor::default();
+            (unsafe { ghostty_ffi::nterm_host_live_cursor(self.host, false, &mut cursor) }
+                && cursor.in_viewport)
                 .then_some(cursor.row)
         }
     }
@@ -1951,7 +1961,7 @@ impl TerminalPane {
             range_count: ranges.len(),
             style,
         };
-        unsafe {
+        let applied = unsafe {
             ghostty_ffi::nterm_host_snapshot_apply_cell_text(
                 self.quick_host(),
                 quick.generation,
@@ -1961,7 +1971,8 @@ impl TerminalPane {
                 text.len(),
                 viewport,
             )
-        }
+        };
+        self.decorations_applied(quick.generation, applied)
     }
 
     fn cancel_quick_select(&mut self) {
@@ -2183,16 +2194,11 @@ impl TerminalPane {
         }
         let mut state = SnapshotView::default();
         let mut actual = SnapshotCell::default();
-        let ready = unsafe {
-            ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut state)
-                && ghostty_ffi::nterm_host_snapshot_resolve_cell(
-                    self.host,
-                    generation,
-                    state.cursor,
-                    false,
-                    &mut actual,
-                )
-        };
+        let ready =
+            unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut state) }
+                && ghostty_ffi::resolve_snapshot_cell(self.host, generation, state.cursor, false)
+                    .map(|cell| actual = cell)
+                    .is_some();
         if !ready || !self.publish_copy_decoration(generation, actual, true) {
             unsafe { ghostty_ffi::nterm_host_snapshot_end(self.host, generation) };
             self.show_error(
@@ -2233,23 +2239,15 @@ impl TerminalPane {
             );
             return;
         }
-        let mut actual = SnapshotCell::default();
-        if !unsafe {
-            ghostty_ffi::nterm_host_snapshot_resolve_cell(
-                host,
-                generation,
-                target,
-                false,
-                &mut actual,
-            )
-        } {
+        let Some(actual) = ghostty_ffi::resolve_snapshot_cell(host, generation, target, false)
+        else {
             self.close_search();
             self.show_error(
                 "Search navigation failed",
                 "Unable to resolve the selected match".into(),
             );
             return;
-        }
+        };
         self.search_worker.cancel_and_wait();
         // Transfer ownership instead of closing search: ending this snapshot
         // would invalidate the match coordinates and briefly show live output.
@@ -2523,17 +2521,7 @@ impl TerminalPane {
         requested: SnapshotCell,
         snap_right: bool,
     ) -> Option<SnapshotCell> {
-        let mut actual = SnapshotCell::default();
-        unsafe {
-            ghostty_ffi::nterm_host_snapshot_resolve_cell(
-                self.host,
-                generation,
-                requested,
-                snap_right,
-                &mut actual,
-            )
-        }
-        .then_some(actual)
+        ghostty_ffi::resolve_snapshot_cell(self.host, generation, requested, snap_right)
     }
 
     fn recent_picker_lines(&self) -> Vec<String> {
@@ -2572,25 +2560,11 @@ impl TerminalPane {
     }
 
     fn read_snapshot_row_from(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
-        let mut result = SnapshotTextRow::default();
-        if !unsafe { ghostty_ffi::nterm_host_snapshot_text_row(host, generation, row, &mut result) }
-        {
-            return None;
-        }
-        let (text, columns) = if result.len == 0 {
-            (Vec::new(), Vec::new())
-        } else {
-            (
-                unsafe { std::slice::from_raw_parts(result.text, result.len) }.to_vec(),
-                unsafe { std::slice::from_raw_parts(result.columns, result.len) }.to_vec(),
-            )
-        };
-        let wraps_to_next = result.wraps_to_next;
-        unsafe { ghostty_ffi::nterm_host_snapshot_text_row_free(&mut result) };
+        let data = ghostty_ffi::read_snapshot_row(host, generation, row, false)?;
         Some(TextRow {
-            text: String::from_utf8(text).ok()?,
-            columns,
-            wraps_to_next,
+            text: String::from_utf8(data.text).ok()?,
+            columns: data.columns,
+            wraps_to_next: data.wraps_to_next,
         })
     }
 
@@ -2865,7 +2839,7 @@ impl TerminalPane {
             let index = layers.len() - 1;
             layers.insert(index, active_search_layer(range));
         }
-        unsafe {
+        let applied = unsafe {
             ghostty_ffi::nterm_host_snapshot_apply_decorations(
                 self.host,
                 generation,
@@ -2873,7 +2847,8 @@ impl TerminalPane {
                 layers.len(),
                 viewport,
             )
-        }
+        };
+        self.decorations_applied(generation, applied)
     }
 
     fn copy_decoration_ranges(
@@ -2944,15 +2919,16 @@ impl TerminalPane {
             layers.push(layer);
         }
         layers.push(matches_layer);
-        unsafe {
+        let applied = unsafe {
             ghostty_ffi::nterm_host_snapshot_apply_decorations(
                 self.search_host(),
                 snapshot_generation,
                 layers.as_ptr(),
                 layers.len(),
                 &viewport,
-            );
-        }
+            )
+        };
+        self.decorations_applied(snapshot_generation, applied);
     }
 
     pub(super) fn show_search_overlay(&mut self, ctx: &egui::Context, bounds: egui::Rect) {

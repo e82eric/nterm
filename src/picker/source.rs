@@ -139,8 +139,8 @@ impl PickerSource {
             return Err("Unable to locate line-split document".into());
         }
         for y in start..end {
-            let text = read_row(host, generation, y).ok_or("Unable to read line-split snapshot")?;
-            let styles = read_styles(host, generation, y)?;
+            let (text, styles) =
+                read_styled_row(host, generation, y).ok_or("Unable to read line-split snapshot")?;
             document.push_row(&text.text, &text.columns, text.wraps_to_next, &styles)?;
             lines.push(split_line_cells(y, &text, columns));
         }
@@ -384,10 +384,9 @@ impl PickerSource {
                             complete_document_source(&document_items);
                             return;
                         }
-                        let captured = read_row(host as *mut Host, generation, row)
+                        let captured = read_styled_row(host as *mut Host, generation, row)
                             .ok_or_else(|| "Unable to read scrollback snapshot".to_owned())
-                            .and_then(|text| {
-                                let styles = read_styles(host as *mut Host, generation, row)?;
+                            .and_then(|(text, styles)| {
                                 builder.push_row(
                                     &text.text,
                                     &text.columns,
@@ -715,34 +714,42 @@ pub(super) fn split_line_cells(
     }
 }
 
-fn read_row(host: *mut Host, generation: u64, row: u64) -> Option<TextRow> {
+fn read_styled_row(
+    host: *mut Host,
+    generation: u64,
+    row: u64,
+) -> Option<(TextRow, Vec<nfm_egui::styled_document::ColumnStyleRun>)> {
+    use nfm_egui::styled_document::{ColumnStyleRun, Style};
     // The native row reader caches its snapshot anchor. A UI-thread line split
     // may read while the original scrollback source is still publishing rows.
     static ROW_READ: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _read = ROW_READ.lock().unwrap_or_else(|error| error.into_inner());
-    let mut result = ghostty_ffi::SnapshotTextRow::default();
-    if !unsafe { ghostty_ffi::nterm_host_snapshot_text_row(host, generation, row, &mut result) } {
-        return None;
-    }
-    let (text, columns) = if result.len == 0 {
-        (Vec::new(), Vec::new())
-    } else {
-        unsafe {
-            (
-                std::slice::from_raw_parts(result.text, result.len).to_vec(),
-                std::slice::from_raw_parts(result.columns, result.len).to_vec(),
-            )
-        }
-    };
-    let wraps_to_next = result.wraps_to_next;
-    unsafe { ghostty_ffi::nterm_host_snapshot_text_row_free(&mut result) };
+    let data = ghostty_ffi::read_snapshot_row(host, generation, row, true)?;
     let mut text = TextRow {
-        text: String::from_utf8(text).ok()?,
-        columns,
-        wraps_to_next,
+        text: String::from_utf8(data.text).ok()?,
+        columns: data.columns,
+        wraps_to_next: data.wraps_to_next,
     };
     trim_trailing_spaces(&mut text);
-    Some(text)
+    let color = |value: u32| {
+        (value != u32::MAX)
+            .then(|| egui::Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
+    };
+    let styles = data
+        .style_runs
+        .iter()
+        .map(|run| ColumnStyleRun {
+            columns: run.start..run.end,
+            style: Style {
+                foreground: color(run.foreground),
+                background: color(run.background),
+                underline_color: color(run.underline_color),
+                flags: run.flags,
+                underline: run.underline != 0,
+            },
+        })
+        .collect();
+    Some((text, styles))
 }
 
 /// Drops the spaces that end a row which does not wrap into the next one.
@@ -757,41 +764,6 @@ fn trim_trailing_spaces(row: &mut TextRow) {
     let len = row.text.trim_end_matches(' ').len();
     row.text.truncate(len);
     row.columns.truncate(len);
-}
-
-fn read_styles(
-    host: *mut Host,
-    generation: u64,
-    row: u64,
-) -> Result<Vec<nfm_egui::styled_document::ColumnStyleRun>, String> {
-    use nfm_egui::styled_document::{ColumnStyleRun, Style};
-    let mut result = ghostty_ffi::SnapshotStyleRuns::default();
-    if !unsafe { ghostty_ffi::nterm_host_snapshot_style_runs(host, generation, row, &mut result) } {
-        return Err("Unable to read snapshot styles".into());
-    }
-    let color = |value: u32| {
-        (value != u32::MAX)
-            .then(|| egui::Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
-    };
-    let runs = if result.len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(result.runs, result.len) }
-            .iter()
-            .map(|run| ColumnStyleRun {
-                columns: run.start..run.end,
-                style: Style {
-                    foreground: color(run.foreground),
-                    background: color(run.background),
-                    underline_color: color(run.underline_color),
-                    flags: run.flags,
-                    underline: run.underline != 0,
-                },
-            })
-            .collect()
-    };
-    unsafe { ghostty_ffi::ghostty_snapshot_style_runs_free(&mut result) };
-    Ok(runs)
 }
 
 pub(super) fn logical_items(
