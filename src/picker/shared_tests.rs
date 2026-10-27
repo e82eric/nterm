@@ -116,7 +116,9 @@ fn full_pane_pipe_options_set_placement_and_result_rows() {
         nfm_egui::Position::FullPane
     );
     let (session, _replies) = pipe::Session::new("full-pane".into());
-    picker.attach_pipe(&ctx, session, Some(&stream));
+    picker
+        .attach_pipe(&ctx, session, &pipe::Open::Stream { options: stream })
+        .unwrap();
     assert_eq!(picker.result_rows, 5);
     assert_eq!(picker.position, config::Position::FullPane);
 }
@@ -538,14 +540,18 @@ fn dynamic_preview_survives_stream_publications_before_completion() {
         },
     );
     let (session, rx) = pipe::Session::new("preview-stream-test".into());
-    picker.attach_pipe(
-        &ctx,
-        session.clone(),
-        Some(&pipe::StreamOptions {
-            preview_visible: true,
-            ..Default::default()
-        }),
-    );
+    picker
+        .attach_pipe(
+            &ctx,
+            session.clone(),
+            &pipe::Open::Stream {
+                options: pipe::StreamOptions {
+                    preview_visible: true,
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
     for sequence in 0..4 {
         let previous_version = picker.shared.selection().map(|s| s.source_version);
         picker.pipe_event(
@@ -586,7 +592,15 @@ fn pipe_stream_publishes_before_end_and_returns_value_without_pasting() {
     let ctx = egui::Context::default();
     let mut picker = items(&ctx);
     let (session, rx) = pipe::Session::new("stream-test".into());
-    picker.attach_pipe(&ctx, session.clone(), Some(&pipe::StreamOptions::default()));
+    picker
+        .attach_pipe(
+            &ctx,
+            session.clone(),
+            &pipe::Open::Stream {
+                options: Default::default(),
+            },
+        )
+        .unwrap();
     picker.pipe_event(
         &ctx,
         pipe::Event::Items {
@@ -612,6 +626,113 @@ fn pipe_stream_publishes_before_end_and_returns_value_without_pasting() {
     assert_eq!(result["status"], "accepted");
     assert_eq!(result["selected"][0]["id"], "original");
     assert_eq!(result["selected"][0]["value"]["path"], "selected-value");
+}
+
+#[test]
+fn named_stream_feeds_configured_preview_and_returns_item() {
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::Items(config::ItemsOptions {
+                values: Vec::new(),
+                provider: None,
+            }),
+            preview: Some(config::Preview::Dynamic {
+                resolve: Some(worker_resolver(
+                    "function(item) return {type='Text',text='help for '..item.value} end",
+                )),
+                max_bytes: None,
+                max_scrollback_lines: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let (session, rx) = pipe::Session::new("named-stream-test".into());
+    picker
+        .attach_pipe(
+            &ctx,
+            session.clone(),
+            &pipe::Open::Named {
+                name: "completions".into(),
+                params: Default::default(),
+                stream: true,
+            },
+        )
+        .unwrap();
+    picker.pipe_event(
+        &ctx,
+        pipe::Event::Items {
+            sequence: 0,
+            items: vec![pipe::Item {
+                id: "7".into(),
+                text: "Path".into(),
+                value: serde_json::json!("-Path"),
+            }],
+            session: session.clone(),
+        },
+    );
+    assert_eq!(rx.try_recv().unwrap()["type"], "ack");
+    picker.pipe_event(
+        &ctx,
+        pipe::Event::End {
+            session: session.clone(),
+        },
+    );
+    assert_eq!(rx.try_recv().unwrap()["type"], "input_complete");
+    assert_eq!(wait_selection(&ctx, &mut picker).text, "Path");
+    // The preview gets the streamed value, not the displayed text.
+    wait_preview_rendered_text(&ctx, &mut picker, "help for -Path");
+    let (action, _) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert!(matches!(action, Some(Action::Cancel)));
+    let result = rx.try_recv().unwrap();
+    assert_eq!(result["status"], "accepted");
+    assert_eq!(result["selected"][0]["id"], "7");
+    assert_eq!(result["selected"][0]["value"], "-Path");
+}
+
+#[test]
+fn named_stream_requires_an_items_picker() {
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::Command(config::CommandOptions {
+                args: vec!["nterm-test-missing-command".into()],
+                cwd: None,
+                line_continuation: None,
+                unique: false,
+                success_exit_codes: None,
+                columns: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let (session, _rx) = pipe::Session::new("named-stream-command".into());
+    let error = picker
+        .attach_pipe(
+            &ctx,
+            session,
+            &pipe::Open::Named {
+                name: "files".into(),
+                params: Default::default(),
+                stream: true,
+            },
+        )
+        .unwrap_err();
+    assert!(error.contains("Items picker"), "{error}");
 }
 
 #[test]
@@ -1770,6 +1891,80 @@ fn command_source_order_survives_shared_search_and_navigation() {
         vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
     );
     assert!(matches!(action, Some(Action::SendInput(value)) if value.trim() == "a"));
+}
+#[test]
+fn file_source_reads_newest_first_and_accepts_joined_continuations() {
+    let dir = std::env::temp_dir().join(format!("nterm-file-picker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("history.txt"),
+        "old\nGet-Item `\r\n  -Force\nnewest\nold\n",
+    )
+    .unwrap();
+    let ctx = egui::Context::default();
+    let mut picker = Picker::start(
+        std::ptr::null_mut(),
+        None,
+        false,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::TextFile(config::TextFileOptions {
+                path: "{history}".into(),
+                reverse: true,
+                line_continuation: Some("`".into()),
+                unique: true,
+            }),
+            sort: config::Sort::SourceOrder,
+            // A relative parameter resolves against the request's cwd.
+            params: [
+                ("history".into(), "history.txt".into()),
+                ("cwd".into(), dir.to_string_lossy().into_owned()),
+            ]
+            .into(),
+            enter_action: config::EnterAction::SendInput,
+            ..Default::default()
+        },
+    );
+    assert_eq!(wait_selection(&ctx, &mut picker).text, "old");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let appearance = picker.appearance(&ctx);
+        let mut ready = false;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let result = picker.shared.show(
+                ui.ctx(),
+                nfm_egui::Placement::new(ui.ctx().content_rect()),
+                &appearance,
+                false,
+            );
+            ready = result.matched == 3 && !result.busy;
+        });
+        output.textures_delta.clear();
+        if ready {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    for _ in 0..2 {
+        frame(
+            &ctx,
+            &mut picker,
+            vec![key(egui::Key::N, egui::Modifiers::CTRL)],
+        );
+    }
+    let (action, _) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert!(
+        matches!(&action, Some(Action::SendInput(value)) if value == "Get-Item \n  -Force"),
+        "{:?}",
+        action.as_ref().map(|_| ())
+    );
 }
 #[test]
 fn scrollback_selection_retains_owned_cell_range_across_publication() {

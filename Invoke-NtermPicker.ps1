@@ -270,10 +270,11 @@ function Invoke-NtermPicker {
     param(
         [Parameter(Mandatory, ParameterSetName='Named')][string] $Name,
         [Parameter(ParameterSetName='Named')][hashtable] $Parameters = @{},
-        [Parameter(ValueFromPipeline, ParameterSetName='Stream')][AllowNull()][object] $InputObject,
+        [Parameter(ValueFromPipeline, ParameterSetName='Stream')]
+        [Parameter(ValueFromPipeline, ParameterSetName='Named')][AllowNull()][object] $InputObject,
         [Parameter(ParameterSetName='Stream')][hashtable] $Options = @{},
-        [Parameter(ParameterSetName='Stream')][string] $DisplayProperty,
-        [Parameter(ParameterSetName='Stream')][string] $ValueProperty,
+        [Parameter(ParameterSetName='Stream')][Parameter(ParameterSetName='Named')][string] $DisplayProperty,
+        [Parameter(ParameterSetName='Stream')][Parameter(ParameterSetName='Named')][string] $ValueProperty,
         [switch] $PassThruResult,
         [switch] $FreshConnection = $script:NtermPickerFreshConnection,
         [ValidateRange(0, 86400)][int] $CancelAfterSeconds = 0
@@ -288,6 +289,9 @@ function Invoke-NtermPicker {
         $nextId = 0L
         $originals = [System.Collections.Generic.Dictionary[string,object]]::new()
         $requestId = [guid]::NewGuid().ToString('N')
+        # Piping into -Name streams the items of a configured Items picker.
+        $streaming = $PSCmdlet.ParameterSetName -eq 'Stream' -or $MyInvocation.ExpectingInput -or
+            $PSBoundParameters.ContainsKey('InputObject')
         $endpoint = $env:NTERM_PICKER_ENDPOINT
         if (-not $endpoint -or -not $env:NTERM_PICKER_TOKEN) {
             throw 'Run this function inside a newly launched nterm shell with picker pipe support.'
@@ -342,7 +346,13 @@ function Invoke-NtermPicker {
             }
             $client.BeginRequest($requestId)
             $request = switch ($PSCmdlet.ParameterSetName) {
-                Named { $strings = @{}; foreach ($key in $Parameters.Keys) { $strings[[string]$key] = [string]$Parameters[$key] }; @{ kind='named'; name=$Name; params=$strings } }
+                Named {
+                    $strings = @{}
+                    foreach ($key in $Parameters.Keys) { $strings[[string]$key] = [string]$Parameters[$key] }
+                    $named = @{ kind='named'; name=$Name; params=$strings }
+                    if ($streaming) { $named.stream = $true }
+                    $named
+                }
                 Stream {
                     $streamOptions = @{}
                     foreach ($key in $Options.Keys) { $streamOptions[$key] = $Options[$key] }
@@ -363,7 +373,7 @@ function Invoke-NtermPicker {
         }
     }
     process {
-        if ($PSCmdlet.ParameterSetName -eq 'Stream' -and $null -eq $result -and $PSBoundParameters.ContainsKey('InputObject')) {
+        if ($streaming -and $null -eq $result -and $PSBoundParameters.ContainsKey('InputObject')) {
             try {
                 $raw = $client.Next(0)
                 if ($null -ne $raw) {
@@ -389,7 +399,7 @@ function Invoke-NtermPicker {
     }
     end {
         try {
-            if ($PSCmdlet.ParameterSetName -eq 'Stream' -and $null -eq $result) {
+            if ($streaming -and $null -eq $result) {
                 if ($batch.Count) { $result = Flush-PickerItems; $sequence++ }
                 if ($null -eq $result) {
                     $last = if ($sequence -eq 0) { $null } else { $sequence - 1 }
@@ -411,7 +421,7 @@ function Invoke-NtermPicker {
             if ($PassThruResult) { $result }
             elseif ($result.status -eq 'accepted') {
                 foreach ($selected in $result.selected) {
-                    if ($PSCmdlet.ParameterSetName -eq 'Stream' -and -not $ValueProperty -and $originals.ContainsKey([string]$selected.id)) {
+                    if ($streaming -and -not $ValueProperty -and $originals.ContainsKey([string]$selected.id)) {
                         $originals[[string]$selected.id]
                     } else { $selected.value }
                 }

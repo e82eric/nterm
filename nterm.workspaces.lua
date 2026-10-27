@@ -333,11 +333,14 @@ local config = {
       preview = rg_preview(),
     },
     ProfileHistory = {
-      type = "Command", args = {"G:/src/nfzf/bin/PowershellHistoryReader.exe"},
+      -- params.history is the PSReadLine history file, read newest first.
+      type = "File", path = "{history}", reverse = true,
       line_continuation = "`", unique = true, sort = "SourceOrder", position = "Cursor",
       preview_visible = false,
       preview = profile_preview([==[$args[0] | & bat.exe --color=always --paging=never --wrap=never --style=plain --language=ps1 --theme="Visual Studio Dark+"]==]),
     },
+    -- profile.example.ps1 streams CompletionMatches into this Items picker
+    -- (piped into Invoke-NtermPicker -Name); the preview runs Get-Help.
     ProfileCompletions = {
       type="Items",items=nterm.json_parse("[]"),position="Cursor",preview_visible=true,
       preview=profile_preview(pipe_help_preview,"commandName"),

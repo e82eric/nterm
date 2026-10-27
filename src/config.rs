@@ -1957,7 +1957,7 @@ mod tests {
         )
         .unwrap();
         let request: crate::picker::pipe::Open = serde_json::from_str(r#"{"kind":"named","name":"Ripgrep","params":{"pattern":"ghostty","cwd":"C:\\src\\ghostty2","cursor":"0","length":"0"}}"#).unwrap();
-        let crate::picker::pipe::Open::Named { name, params } = request else {
+        let crate::picker::pipe::Open::Named { name, params, .. } = request else {
             panic!("expected named picker")
         };
         let options = bindings
@@ -1991,7 +1991,7 @@ mod tests {
             r#"{"kind":"named","name":"files","params":{"roots":"[\"G:\\\\src\",\"C:\\\\src\"]"}}"#,
         )
         .unwrap();
-        let crate::picker::pipe::Open::Named { name, params } = request else {
+        let crate::picker::pipe::Open::Named { name, params, .. } = request else {
             panic!("expected named picker")
         };
         let options = bindings

@@ -1,7 +1,7 @@
 //! Ghostty config/request adapter for NFM's streaming command source.
 use crate::ghostty_ffi::SnapshotCellRange;
-use crate::picker::config::{CommandColumns, CommandOptions};
-pub(crate) use nfm_picker_sources::command::CommandValues;
+use crate::picker::config::{CommandColumns, CommandOptions, TextFileOptions};
+pub(crate) use nfm_picker_sources::records::StreamValues;
 use nfm_search_core::{
     snapshot_store::SnapshotStore,
     store::{PublishingStreamingItemStoreWithPayload, StreamingItemSnapshotWithPayload},
@@ -51,10 +51,11 @@ pub(crate) fn start(
     cancelled: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     ctx: egui::Context,
-    command_values: Option<CommandValues>,
+    command_values: Option<StreamValues>,
 ) -> Option<JoinHandle<()>> {
-    use nfm_picker_sources::command::{
-        self, CommandControl, CommandSink, CommandSourceOptions, CommandSpec,
+    use nfm_picker_sources::{
+        command::{self, CommandSourceOptions, CommandSpec},
+        records::{StreamControl, StreamSink},
     };
     let (program, args, cwd) = match resolve(&options, &params) {
         Ok(command) => command,
@@ -81,13 +82,13 @@ pub(crate) fn start(
     let budget_cancel = cancelled.clone();
     let budget_error = error.clone();
     let usage = Mutex::new((0usize, 0usize));
-    let sink = CommandSink {
+    let sink = StreamSink {
         store,
         payload: SnapshotCellRange::default(),
         values: command_values,
         error,
     };
-    let control = CommandControl {
+    let control = StreamControl {
         cancelled,
         changed: Arc::new(move || {
             if ipc {
@@ -130,6 +131,78 @@ pub(crate) fn start(
     }
 }
 
+/// The file path with a `{name}` parameter substituted, relative to `cwd`.
+fn resolve_file(
+    options: &TextFileOptions,
+    params: &BTreeMap<String, String>,
+) -> Result<std::path::PathBuf, String> {
+    let path = match options
+        .path
+        .strip_prefix('{')
+        .and_then(|path| path.strip_suffix('}'))
+    {
+        Some(name) => params
+            .get(name)
+            .ok_or_else(|| format!("missing file picker parameter {name:?}"))?,
+        None => &options.path,
+    };
+    if path.trim().is_empty() || path.contains('\0') {
+        return Err("file picker requires a path without NUL".into());
+    }
+    let path = std::path::Path::new(path);
+    Ok(match params.get("cwd") {
+        Some(cwd) if path.is_relative() => std::path::Path::new(cwd).join(path),
+        _ => path.to_path_buf(),
+    })
+}
+
+pub(crate) fn start_file(
+    options: TextFileOptions,
+    params: &BTreeMap<String, String>,
+    store: Arc<SnapshotStore<Items>>,
+    cancelled: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+    ctx: egui::Context,
+    command_values: Option<StreamValues>,
+) -> Option<JoinHandle<()>> {
+    use nfm_picker_sources::{
+        file::{self, FileSourceOptions},
+        records::{StreamControl, StreamSink},
+    };
+    let path = match resolve_file(&options, params) {
+        Ok(path) => path,
+        Err(message) => {
+            crate::error_log::error("picker file", "File failed", &message);
+            *error.lock().unwrap() = Some(message);
+            PublishingStreamingItemStoreWithPayload::new(store).complete();
+            ctx.request_repaint();
+            return None;
+        }
+    };
+    let mut source = FileSourceOptions::new(path);
+    source.reverse = options.reverse;
+    source.line_continuation = options.line_continuation;
+    source.unique = options.unique;
+    let sink = StreamSink {
+        store,
+        payload: SnapshotCellRange::default(),
+        values: command_values,
+        error,
+    };
+    let control = StreamControl {
+        cancelled,
+        changed: Arc::new(move || ctx.request_repaint()),
+        failed: Arc::new(|message| crate::error_log::error("picker file", "File failed", message)),
+    };
+    match file::start(source, sink, control) {
+        Ok(worker) => Some(worker),
+        Err(message) => {
+            crate::error_log::error("picker file", "Worker failed", &message);
+            None
+        }
+    }
+}
+
 type StructuredItems = nfm_picker_sources::structured::StructuredStreamingSnapshot;
 
 /// One output line as a record with exactly `columns` fields. Missing fields
@@ -146,7 +219,7 @@ fn split_record(line: &[u8], delimiter: &str, columns: usize) -> csv::StringReco
 /// accepted value. Returns false once `max_rows` is reached.
 fn add_row(
     rows: &mut nfm_picker_sources::structured::StructuredStreamingStore,
-    values: &CommandValues,
+    values: &StreamValues,
     line: &[u8],
     columns: &CommandColumns,
     max_rows: usize,
@@ -177,7 +250,7 @@ pub(crate) fn start_structured(
     columns: CommandColumns,
     params: BTreeMap<String, String>,
     store: Arc<SnapshotStore<StructuredItems>>,
-    values: CommandValues,
+    values: StreamValues,
     cancelled: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     ctx: egui::Context,
@@ -509,7 +582,7 @@ mod tests {
     #[cfg(windows)]
     fn unique_command_continuation_keeps_accepted_value_by_result_index() {
         let store = Arc::new(SnapshotStore::<Items>::new());
-        let values: CommandValues = Arc::default();
+        let values: StreamValues = Arc::default();
         let error = Arc::new(Mutex::new(None));
         let worker = start(
             CommandOptions {
@@ -553,11 +626,11 @@ mod tests {
         params: BTreeMap<String, String>,
     ) -> (
         Arc<SnapshotStore<StructuredItems>>,
-        CommandValues,
+        StreamValues,
         Arc<Mutex<Option<String>>>,
     ) {
         let store = Arc::new(SnapshotStore::new());
-        let values: CommandValues = Arc::default();
+        let values: StreamValues = Arc::default();
         let error = Arc::new(Mutex::new(None));
         let columns = CommandColumns {
             names: vec!["Hash".into(), "Branch".into(), "Subject".into()],

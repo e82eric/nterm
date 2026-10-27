@@ -1165,6 +1165,7 @@ impl TerminalPane {
                 | crate::picker::config::Source::FileSystem(_)
                 | crate::picker::config::Source::Items(_)
                 | crate::picker::config::Source::Command(_)
+                | crate::picker::config::Source::TextFile(_)
         ) {
             let previous = if replace { self.picker.take() } else { None };
             self.picker = Some(crate::picker::Picker::start_replacing(
@@ -1534,7 +1535,7 @@ impl TerminalPane {
     ) {
         use crate::picker::pipe::Open;
         let (entry, params) = match &request {
-            Open::Named { name, params } => (
+            Open::Named { name, params, .. } => (
                 bindings
                     .named(name)
                     .ok_or_else(|| "unknown named picker".to_owned()),
@@ -1561,14 +1562,17 @@ impl TerminalPane {
         let palette = super::PaletteContext::default();
         self.open_picker(ctx, entry, Some(params), bindings, &palette);
         if let Some(picker) = &mut self.picker {
-            picker.attach_pipe(
-                ctx,
-                session.clone(),
-                match &request {
-                    Open::Stream { options } => Some(options),
-                    _ => None,
-                },
-            );
+            if let Err(message) = picker.attach_pipe(ctx, session.clone(), &request) {
+                session.finish(
+                    "error",
+                    serde_json::json!({"code":"invalid_definition","message":message}),
+                );
+                let picker = self.picker.take().unwrap();
+                let (generation, from_copy) = (picker.generation, picker.from_copy);
+                drop(picker);
+                self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
+                return;
+            }
             picker.bind_pipe_search_wake(self.wake.proxy.clone(), self.wake.window_id);
             session.reply(serde_json::json!({"type":"opened","request_id":session.id}));
         } else {

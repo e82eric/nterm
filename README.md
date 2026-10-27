@@ -921,6 +921,23 @@ Set `unique = true` on a Command picker to retain only the first occurrence
 of each exact accepted value in the process output. Deduplication happens after
 continuation lines are joined. The default is `false`.
 
+`File` streams the lines of a text file without running a process. `path` is
+a file path, or `{name}` for a request parameter such as `{history}`; a
+relative path resolves against `params.cwd`. Set `reverse = true` to read from
+the end so the newest lines appear first, which suits history and log files.
+`line_continuation` and `unique` work as for `Command`: continued lines stay in
+file order within their result in either direction, and with `reverse` the
+`unique` copy kept is the newest. The file's length is read once when the
+picker opens. File pickers only support `SendInput`.
+
+```lua
+ProfileHistory = {
+  type = "File", position = "Cursor", sort = "Source",
+  path = os.getenv("APPDATA") .. "/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
+  reverse = true, line_continuation = "`", unique = true,
+},
+```
+
 #### Shell working directory
 
 Pickers opened with a key binding run commands and previews in the shell's
@@ -1331,6 +1348,20 @@ $path = Get-ChildItem -File |
 'first', 'second', 'third' | Invoke-NtermPicker -PassThruResult
 ```
 
+#### Stream candidates into a named picker
+
+Piping into `-Name` streams the candidates into a configured `type = "Items"`
+picker. The Lua definition keeps its presentation and preview, including
+Command and Dynamic previews that a plain stream cannot use, and only the name
+needs to be in `named`:
+
+```powershell
+# ProfileCompletions in nterm.example.lua previews Get-Help for each value.
+$completions.CompletionMatches |
+    Invoke-NtermPicker -Name ProfileCompletions -Parameters @{ commandName = 'Get-Item' } `
+        -DisplayProperty ListItemText -ValueProperty CompletionText
+```
+
 Enter accepts; Escape cancels. Ctrl+C disconnects the client and cancels its
 picker. Ordinary completion keeps the authenticated connection for the next
 request. Use `Disconnect-NtermPicker` to release it before connecting from
@@ -1349,7 +1380,9 @@ git branch --format='%(refname:short)' | npick --query main
 
 Without a name, each stdin line is a candidate. `--display N` and `--value N`
 show and return tab-separated fields (`-d` sets the separator), and `--json`
-reads `{"text": ..., "value": ...}` lines. It exits 0 with the value on stdout,
+reads `{"text": ..., "value": ...}` lines. With `--stdin NAME`, the stdin lines
+fill the named Items picker instead, which keeps its Lua preview. It exits 0
+with the value on stdout,
 130 when cancelled, and 2 on errors. For example, bind Ctrl+T in bash to insert
 a file:
 

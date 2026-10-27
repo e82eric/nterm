@@ -1028,7 +1028,7 @@ mod tests {
                     panic!("expected open");
                 };
                 match request {
-                    Open::Named { name, params } => {
+                    Open::Named { name, params, .. } => {
                         assert_eq!(name, "demo");
                         assert_eq!(params["query"], "needle");
                     }
@@ -1114,6 +1114,103 @@ mod tests {
                     "disconnected request remained active"
                 );
                 std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    #[test]
+    fn powershell_client_streams_items_into_a_named_picker() {
+        for value_property in [false, true] {
+            let service = Service::new(egui::Context::default()).unwrap();
+            // A named stream needs only the named permission, not allow_stream.
+            service.update(
+                &Policy {
+                    enabled: true,
+                    named: vec!["completions".into()],
+                    ..Default::default()
+                },
+                unsafe { GetCurrentProcessId() },
+                creation(unsafe { GetCurrentProcess() }).unwrap(),
+            );
+            let command = format!(
+                "@([pscustomobject]@{{T='one';V='1'}}, [pscustomobject]@{{T='two';V='2'}}) | Invoke-NtermPicker -Name completions -Parameters @{{commandName='Get-Item'}} -DisplayProperty T {} | ConvertTo-Json -Compress",
+                if value_property {
+                    "-ValueProperty V"
+                } else {
+                    ""
+                }
+            );
+            let mut child = run_client(&service, &command, &service.token);
+            let Event::Open { request, session } = service
+                .events
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+            else {
+                panic!("expected open");
+            };
+            let Open::Named {
+                name,
+                params,
+                stream,
+            } = request
+            else {
+                panic!("expected a named request");
+            };
+            assert_eq!(name, "completions");
+            assert_eq!(params["commandName"], "Get-Item");
+            assert!(stream);
+            session.reply(json!({"type":"opened","request_id":session.id}));
+            let mut received = Vec::new();
+            loop {
+                match service
+                    .events
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                {
+                    Event::Items {
+                        sequence,
+                        items,
+                        session,
+                    } => {
+                        received.extend(items);
+                        session.reply(
+                            json!({"type":"ack","request_id":session.id,"sequence":sequence}),
+                        );
+                    }
+                    Event::End { session } => {
+                        session.reply(json!({"type":"input_complete","request_id":session.id}));
+                        break;
+                    }
+                    Event::Open { .. } => panic!("unexpected second open"),
+                }
+            }
+            let texts: Vec<_> = received.iter().map(|item| item.text.as_str()).collect();
+            assert_eq!(texts, ["one", "two"]);
+            let selected = &received[1];
+            assert_eq!(selected.value, if value_property { "2" } else { "two" });
+            session.finish(
+                "accepted",
+                json!({"selected":[{"id":selected.id,"text":selected.text,"value":selected.value}]}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    panic!("client stalled");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+            if value_property {
+                assert_eq!(result, "2");
+            } else {
+                // Without -ValueProperty the original piped object comes back.
+                assert_eq!(result, json!({"T":"two","V":"2"}));
             }
         }
     }
@@ -1519,7 +1616,7 @@ fn serve_request(
         )?;
         return Ok(());
     }
-    let stream = matches!(request, Open::Stream { .. });
+    let stream = request.streams_items();
     let capability = match &request {
         Open::Named { name, .. } => Capability::Named(name.clone()),
         Open::Stream { .. } => Capability::Stream,

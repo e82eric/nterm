@@ -2,11 +2,11 @@
 -- Lua reads text/images; directory previews use preview.directory_items and video previews use
 -- configurable ffmpeg/ffprobe commands. Help/history command previews require pwsh with
 -- -CommandWithArgs (history also uses bat). Text search requires rg; ProfileHistory
--- additionally requires PowershellHistoryReader.exe.
+-- reads the PSReadLine history file directly, newest first.
 -- Snippets use GHOSTTY_SNIPPETS_FILE or ~/ghostty-snippets.json, with initial JSON:
 -- {"snippets": []}. SaveSnippet writes to that file.
 -- CodexSuggestions invokes codex exec and sends the current terminal context.
--- profile.example.ps1 uses ProfileFiles/ProfileDirectories and streamed requests.
+-- profile.example.ps1 uses the Profile* named pickers and streamed requests.
 
 -- Config lookup: --lua-config=PATH, then ~/nterm.lua, then nterm.lua beside
 -- the executable. Only the first available file is loaded.
@@ -339,11 +339,14 @@ return {
       preview = rg_preview(),
     },
     ProfileHistory = {
-      type = "Command", args = {"PowershellHistoryReader.exe"},
+      -- params.history is the PSReadLine history file, read newest first.
+      type = "File", path = "{history}", reverse = true,
       line_continuation = "`", unique = true, sort = "SourceOrder", position = "Cursor",
       preview_visible = false,
       preview = profile_preview([==[$args[0] | & bat.exe --color=always --paging=never --wrap=never --style=plain --language=ps1 --theme="Visual Studio Dark+"]==]),
     },
+    -- profile.example.ps1 streams CompletionMatches into this Items picker
+    -- (piped into Invoke-NtermPicker -Name); the preview runs Get-Help.
     ProfileCompletions = {
       type="Items",items=nterm.json_parse("[]"),position="Cursor",preview_visible=true,
       preview=profile_preview(pipe_help_preview,"commandName"),

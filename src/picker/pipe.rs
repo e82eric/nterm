@@ -40,11 +40,21 @@ pub(crate) enum Open {
         name: String,
         #[serde(default)]
         params: std::collections::BTreeMap<String, String>,
+        /// The client sends the items of this Items picker in `items` frames,
+        /// as for a stream; the configured definition supplies the preview.
+        #[serde(default)]
+        stream: bool,
     },
     Stream {
         #[serde(default)]
         options: StreamOptions,
     },
+}
+impl Open {
+    /// Whether `items` and `end_items` frames follow this request.
+    pub(crate) fn streams_items(&self) -> bool {
+        matches!(self, Self::Stream { .. } | Self::Named { stream: true, .. })
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -159,7 +169,7 @@ impl Policy {
             return Err("picker pipe is disabled in Lua configuration".into());
         }
         match request {
-            Open::Named { name, params } => {
+            Open::Named { name, params, .. } => {
                 if !self.named.contains(name) {
                     return Err("named picker is not exposed to IPC".into());
                 }
@@ -320,10 +330,38 @@ mod tests {
             policy
                 .authorize(&Open::Named {
                     name: "files".into(),
-                    params: Default::default()
+                    params: Default::default(),
+                    stream: false,
                 })
                 .is_err()
         );
+    }
+    #[test]
+    fn named_stream_needs_only_the_named_permission() {
+        let Message::Open { request, .. } = parse(br#"{"type":"open","request_id":"r","request":{"kind":"named","name":"completions","params":{"commandName":"Get-Item"},"stream":true}}"#).unwrap() else {
+            panic!("expected open");
+        };
+        assert!(request.streams_items());
+        let Message::Open { request: plain, .. } = parse(
+            br#"{"type":"open","request_id":"r","request":{"kind":"named","name":"completions"}}"#,
+        )
+        .unwrap() else {
+            panic!("expected open");
+        };
+        assert!(!plain.streams_items());
+        // The configuration defines the picker, so allow_stream is not needed.
+        let policy = Policy {
+            enabled: true,
+            named: vec!["completions".into()],
+            ..Default::default()
+        };
+        assert!(policy.authorize(&request).is_ok());
+        let unlisted = Policy {
+            enabled: true,
+            allow_stream: true,
+            ..Default::default()
+        };
+        assert!(unlisted.authorize(&request).is_err());
     }
     #[test]
     fn only_one_terminal_result_wins() {

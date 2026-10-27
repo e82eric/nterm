@@ -338,6 +338,20 @@ pub(crate) enum DefinitionSource {
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     },
+    /// The lines of a text file, newest first with `reverse`.
+    File {
+        path: String,
+        #[serde(default)]
+        reverse: bool,
+        #[serde(default)]
+        line_continuation: Option<String>,
+        #[serde(default)]
+        unique: Option<bool>,
+        #[serde(default)]
+        enter_action: Option<EnterAction>,
+        #[serde(skip)]
+        callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
+    },
     FileSystem {
         #[serde(default)]
         roots: Vec<String>,
@@ -559,6 +573,39 @@ impl Definition {
                     EnterAction::SendInput,
                 )
             }
+            DefinitionSource::File {
+                path,
+                reverse,
+                line_continuation,
+                unique,
+                ..
+            } => {
+                if path.trim().is_empty() || path.contains('\0') {
+                    return Err(format!("pickers.{name}.path must be a nonempty path"));
+                }
+                if line_continuation
+                    .as_ref()
+                    .is_some_and(|value| value.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n')))
+                {
+                    return Err(format!(
+                        "pickers.{name}.line_continuation cannot contain NUL or a newline; use a literal continuation marker"
+                    ));
+                }
+                if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
+                    return Err(format!(
+                        "pickers.{name}: File only supports enter_action SendInput"
+                    ));
+                }
+                (
+                    Source::TextFile(TextFileOptions {
+                        path,
+                        reverse,
+                        line_continuation: line_continuation.filter(|value| !value.is_empty()),
+                        unique: unique.unwrap_or(defaults.unique),
+                    }),
+                    EnterAction::SendInput,
+                )
+            }
             DefinitionSource::FileSystem {
                 roots,
                 max_depth,
@@ -598,6 +645,8 @@ impl Definition {
                 )
             }
         };
+        // A file streams through the command picker's source.
+        let label = matches!(source, Source::TextFile(_)).then_some("FILE PICKER");
         let mut options = Options {
             scope,
             position,
@@ -610,7 +659,7 @@ impl Definition {
             params: BTreeMap::new(),
             preview: None,
             preview_visible,
-            label: None,
+            label,
         };
         if let Some(query) = initial_query {
             options.params.insert("query".into(), query);
@@ -656,6 +705,7 @@ impl Definition {
             DefinitionSource::Scrollback { callback, .. }
             | DefinitionSource::FileSystem { callback, .. }
             | DefinitionSource::Command { callback, .. }
+            | DefinitionSource::File { callback, .. }
             | DefinitionSource::Items { callback, .. } => *callback = Some(value),
             DefinitionSource::Factory { .. }
             | DefinitionSource::ErrorLog { .. }
@@ -686,6 +736,11 @@ impl Definition {
                 enter_action,
                 ..
             }
+            | DefinitionSource::File {
+                callback,
+                enter_action,
+                ..
+            }
             | DefinitionSource::FileSystem {
                 callback,
                 enter_action,
@@ -704,6 +759,7 @@ impl Definition {
             DefinitionSource::Scrollback { callback, .. }
             | DefinitionSource::FileSystem { callback, .. }
             | DefinitionSource::Command { callback, .. }
+            | DefinitionSource::File { callback, .. }
             | DefinitionSource::Items { callback, .. } => callback.as_ref(),
             DefinitionSource::Factory { .. }
             | DefinitionSource::ErrorLog { .. }
@@ -771,6 +827,7 @@ pub(crate) enum Source {
     FileSystem(FileOptions),
     Items(ItemsOptions),
     Command(CommandOptions),
+    TextFile(TextFileOptions),
 }
 
 #[derive(Clone)]
@@ -788,6 +845,16 @@ pub(crate) struct CommandOptions {
     pub(crate) success_exit_codes: Option<Vec<i32>>,
     /// Split each output line into these columns for a structured picker.
     pub(crate) columns: Option<CommandColumns>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TextFileOptions {
+    /// A path, or `{name}` for a request parameter. Relative paths resolve
+    /// against the `cwd` parameter.
+    pub(crate) path: String,
+    pub(crate) reverse: bool,
+    pub(crate) line_continuation: Option<String>,
+    pub(crate) unique: bool,
 }
 
 #[derive(Clone)]
@@ -1134,6 +1201,11 @@ impl Bindings {
                             .and_then(|arg| arg.strip_suffix('}'))
                             .is_none_or(|name| options.params.contains_key(name))
                     }),
+                    Source::TextFile(file) => file
+                        .path
+                        .strip_prefix('{')
+                        .and_then(|path| path.strip_suffix('}'))
+                        .is_none_or(|name| options.params.contains_key(name)),
                     _ => true,
                 },
             })
@@ -1888,6 +1960,34 @@ mod tests {
             assert!(consumed);
             assert_eq!(open.is_some(), !repeat);
             assert!(matches!(&events[..], [egui::Event::Text(text)] if text == "x"));
+        }
+    }
+
+    #[test]
+    fn file_picker_resolves_and_validates_its_options() {
+        let resolve = |definition: serde_json::Value| {
+            let definitions =
+                BTreeMap::from([("test".into(), serde_json::from_value(definition).unwrap())]);
+            Bindings::compile(Some(definitions), Some(Vec::new()))
+                .and_then(|bindings| bindings.named("test").unwrap().resolve(&Default::default()))
+        };
+        let options = resolve(serde_json::json!({
+            "type": "File", "path": "{history}", "reverse": true,
+            "line_continuation": "`", "unique": true,
+        }))
+        .unwrap();
+        assert_eq!(options.label, Some("FILE PICKER"));
+        let Source::TextFile(file) = options.source else {
+            panic!("expected a file source");
+        };
+        assert!(file.reverse && file.unique);
+        assert_eq!(file.line_continuation.as_deref(), Some("`"));
+        for invalid in [
+            serde_json::json!({ "type": "File", "path": "" }),
+            serde_json::json!({ "type": "File", "path": "x", "line_continuation": "\n" }),
+            serde_json::json!({ "type": "File", "path": "x", "enter_action": "Navigate" }),
+        ] {
+            assert!(resolve(invalid).is_err());
         }
     }
 

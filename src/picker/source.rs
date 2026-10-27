@@ -70,7 +70,7 @@ pub(super) enum PickerSource {
     },
     Command {
         runtime: Runtime,
-        values: Option<command::CommandValues>,
+        values: Option<command::StreamValues>,
     },
 }
 
@@ -209,11 +209,16 @@ impl PickerSource {
         ctx: egui::Context,
         options: &mut config::Options,
     ) -> (Self, Arc<std::sync::Mutex<Option<String>>>) {
-        let store = Arc::new(if matches!(&options.source, config::Source::Command(_)) {
-            SnapshotStore::new_append_only()
-        } else {
-            SnapshotStore::new()
-        });
+        let store = Arc::new(
+            if matches!(
+                &options.source,
+                config::Source::Command(_) | config::Source::TextFile(_)
+            ) {
+                SnapshotStore::new_append_only()
+            } else {
+                SnapshotStore::new()
+            },
+        );
         let error = Arc::new(std::sync::Mutex::new(None));
         if let crate::picker::config::Source::Items(items) = &mut options.source {
             if let Some(provider) = &items.provider {
@@ -238,6 +243,11 @@ impl PickerSource {
         let command_values = match &options.source {
             crate::picker::config::Source::Command(config)
                 if config.line_continuation.is_some() || config.columns.is_some() =>
+            {
+                Some(Arc::default())
+            }
+            crate::picker::config::Source::TextFile(config)
+                if config.line_continuation.is_some() =>
             {
                 Some(Arc::default())
             }
@@ -299,9 +309,9 @@ impl PickerSource {
                     store: Arc::new(SnapshotStore::new()),
                 }
             }
-            crate::picker::config::Source::Items(_) | crate::picker::config::Source::Command(_) => {
-                Session::Streaming
-            }
+            crate::picker::config::Source::Items(_)
+            | crate::picker::config::Source::Command(_)
+            | crate::picker::config::Source::TextFile(_) => Session::Streaming,
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let document = Arc::new(std::sync::OnceLock::new());
@@ -329,6 +339,16 @@ impl PickerSource {
             crate::picker::command::start(
                 config.clone(),
                 options.params.clone(),
+                store.clone(),
+                cancelled.clone(),
+                error.clone(),
+                ctx.clone(),
+                command_values.clone(),
+            )
+        } else if let crate::picker::config::Source::TextFile(config) = &options.source {
+            crate::picker::command::start_file(
+                config.clone(),
+                &options.params,
                 store.clone(),
                 cancelled.clone(),
                 error.clone(),
@@ -493,7 +513,7 @@ impl PickerSource {
                 runtime,
                 values: item_values,
             },
-            config::Source::Command(_) => Self::Command {
+            config::Source::Command(_) | config::Source::TextFile(_) => Self::Command {
                 runtime,
                 values: command_values,
             },
@@ -524,6 +544,9 @@ impl PickerSource {
     }
     pub(super) fn is_filesystem(&self) -> bool {
         matches!(self, Self::FileSystem(_))
+    }
+    pub(super) fn is_items(&self) -> bool {
+        matches!(self, Self::Items { .. })
     }
     pub(super) fn label(&self) -> &'static str {
         match self {

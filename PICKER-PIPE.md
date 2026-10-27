@@ -14,8 +14,7 @@ Use `nterm.example.lua`, or merge these entries into your Lua configuration
 ```lua
 picker_pipe = {
   enabled = true,
-  allow_stream = true,
-  named = { "ProfileFiles", "ProfileDirectories" },
+  named = { "ProfileFiles", "ProfileDirectories", "ProfileRipgrep", "ProfileHistory", "ProfileCompletions" },
 },
 pickers = {
   ProfileFiles = {
@@ -25,6 +24,19 @@ pickers = {
   ProfileDirectories = {
     type = "FileSystem", roots = { "." }, directories_only = true,
     position = "Cursor", preview_visible = false,
+  },
+  ProfileRipgrep = {
+    type = "Command", position = "Cursor", success_exit_codes = { 0, 1 },
+    args = { "rg", "--no-messages", "--color=never", "-i", "--vimgrep", "--", "{pattern}" },
+  },
+  ProfileHistory = {
+    type = "File", path = "{history}", reverse = true,
+    position = "Cursor", sort = "Source", line_continuation = "`", unique = true,
+  },
+  -- The profile streams its completions into this Items picker. For a
+  -- Get-Help preview, copy ProfileCompletions' preview from nterm.example.lua.
+  ProfileCompletions = {
+    type = "Items", items = nterm.json_parse("[]"), position = "Cursor",
   },
 },
 ```
@@ -42,13 +54,22 @@ PSReadLine's saved history, Ctrl+Shift+G searches with `rg` and inserts an `nvim
 command for review, and Ctrl+Space opens PowerShell completions. Customize the
 editor command and shortcuts as needed; dot-sourcing replaces those bindings.
 
-PowerShell 7.3+ and PSReadLine are required. Ripgrep is optional for text search,
-and `fzf` on `PATH` enables the fallback outside nterm. File and directory
-bindings use nterm's builtin FileWalker through the named FileSystem pickers,
-passing the selected roots and current directory. Outside nterm they enumerate
-with `Get-ChildItem`; no `fd` or custom history-reader executable is required.
-History, text search, and completions use streamed requests and collect candidates
-before opening the picker. Command previews are optional in `nterm.example.lua`.
+PowerShell 7.4+ (for `-CommandWithArgs`) and PSReadLine are required. Ripgrep
+is optional for text search.
+The script does nothing outside an nterm pane: it returns unless
+`NTERM_PICKER_ENDPOINT` and `NTERM_PICKER_TOKEN` are set, and loads
+`Invoke-NtermPicker.ps1` only when `Invoke-NtermPicker` is not already defined.
+File and directory bindings use nterm's builtin FileWalker through the named
+FileSystem pickers, passing the selected roots and current directory; no `fd` or
+custom history-reader executable is required.
+History and text search open the ProfileHistory and ProfileRipgrep Command
+pickers, so nterm runs the command and results appear as they arrive. History
+passes PSReadLine's `HistorySavePath` as `params.history`. Completions pipe
+PowerShell's matches into the ProfileCompletions Items picker (a named stream,
+see [Requests](#requests)), so the Lua configuration supplies the preview and
+there is no item cap below the stream limits. Command previews are optional in
+`nterm.example.lua`. The profile sends no client-defined streams, so
+`allow_stream` can stay `false`.
 Fresh connections avoid retaining the pane's connection slot between requests;
 profile initialization still connects until the first request completes. Run
 `Disconnect-NtermPicker` before starting another PowerShell process in that pane.
@@ -84,6 +105,10 @@ Get-ChildItem | Invoke-NtermPicker -DisplayProperty Name
 
 # Stream display/value pairs; return the selected FullName property.
 Get-ChildItem | Invoke-NtermPicker -DisplayProperty Name -ValueProperty FullName
+
+# Stream items into a configured Items picker, which keeps its Lua preview.
+# Needs only the name in picker_pipe.named, not allow_stream.
+Get-ChildItem | Invoke-NtermPicker -Name ProfileCompletions -DisplayProperty Name -ValueProperty FullName
 
 # Inspect the complete result, including status and selected IDs.
 'first', 'second', 'third' | Invoke-NtermPicker -PassThruResult
@@ -204,6 +229,23 @@ Stream options also accept a static `Text` or `Ansi` preview in the existing
 preview schema. Command previews are rejected. Streamed items do not currently
 support per-item previews or updates.
 
+A named request with `"stream":true` combines the two: the configured picker
+supplies the presentation and preview (including Command and Dynamic previews),
+and the client supplies its items in `items` frames as described below.
+
+```json
+{"type":"open","request_id":"r1","request":{"kind":"named","name":"ProfileCompletions","params":{"commandName":"Get-Item"},"stream":true}}
+```
+
+The name must be listed in `picker_pipe.named`; `allow_stream` is not required,
+because the configuration, not the client, defines the picker and its preview.
+The picker must be `type = "Items"`, or the request fails with
+`invalid_definition`. Streamed items replace any configured `items`. Previews
+receive each item's `value` when it is a string, otherwise its JSON encoding;
+the result returns the client's item ID and value, as for a stream.
+`Invoke-NtermPicker` sends this request when input is piped to `-Name`, and
+`npick --stdin NAME` sends it with the lines of stdin.
+
 Server sends `opened` after UI creation, or a terminal error result. Another
 active overlay returns `busy`. There is one pipe connection slot per pane;
 another client waits at most five seconds to connect and fails if it remains
@@ -239,7 +281,8 @@ accepted before input completion. Version 1 returns a single selection:
 ```
 
 Named results use the selected source index as their ID and return
-the source's normal accepted value. They bypass application actions, terminal
+the source's normal accepted value; a named stream returns the streamed item's
+ID and value instead. They bypass application actions, terminal
 insertion, and configured acceptance callbacks.
 
 Cancellation:
@@ -307,6 +350,7 @@ npick files                       # a named picker; prints the selected value
 npick root_cd                     # params: npick NAME KEY=VALUE...
 fd -t f | npick --query src       # stream lines from stdin
 ps -eo pid,comm | npick -d ' ' --value 1
+compgen -c | npick --stdin completions   # stdin into a named Items picker
 ```
 
 Named requests add the caller's directory as `params.cwd` unless given. It

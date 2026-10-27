@@ -91,21 +91,36 @@ impl Picker {
         &mut self,
         ctx: &egui::Context,
         session: Arc<pipe::Session>,
-        stream: Option<&pipe::StreamOptions>,
-    ) {
+        request: &pipe::Open,
+    ) -> Result<(), String> {
         self.pipe_session = Some(session.clone());
-        if let Some(options) = stream {
-            self.pipe_publisher = Some(self.source.begin_pipe_stream());
-            self.shared
-                .replace_source(ctx, self.source.provider(), &options.initial_query);
-            self.result_rows = options.result_rows.unwrap_or(7);
-            self.preview_rows = options.preview_rows.unwrap_or(14);
-            self.shared.set_presentation(
-                self.result_rows,
-                self.preview_rows,
-                options.preview_visible,
-            );
+        match request {
+            pipe::Open::Stream { options } => {
+                self.pipe_publisher = Some(self.source.begin_pipe_stream());
+                self.shared
+                    .replace_source(ctx, self.source.provider(), &options.initial_query);
+                self.result_rows = options.result_rows.unwrap_or(7);
+                self.preview_rows = options.preview_rows.unwrap_or(14);
+                self.shared.set_presentation(
+                    self.result_rows,
+                    self.preview_rows,
+                    options.preview_visible,
+                );
+            }
+            // The definition keeps its presentation and preview; only its
+            // items come from the client.
+            pipe::Open::Named { stream: true, .. } => {
+                if !self.source.is_items() {
+                    return Err("streamed items require an Items picker".into());
+                }
+                self.pipe_publisher = Some(self.source.begin_pipe_stream());
+                let query = self.shared.query().to_owned();
+                self.shared
+                    .replace_source(ctx, self.source.provider(), query);
+            }
+            pipe::Open::Named { .. } => {}
         }
+        Ok(())
     }
     pub(crate) fn bind_pipe_search_wake(
         &self,

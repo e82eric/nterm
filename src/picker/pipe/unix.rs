@@ -527,7 +527,7 @@ fn serve_request(
         )?;
         return Ok(());
     }
-    let stream_items = matches!(request, Open::Stream { .. });
+    let stream_items = request.streams_items();
     let capability = match &request {
         Open::Named { name, .. } => Capability::Named(name.clone()),
         Open::Stream { .. } => Capability::Stream,
@@ -768,7 +768,7 @@ mod tests {
         let Event::Open { request, session } = next_event(&service) else {
             panic!("expected open");
         };
-        let Open::Named { name, params } = request else {
+        let Open::Named { name, params, .. } = request else {
             panic!("expected a named request");
         };
         assert_eq!((name.as_str(), params["cwd"].as_str()), ("files", "/tmp"));

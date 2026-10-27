@@ -2,6 +2,8 @@
 //!
 //!   npick [OPTIONS] NAME [KEY=VALUE...]   open a named picker from nterm.lua
 //!   COMMAND | npick [OPTIONS]             pick one of the lines on stdin
+//!   COMMAND | npick --stdin NAME [KEY=VALUE...]
+//!                                         stream stdin into a named Items picker
 //!
 //! Exits 0 with the selected value on stdout, 130 when cancelled, and 2 on
 //! errors, so `sel=$(npick ...) || return` works in scripts.
@@ -42,11 +44,13 @@ mod unix {
     const USAGE: &str = "\
 Usage: npick [OPTIONS] NAME [KEY=VALUE...]
        COMMAND | npick [OPTIONS]
+       COMMAND | npick --stdin [OPTIONS] NAME [KEY=VALUE...]
 
 Opens a picker in the nterm pane this shell runs in and prints the
 selected value. NAME opens a picker from nterm.lua; it must be listed in
 picker_pipe.named. Without NAME, each line of stdin is a candidate
-(picker_pipe.allow_stream must be true).
+(picker_pipe.allow_stream must be true). With --stdin and NAME, stdin
+fills that named Items picker, which keeps its configured preview.
 
 Options:
   -q, --query TEXT       initial query
@@ -56,6 +60,7 @@ Options:
       --display N        show field N (1-based) instead of the whole line
       --value N          return field N instead of the whole line
       --json             each line is {\"text\": ..., \"value\": ...}
+      --stdin            stream stdin into the named picker NAME
       --preview TEXT     show a text preview; {item} is the item's value
   -h, --help             show this help
 
@@ -70,6 +75,7 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         pub(crate) display: Option<usize>,
         pub(crate) value: Option<usize>,
         pub(crate) json: bool,
+        pub(crate) stdin: bool,
         pub(crate) preview: Option<String>,
         pub(crate) name: Option<String>,
         pub(crate) params: Vec<(String, String)>,
@@ -116,6 +122,7 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
                 "--display" => parsed.display = Some(field("--display", value())?),
                 "--value" => parsed.value = Some(field("--value", value())?),
                 "--json" => parsed.json = true,
+                "--stdin" => parsed.stdin = true,
                 "--preview" => parsed.preview = Some(value().ok_or("--preview needs a value")?),
                 "--" => {
                     for rest in args.by_ref() {
@@ -130,6 +137,9 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         }
         if parsed.json && (parsed.display.is_some() || parsed.value.is_some()) {
             return Err("--json cannot be combined with --display or --value".into());
+        }
+        if parsed.stdin && parsed.name.is_none() {
+            return Err("--stdin needs a picker NAME".into());
         }
         Ok(parsed)
     }
@@ -195,6 +205,9 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
                     .entry("query")
                     .or_insert_with(|| query.clone().into());
             }
+            if args.stdin {
+                return json!({"kind": "named", "name": name, "params": params, "stream": true});
+            }
             return json!({"kind": "named", "name": name, "params": params});
         }
         let mut options = Map::new();
@@ -229,7 +242,7 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
             .filter(|v| !v.is_empty())
             .ok_or("NTERM_PICKER_TOKEN is not set")?;
         let request = request(&args);
-        let items = if args.name.is_some() {
+        let items = if args.name.is_some() && !args.stdin {
             None
         } else {
             if std::io::stdin().is_terminal() {
@@ -325,8 +338,20 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         }
 
         #[test]
+        fn stdin_streams_into_a_named_picker() {
+            let parsed = args(&["--stdin", "--display", "1", "completions", "commandName=ls"]);
+            let streamed = request(&parsed);
+            assert_eq!(streamed["kind"], "named");
+            assert_eq!(streamed["name"], "completions");
+            assert_eq!(streamed["params"]["commandName"], "ls");
+            assert_eq!(streamed["stream"], true);
+            assert!(request(&args(&["completions"])).get("stream").is_none());
+        }
+
+        #[test]
         fn rejects_invalid_arguments() {
             for list in [
+                &["--stdin"][..],
                 &["--bogus"][..],
                 &["--rows", "0"],
                 &["--display", "0"],
