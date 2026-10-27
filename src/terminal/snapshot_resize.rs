@@ -178,20 +178,19 @@ impl TerminalPane {
                 }
             })
             .flatten();
-        let mut map = ghostty_ffi::SnapshotReflowMap::default();
-        if !unsafe { ghostty_ffi::nterm_host_snapshot_resize(self.host, generation, &mut map) } {
+        // Ghostty carries every retained position through the reflow in place.
+        if !unsafe {
+            ghostty_ffi::nterm_host_snapshot_resize(
+                self.host,
+                generation,
+                cells.as_mut_ptr(),
+                cells.len(),
+            )
+        } {
             return Err("Unable to reflow snapshot".into());
         }
         // Resizing clears every decoration.
         self.decorated_viewport.set(None);
-        for cell in &mut cells {
-            *cell = map
-                .translate(*cell)
-                .ok_or("Unable to translate snapshot position after reflow")?;
-        }
-        // All controllers reuse the same indexed map; no terminal scans or
-        // per-position FFI calls are needed. Release it before rebuilding UI.
-        drop(map);
         let mut view = SnapshotView::default();
         if !unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view) } {
             return Err("Resized snapshot unavailable".into());

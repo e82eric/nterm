@@ -500,9 +500,9 @@ bool nterm_host_snapshot_view(
 ) {
     ghostty_clear_error(); bool succeeded = ghostty_surface_snapshot_view(host->surface, generation, view); runtime_error(host, "nterm_host_snapshot_view"); return succeeded; }
 bool nterm_host_snapshot_resize(NtermHost *host, uint64_t generation,
-    ghostty_snapshot_reflow_map_s *result) {
+    ghostty_snapshot_cell_s *cells, size_t count) {
     ghostty_clear_error();
-    return ghostty_surface_snapshot_resize(host->surface, generation, result);
+    return ghostty_surface_snapshot_resize(host->surface, generation, cells, count);
 }
 bool nterm_host_snapshot_selection_text(
     NtermHost *host, uint64_t generation,

@@ -93,88 +93,6 @@ pub(crate) struct SnapshotLogicalRange {
     pub end: SnapshotLogicalPosition,
 }
 
-/// One run in a frozen terminal's resize translation map.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ReflowSegment {
-    pub old_row: u64,
-    pub new_row: u64,
-    pub old_column: u32,
-    pub new_column: u32,
-    pub count: u32,
-    pub step: u32,
-}
-
-/// Owns Zig's immutable map buffers until Drop. Never borrows terminal pages.
-#[repr(C)]
-#[derive(Default)]
-pub(crate) struct SnapshotReflowMap {
-    pub handle: *mut c_void,
-    pub segments: *const ReflowSegment,
-    pub segment_count: usize,
-    pub row_offsets: *const u32,
-    pub old_rows: u64,
-    pub new_rows: u64,
-    pub old_columns: u32,
-    pub new_columns: u32,
-}
-
-impl SnapshotReflowMap {
-    pub(crate) fn translate(&self, cell: SnapshotCell) -> Option<SnapshotCell> {
-        if cell.y >= self.old_rows
-            || cell.x >= self.old_columns
-            || self.row_offsets.is_null()
-            || self.segments.is_null()
-        {
-            return None;
-        }
-        let row = usize::try_from(cell.y).ok()?;
-        // The C API owns an immutable old_rows+1 offset array and segment_count
-        // segment array for this value's entire lifetime.
-        let (mut lo, mut hi) = unsafe {
-            (
-                *self.row_offsets.add(row) as usize,
-                *self.row_offsets.add(row + 1) as usize,
-            )
-        };
-        if lo > hi || hi > self.segment_count {
-            return None;
-        }
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let segment = unsafe { *self.segments.add(mid) };
-            if cell.x < segment.old_column {
-                hi = mid;
-            } else if cell.x - segment.old_column >= segment.count {
-                lo = mid + 1;
-            } else {
-                let x = segment
-                    .new_column
-                    .checked_add((cell.x - segment.old_column).checked_mul(segment.step)?)?;
-                return (x < self.new_columns && segment.new_row < self.new_rows).then_some(
-                    SnapshotCell {
-                        x,
-                        y: segment.new_row,
-                    },
-                );
-            }
-        }
-        None
-    }
-}
-
-impl Drop for SnapshotReflowMap {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { ghostty_snapshot_reflow_map_free(self) };
-        }
-    }
-}
-
-unsafe extern "C" {
-    fn ghostty_snapshot_reflow_map_free(map: *mut SnapshotReflowMap);
-}
-
 #[cfg(all(test, target_pointer_width = "64"))]
 mod copy_mode_abi_tests {
     use super::{SnapshotCell, SnapshotCellRange, SnapshotView};
@@ -182,12 +100,6 @@ mod copy_mode_abi_tests {
 
     #[test]
     fn shared_copy_types_match_native_snapshot_layout() {
-        assert_eq!(size_of::<super::ReflowSegment>(), 32);
-        assert_eq!(offset_of!(super::ReflowSegment, old_column), 16);
-        assert_eq!(offset_of!(super::ReflowSegment, step), 28);
-        assert_eq!(size_of::<super::SnapshotReflowMap>(), 56);
-        assert_eq!(offset_of!(super::SnapshotReflowMap, row_offsets), 24);
-        assert_eq!(offset_of!(super::SnapshotReflowMap, old_columns), 48);
         assert_eq!(size_of::<SnapshotCell>(), 16);
         assert_eq!(align_of::<SnapshotCell>(), 8);
         assert_eq!(offset_of!(SnapshotCell, x), 0);
@@ -224,66 +136,6 @@ mod copy_mode_abi_tests {
         assert_eq!(resolve_cell_in_row(&widths, cell(2), true), Some(cell(3)));
         assert_eq!(resolve_cell_in_row(&widths, cell(4), false), None);
         assert_eq!(resolve_cell_in_row(&[2, 0], cell(1), true), Some(cell(0)));
-    }
-
-    #[test]
-    fn reflow_map_indexes_split_rows_and_collapsed_padding() {
-        use super::{ReflowSegment, SnapshotReflowMap};
-        let segments = [
-            ReflowSegment {
-                old_row: 0,
-                new_row: 0,
-                old_column: 0,
-                new_column: 0,
-                count: 6,
-                step: 1,
-            },
-            ReflowSegment {
-                old_row: 0,
-                new_row: 1,
-                old_column: 6,
-                new_column: 0,
-                count: 6,
-                step: 1,
-            },
-            ReflowSegment {
-                old_row: 1,
-                new_row: 2,
-                old_column: 0,
-                new_column: 0,
-                count: 3,
-                step: 1,
-            },
-            ReflowSegment {
-                old_row: 1,
-                new_row: 2,
-                old_column: 3,
-                new_column: 2,
-                count: 9,
-                step: 0,
-            },
-        ];
-        let offsets = [0, 2, 4];
-        let map = SnapshotReflowMap {
-            segments: segments.as_ptr(),
-            segment_count: segments.len(),
-            row_offsets: offsets.as_ptr(),
-            old_rows: 2,
-            new_rows: 3,
-            old_columns: 12,
-            new_columns: 6,
-            ..Default::default()
-        };
-        assert_eq!(
-            map.translate(SnapshotCell { x: 10, y: 0 }),
-            Some(SnapshotCell { x: 4, y: 1 })
-        );
-        assert_eq!(
-            map.translate(SnapshotCell { x: 11, y: 1 }),
-            Some(SnapshotCell { x: 2, y: 2 })
-        );
-        assert_eq!(map.translate(SnapshotCell { x: 12, y: 0 }), None);
-        assert_eq!(map.translate(SnapshotCell { x: 0, y: 2 }), None);
     }
 }
 
@@ -536,7 +388,8 @@ unsafe extern "C" {
     pub(crate) fn nterm_host_snapshot_resize(
         host: *mut Host,
         generation: u64,
-        result: *mut SnapshotReflowMap,
+        cells: *mut SnapshotCell,
+        count: usize,
     ) -> bool;
     pub(crate) fn nterm_host_snapshot_selection_text(
         host: *mut Host,
