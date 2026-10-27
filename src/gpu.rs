@@ -19,13 +19,10 @@ pub(crate) struct SharedGpu {
 }
 
 impl SharedGpu {
-    /// DX12 on Windows and Vulkan elsewhere, unless WGPU_BACKEND overrides it.
+    /// Vulkan, unless WGPU_BACKEND overrides it. wgpu's DX12 swapchain
+    /// stretches the previous image while a window resizes.
     fn backends() -> wgpu::Backends {
-        wgpu::Backends::from_env().unwrap_or(if cfg!(windows) {
-            wgpu::Backends::DX12
-        } else {
-            wgpu::Backends::VULKAN
-        })
+        wgpu::Backends::from_env().unwrap_or(wgpu::Backends::VULKAN)
     }
 
     pub fn new() -> Result<Self, String> {
