@@ -129,7 +129,7 @@ fn unpack(rgb: u32) -> Color32 {
     Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
-fn blend(a: Color32, b: Color32, amount: f32) -> Color32 {
+pub(crate) fn blend(a: Color32, b: Color32, amount: f32) -> Color32 {
     let mix = |a: u8, b: u8| (f32::from(a) * (1.0 - amount) + f32::from(b) * amount).round() as u8;
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }

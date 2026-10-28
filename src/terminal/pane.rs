@@ -838,7 +838,7 @@ impl TerminalPane {
         let label = if let Some(picker) = &self.picker {
             picker.label()
         } else if let Some(quick) = &self.quick_select {
-            if matches!(quick.purpose, QuickSelectPurpose::YankLines { .. }) {
+            if matches!(quick.purpose(), QuickSelectPurpose::YankLines { .. }) {
                 "YANK LINES"
             } else {
                 "QUICK SELECT"
@@ -956,7 +956,7 @@ impl TerminalPane {
                 }
                 quick_select::InputAction::Select { cell, shifted } => {
                     if matches!(
-                        self.quick_select.as_ref().map(|quick| quick.purpose),
+                        self.quick_select.as_ref().map(|quick| quick.purpose()),
                         Some(QuickSelectPurpose::YankLines { .. })
                     ) {
                         self.complete_quick_select(ui.ctx(), cell);
@@ -1884,7 +1884,7 @@ impl TerminalPane {
         let Some(quick) = &self.quick_select else {
             return false;
         };
-        let (generation, from_copy, purpose) = (quick.generation, quick.from_copy, quick.purpose);
+        let (generation, from_copy, purpose) = (quick.generation, quick.from_copy, quick.purpose());
         let host = self.quick_host();
         let mut view = SnapshotView::default();
         if !unsafe { ghostty_ffi::nterm_host_snapshot_view(host, generation, &mut view) } {
@@ -1899,7 +1899,7 @@ impl TerminalPane {
         let Some(mut quick) = self.build_quick_select(generation, from_copy, view, true) else {
             return false;
         };
-        quick.purpose = purpose;
+        quick.set_purpose(purpose);
         self.quick_select = Some(quick);
         // Move the viewport and replace labels in the same Ghostty operation.
         let viewport = SnapshotViewportOptions {
@@ -1936,17 +1936,43 @@ impl TerminalPane {
             background_rgb: crate::colors::rgb(palette.selection_background),
             flags: 3,
         };
-        let layer = SnapshotDecorationLayer {
+        // Linewise yanks start from the origin row, so tint that whole row.
+        // It sits after the hints because earlier layers win.
+        let origin_row = quick.origin_row().map(|y| SnapshotCellRange {
+            start: SnapshotCell { x: 0, y },
+            end: SnapshotCell {
+                x: quick.view.columns.saturating_sub(1) as _,
+                y,
+            },
+        });
+        let mut layers = vec![SnapshotDecorationLayer {
             ranges: ranges.as_ptr(),
             range_count: ranges.len(),
             style,
-        };
+        }];
+        if let Some(range) = &origin_row {
+            layers.push(SnapshotDecorationLayer {
+                ranges: range,
+                range_count: 1,
+                // Background only, like a cursorline, so the row keeps its
+                // own text colors.
+                style: SnapshotDecorationStyle {
+                    foreground_rgb: 0,
+                    background_rgb: crate::colors::rgb(crate::colors::blend(
+                        palette.background,
+                        palette.accent,
+                        0.15,
+                    )),
+                    flags: 2,
+                },
+            });
+        }
         let applied = unsafe {
             ghostty_ffi::nterm_host_snapshot_apply_cell_text(
                 self.quick_host(),
                 quick.generation,
-                &layer,
-                1,
+                layers.as_ptr(),
+                layers.len(),
                 text.as_ptr(),
                 text.len(),
                 viewport,
@@ -1984,7 +2010,7 @@ impl TerminalPane {
             boundaries: None,
         };
         match nfm_egui::copy_controller::CopyController::new(&mut self.copy_mode, &document, view)
-            .select_quick(quick.purpose, target)
+            .select_quick(quick.purpose(), target)
         {
             Ok(update) => {
                 self.apply_copy_update(update, quick.generation, ctx, None);
@@ -2431,7 +2457,12 @@ impl TerminalPane {
                 CopyEffect::QuickSelect { origin } => {
                     self.open_quick_select();
                     if let Some(quick) = &mut self.quick_select {
-                        quick.purpose = QuickSelectPurpose::YankLines { origin };
+                        quick.set_purpose(QuickSelectPurpose::YankLines { origin });
+                        // open_quick_select published before the purpose was
+                        // known; republish so the origin row is decorated.
+                        if !self.publish_quick_select() {
+                            self.cancel_quick_select();
+                        }
                     }
                 }
                 CopyEffect::OpenLineSplit { cursor } => {
