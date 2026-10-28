@@ -1001,10 +1001,6 @@ impl TerminalPane {
             picker.typography = self.picker_font.typography(ctx, self.host);
             picker.show_scoped(ctx, bounds, self.workspace_bounds, false);
         }
-        if self.search.active {
-            self.search
-                .show(ctx, bounds, self.pending_search_snapshot.is_some(), false);
-        }
     }
 
     // Text is typed input; line breaks are Enter keys, never bracketed paste.
@@ -2915,10 +2911,15 @@ impl TerminalPane {
         self.decorations_applied(snapshot_generation, applied);
     }
 
-    pub(super) fn show_search_overlay(&mut self, ctx: &egui::Context, bounds: egui::Rect) {
+    pub(super) fn search_active(&self) -> bool {
+        self.search.active
+    }
+
+    /// Shows the query field in `rect`, the status bar's free space.
+    pub(super) fn show_search_bar(&mut self, ctx: &egui::Context, rect: egui::Rect) {
         let action = self
             .search
-            .show(ctx, bounds, self.pending_search_snapshot.is_some(), true);
+            .show_bar(ctx, rect, self.pending_search_snapshot.is_some());
         if action.changed {
             self.search.accept_requested = false;
             self.queue_search();

@@ -1359,7 +1359,6 @@ impl TerminalView {
                     input.suppress_forward || consumed,
                 );
                 action = input.action;
-                p.show_search_overlay(&ctx, bounds);
                 p.show_toasts(&ctx, bounds);
             }
             self.run_picker_callback(origin, gl, &ctx);

@@ -896,7 +896,9 @@ impl TerminalView {
             egui::pos2(right_edge, rect.bottom()),
         );
         right_edge = workspace_rect.left() - 12.0;
-        if let Some(detail) = status.detail {
+        // While searching, the query field takes the detail text's place.
+        let searching = self.active_pane_ref().search_active();
+        if let Some(detail) = status.detail.filter(|_| !searching) {
             let text = painter.layout_no_wrap(detail, font.clone(), foreground);
             let left = right_edge - text.size().x;
             if left > label_rect.right() + 8.0 {
@@ -905,6 +907,15 @@ impl TerminalView {
                     text,
                     foreground,
                 );
+            }
+        }
+        if searching {
+            let search_rect = egui::Rect::from_min_max(
+                egui::pos2(label_rect.right() + 8.0, rect.top()),
+                egui::pos2(right_edge, rect.bottom()),
+            );
+            if let Some(p) = self.active_pane().and_then(|p| self.pane_mut(p)) {
+                p.show_search_bar(ui.ctx(), search_rect);
             }
         }
         self.workspace_bar(ui, workspace_rect);

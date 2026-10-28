@@ -60,12 +60,13 @@ impl SearchUi {
             None => format!("0/{}", self.matches.len()),
         }
     }
-    pub(crate) fn show(
+    /// The query field, drawn in the status bar's free space so it never
+    /// covers terminal rows.
+    pub(crate) fn show_bar(
         &mut self,
         ctx: &egui::Context,
-        bounds: egui::Rect,
+        rect: egui::Rect,
         pending: bool,
-        interactive: bool,
     ) -> SearchUiAction {
         if !self.active {
             return SearchUiAction::default();
@@ -76,160 +77,110 @@ impl SearchUi {
         let mut navigate = None;
         let mut close = false;
         let mut accept = false;
-        let available_width = bounds.width();
-        let search_width = (available_width - 24.0).max(1.0);
         let palette = crate::colors::palette();
-        let fill = palette.panel_background;
-        let border = palette.border;
-        let accent = palette.accent;
-        let text_color = palette.text;
-        let muted_text = palette.muted_text;
-        let selection = palette.selection_background;
+        let font = egui::FontId::monospace(13.0);
+        let height = (rect.height() - 4.0).max(1.0);
 
-        let id = if interactive {
-            "terminal-search"
-        } else {
-            "terminal-search-background"
-        };
-        let order = if interactive {
-            egui::Order::Foreground
-        } else {
-            egui::Order::Middle
-        };
-        egui::Area::new(id.into())
-            .fixed_pos(bounds.left_bottom() - egui::vec2(0.0, 30.0))
-            .order(order)
-            .interactable(interactive)
+        egui::Area::new("terminal-search".into())
+            // Matches the status chips, which sit 1pt below the bar's center.
+            .fixed_pos(rect.min + egui::vec2(0.0, 1.0))
+            .order(egui::Order::Foreground)
             .fade_in(false)
             .movable(false)
             .show(ctx, |ui| {
-                let frame = egui::Frame::new()
-                    .fill(fill)
-                    .inner_margin(egui::Margin::symmetric(12, 3));
-                let frame_response = frame.show(ui, |ui| {
-                    ui.set_width(search_width);
-                    ui.visuals_mut().text_cursor.stroke = egui::Stroke::new(2.0, text_color);
-                    ui.visuals_mut().selection.bg_fill = selection;
-                    ui.visuals_mut().selection.stroke.color = palette.selection_text;
-                    ui.horizontal_centered(|ui| {
-                        ui.spacing_mut().item_spacing.x = 10.0;
-                        ui.add_sized(
-                            [16.0, 24.0],
-                            egui::Label::new(
-                                egui::RichText::new(if self.backward { "?" } else { "/" })
-                                    .font(egui::FontId::monospace(16.0))
-                                    .color(accent),
-                            ),
-                        );
+                ui.set_min_size(rect.size());
+                ui.set_max_size(rect.size());
+                ui.visuals_mut().text_cursor.stroke = egui::Stroke::new(2.0, palette.text);
+                ui.visuals_mut().selection.bg_fill = palette.selection_background;
+                ui.visuals_mut().selection.stroke.color = palette.selection_text;
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        egui::RichText::new(if self.backward { "?" } else { "/" })
+                            .font(font.clone())
+                            .color(palette.accent),
+                    );
 
-                        let match_label = if pending {
-                            "…".to_owned()
-                        } else if self.error.is_some() {
-                            "SEARCH ERROR".to_owned()
-                        } else {
-                            self.match_label()
-                        };
-                        let match_label = if available_width >= 600.0 {
-                            let mode = if self.regex { "REGEX" } else { "LITERAL" };
-                            format!("{match_label}   ·   {mode}")
-                        } else {
-                            match_label
-                        };
-                        let match_width = if available_width >= 600.0 {
-                            210.0
-                        } else {
-                            74.0
-                        };
-                        let input_width = (ui.available_width() - match_width - 10.0).max(1.0);
-                        let response = if interactive {
-                            let response = ui.add_sized(
-                                [input_width, 24.0],
-                                egui::TextEdit::singleline(&mut self.query)
-                                    .frame(egui::Frame::NONE)
-                                    .font(egui::FontId::monospace(15.0))
-                                    .vertical_align(egui::Align::Center)
-                                    .text_color(text_color),
-                            );
-                            if self.focus_requested {
-                                response.request_focus();
-                                self.focus_requested = false;
-                            }
-                            query_changed = response.changed();
-                            Some(response)
-                        } else {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(input_width, 24.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().with_clip_rect(rect).text(
-                                rect.left_center(),
-                                egui::Align2::LEFT_CENTER,
-                                &self.query,
-                                egui::FontId::monospace(15.0),
-                                text_color,
-                            );
-                            None
-                        };
+                    let (count, status_color) = if pending {
+                        ("…".to_owned(), palette.muted_text)
+                    } else if self.error.is_some() {
+                        ("SEARCH ERROR".to_owned(), palette.accent)
+                    } else {
+                        (self.match_label(), palette.muted_text)
+                    };
+                    let mode = if self.regex { "REGEX" } else { "LITERAL" };
+                    // The query keeps priority in narrow bars: the mode drops
+                    // out first, then the count.
+                    let available = ui.available_width();
+                    let status = [format!("{count}   ·   {mode}"), count]
+                        .into_iter()
+                        .map(|text| {
+                            ui.painter()
+                                .layout_no_wrap(text, font.clone(), status_color)
+                        })
+                        .find(|galley| available >= galley.size().x + 120.0);
+                    let status_width = status.as_ref().map_or(0.0, |galley| galley.size().x);
+                    let input_width =
+                        (available - status_width - ui.spacing().item_spacing.x).max(1.0);
+                    let response = ui.add_sized(
+                        [input_width, height],
+                        egui::TextEdit::singleline(&mut self.query)
+                            .frame(egui::Frame::NONE)
+                            .font(font.clone())
+                            .vertical_align(egui::Align::Center)
+                            .text_color(palette.text),
+                    );
+                    if self.focus_requested {
+                        response.request_focus();
+                        self.focus_requested = false;
+                    }
+                    query_changed = response.changed();
 
-                        let (count_rect, count_response) = ui.allocate_exact_size(
-                            egui::vec2(match_width, 24.0),
+                    if let Some(status) = status {
+                        let (status_rect, status_response) = ui.allocate_exact_size(
+                            egui::vec2(status_width, height),
                             egui::Sense::hover(),
                         );
-                        if let Some(error) = &self.error {
-                            count_response.on_hover_text(error);
-                        }
-                        let match_color = if self.error.is_some() {
-                            accent
-                        } else {
-                            muted_text
-                        };
-                        ui.painter().text(
-                            count_rect.right_center(),
-                            egui::Align2::RIGHT_CENTER,
-                            match_label,
-                            egui::FontId::monospace(14.0),
-                            match_color,
+                        ui.painter().galley(
+                            egui::pos2(
+                                status_rect.left(),
+                                status_rect.center().y - status.size().y / 2.0,
+                            ),
+                            status,
+                            status_color,
                         );
-
-                        if response
-                            .as_ref()
-                            .is_some_and(|response| response.has_focus() || response.lost_focus())
-                        {
-                            if ui.input(|input| {
-                                input.modifiers.ctrl && input.key_pressed(egui::Key::R)
-                            }) {
-                                self.regex = !self.regex;
-                                self.error = None;
-                                mode_changed = true;
-                            }
-                            let search_key = ui.input(|input| {
-                                if input.modifiers.ctrl && input.key_pressed(egui::Key::N) {
-                                    Some(false)
-                                } else if input.modifiers.ctrl && input.key_pressed(egui::Key::P) {
-                                    Some(true)
-                                } else {
-                                    None
-                                }
-                            });
-                            if search_key.is_some() {
-                                navigate = search_key;
-                            }
-                            if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                                accept = true;
-                            }
-                            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-                                close = true;
-                            }
+                        if let Some(error) = &self.error {
+                            status_response.on_hover_text(error);
                         }
-                    });
+                    }
+
+                    if response.has_focus() || response.lost_focus() {
+                        if ui.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::R))
+                        {
+                            self.regex = !self.regex;
+                            self.error = None;
+                            mode_changed = true;
+                        }
+                        let search_key = ui.input(|input| {
+                            if input.modifiers.ctrl && input.key_pressed(egui::Key::N) {
+                                Some(false)
+                            } else if input.modifiers.ctrl && input.key_pressed(egui::Key::P) {
+                                Some(true)
+                            } else {
+                                None
+                            }
+                        });
+                        if search_key.is_some() {
+                            navigate = search_key;
+                        }
+                        if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                            accept = true;
+                        }
+                        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                            close = true;
+                        }
+                    }
                 });
-                ui.painter().line_segment(
-                    [
-                        frame_response.response.rect.left_top(),
-                        frame_response.response.rect.right_top(),
-                    ],
-                    egui::Stroke::new(1.0, border),
-                );
             });
 
         SearchUiAction {
