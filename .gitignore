@@ -1,3 +1,5 @@
 /target/
 /out/
 /.idea/
+# Demo recordings; the README uses the GIFs published in e82eric/nterm-demo.
+/docs/images/

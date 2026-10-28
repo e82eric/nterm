@@ -1,13 +1,139 @@
-# Picker pipe, protocol version 1
+# Opening pickers from the shell
+
+Shells open allowlisted named pickers through the authenticated local named pipe
+(Windows) or Unix socket (Linux). On Linux, use `npick`, installed beside
+`nterm`; see [npick on Linux](#npick-on-linux). On Windows, the supplied
+helper requires PowerShell 7.3+.
+Pipe access is disabled by default. Add this to your returned Lua table, restart
+the application, then load the helper inside its newly launched shell:
+
+```lua
+picker_pipe = {
+  enabled = true,
+  named = { "files", "builtin.lines" },
+  allow_stream = true,
+},
+```
+
+`named` is an exact allowlist. `files` refers to the custom Lua picker above;
+built-ins use their `builtin.` names. `allow_stream` permits candidates sent
+directly from the shell.
+
+## Open a configured picker by name
+
+```powershell
+. C:\src\nterm\Invoke-NtermPicker.ps1
+
+$path = Invoke-NtermPicker -Name files
+$line = Invoke-NtermPicker -Name builtin.lines
+
+# For a configured Command picker such as Ripgrep in the sample Lua file:
+$match = Invoke-NtermPicker -Name Ripgrep -Parameters @{ pattern = 'TODO'; cwd = $PWD.Path }
+```
+
+Allowlist `Ripgrep` as well to run that example. Named requests use the source,
+preview, and factory configured in Lua. String parameters are available to
+callbacks as `params`; Command sources substitute whole `{name}` arguments from
+them, and `params.cwd` overrides the command's configured directory. FileSystem
+roots still come from Lua, independently of the shell's working directory.
+
+Pipe acceptance returns the selected value to the caller. It bypasses terminal
+insertion, navigation, and acceptance callbacks, including for `builtin.lines`.
+The shell decides how to use the result.
+
+## Stream custom candidates from the shell
+
+No named Lua picker is needed; enable `allow_stream` and dot-source the helper
+as above. It returns the selected original object, or the property specified
+with `-ValueProperty`:
+
+```powershell
+# Return the selected FileInfo object.
+$file = Get-ChildItem -File | Invoke-NtermPicker -DisplayProperty Name
+
+# Return its FullName string instead.
+$path = Get-ChildItem -File |
+    Invoke-NtermPicker -DisplayProperty Name -ValueProperty FullName
+
+# Inspect status, query, and selection.
+'first', 'second', 'third' | Invoke-NtermPicker -PassThruResult
+```
+
+## Stream candidates into a named picker
+
+Piping into `-Name` streams the candidates into a configured `type = "Items"`
+picker. The Lua definition keeps its presentation and preview, including
+Command and Dynamic previews that a plain stream cannot use, and only the name
+needs to be in `named`:
+
+```powershell
+# ProfileCompletions in nterm.example.lua previews Get-Help for each value.
+$completions.CompletionMatches |
+    Invoke-NtermPicker -Name ProfileCompletions -Parameters @{ commandName = 'Get-Item' } `
+        -DisplayProperty ListItemText -ValueProperty CompletionText
+```
+
+Enter accepts; Escape cancels. Ctrl+C disconnects the client and cancels its
+picker. Ordinary completion keeps the authenticated connection for the next
+request. Use `Disconnect-NtermPicker` to release it before connecting from
+another process in the same pane. Another active overlay can return `busy`;
+requests are not queued. Returned paths are not automatically shell-quoted.
+
+## npick on Linux
+
+With `picker_pipe` enabled as above, `npick` opens pickers from the shell
+running in a pane and prints the selected value:
+
+```sh
+npick files                        # a named picker from nterm.lua
+git branch --format='%(refname:short)' | npick --query main
+```
+
+Without a name, each stdin line is a candidate. `--display N` and `--value N`
+show and return tab-separated fields (`-d` sets the separator), and `--json`
+reads `{"text": ..., "value": ...}` lines. With `--stdin NAME`, the stdin lines
+fill the named Items picker instead, which keeps its Lua preview. It exits 0
+with the value on stdout,
+130 when cancelled, and 2 on errors. For example, bind Ctrl+T in bash to insert
+a file:
+
+```bash
+__npick_file() {
+  local file
+  file=$(npick files) || return
+  READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}$file${READLINE_LINE:READLINE_POINT}"
+  READLINE_POINT=$((READLINE_POINT + ${#file}))
+}
+[[ -n $NTERM_PICKER_ENDPOINT ]] && bind -x '"\C-t": __npick_file'
+```
+
+[npick-completion.bash](../npick-completion.bash) is the bash counterpart of the
+PowerShell profile's completion picker. Source it from `~/.bashrc`
+(`deploy.sh` installs it to `share/nterm/` beside the app). In
+nterm panes, Ctrl+Space lists what Tab would complete for the word at
+the cursor, using bash-completion when it is installed; Enter replaces that
+word, quoting file names. A key binding cannot enable readline's unquoting, so
+for words containing quotes, backslashes or `~` it falls back to bash's own
+file, directory and `$variable` completion.
+
+See [the protocol](#picker-pipe-protocol-version-1) below and
+[Invoke-NtermPicker.ps1](../Invoke-NtermPicker.ps1) for PSReadLine bindings,
+stream options, protocol limits, authentication and cancellation.
+For a portable PowerShell profile with file, directory, history, text-search,
+and completion bindings, see [profile.example.ps1](../profile.example.ps1).
+Executable sources and command previews must be defined in allowlisted Lua
+pickers; clients cannot submit executable definitions.
+
+## Picker pipe, protocol version 1
 
 The egui host owns one local connection endpoint per pane: a duplex byte-mode
 named pipe on Windows and a Unix-domain stream socket on Linux. Both speak the
 protocol below. On Linux, use the `npick` client; see
 [Linux transport](#linux-transport).
 
-## Enable and test
+### Enable and test
 
-For a portable set of PowerShell bindings, see [profile.example.ps1](profile.example.ps1).
+For a portable set of PowerShell bindings, see [profile.example.ps1](../profile.example.ps1).
 Use `nterm.example.lua`, or merge these entries into your Lua configuration
 (preserving any existing pickers and permissions):
 
@@ -173,7 +299,7 @@ Set-PSReadLineKeyHandler -Chord Alt+f -ScriptBlock {
 Selections are returned as data; this binding quotes a path for PowerShell.
 The helper does not evaluate returned strings or run acceptance callbacks.
 
-## Wire format and authentication
+### Wire format and authentication
 
 Each frame is `u32 little-endian length` followed by that many UTF-8 JSON bytes.
 Maximum frame size is 1 MiB. Read/write call boundaries are not frame boundaries.
@@ -209,7 +335,7 @@ fields total. Different roles prevent reflection. Fresh challenges prevent
 replaying authentication proofs. Proof comparisons are constant-time for valid
 lengths. Tokens and proofs must not be logged.
 
-## Requests
+### Requests
 
 Only one request is active at a time per authenticated connection. Subsequent
 requests reuse authentication, but effective identity, process/shell ancestry,
@@ -253,7 +379,7 @@ occupied. A persistent client retains that slot until it disconnects; use
 `Disconnect-NtermPicker` before invoking a helper from a different process in
 the same pane. There is no request queue or automatic request replay.
 
-## Streaming and results
+### Streaming and results
 
 Items are append-only with unique IDs and arbitrary JSON values:
 
@@ -328,7 +454,7 @@ is read concurrently with response delivery. A Lua reload that revokes the activ
 request capability cancels that request. Disabling the pipe or exit of the pane
 shell closes idle connections; pane closure stops the service.
 
-## Linux transport
+### Linux transport
 
 Each pane listens on `$XDG_RUNTIME_DIR/nterm/<pid>/pane-<id>.sock`, or a
 `nterm-<uid>` directory under the temporary directory when no runtime
@@ -357,7 +483,7 @@ Named requests add the caller's directory as `params.cwd` unless given. It
 exits 0 with the value on stdout, 130 when cancelled, and 2 on errors.
 `npick --help` lists all options.
 
-## Security controls and remaining risks
+### Security controls and remaining risks
 
 - An explicit DACL grants precise data, attribute-read, security-read, and
   synchronization rights to the current logon SID. It excludes pipe-instance
@@ -411,7 +537,7 @@ References: [pipe ACLs](https://learn.microsoft.com/en-us/windows/win32/ipc/name
 [effective client security context](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-impersonatenamedpipeclient),
 [handle duplication](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-duplicatehandle).
 
-Pipe requests and search-result updates now wake the native window event loop
+Pipe requests and search-result updates wake the native window event loop
 and request a redraw directly. Egui repaint requests remain as a fallback.
 GPU presentation keeps its existing pacing.
 

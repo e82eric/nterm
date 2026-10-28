@@ -1,6 +1,6 @@
 # PowerShell 7.4+. Dot-source this file from your $PROFILE.
 # nterm Lua: allow the ProfileFiles, ProfileDirectories, ProfileRipgrep,
-# ProfileHistory and ProfileCompletions named pickers. See PICKER-PIPE.md or
+# ProfileHistory and ProfileCompletions named pickers. See docs/picker-pipe.md or
 # nterm.example.lua.
 # Outside an nterm pane this file does nothing, so your other bindings stay.
 param([string[]]$PickerRoots = @((Get-Location).Path))

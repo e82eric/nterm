@@ -114,7 +114,7 @@ To use other keys or modifiers, add bindings such as:
 
 `nterm.workspace_keys("ALT")` generates the SWM-style bindings with a
 different modifier. Supplying `keys` replaces default bindings, so append the
-other application shortcuts you want. See [workspaces.example.lua](workspaces.example.lua).
+other application shortcuts you want. See [workspaces.example.lua](../workspaces.example.lua).
 
 ## Layout behavior
 
@@ -219,3 +219,99 @@ Workspace descriptions include `id`, `index`, ordered `panes`, `focused`, `layou
 that window's lifetime. Workspace indexes are positions that change when an
 earlier workspace is removed; Lua operations
 take IDs unless a method explicitly accepts an options table.
+
+## Windows
+
+Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> to open another terminal in
+a new window within the same process. Each window has its own shell, terminal
+view, floating pane, and UI state. Windows share the native Ghostty app and its
+configuration; theme and font changes apply to all windows. Closing a window
+closes its terminals, and the app exits after the last window closes.
+
+## Floating panes
+
+Floating panes open above a workspace's tiled panes. Press
+<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> to show or hide one; the first press
+creates it, and hiding it keeps its shell running. While visible, it receives
+keyboard, paste, and mouse input. Exiting its shell, or pressing
+<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd>, closes only that floating pane.
+
+The command palette includes a restore entry for each of the current workspace's
+floating panes, including hidden ones. Entries always show its stable ID,
+followed by its explicit name
+or current terminal title, and mark the visible pane as active. Labels are
+captured when the palette opens; selecting an entry restores that pane by ID.
+If its shell exits while the palette is open, selection reports that the pane
+has closed.
+
+Each workspace owns its floating panes, with one visible at a time. The actions below act on the current
+workspace's floats. Hidden panes, and floats of other workspaces, keep their
+shells running. Floats close with their workspace. The default shortcuts are:
+
+| Shortcut | Action |
+| --- | --- |
+| Ctrl+Shift+E | `ToggleFloatingPane` |
+| Ctrl+Alt+Shift+E | `CreateFloatingPane` |
+| Ctrl+Alt+] | `NextFloatingPane` |
+| Ctrl+Alt+[ | `PreviousFloatingPane` |
+| Ctrl+Shift+W | `CloseFloatingPane` |
+
+These action names can also be assigned in Lua `keys`. Toggle hides the visible
+pane or restores the last focused pane, creating one if none exist. Next and
+previous follow creation order, wrap around, and restore a hidden pane. With no
+panes, cycling does nothing. Closing the visible pane restores the most recently
+focused remaining pane; closing a hidden pane leaves the current visibility
+unchanged. A shell exiting removes its pane in the same way.
+
+Named actions and picker selection callbacks support:
+
+```lua
+actions = {
+  {
+    name = "ToolsPane",
+    action = function(app)
+      local pane = app:get_floating_pane("tools")
+      if pane then
+        app:restore_floating_pane(pane.id)
+      else
+        pane = app:create_floating_pane({
+          name = "tools", command = "pwsh.exe", cwd = "C:\\src",
+        })
+        app:show_toast("Floating pane", "Created " .. pane.name .. " (" .. pane.id .. ")")
+      end
+    end,
+  },
+},
+keys = {
+  { key = "t", mods = "CTRL|ALT", action = "ToolsPane" },
+},
+```
+
+`app:create_floating_pane(options)` returns `{id, name, workspace, visible, focused}` after
+native creation succeeds. All options are optional; omitted command and working
+directory use the normal terminal defaults. `command` is a Ghostty command
+string. Names must be nonempty and unique among the workspace's floating panes.
+IDs are stable, monotonically increasing within a window, and never reused.
+
+`app:get_floating_pane(id_or_name, workspace_id?)` returns a description or
+`nil`; with no target it returns the last focused floating pane. It searches the
+current workspace unless given a workspace ID; to search every workspace, loop
+over `app:get_workspaces()`. `app:get_floating_panes(workspace_id?)` returns a
+workspace's descriptions in creation order. Descriptions are snapshots; `focused`
+means the pane is the window's terminal input target, even if the OS window
+itself is unfocused.
+
+`app:restore_floating_pane(id_or_name)`, `app:toggle_floating_pane()`,
+`app:next_floating_pane()`, `app:previous_floating_pane()`, and
+`app:close_floating_pane(id_or_name)` change pane state immediately and act on
+the current workspace's floats. `app:tile_floating_pane` and `app:float_pane`
+move terminals between floating and tiled; see
+[Lua automation and appearance](#lua-automation-and-appearance).
+Close without a target closes the last focused pane, including when hidden.
+Restore or explicit close of a missing pane raises a Lua error; lookup returns
+`nil`. Creation errors are synchronous and can be handled with `pcall`.
+Pane operations already performed remain in effect if a callback subsequently
+fails. Queued paste/send-text commands still apply to the originating pane and
+are discarded if that pane was closed by the callback. Retained app handles
+expire when their callback returns.
+

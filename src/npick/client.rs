@@ -1,4 +1,4 @@
-//! The client side of the picker IPC protocol (PICKER-PIPE.md): connect,
+//! The client side of the picker IPC protocol (docs/picker-pipe.md): connect,
 //! authenticate, open one picker, stream items and return its result.
 //!
 //! Included by the `npick` binary and by the Unix server's tests, so it only
