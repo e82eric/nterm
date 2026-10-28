@@ -344,7 +344,8 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> *mut Host;
     pub(crate) fn nterm_host_destroy(host: *mut Host);
-    pub(crate) fn nterm_host_close_process(host: *mut Host);
+    pub(crate) fn nterm_window_attach(window: *mut c_void);
+    pub(crate) fn nterm_window_detach(window: *mut c_void);
     pub(crate) fn nterm_host_create_child(
         parent: *mut Host,
         userdata: *mut c_void,

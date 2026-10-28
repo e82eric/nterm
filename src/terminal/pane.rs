@@ -22,7 +22,7 @@ use nfm_egui::quick_select::{self, Purpose as QuickSelectPurpose, QuickSelect};
 use std::ffi::{c_char, c_void};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
 
@@ -90,7 +90,8 @@ struct WakeState {
     pipe: Option<crate::picker::pipe::Service>,
     context: egui::Context,
     proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
-    window_id: egui_winit::winit::window::WindowId,
+    /// Read on native threads; changes when the pane moves to another window.
+    window_id: AtomicU64,
     frame_ready_pending: AtomicBool,
     close: AtomicBool,
     title: std::sync::Mutex<String>,
@@ -111,6 +112,9 @@ impl WakeState {
             );
         }
         (std::ffi::CString::default(), std::ffi::CString::default())
+    }
+    fn window_id(&self) -> egui_winit::winit::window::WindowId {
+        self.window_id.load(Ordering::Acquire).into()
     }
 }
 
@@ -164,7 +168,7 @@ extern "C" fn nterm_frame_ready(userdata: *mut c_void) {
         if !state.frame_ready_pending.swap(true, Ordering::AcqRel)
             && state
                 .proxy
-                .send_event(UserEvent::FrameReady(state.window_id))
+                .send_event(UserEvent::FrameReady(state.window_id()))
                 .is_err()
         {
             state.frame_ready_pending.store(false, Ordering::Release);
@@ -217,7 +221,6 @@ impl SpawnOptions {
 
 pub(super) struct TerminalPane {
     pub(super) workspace_bounds: Option<egui::Rect>,
-    detached: bool,
     host: *mut Host,
     wake: Box<WakeState>,
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
@@ -321,10 +324,6 @@ impl TerminalPane {
         self.toasts.push_error(title.into(), error, 10000);
     }
 
-    pub(super) fn show_notice(&mut self, title: &str, message: String) {
-        self.toasts.push(title.into(), message, 3000);
-    }
-
     pub(super) fn has_toasts(&self) -> bool {
         !self.toasts.is_empty()
     }
@@ -411,9 +410,7 @@ impl TerminalPane {
     }
 
     pub(super) fn refresh_picker_font(&mut self, ctx: &egui::Context) {
-        if !self.detached {
-            self.picker_font = crate::picker::font::PickerFont::new(ctx, self.host);
-        }
+        self.picker_font = crate::picker::font::PickerFont::new(ctx, self.host);
     }
     pub(super) fn take_config_issues(&self) -> Vec<String> {
         std::mem::take(&mut *self.wake.config_issues.lock().unwrap())
@@ -426,7 +423,6 @@ impl TerminalPane {
         let picker_font = crate::picker::font::PickerFont::new(&wake.context, host);
         let search_worker = SnapshotSearchAdapter::new(wake.context.clone());
         Self {
-            detached: false,
             workspace_bounds: None,
             host,
             wake,
@@ -456,9 +452,6 @@ impl TerminalPane {
     }
 
     pub(super) fn acquire_frame(&mut self) -> bool {
-        if self.detached {
-            return false;
-        }
         // Clear before taking the mailbox so a concurrent publication cannot
         // lose its notification. The callback always draws the current frame.
         self.wake
@@ -481,17 +474,12 @@ impl TerminalPane {
         self.cancel_quick_select();
         self.close_search();
         self.close_copy_mode();
-        if !self.detached {
-            self.painter.lock().destroy();
-        }
+        self.painter.lock().destroy();
         unsafe { ghostty_ffi::nterm_host_destroy(self.host) };
         self.host = std::ptr::null_mut();
     }
 
     pub(super) fn set_active(&mut self, ctx: &egui::Context, active: bool, window_focused: bool) {
-        if self.detached {
-            return;
-        }
         if self.active != active {
             if !active {
                 self.cancel_workspace_picker();
@@ -663,7 +651,7 @@ impl TerminalPane {
             ),
             context: egui_ctx.clone(),
             proxy,
-            window_id: window.id,
+            window_id: AtomicU64::new(window.id.into()),
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             title: std::sync::Mutex::new(String::new()),
@@ -674,7 +662,7 @@ impl TerminalPane {
         });
         #[cfg(any(windows, unix))]
         if let Some(pipe) = &wake.pipe {
-            pipe.bind_window(wake.proxy.clone(), wake.window_id);
+            pipe.bind_window(wake.proxy.clone(), wake.window_id());
         }
         let (picker_endpoint, picker_token) = wake.picker_environment();
         let mut error_buffer = [0 as c_char; 2048];
@@ -711,7 +699,7 @@ impl TerminalPane {
         gl: &glow::Context,
         options: &SpawnOptions,
     ) -> Result<Self, crate::native_error::FatalError> {
-        self.spawn(&self.wake.context, gl, self.wake.window_id, None, options)
+        self.spawn(&self.wake.context, gl, self.wake.window_id(), None, options)
     }
 
     pub(super) fn create_window(
@@ -727,6 +715,27 @@ impl TerminalPane {
             Some(window.native),
             &SpawnOptions::default(),
         )
+    }
+
+    /// Moves this terminal to another window, keeping its process and UI
+    /// state. Frame, pipe, and picker search wakes go to that window; its next
+    /// layout resizes the terminal for the window's size and scale.
+    pub(super) fn move_to_window(&mut self, window_id: egui_winit::winit::window::WindowId) {
+        self.wake
+            .window_id
+            .store(window_id.into(), Ordering::Release);
+        #[cfg(any(windows, unix))]
+        if let Some(pipe) = &self.wake.pipe {
+            pipe.bind_window(self.wake.proxy.clone(), window_id);
+        }
+        if let Some(picker) = &self.picker {
+            picker.bind_pipe_search_wake(self.wake.proxy.clone(), window_id);
+        }
+        // A notification already sent went to the old window.
+        self.wake
+            .frame_ready_pending
+            .store(false, Ordering::Release);
+        self.workspace_bounds = None;
     }
 
     /// `native` is the handle of a new window this terminal is the first in;
@@ -746,7 +755,7 @@ impl TerminalPane {
             })?),
             context: ctx.clone(),
             proxy: self.wake.proxy.clone(),
-            window_id,
+            window_id: AtomicU64::new(window_id.into()),
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             title: std::sync::Mutex::new(String::new()),
@@ -757,7 +766,7 @@ impl TerminalPane {
         });
         #[cfg(any(windows, unix))]
         if let Some(pipe) = &wake.pipe {
-            pipe.bind_window(wake.proxy.clone(), wake.window_id);
+            pipe.bind_window(wake.proxy.clone(), wake.window_id());
         }
         let (picker_endpoint, picker_token) = wake.picker_environment();
         let mut error_buffer = [0 as c_char; 2048];
@@ -799,7 +808,7 @@ impl TerminalPane {
         Ok(Self::new(host, wake, gl))
     }
 
-    pub(super) fn tick(&mut self) {
+    pub(super) fn tick(&self) {
         unsafe { ghostty_ffi::nterm_host_tick(self.host) };
     }
 
@@ -809,36 +818,11 @@ impl TerminalPane {
     pub(super) fn set_corner_radius(&self, radius: f32) {
         self.painter.lock().set_corner_radius(radius);
     }
-    pub(super) fn close_process(&mut self) {
-        if self.detached {
-            return;
-        }
-        self.picker = None;
-        self.cancel_quick_select();
-        self.close_search();
-        self.close_copy_mode();
-        #[cfg(any(windows, unix))]
-        {
-            self.wake.pipe.take();
-        }
-        self.painter.lock().destroy();
-        unsafe {
-            ghostty_ffi::nterm_host_close_process(self.host);
-        }
-        self.detached = true;
-        self.active = false;
-        self.focused = false;
-    }
-
     pub(super) fn title(&self) -> String {
         self.wake.title.lock().unwrap().clone()
     }
     pub(super) fn pwd(&self) -> Option<String> {
         self.wake.pwd.lock().unwrap().clone()
-    }
-
-    pub(super) fn request_repaint(&self) {
-        self.wake.context.request_repaint();
     }
 
     pub(super) fn paint_callback(&self) -> crate::painter::PaintCallback {
@@ -1583,7 +1567,7 @@ impl TerminalPane {
                 self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
                 return;
             }
-            picker.bind_pipe_search_wake(self.wake.proxy.clone(), self.wake.window_id);
+            picker.bind_pipe_search_wake(self.wake.proxy.clone(), self.wake.window_id());
             session.reply(serde_json::json!({"type":"opened","request_id":session.id}));
         } else {
             session.finish(

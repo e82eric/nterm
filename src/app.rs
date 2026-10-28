@@ -227,6 +227,8 @@ impl NativeWindow {
         }
         let gl = shared_ui.borrow().gl.clone();
         let egui = WindowUi::new(event_loop, surface.window(), &shared_ui.borrow());
+        // Resize edges and Alt+Space handling, whichever terminals it holds.
+        unsafe { crate::ghostty_ffi::nterm_window_attach(surface.pane_window().native) };
         Ok(Self {
             surface,
             shared_ui,
@@ -241,9 +243,13 @@ impl NativeWindow {
     fn start(&mut self) -> Result<(), FatalError> {
         let shell = self.shell.as_mut().expect("terminal shell");
         shell.terminal.run_startup(&self.egui.egui_ctx, &self.gl);
+        self.show();
+        Ok(())
+    }
+
+    fn show(&self) {
         self.surface.window().set_visible(true);
         self.surface.window().request_redraw();
-        Ok(())
     }
 
     fn redraw(&mut self) -> Result<(), FatalError> {
@@ -297,6 +303,7 @@ impl Drop for NativeWindow {
         if let Some(shell) = &mut self.shell {
             shell.destroy();
         }
+        unsafe { crate::ghostty_ffi::nterm_window_detach(self.surface.pane_window().native) };
     }
 }
 
@@ -343,6 +350,41 @@ impl NativeApp {
         window.start()?;
         self.windows.insert(window.surface.window().id(), window);
         self.sync_viewports()?;
+        Ok(())
+    }
+
+    /// Opens a window whose first pane is one moved out of `origin`. Startup
+    /// does not run: the pane's shell is already running. On failure the pane
+    /// is handed back for the origin to keep.
+    fn open_window_with_pane(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        origin: winit::window::WindowId,
+        pane: crate::terminal::MovedPane,
+    ) -> Result<(), (crate::terminal::MovedPane, FatalError)> {
+        let mut window = match NativeWindow::new(
+            event_loop,
+            self.shared_ui.as_ref().expect("shared renderer").clone(),
+        ) {
+            Ok(window) => window,
+            Err(error) => return Err((pane, error)),
+        };
+        let origin = self.windows[&origin].shell.as_ref().expect("origin terminal");
+        let terminal = origin
+            .terminal
+            .adopt_window(pane, window.surface.pane_window());
+        window.shell = Some(ShellApp {
+            terminal,
+            _startup: origin._startup.clone(),
+        });
+        window.show();
+        self.windows.insert(window.surface.window().id(), window);
+        // The pane is already this window's; a failure here is fatal like
+        // any other viewport sync failure.
+        if let Err(error) = self.sync_viewports() {
+            self.fatal_error = Some(error);
+            event_loop.exit();
+        }
         Ok(())
     }
 
@@ -436,6 +478,20 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
                 return;
             }
             let terminal = &mut window.shell.as_mut().expect("terminal shell").terminal;
+            // Before the close check: moving a window's last pane closes it.
+            for pane in terminal.take_moved_panes() {
+                if let Err((pane, error)) = self.open_window_with_pane(event_loop, id, pane) {
+                    let origin = self.windows.get_mut(&id).expect("origin window");
+                    let terminal = &mut origin.shell.as_mut().expect("terminal shell").terminal;
+                    terminal.return_moved_pane(pane);
+                    terminal.window_error(error.to_string());
+                    origin.surface.window().request_redraw();
+                }
+            }
+            let Some(window) = self.windows.get_mut(&id) else {
+                return;
+            };
+            let terminal = &mut window.shell.as_mut().expect("terminal shell").terminal;
             if terminal.should_close() {
                 self.close_window(event_loop, id);
                 return;
@@ -488,13 +544,16 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             UserEvent::GhosttyWake => {
                 APP_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
                 // All windows/panes share one app; a single tick drains its mailbox.
-                if let Some(window) = self.windows.values_mut().next() {
-                    window
+                for window in self.windows.values_mut() {
+                    if window
                         .shell
                         .as_mut()
                         .expect("terminal shell")
                         .terminal
-                        .tick();
+                        .tick()
+                    {
+                        break;
+                    }
                 }
             }
             UserEvent::FrameReady(id) => {

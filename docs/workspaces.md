@@ -51,8 +51,7 @@ floating panes, copy mode, and pickers remain available.
 `FloatOrTilePane` (Ctrl+Alt+F) moves a terminal between the tiled layout and the
 workspace's floating panes without restarting it. A tiled pane becomes the
 visible float; the visible float becomes a tiled pane after the focused pane and
-takes focus. A workspace keeps at least one tiled pane, and the window's first
-pane cannot float because it owns the window's terminal app.
+takes focus. A workspace keeps at least one tiled pane.
 
 While a floating pane is visible, the focus keys cycle through the workspace's
 floating panes instead of the tiled ones: H/K go to the previous float, J/L
@@ -85,10 +84,10 @@ workspaces through the shortcut or palette.
 
 The command palette also exposes remove, creation, previous/next/
 last workspace, move-pane workspace picker, move pane to new workspace,
-tile-reversed, and horizontal-grid. Bind their action names in Lua:
-`RemoveWorkspace`, `CreateWorkspace`, `NextWorkspace`,
+move pane to new window, tile-reversed, and horizontal-grid. Bind their
+action names in Lua: `RemoveWorkspace`, `CreateWorkspace`, `NextWorkspace`,
 `PreviousWorkspace`, `LastWorkspace`,
-`MovePaneToWorkspacePicker`, `MovePaneToNewWorkspace`,
+`MovePaneToWorkspacePicker`, `MovePaneToNewWorkspace`, `MovePaneToNewWindow`,
 `SetTileReversed`, and `SetHorizontalGrid`.
 
 `ResizeLeft`, `ResizeRight`, `ResizeUp`, and `ResizeDown` move a shared divider
@@ -210,6 +209,8 @@ workspace and of workspaces created without an explicit `layout`, including
 | `app:focus_pane(id)` | Switch workspace and focus pane |
 | `app:move_pane(id,workspace_id)` | Move without restarting; stay on current workspace |
 | `app:move_float(id,workspace_id)` | Move a floating pane; it becomes the destination's visible float; stay on current workspace |
+| `app:move_pane_to_new_window(id)` | Move a tiled pane into a new window without restarting |
+| `app:move_float_to_new_window(id)` | Move a floating pane into a new window as its tiled pane |
 | `app:close_pane(id)` | Close terminal; remove empty workspace, or close window if it was the final pane |
 | `app:float_pane(id)` | Turn a tiled pane into a floating pane in its workspace; returns the float's description |
 | `app:tile_floating_pane(id_or_name?)` | Turn the current workspace's float (default: last focused) into a tiled pane after the focused pane; returns `{id,workspace}` |
@@ -227,6 +228,16 @@ a new window within the same process. Each window has its own shell, terminal
 view, floating pane, and UI state. Windows share the native Ghostty app and its
 configuration; theme and font changes apply to all windows. Closing a window
 closes its terminals, and the app exits after the last window closes.
+
+`MovePaneToNewWindow` (unbound by default; also in the command palette) moves
+the visible float, or else the focused tiled pane, into a new window. The shell
+keeps running, and copy mode, search, quick select, and pane-scope pickers
+stay open; a workspace-scope picker is cancelled. A float becomes the new
+window's tiled pane. The new window starts with one workspace and does not run
+`startup`. Any pane can move, including the window's first. Moving a
+workspace's last tiled pane removes that
+workspace and closes its floats, as with other moves, and moving a window's
+last pane closes that window.
 
 ## Floating panes
 

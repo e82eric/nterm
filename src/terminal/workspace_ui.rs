@@ -54,6 +54,8 @@ pub(crate) enum WorkspaceAction {
     MovePaneToWorkspacePicker,
     /// Moves the focused pane, or the visible float, into a new workspace.
     MovePaneToNewWorkspace,
+    /// Moves the focused pane, or the visible float, into a new window.
+    MovePaneToNewWindow,
     NextWorkspace,
     PreviousWorkspace,
     LastWorkspace,
@@ -94,6 +96,7 @@ impl WorkspaceAction {
         Self::WorkspacePicker,
         Self::MovePaneToWorkspacePicker,
         Self::MovePaneToNewWorkspace,
+        Self::MovePaneToNewWindow,
         Self::NextWorkspace,
         Self::PreviousWorkspace,
         Self::LastWorkspace,
@@ -152,6 +155,7 @@ impl WorkspaceAction {
             WorkspacePicker => "WorkspacePicker".into(),
             MovePaneToWorkspacePicker => "MovePaneToWorkspacePicker".into(),
             MovePaneToNewWorkspace => "MovePaneToNewWorkspace".into(),
+            MovePaneToNewWindow => "MovePaneToNewWindow".into(),
             NextWorkspace => "NextWorkspace".into(),
             PreviousWorkspace => "PreviousWorkspace".into(),
             LastWorkspace => "LastWorkspace".into(),
@@ -209,6 +213,7 @@ impl WorkspaceAction {
             | WorkspacePicker
             | MovePaneToWorkspacePicker
             | MovePaneToNewWorkspace
+            | MovePaneToNewWindow
             | NextWorkspace
             | PreviousWorkspace
             | LastWorkspace
@@ -356,25 +361,13 @@ impl TerminalView {
         self.workspace().focused
     }
     pub(super) fn tiled_ref(&self, id: u64) -> Option<&super::TerminalPane> {
-        if id == 0 {
-            Some(&self.main)
-        } else {
-            self.tiled.iter().find(|(i, _)| *i == id).map(|(_, p)| p)
-        }
+        self.tiled.iter().find(|(i, _)| *i == id).map(|(_, p)| p)
     }
     pub(super) fn tiled_mut(&mut self, id: u64) -> Option<&mut super::TerminalPane> {
-        if id == 0 {
-            if self.workspaces.iter().any(|w| w.panes.contains(&0)) {
-                Some(&mut self.main)
-            } else {
-                None
-            }
-        } else {
-            self.tiled
-                .iter_mut()
-                .find(|(i, _)| *i == id)
-                .map(|(_, p)| p)
-        }
+        self.tiled
+            .iter_mut()
+            .find(|(i, _)| *i == id)
+            .map(|(_, p)| p)
     }
     pub(super) fn select_workspace(&mut self, id: u64) -> Result<(), String> {
         if !self.workspaces.iter().any(|w| w.id == id) {
@@ -463,10 +456,6 @@ impl TerminalView {
     /// Moves a tiled pane's terminal into its workspace's floats and shows it.
     /// Returns the workspace and the new float ID.
     pub(super) fn float_tiled(&mut self, id: u64) -> Result<(u64, u64), String> {
-        if id == 0 {
-            // Pane 0 owns the window's terminal app; other panes are its children.
-            return Err("the window's first pane cannot float".into());
-        }
         let w = self
             .workspaces
             .iter()
@@ -577,6 +566,55 @@ impl TerminalView {
         }
         Ok(())
     }
+    /// Takes a pane out of this window; the app opens a new window around it
+    /// after this frame. Its process, copy mode, search, quick select, and
+    /// pane pickers carry over; a workspace-scope picker is cancelled. A float
+    /// becomes the new window's tiled pane.
+    pub(super) fn move_pane_to_new_window(&mut self, pane: PaneRef) -> Result<(), String> {
+        let mut pane = match pane {
+            PaneRef::Tiled(id) => {
+                let at = self
+                    .tiled
+                    .iter()
+                    .position(|(i, _)| *i == id)
+                    .ok_or("pane does not exist")?;
+                for w in &mut self.workspaces {
+                    w.remove(id);
+                }
+                self.prune_workspaces();
+                self.tiled.remove(at).1
+            }
+            PaneRef::Floating(id) => {
+                let float = self
+                    .floating
+                    .remove(id)
+                    .ok_or("floating pane does not exist")?;
+                for w in &mut self.workspaces {
+                    w.floats.remove(id);
+                }
+                float.pane
+            }
+        };
+        pane.cancel_workspace_picker();
+        self.moved_panes.push(pane);
+        self.context.request_repaint();
+        Ok(())
+    }
+    /// Takes back a pane whose new window could not open, as a tiled pane
+    /// after the focused one in the current workspace.
+    pub(crate) fn return_moved_pane(&mut self, pane: super::MovedPane) {
+        let id = self.next_pane;
+        self.next_pane += 1;
+        self.tiled.push((id, pane.0));
+        let w = self.workspace_mut();
+        let at = w
+            .panes
+            .iter()
+            .position(|p| Some(*p) == w.focused)
+            .map_or(w.panes.len(), |i| i + 1);
+        w.panes.insert(at, id);
+        w.focus(id);
+    }
     fn close_tiled(&mut self, id: u64) -> Result<(), String> {
         if !self.workspaces.iter().any(|w| w.panes.contains(&id)) {
             return Err("pane does not exist".into());
@@ -585,13 +623,11 @@ impl TerminalView {
             w.remove(id);
         }
         self.prune_workspaces();
-        if id == 0 {
-            self.close_main_pending = true;
-        } else if let Some(i) = self.tiled.iter().position(|(i, _)| *i == id) {
+        if let Some(i) = self.tiled.iter().position(|(i, _)| *i == id) {
             let (_, p) = self.tiled.remove(i);
             self.closed_panes.push(p);
         }
-        self.main.request_repaint();
+        self.context.request_repaint();
         Ok(())
     }
     pub(super) fn host_request(
@@ -740,6 +776,14 @@ impl TerminalView {
                 self.close_tiled(id)?;
                 Ok(Value::Null)
             }
+            Request::MovePaneToNewWindow(id) => {
+                self.move_pane_to_new_window(PaneRef::Tiled(id))?;
+                Ok(Value::Null)
+            }
+            Request::MoveFloatToNewWindow(id) => {
+                self.move_pane_to_new_window(PaneRef::Floating(id))?;
+                Ok(Value::Null)
+            }
             Request::FocusPane(id) => {
                 let target = self
                     .workspaces
@@ -819,6 +863,11 @@ impl TerminalView {
                         self.move_pane_to_new_workspace(pane, gl)?;
                     }
                 }
+                MovePaneToNewWindow => {
+                    if let Some(pane) = self.active_pane() {
+                        self.move_pane_to_new_window(pane)?;
+                    }
+                }
                 WorkspacePicker | MovePaneToWorkspacePicker => {
                     self.open_workspace_picker(ctx, action == MovePaneToWorkspacePicker);
                 }
@@ -892,7 +941,7 @@ impl TerminalView {
             Ok(())
         })();
         if let Err(error) = result {
-            self.main.show_error("Workspace action failed", error);
+            self.show_error("Workspace action failed", error);
         }
         ctx.request_repaint();
     }
@@ -1096,7 +1145,10 @@ impl TerminalView {
             let result = callback.with_host(&mut |r| self.host_request(r, gl), || {
                 callback.call_action(String::new())
             });
-            self.main.finish_lua_action(result, ctx);
+            // Its output (toasts, text) goes to the pane that has focus after it.
+            if let Some(pane) = self.active_pane().and_then(|p| self.pane_mut(p)) {
+                pane.finish_lua_action(result, ctx);
+            }
         }
     }
     /// Pane lifecycle work before building a frame: releases terminals closed
@@ -1106,10 +1158,6 @@ impl TerminalView {
     pub(crate) fn before_frame(&mut self) {
         for mut p in self.closed_panes.drain(..) {
             p.destroy();
-        }
-        if self.close_main_pending {
-            self.close_main_pending = false;
-            self.main.close_process();
         }
         let exited: Vec<_> = self
             .workspaces
@@ -1159,7 +1207,6 @@ impl TerminalView {
             available.max,
         );
         let content = egui::Rect::from_min_max(available.min, status.right_top());
-        self.main.workspace_bounds = Some(content);
         for (_, pane) in &mut self.tiled {
             pane.workspace_bounds = Some(content);
         }
@@ -1204,9 +1251,6 @@ impl TerminalView {
             if let Some(p) = self.pane_mut(pane) {
                 p.set_active(&ctx, true, focused_window);
             }
-        }
-        if target != Some(PaneRef::Tiled(0)) {
-            self.main.set_active(&ctx, false, focused_window);
         }
         for (id, p) in &mut self.tiled {
             if target != Some(PaneRef::Tiled(*id)) {
@@ -1283,8 +1327,6 @@ impl TerminalView {
         #[cfg(any(windows, unix))]
         {
             let interactive = |pane| origin == Some(pane);
-            self.main
-                .handle_pipe_requests(&ctx, &bindings, interactive(PaneRef::Tiled(0)));
             for (id, p) in &mut self.tiled {
                 p.handle_pipe_requests(&ctx, &bindings, interactive(PaneRef::Tiled(*id)));
             }
@@ -1294,15 +1336,14 @@ impl TerminalView {
             }
         }
         let mut action = None;
-        // The main pane shows its toasts over the workspace while another pane
-        // is focused; Escape dismisses those along with the focused pane's.
-        let main_toasts = self.focused_id() != Some(0) && self.main.has_toasts();
+        // Escape dismisses the window's toasts along with the focused pane's.
+        let window_toasts = !self.toasts.is_empty();
         let mut toasts_dismissed = false;
         if let (Some(origin), Some(bounds)) = (origin, bounds) {
             let bindings = self.picker_bindings.clone();
             if let Some(p) = self.pane_mut(origin) {
                 toasts_dismissed = !consumed
-                    && (p.has_toasts() || main_toasts)
+                    && (p.has_toasts() || window_toasts)
                     && p.escape_dismisses_toasts()
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
                 if toasts_dismissed {
@@ -1322,23 +1363,21 @@ impl TerminalView {
             self.run_picker_callback(origin, gl, &ctx);
         }
         if toasts_dismissed {
-            self.main.dismiss_toasts();
+            self.toasts.clear();
         }
         if let Some(action) = action {
             self.execute_action(action, self.floats().visible().is_some(), &ctx, gl);
         }
         self.show_mode_status(ui, status);
         self.show_floating(ui, content, floating_rect, &floating_style);
-        self.main.drain_clipboard(&ctx);
         for (_, p) in &self.tiled {
             p.drain_clipboard(&ctx);
         }
         for p in &self.floating.entries {
             p.drain_clipboard(&ctx);
         }
-        if self.focused_id() != Some(0) {
-            self.main.show_toasts(&ctx, content);
-        }
+        self.toasts
+            .show(&ctx, content, egui::Id::new("window-toasts"), None, 0.0);
     }
 }
 #[cfg(test)]

@@ -23,14 +23,11 @@ struct NtermHost {
     NtermHost *next;
     bool focused;
     ghostty_platform_wgpu_s platform;
-#ifdef _WIN32
-    HWND window;
-    WNDPROC previous_window_proc;
-#endif
 };
 
 #ifdef _WIN32
-static const wchar_t host_property[] = L"NtermHost.QuickSelect";
+// Holds the window procedure that window_proc replaced.
+static const wchar_t window_property[] = L"Nterm.WindowProc";
 // An undecorated window has no sizing border. Report a thin band along the
 // edges as one so Windows runs its native resize loop, including resize
 // cursors and snapping. Maximized windows have no band.
@@ -49,9 +46,9 @@ static LRESULT host_resize_hit_test(HWND window, LPARAM lparam) {
     if (right) return HTRIGHT;
     return HTNOWHERE;
 }
-static LRESULT CALLBACK host_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    NtermHost *host = (NtermHost *)GetPropW(window, host_property);
-    if (!host) return DefWindowProcW(window, message, wparam, lparam);
+static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    WNDPROC previous = (WNDPROC)GetPropW(window, window_property);
+    if (!previous) return DefWindowProcW(window, message, wparam, lparam);
     if (message == WM_NCHITTEST) {
         LRESULT edge = host_resize_hit_test(window, lparam);
         if (edge != HTNOWHERE) return edge;
@@ -59,15 +56,40 @@ static LRESULT CALLBACK host_window_proc(HWND window, UINT message, WPARAM wpara
     // Winit still receives WM_SYSKEYDOWN. Only prevent the default system-menu
     // action generated for Alt+Space, so the app can own this shortcut.
     if (message == WM_SYSCOMMAND && (wparam & 0xfff0) == SC_KEYMENU && lparam == L' ') return 0;
-    WNDPROC previous = host->previous_window_proc;
     if (message == WM_NCDESTROY) {
         SetWindowLongPtrW(window, GWLP_WNDPROC, (LONG_PTR)previous);
-        RemovePropW(window, host_property);
-        host->window = NULL;
+        RemovePropW(window, window_property);
     }
     return CallWindowProcW(previous, window, message, wparam, lparam);
 }
 #endif
+
+// Gives a native window its resize edges and Alt+Space handling. These belong
+// to the window, not to any terminal in it.
+void nterm_window_attach(void *window) {
+#ifdef _WIN32
+    HWND hwnd = (HWND)window;
+    if (!hwnd || GetPropW(hwnd, window_property)) return;
+    WNDPROC previous = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+    if (previous && SetPropW(hwnd, window_property, (HANDLE)previous))
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)window_proc);
+#else
+    (void)window;
+#endif
+}
+
+void nterm_window_detach(void *window) {
+#ifdef _WIN32
+    HWND hwnd = (HWND)window;
+    WNDPROC previous = hwnd ? (WNDPROC)GetPropW(hwnd, window_property) : NULL;
+    if (!previous) return;
+    if ((WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC) == window_proc)
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)previous);
+    RemovePropW(hwnd, window_property);
+#else
+    (void)window;
+#endif
+}
 
 extern void nterm_frame_ready(void *userdata);
 extern void nterm_close(void *userdata);
@@ -291,13 +313,6 @@ NtermHost *nterm_host_create(
     host->shared->base_config = base_config;
     host->shared->hosts = host;
     host->platform = options.platform.wgpu;
-#ifdef _WIN32
-    if (SetPropW((HWND)window, host_property, host)) {
-        host->previous_window_proc = (WNDPROC)SetWindowLongPtrW((HWND)window, GWLP_WNDPROC, (LONG_PTR)host_window_proc);
-        if (host->previous_window_proc) host->window = (HWND)window;
-        else RemovePropW((HWND)window, host_property);
-    }
-#endif
     return host;
 }
 
@@ -344,13 +359,6 @@ NtermHost *nterm_host_create_child(
     host->shared = parent->shared;
     host->next = host->shared->hosts;
     host->shared->hosts = host;
-#ifdef _WIN32
-    if (window && SetPropW((HWND)window, host_property, host)) {
-        host->previous_window_proc = (WNDPROC)SetWindowLongPtrW((HWND)window, GWLP_WNDPROC, (LONG_PTR)host_window_proc);
-        if (host->previous_window_proc) host->window = (HWND)window;
-        else RemovePropW((HWND)window, host_property);
-    }
-#endif
     return host;
 }
 
@@ -389,24 +397,8 @@ bool nterm_host_apply_theme(NtermHost *host, const char *name, char *error, size
     return nterm_host_apply_settings(host, name, NULL, 0, error, capacity);
 }
 
-// Keep the window's app/configuration owner available to create future panes
-// after the last terminal has closed. The process and renderer are released.
-void nterm_host_close_process(NtermHost *host) {
-    if (!host || !host->surface) return;
-    ghostty_surface_free(host->surface);
-    host->surface = NULL;
-    host->focused = false;
-}
-
 void nterm_host_destroy(NtermHost *host) {
     if (!host) return;
-#ifdef _WIN32
-    if (host->window) {
-        if ((WNDPROC)GetWindowLongPtrW(host->window, GWLP_WNDPROC) == host_window_proc)
-            SetWindowLongPtrW(host->window, GWLP_WNDPROC, (LONG_PTR)host->previous_window_proc);
-        RemovePropW(host->window, host_property);
-    }
-#endif
     if (host->surface) ghostty_surface_free(host->surface);
     NtermHost **link = &host->shared->hosts;
     while (*link && *link != host) link = &(*link)->next;

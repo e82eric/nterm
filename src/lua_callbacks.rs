@@ -702,6 +702,8 @@ impl UserData for App {
             ("create_pane", "CreatePane"),
             ("move_pane", "MovePane"),
             ("move_float", "MoveFloat"),
+            ("move_pane_to_new_window", "MovePaneToNewWindow"),
+            ("move_float_to_new_window", "MoveFloatToNewWindow"),
             ("close_pane", "ClosePane"),
             ("focus_pane", "FocusPane"),
             ("get_panes", "ListPanes"),

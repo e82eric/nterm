@@ -20,6 +20,12 @@ fn main() {
     if cfg!(target_family = "unix") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
     }
+    // Ghostty creates surfaces on the UI thread, deep inside egui frames, and
+    // its surface setup uses large stack frames. MSVC's 1 MiB default
+    // overflowed when creating a floating pane.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
     println!("cargo:rerun-if-changed=src/host_shim.c");
     println!(
         "cargo:rerun-if-changed={}",

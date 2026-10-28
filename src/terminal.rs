@@ -11,18 +11,19 @@ pub(crate) mod workspace_ui;
 use pane::TerminalPane;
 
 pub(crate) struct TerminalView {
-    main: TerminalPane,
-    /// Tiled terminals other than pane 0 (`main`), across all workspaces, by
-    /// tiled ID. Which workspace each belongs to is in `Workspace::panes`.
+    /// Tiled terminals across all workspaces, by tiled ID. Which workspace
+    /// each belongs to is in `Workspace::panes`.
     tiled: Vec<(u64, TerminalPane)>,
     closed_panes: Vec<TerminalPane>,
-    close_main_pending: bool,
     workspaces: Vec<workspace::Workspace>,
     current: u64,
     previous: u64,
     next_workspace: u64,
     next_pane: u64,
     messages: crate::messages::Messages,
+    /// The window's own notices and errors, shown over the workspace.
+    toasts: crate::toast::Toasts,
+    context: egui::Context,
 
     command_label: String,
     reload_source: crate::config::ReloadSource,
@@ -31,6 +32,9 @@ pub(crate) struct TerminalView {
     floating_padding: Option<crate::config::FloatingPadding>,
     floating: floating::Panes<FloatingTerminal>,
     new_window_requested: bool,
+    /// Panes taken out of this window this frame, each to become the first
+    /// pane of a new window.
+    moved_panes: Vec<TerminalPane>,
     /// Set by the status bar's close button; the app then closes this window.
     close_requested: bool,
 }
@@ -38,6 +42,9 @@ pub(crate) struct TerminalView {
 struct FloatingTerminal {
     pane: TerminalPane,
 }
+
+/// A terminal taken out of one window on its way to a new window.
+pub(crate) struct MovedPane(TerminalPane);
 
 /// Window state that a pane's pickers show: the command palette's float and
 /// workspace entries, and the messages picker's configuration issues. Built by
@@ -74,7 +81,7 @@ impl FloatingTerminal {
 }
 
 /// A terminal in this window. Tiled and floating panes have separate ID
-/// spaces, so a reference says which kind it is; tiled 0 is `main`.
+/// spaces, so a reference says which kind it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneRef {
     Tiled(u64),
@@ -83,15 +90,35 @@ pub(crate) enum PaneRef {
 
 impl TerminalView {
     pub(crate) fn apply_theme(&mut self, name: &str) -> Result<(), String> {
-        self.main.apply_theme(name)
+        self.app_pane().ok_or("no terminal is open")?.apply_theme(name)
     }
+    /// Any terminal in this window. Every terminal shares one native app, so
+    /// app-wide work (ticks, settings, and new terminals) can go through any
+    /// of them. None only once the window's last terminal has closed.
+    fn app_pane(&self) -> Option<&TerminalPane> {
+        self.tiled
+            .first()
+            .map(|(_, p)| p)
+            .or_else(|| self.floating.entries.first().map(|e| &e.value.pane))
+    }
+    /// The visible float, else the focused tiled pane. Only called while the
+    /// window has a tiled pane.
     fn active_pane_ref(&self) -> &TerminalPane {
         if let Some(float) = self.visible_float() {
             &float.pane
         } else {
-            self.tiled_ref(self.focused_id().unwrap_or(0))
-                .unwrap_or(&self.main)
+            self.focused_id()
+                .and_then(|id| self.tiled_ref(id))
+                .or_else(|| self.tiled.first().map(|(_, p)| p))
+                .expect("an open window has a tiled pane")
         }
+    }
+    fn show_error(&mut self, title: &str, error: String) {
+        crate::error_log::error("terminal", title, &error);
+        self.toasts.push_error(title.into(), error, 10000);
+    }
+    fn show_notice(&mut self, title: &str, message: String) {
+        self.toasts.push(title.into(), message, 3000);
     }
 
     pub(crate) fn new(
@@ -107,17 +134,79 @@ impl TerminalView {
         mut issues: Vec<String>,
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
-        let main = TerminalPane::create(egui_ctx, gl, proxy, window, argc, argv)?;
-        issues.extend(main.take_config_issues());
+        let pane = TerminalPane::create(egui_ctx, gl, proxy, window, argc, argv)?;
+        issues.extend(pane.take_config_issues());
         #[cfg(any(windows, unix))]
-        main.set_pipe_policy(&picker_bindings.pipe_policy);
-        Ok(Self {
-            messages: crate::messages::Messages::new(issues),
+        pane.set_pipe_policy(&picker_bindings.pipe_policy);
+        Ok(Self::with_pane(
+            pane,
+            egui_ctx,
+            issues,
+            command_label,
+            reload_source,
+            std::rc::Rc::new(picker_bindings),
+            floating_padding,
+        ))
+    }
 
-            main,
+    pub(crate) fn new_window(
+        &self,
+        egui_ctx: &egui::Context,
+        gl: &glow::Context,
+        window: crate::graphics::PaneWindow,
+    ) -> Result<Self, crate::native_error::FatalError> {
+        let pane = self
+            .app_pane()
+            .ok_or_else(|| {
+                crate::native_error::FatalError::new("open a window", "no terminal is open")
+            })?
+            .create_window(egui_ctx, gl, window)?;
+        #[cfg(any(windows, unix))]
+        pane.set_pipe_policy(&self.picker_bindings.pipe_policy);
+        Ok(self.sibling(pane))
+    }
+
+    /// A view for a new window whose first pane is one moved out of this
+    /// window, with its process and UI state intact.
+    pub(crate) fn adopt_window(
+        &self,
+        mut pane: MovedPane,
+        window: crate::graphics::PaneWindow,
+    ) -> Self {
+        pane.0.move_to_window(window.id);
+        self.sibling(pane.0)
+    }
+
+    /// A view for another window around `pane`, sharing this window's settings.
+    fn sibling(&self, pane: TerminalPane) -> Self {
+        let issues = pane.take_config_issues();
+        Self::with_pane(
+            pane,
+            &self.context,
+            issues,
+            self.command_label.clone(),
+            self.reload_source.clone(),
+            self.picker_bindings.clone(),
+            self.floating_padding,
+        )
+    }
+
+    /// A one-workspace view whose only pane is `pane`, tiled pane 0.
+    fn with_pane(
+        pane: TerminalPane,
+        context: &egui::Context,
+        issues: Vec<String>,
+        command_label: String,
+        reload_source: crate::config::ReloadSource,
+        picker_bindings: std::rc::Rc<crate::picker::config::Bindings>,
+        floating_padding: Option<crate::config::FloatingPadding>,
+    ) -> Self {
+        Self {
+            messages: crate::messages::Messages::new(issues),
+            toasts: Default::default(),
+            context: context.clone(),
+            tiled: vec![(0, pane)],
             closed_panes: Vec::new(),
-            close_main_pending: false,
-            tiled: Vec::new(),
             workspaces: vec![{
                 let mut w = workspace::Workspace::new(1, 1);
                 w.layout = picker_bindings.default_layout;
@@ -132,58 +221,24 @@ impl TerminalView {
             command_label,
             reload_source,
             close_requested: false,
-            picker_bindings: std::rc::Rc::new(picker_bindings),
+            picker_bindings,
             floating_padding,
             floating: Default::default(),
             new_window_requested: false,
-        })
+            moved_panes: Vec::new(),
+        }
     }
 
-    pub(crate) fn new_window(
-        &self,
-        egui_ctx: &egui::Context,
-        gl: &glow::Context,
-        window: crate::graphics::PaneWindow,
-    ) -> Result<Self, crate::native_error::FatalError> {
-        let main = self.main.create_window(egui_ctx, gl, window)?;
-        #[cfg(any(windows, unix))]
-        main.set_pipe_policy(&self.picker_bindings.pipe_policy);
-        Ok(Self {
-            messages: crate::messages::Messages::new(main.take_config_issues()),
-            main,
-            closed_panes: Vec::new(),
-            close_main_pending: false,
-            tiled: Vec::new(),
-            workspaces: vec![{
-                let mut w = workspace::Workspace::new(1, 1);
-                w.layout = self.picker_bindings.default_layout;
-                w.panes.push(0);
-                w.focused = Some(0);
-                w
-            }],
-            current: 1,
-            previous: 1,
-            next_workspace: 2,
-            next_pane: 1,
-            command_label: self.command_label.clone(),
-            reload_source: self.reload_source.clone(),
-            close_requested: false,
-            picker_bindings: self.picker_bindings.clone(),
-            floating_padding: self.floating_padding,
-            floating: Default::default(),
-            new_window_requested: false,
-        })
-    }
-
-    /// Creates a tiled or floating pane's terminal as a child of the window's
-    /// app, with the configured pipe policy applied.
+    /// Creates a tiled or floating pane's terminal in the window's app, with
+    /// the configured pipe policy applied.
     fn create_pane(
         &self,
         gl: &glow::Context,
         options: &pane::SpawnOptions,
     ) -> Result<TerminalPane, String> {
         let pane = self
-            .main
+            .app_pane()
+            .ok_or("no terminal is open")?
             .create_child(gl, options)
             .map_err(|e| e.to_string())?;
         #[cfg(any(windows, unix))]
@@ -195,17 +250,24 @@ impl TerminalView {
         std::mem::take(&mut self.new_window_requested)
     }
 
-    pub(crate) fn window_error(&mut self, error: String) {
-        self.main
-            .show_error("Could not open terminal window", error);
+    /// Panes moved out of this window since the last call, each for a new
+    /// window to adopt.
+    pub(crate) fn take_moved_panes(&mut self) -> Vec<MovedPane> {
+        self.moved_panes.drain(..).map(MovedPane).collect()
     }
 
-    pub(crate) fn tick(&mut self) {
-        self.main.tick();
+    pub(crate) fn window_error(&mut self, error: String) {
+        self.show_error("Could not open terminal window", error);
+    }
+
+    /// Drains the shared native app's mailbox. False if this window has no
+    /// terminal left to do it through.
+    pub(crate) fn tick(&mut self) -> bool {
+        self.app_pane().map(|pane| pane.tick()).is_some()
     }
 
     pub(crate) fn acquire_frames(&mut self) -> bool {
-        let mut acquired = self.main.acquire_frame();
+        let mut acquired = false;
         for (_, pane) in &mut self.tiled {
             acquired |= pane.acquire_frame();
         }
@@ -356,7 +418,7 @@ impl TerminalView {
                 serde_json::json!({"id": pane, "workspace": self.current})
             }
         };
-        self.main.request_repaint();
+        self.context.request_repaint();
         Ok(result)
     }
     fn execute_action(
@@ -370,12 +432,12 @@ impl TerminalView {
             AppAction::Workspace(action) => self.workspace_action(action, ctx, gl),
             AppAction::SelectWorkspaceId(id) => {
                 if let Err(error) = self.select_workspace(id) {
-                    self.main.show_error("Workspace action failed", error);
+                    self.show_error("Workspace action failed", error);
                 }
             }
             AppAction::MovePaneToWorkspaceId { pane, workspace } => {
                 if let Err(error) = self.move_pane_to_workspace(pane, workspace, gl) {
-                    self.main.show_error("Workspace action failed", error);
+                    self.show_error("Workspace action failed", error);
                 }
             }
             AppAction::ReloadConfig => match self.reload_source.reload() {
@@ -384,14 +446,16 @@ impl TerminalView {
                         || config.font_family.is_some()
                         || config.font_size.is_some()
                     {
-                        if let Err(error) = self.main.apply_settings(&config) {
-                            self.main
-                                .show_error("Could not reload configuration", error);
+                        let applied = match self.app_pane() {
+                            Some(pane) => pane.apply_settings(&config),
+                            None => Err("no terminal is open".into()),
+                        };
+                        if let Err(error) = applied {
+                            self.show_error("Could not reload configuration", error);
                             return;
                         }
                     }
                     if config.font_family.is_some() || config.font_size.is_some() {
-                        self.main.refresh_picker_font(ctx);
                         for (_, pane) in &mut self.tiled {
                             pane.refresh_picker_font(ctx);
                         }
@@ -403,7 +467,6 @@ impl TerminalView {
                     #[cfg(any(windows, unix))]
                     {
                         let policy = &self.picker_bindings.pipe_policy;
-                        self.main.set_pipe_policy(policy);
                         for (_, pane) in &self.tiled {
                             pane.set_pipe_policy(policy);
                         }
@@ -413,11 +476,9 @@ impl TerminalView {
                     }
                     self.floating_padding = config.padding;
                     crate::colors::COLORS.reload(ctx, config.colors);
-                    self.main.show_notice("", "Configuration reloaded".into());
+                    self.show_notice("", "Configuration reloaded".into());
                 }
-                Err(error) => self
-                    .main
-                    .show_error("Could not reload configuration", error),
+                Err(error) => self.show_error("Could not reload configuration", error),
             },
             AppAction::OpenThemePicker => {
                 let entry = self
@@ -443,8 +504,8 @@ impl TerminalView {
                 pane.open_picker(ctx, entry, None, &bindings, &palette);
             }
             AppAction::ApplyTheme(name) => match self.apply_theme(&name) {
-                Ok(()) => self.main.show_notice("Theme applied", name),
-                Err(error) => self.main.show_error("Could not apply theme", error),
+                Ok(()) => self.show_notice("Theme applied", name),
+                Err(error) => self.show_error("Could not apply theme", error),
             },
             AppAction::ShowMessages | AppAction::OpenErrorLog => self.show_messages(ctx),
             AppAction::NewWindow => {
@@ -454,7 +515,7 @@ impl TerminalView {
                 if self.floats().contains(id) {
                     self.floats_mut().show(id);
                 } else {
-                    self.main.show_notice(
+                    self.show_notice(
                         "Floating pane closed",
                         format!("Pane {id} is no longer available"),
                     );
@@ -473,7 +534,7 @@ impl TerminalView {
                     _ => floating::Request::Close(None),
                 };
                 if let Err(error) = self.floating_request(request, gl) {
-                    self.main.show_error("Floating pane action failed", error);
+                    self.show_error("Floating pane action failed", error);
                 }
             }
             _ => {
@@ -599,7 +660,7 @@ impl TerminalView {
     fn show_messages(&mut self, ctx: &egui::Context) {
         let issues = self.messages.config_issues().to_vec();
         if issues.is_empty() && crate::error_log::snapshot().is_empty() {
-            self.main.show_notice("Messages", "No messages.".into());
+            self.show_notice("Messages", "No messages.".into());
             return;
         }
         if let Some(floating) = self.visible_float_mut() {
@@ -825,10 +886,12 @@ impl TerminalView {
         for mut pane in self.closed_panes.drain(..) {
             pane.destroy();
         }
+        for mut pane in self.moved_panes.drain(..) {
+            pane.destroy();
+        }
         for (_, mut pane) in self.tiled.drain(..) {
             pane.destroy();
         }
-        self.main.destroy();
     }
 }
 

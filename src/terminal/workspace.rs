@@ -353,6 +353,10 @@ pub(crate) enum Request {
     /// Moves a float to another workspace and makes it that workspace's
     /// visible float.
     MoveFloat(u64, u64),
+    /// Moves a tiled pane into a new window.
+    MovePaneToNewWindow(u64),
+    /// Moves a float into a new window as its tiled pane.
+    MoveFloatToNewWindow(u64),
     ClosePane(u64),
     FocusPane(u64),
     ListPanes,
