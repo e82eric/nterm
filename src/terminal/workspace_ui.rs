@@ -596,7 +596,8 @@ impl TerminalView {
             }
         };
         pane.cancel_workspace_picker();
-        self.moved_panes.push(pane);
+        self.requests
+            .push(super::WindowRequest::MovePaneToNewWindow(super::MovedPane(pane)));
         self.context.request_repaint();
         Ok(())
     }
@@ -1149,6 +1150,7 @@ impl TerminalView {
             if let Some(pane) = self.active_pane().and_then(|p| self.pane_mut(p)) {
                 pane.finish_lua_action(result, ctx);
             }
+            self.post_requests();
         }
     }
     /// Pane lifecycle work before building a frame: releases terminals closed

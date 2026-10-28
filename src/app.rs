@@ -183,6 +183,10 @@ pub(crate) enum UserEvent {
     GhosttyWake,
     FrameReady(winit::window::WindowId),
     PickerWake { window_id: winit::window::WindowId },
+    /// A window's frame queued requests, or left it with no panes. Posted so
+    /// they are handled after the frame, with the event loop and every window
+    /// available.
+    WindowRequests(winit::window::WindowId),
 }
 
 struct NativeApp {
@@ -388,6 +392,61 @@ impl NativeApp {
         Ok(())
     }
 
+    /// Carries out what a window's frames asked for, in order, then closes the
+    /// window if it has no panes left. Moved panes leave before that check, so
+    /// moving a window's last pane out opens the new window first.
+    fn handle_window_requests(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        id: winit::window::WindowId,
+    ) {
+        use crate::terminal::WindowRequest;
+        let Some(window) = self.windows.get_mut(&id) else {
+            return;
+        };
+        let requests = window
+            .shell
+            .as_mut()
+            .expect("terminal shell")
+            .terminal
+            .take_requests();
+        for request in requests {
+            let (returned, error) = match request {
+                WindowRequest::NewWindow => match self.open_window(event_loop, id) {
+                    Ok(()) => continue,
+                    Err(error) => (None, error),
+                },
+                WindowRequest::MovePaneToNewWindow(pane) => {
+                    match self.open_window_with_pane(event_loop, id, pane) {
+                        Ok(()) => continue,
+                        Err((pane, error)) => (Some(pane), error),
+                    }
+                }
+            };
+            let origin = self.windows.get_mut(&id).expect("requesting window");
+            let terminal = &mut origin.shell.as_mut().expect("terminal shell").terminal;
+            if let Some(pane) = returned {
+                terminal.return_moved_pane(pane);
+            }
+            terminal.window_error(error.to_string());
+            origin.surface.window().request_redraw();
+        }
+        if self.fatal_error.is_some() {
+            return;
+        }
+        let closing = self.windows.get(&id).is_some_and(|window| {
+            window
+                .shell
+                .as_ref()
+                .expect("terminal shell")
+                .terminal
+                .should_close()
+        });
+        if closing {
+            self.close_window(event_loop, id);
+        }
+    }
+
     fn sync_viewports(&mut self) -> Result<(), FatalError> {
         if let Some(shared) = &self.shared_ui {
             shared
@@ -473,41 +532,9 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             return;
         };
         if matches!(event, WindowEvent::RedrawRequested) {
+            // What the frame asked for arrives as `UserEvent::WindowRequests`.
             if let Err(error) = window.redraw() {
                 self.fail(event_loop, error);
-                return;
-            }
-            let terminal = &mut window.shell.as_mut().expect("terminal shell").terminal;
-            // Before the close check: moving a window's last pane closes it.
-            for pane in terminal.take_moved_panes() {
-                if let Err((pane, error)) = self.open_window_with_pane(event_loop, id, pane) {
-                    let origin = self.windows.get_mut(&id).expect("origin window");
-                    let terminal = &mut origin.shell.as_mut().expect("terminal shell").terminal;
-                    terminal.return_moved_pane(pane);
-                    terminal.window_error(error.to_string());
-                    origin.surface.window().request_redraw();
-                }
-            }
-            let Some(window) = self.windows.get_mut(&id) else {
-                return;
-            };
-            let terminal = &mut window.shell.as_mut().expect("terminal shell").terminal;
-            if terminal.should_close() {
-                self.close_window(event_loop, id);
-                return;
-            }
-            if terminal.take_new_window_request() {
-                if let Err(error) = self.open_window(event_loop, id) {
-                    if let Some(parent) = self.windows.get_mut(&id) {
-                        parent
-                            .shell
-                            .as_mut()
-                            .expect("parent terminal")
-                            .terminal
-                            .window_error(error.to_string());
-                        parent.surface.window().request_redraw();
-                    }
-                }
             }
             return;
         }
@@ -530,11 +557,12 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
         if self.fatal_error.is_some() {
             return;
         }
         match event {
+            UserEvent::WindowRequests(id) => self.handle_window_requests(event_loop, id),
             UserEvent::PickerWake { window_id } => {
                 if let Some(window) = self.windows.get_mut(&window_id) {
                     // Service queued work immediately; only GPU presentation is paced.

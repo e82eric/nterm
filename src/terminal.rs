@@ -31,10 +31,12 @@ pub(crate) struct TerminalView {
     picker_bindings: std::rc::Rc<crate::picker::config::Bindings>,
     floating_padding: Option<crate::config::FloatingPadding>,
     floating: floating::Panes<FloatingTerminal>,
-    new_window_requested: bool,
-    /// Panes taken out of this window this frame, each to become the first
-    /// pane of a new window.
-    moved_panes: Vec<TerminalPane>,
+    /// Work for the app to do after this window's frame; see `post_requests`.
+    requests: Vec<WindowRequest>,
+    /// Whether a `UserEvent::WindowRequests` is on its way to the app.
+    requests_posted: bool,
+    proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
+    window_id: egui_winit::winit::window::WindowId,
     /// Set by the status bar's close button; the app then closes this window.
     close_requested: bool,
 }
@@ -45,6 +47,16 @@ struct FloatingTerminal {
 
 /// A terminal taken out of one window on its way to a new window.
 pub(crate) struct MovedPane(TerminalPane);
+
+/// Something a window's frame asks of the app. A frame cannot do these
+/// itself: they need the event loop or other windows, which the app holds.
+pub(crate) enum WindowRequest {
+    /// Open another window with a new terminal.
+    NewWindow,
+    /// Open a new window whose first pane is this one, moved out of the
+    /// requesting window.
+    MovePaneToNewWindow(MovedPane),
+}
 
 /// Window state that a pane's pickers show: the command palette's float and
 /// workspace entries, and the messages picker's configuration issues. Built by
@@ -134,13 +146,16 @@ impl TerminalView {
         mut issues: Vec<String>,
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
-        let pane = TerminalPane::create(egui_ctx, gl, proxy, window, argc, argv)?;
+        let window_id = window.id;
+        let pane = TerminalPane::create(egui_ctx, gl, proxy.clone(), window, argc, argv)?;
         issues.extend(pane.take_config_issues());
         #[cfg(any(windows, unix))]
         pane.set_pipe_policy(&picker_bindings.pipe_policy);
         Ok(Self::with_pane(
             pane,
             egui_ctx,
+            proxy,
+            window_id,
             issues,
             command_label,
             reload_source,
@@ -155,6 +170,7 @@ impl TerminalView {
         gl: &glow::Context,
         window: crate::graphics::PaneWindow,
     ) -> Result<Self, crate::native_error::FatalError> {
+        let window_id = window.id;
         let pane = self
             .app_pane()
             .ok_or_else(|| {
@@ -163,7 +179,7 @@ impl TerminalView {
             .create_window(egui_ctx, gl, window)?;
         #[cfg(any(windows, unix))]
         pane.set_pipe_policy(&self.picker_bindings.pipe_policy);
-        Ok(self.sibling(pane))
+        Ok(self.sibling(pane, window_id))
     }
 
     /// A view for a new window whose first pane is one moved out of this
@@ -174,15 +190,17 @@ impl TerminalView {
         window: crate::graphics::PaneWindow,
     ) -> Self {
         pane.0.move_to_window(window.id);
-        self.sibling(pane.0)
+        self.sibling(pane.0, window.id)
     }
 
     /// A view for another window around `pane`, sharing this window's settings.
-    fn sibling(&self, pane: TerminalPane) -> Self {
+    fn sibling(&self, pane: TerminalPane, window_id: egui_winit::winit::window::WindowId) -> Self {
         let issues = pane.take_config_issues();
         Self::with_pane(
             pane,
             &self.context,
+            self.proxy.clone(),
+            window_id,
             issues,
             self.command_label.clone(),
             self.reload_source.clone(),
@@ -195,6 +213,8 @@ impl TerminalView {
     fn with_pane(
         pane: TerminalPane,
         context: &egui::Context,
+        proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
+        window_id: egui_winit::winit::window::WindowId,
         issues: Vec<String>,
         command_label: String,
         reload_source: crate::config::ReloadSource,
@@ -224,8 +244,10 @@ impl TerminalView {
             picker_bindings,
             floating_padding,
             floating: Default::default(),
-            new_window_requested: false,
-            moved_panes: Vec::new(),
+            requests: Vec::new(),
+            requests_posted: false,
+            proxy,
+            window_id,
         }
     }
 
@@ -246,14 +268,24 @@ impl TerminalView {
         Ok(pane)
     }
 
-    pub(crate) fn take_new_window_request(&mut self) -> bool {
-        std::mem::take(&mut self.new_window_requested)
+    /// Requests made since the last call, in order, for the app to carry out.
+    pub(crate) fn take_requests(&mut self) -> Vec<WindowRequest> {
+        self.requests_posted = false;
+        std::mem::take(&mut self.requests)
     }
 
-    /// Panes moved out of this window since the last call, each for a new
-    /// window to adopt.
-    pub(crate) fn take_moved_panes(&mut self) -> Vec<MovedPane> {
-        self.moved_panes.drain(..).map(MovedPane).collect()
+    /// Asks the app, by a posted event, to handle this window's requests, and
+    /// to close the window once it has no panes left. Called after a frame or
+    /// a Lua callback; the app handles the event after the current one, so
+    /// never in the middle of a frame.
+    fn post_requests(&mut self) {
+        if self.requests_posted || (self.requests.is_empty() && !self.should_close()) {
+            return;
+        }
+        self.requests_posted = self
+            .proxy
+            .send_event(UserEvent::WindowRequests(self.window_id))
+            .is_ok();
     }
 
     pub(crate) fn window_error(&mut self, error: String) {
@@ -509,7 +541,7 @@ impl TerminalView {
             },
             AppAction::ShowMessages | AppAction::OpenErrorLog => self.show_messages(ctx),
             AppAction::NewWindow => {
-                self.new_window_requested = true;
+                self.requests.push(WindowRequest::NewWindow);
             }
             AppAction::RestoreFloatingPane(id) => {
                 if self.floats().contains(id) {
@@ -650,6 +682,7 @@ impl TerminalView {
     }
     pub(crate) fn update(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
         self.update_workspaces(ui, gl);
+        self.post_requests();
     }
 
     pub(crate) fn should_close(&self) -> bool {
@@ -886,8 +919,10 @@ impl TerminalView {
         for mut pane in self.closed_panes.drain(..) {
             pane.destroy();
         }
-        for mut pane in self.moved_panes.drain(..) {
-            pane.destroy();
+        for request in self.requests.drain(..) {
+            if let WindowRequest::MovePaneToNewWindow(mut pane) = request {
+                pane.0.destroy();
+            }
         }
         for (_, mut pane) in self.tiled.drain(..) {
             pane.destroy();
