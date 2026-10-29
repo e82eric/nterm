@@ -1218,6 +1218,7 @@ impl TerminalPane {
                 0,
                 ctx.clone(),
                 options,
+                &bindings.prompt_patterns,
                 previous,
             ));
         } else {
@@ -1259,6 +1260,7 @@ impl TerminalPane {
                 view.total_rows,
                 ctx.clone(),
                 options,
+                &bindings.prompt_patterns,
                 previous,
             ));
         }
@@ -1626,7 +1628,6 @@ impl TerminalPane {
         if let Some(picker) = self.picker.as_mut() {
             picker.typography = typography;
             picker.builtin_pickers = bindings.builtin_pickers;
-            picker.set_prompt_patterns(bindings.prompt_patterns.clone());
             picker.set_cursor_scroll_padding(bindings.cursor_scroll_padding);
         }
         let action = self
@@ -2622,7 +2623,6 @@ impl TerminalPane {
                             cursor.y,
                             ctx.clone(),
                             bindings.builtin_pickers,
-                            bindings.prompt_patterns.clone(),
                         )
                     } else {
                         Err("Unable to read the copy-mode snapshot".into())
@@ -2725,10 +2725,20 @@ impl TerminalPane {
         {
             return true;
         }
+        let host = self.host;
         let Some(rows) = self
             .prompt_patterns
             .boundaries(self.copy_mode.total_rows(), |row| {
-                self.read_snapshot_row(generation, row)
+                let data = ghostty_ffi::read_snapshot_row(host, generation, row, false)?;
+                let prompt = data.prompt;
+                Some((
+                    TextRow {
+                        text: String::from_utf8(data.text).ok()?,
+                        columns: data.columns,
+                        wraps_to_next: data.wraps_to_next,
+                    },
+                    prompt,
+                ))
             })
         else {
             return false;

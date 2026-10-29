@@ -272,7 +272,7 @@ fn parse_builtin_table(
     };
     for pair in overrides.clone().pairs::<String, mlua::Value>() {
         let (field, value) = pair.map_err(|e| e.to_string())?;
-        if field == "type" || field == "regex" {
+        if field == "type" || field == "regex" || field == "prompts" {
             return Err(format!("builtin_pickers.{name}.{field} is built in"));
         }
         base.raw_set(field, value).map_err(|e| e.to_string())?;
@@ -1642,9 +1642,14 @@ mod tests {
             crate::picker::config::EnterAction::SendInput
         ));
         match words.source {
-            crate::picker::config::Source::Scrollback { regex, unique } => {
+            crate::picker::config::Source::Scrollback {
+                regex,
+                unique,
+                prompts,
+            } => {
                 assert_eq!(regex.as_str(), r"\S+");
                 assert!(unique);
+                assert!(!prompts);
             }
             _ => panic!("word source"),
         }

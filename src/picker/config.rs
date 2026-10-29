@@ -304,6 +304,10 @@ pub(crate) enum DefinitionSource {
         regex: Option<String>,
         #[serde(default)]
         unique: Option<bool>,
+        /// List the commands at prompts, found by OSC 133 marks and the
+        /// configured prompt patterns, instead of matching `regex`.
+        #[serde(default)]
+        prompts: bool,
         #[serde(default)]
         enter_action: Option<EnterAction>,
         #[serde(skip)]
@@ -456,7 +460,15 @@ impl Definition {
                 (Source::CommandPalette(Vec::new()), EnterAction::SendInput)
             }
             DefinitionSource::Factory { .. } => unreachable!(),
-            DefinitionSource::Scrollback { regex, unique, .. } => {
+            DefinitionSource::Scrollback {
+                regex,
+                unique,
+                prompts,
+                ..
+            } => {
+                if prompts && regex.is_some() {
+                    return Err(format!("pickers.{name}: prompts and regex are exclusive"));
+                }
                 let regex = Regex::new(&regex.unwrap_or_else(default_regex))
                     .map_err(|error| format!("pickers.{name}.regex: {error}"))?;
                 if regex.is_match("") {
@@ -466,6 +478,7 @@ impl Definition {
                     Source::Scrollback {
                         regex,
                         unique: unique.unwrap_or(defaults.unique),
+                        prompts,
                     },
                     enter_action.unwrap_or(EnterAction::Navigate),
                 )
@@ -780,7 +793,8 @@ pub(crate) enum BindingTarget {
     Picker(String),
 }
 
-pub(crate) const BUILTIN_NAMES: [&str; 4] = ["themes", "command_palette", "lines", "words"];
+pub(crate) const BUILTIN_NAMES: [&str; 5] =
+    ["themes", "command_palette", "lines", "words", "prompts"];
 
 pub(crate) fn builtin_defaults(name: &str) -> serde_json::Value {
     match name {
@@ -795,6 +809,9 @@ pub(crate) fn builtin_defaults(name: &str) -> serde_json::Value {
         }
         "words" => {
             serde_json::json!({"type":"Scrollback", "regex":"\\S+", "enter_action":"SendInput", "unique":true, "preview_visible":false, "preview":{"type":"Scrollback", "rows":12}})
+        }
+        "prompts" => {
+            serde_json::json!({"type":"Scrollback", "prompts":true, "enter_action":"Navigate", "preview_visible":true, "preview":{"type":"Scrollback", "rows":12}})
         }
         _ => unreachable!("validated builtin picker name"),
     }
@@ -823,7 +840,12 @@ pub(crate) enum Source {
     ErrorLog,
     CommandPalette(Vec<crate::actions::Entry>),
     Workspaces(Vec<crate::actions::Entry>),
-    Scrollback { regex: Regex, unique: bool },
+    /// With `prompts`, lists commands at prompts instead of `regex` matches.
+    Scrollback {
+        regex: Regex,
+        unique: bool,
+        prompts: bool,
+    },
     FileSystem(FileOptions),
     Items(ItemsOptions),
     Command(CommandOptions),
@@ -932,6 +954,7 @@ impl Default for Options {
             source: Source::Scrollback {
                 regex: Regex::new(&default_regex()).unwrap(),
                 unique: false,
+                prompts: false,
             },
             enter_action: EnterAction::Navigate,
             params: BTreeMap::new(),

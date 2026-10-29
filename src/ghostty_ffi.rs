@@ -122,6 +122,8 @@ mod copy_mode_abi_tests {
         assert_eq!(offset_of!(super::SnapshotRow, cell_count), 32);
         assert_eq!(offset_of!(super::SnapshotRow, style_runs), 40);
         assert_eq!(offset_of!(super::SnapshotRow, wraps_to_next), 56);
+        assert_eq!(offset_of!(super::SnapshotRow, semantic_prompt), 57);
+        assert_eq!(offset_of!(super::SnapshotRow, input_column), 60);
         assert_eq!(size_of::<super::LiveCursor>(), 40);
         assert_eq!(offset_of!(super::LiveCursor, in_viewport), 32);
     }
@@ -217,6 +219,10 @@ pub(crate) struct SnapshotRow {
     pub(crate) style_runs: *const SnapshotStyleRun,
     pub(crate) style_run_count: usize,
     pub(crate) wraps_to_next: bool,
+    /// OSC 133 state: 0 none, 1 primary prompt, 2 prompt continuation.
+    pub(crate) semantic_prompt: u8,
+    /// First cell marked as input by OSC 133, or u32::MAX.
+    pub(crate) input_column: u32,
 }
 
 impl Default for SnapshotRow {
@@ -230,8 +236,21 @@ impl Default for SnapshotRow {
             style_runs: std::ptr::null(),
             style_run_count: 0,
             wraps_to_next: false,
+            semantic_prompt: 0,
+            input_column: u32::MAX,
         }
     }
+}
+
+/// What OSC 133 shell integration marks say about a snapshot row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RowPrompt {
+    /// The row starts a prompt (OSC 133;A), not a continuation line.
+    pub(crate) primary: bool,
+    /// The row has prompt cells, primary or continuation.
+    pub(crate) marked: bool,
+    /// First cell of the command typed at the prompt (after OSC 133;B).
+    pub(crate) input_column: Option<u32>,
 }
 
 /// An owned copy of one frozen snapshot row.
@@ -243,6 +262,7 @@ pub(crate) struct SnapshotRowData {
     pub(crate) widths: Vec<u8>,
     pub(crate) style_runs: Vec<SnapshotStyleRun>,
     pub(crate) wraps_to_next: bool,
+    pub(crate) prompt: RowPrompt,
 }
 
 /// Read one row of a frozen snapshot, optionally with its style runs.
@@ -279,6 +299,11 @@ pub(crate) fn read_snapshot_row(
                 .to_vec()
         },
         wraps_to_next: result.wraps_to_next,
+        prompt: RowPrompt {
+            primary: result.semantic_prompt == 1,
+            marked: result.semantic_prompt != 0,
+            input_column: (result.input_column != u32::MAX).then_some(result.input_column),
+        },
     };
     unsafe { nterm_host_snapshot_row_free(&mut result) };
     Some(data)

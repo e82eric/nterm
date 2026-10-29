@@ -120,7 +120,6 @@ impl PickerSource {
         row: u64,
         total_rows: u64,
         columns: usize,
-        patterns: &crate::config::prompts::Patterns,
     ) -> Result<Self, String> {
         let start = row.saturating_sub(10);
         let end = row.saturating_add(11).min(total_rows);
@@ -139,34 +138,14 @@ impl PickerSource {
             return Err("Unable to locate line-split document".into());
         }
         for y in start..end {
-            let (text, styles) =
+            let (text, styles, _) =
                 read_styled_row(host, generation, y).ok_or("Unable to read line-split snapshot")?;
             document.push_row(&text.text, &text.columns, text.wraps_to_next, &styles)?;
             lines.push(split_line_cells(y, &text, columns));
         }
         let target = usize::try_from(row - start).map_err(|_| "Invalid line-split row")?;
-        let prompts = lines
-            .get(target)
-            .and_then(|line| {
-                let text: String = line.cells.iter().map(|cell| cell.text.as_str()).collect();
-                patterns.prefix_end(&text).map(|matched_end| {
-                    let mut bytes = 0;
-                    let mut end = 0;
-                    for cell in &line.cells {
-                        if bytes >= matched_end {
-                            break;
-                        }
-                        bytes += cell.text.len();
-                        end = cell.columns.end;
-                    }
-                    0..end
-                })
-            })
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut source = Self::split_candidates(nfm_picker_sources::line_split::split(
-            &lines, target, &prompts,
-        ));
+        let mut source =
+            Self::split_candidates(nfm_picker_sources::line_split::split(&lines, target, &[]));
         let _ = source.runtime().document.set(document.finish());
         if let Self::Scrollback(runtime) = &mut source {
             runtime.logical_origin = origin;
@@ -208,6 +187,7 @@ impl PickerSource {
         rows: u64,
         ctx: egui::Context,
         options: &mut config::Options,
+        prompt_patterns: &crate::config::prompts::Patterns,
     ) -> (Self, Arc<std::sync::Mutex<Option<String>>>) {
         let store = Arc::new(
             if matches!(
@@ -355,7 +335,11 @@ impl PickerSource {
                 ctx.clone(),
                 command_values.clone(),
             )
-        } else if let crate::picker::config::Source::Scrollback { regex, unique } = &options.source
+        } else if let crate::picker::config::Source::Scrollback {
+            regex,
+            unique,
+            prompts,
+        } = &options.source
         {
             let Session::Document {
                 store: document_items,
@@ -365,6 +349,7 @@ impl PickerSource {
             };
             let document_items = document_items.clone();
             let regex = regex.clone();
+            let prompts = prompts.then(|| prompt_patterns.clone());
             let mut seen = unique.then(std::collections::HashSet::new);
             let generation = generation.expect("scrollback picker requires a snapshot");
             let (cancelled, error) = (cancelled.clone(), error.clone());
@@ -379,6 +364,8 @@ impl PickerSource {
                     // Export the document once. Subsequent search and preview
                     // reads use Rust storage without holding terminal locks.
                     let mut builder = nfm_egui::styled_document::DocumentBuilder::default();
+                    // OSC 133 marks for each row, kept for listing prompts.
+                    let mut row_prompts = Vec::new();
                     for row in 0..rows {
                         if cancelled.load(Ordering::Acquire) {
                             complete_document_source(&document_items);
@@ -386,7 +373,10 @@ impl PickerSource {
                         }
                         let captured = read_styled_row(host as *mut Host, generation, row)
                             .ok_or_else(|| "Unable to read scrollback snapshot".to_owned())
-                            .and_then(|(text, styles)| {
+                            .and_then(|(text, styles, prompt)| {
+                                if prompts.is_some() {
+                                    row_prompts.push(prompt);
+                                }
                                 builder.push_row(
                                     &text.text,
                                     &text.columns,
@@ -444,7 +434,16 @@ impl PickerSource {
                             break;
                         }
                         lines.reverse();
-                        for (text, range) in newest_logical_items(&lines, &regex, &mut seen) {
+                        let items = match &prompts {
+                            Some(patterns) => prompt_item(&lines, &row_prompts, patterns)
+                                .filter(|(text, _)| {
+                                    seen.as_mut().is_none_or(|seen| seen.insert(text.clone()))
+                                })
+                                .into_iter()
+                                .collect(),
+                            None => newest_logical_items(&lines, &regex, &mut seen),
+                        };
+                        for (text, range) in items {
                             if cancelled.load(Ordering::Acquire) {
                                 break;
                             }
@@ -718,7 +717,11 @@ fn read_styled_row(
     host: *mut Host,
     generation: u64,
     row: u64,
-) -> Option<(TextRow, Vec<nfm_egui::styled_document::ColumnStyleRun>)> {
+) -> Option<(
+    TextRow,
+    Vec<nfm_egui::styled_document::ColumnStyleRun>,
+    ghostty_ffi::RowPrompt,
+)> {
     use nfm_egui::styled_document::{ColumnStyleRun, Style};
     // The native row reader caches its snapshot anchor. A UI-thread line split
     // may read while the original scrollback source is still publishing rows.
@@ -749,7 +752,7 @@ fn read_styled_row(
             },
         })
         .collect();
-    Some((text, styles))
+    Some((text, styles, data.prompt))
 }
 
 /// Drops the spaces that end a row which does not wrap into the next one.
@@ -804,6 +807,46 @@ pub(super) fn newest_logical_items(
         .rev()
         .filter(|(text, _)| seen.as_mut().is_none_or(|seen| seen.insert(text.clone())))
         .collect()
+}
+
+/// The command typed at a prompt in a logical line, with its cells. A line is
+/// a prompt when OSC 133 marks it or a prompt pattern matches; `row_prompts`
+/// holds the marks by snapshot row.
+pub(super) fn prompt_item(
+    rows: &[(u64, TextRow)],
+    row_prompts: &[ghostty_ffi::RowPrompt],
+    patterns: &crate::config::prompts::Patterns,
+) -> Option<(String, SnapshotCellRange)> {
+    let mut text = String::new();
+    let mut points = Vec::new();
+    for (y, row) in rows {
+        if row.text.len() != row.columns.len() {
+            return None;
+        }
+        text.push_str(&row.text);
+        points.extend(row.columns.iter().map(|&x| SnapshotCell { x, y: *y }));
+    }
+    let line_rows: Vec<_> = rows
+        .iter()
+        .map(|(y, row)| crate::config::prompts::LineRow {
+            columns: &row.columns,
+            prompt: row_prompts.get(*y as usize).copied().unwrap_or_default(),
+        })
+        .collect();
+    let start = patterns.command_start(&text, &line_rows)?;
+    let typed = &text[start..];
+    let command = typed.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let begin = start + (typed.len() - typed.trim_start().len());
+    Some((
+        command.to_owned(),
+        SnapshotCellRange {
+            start: points[begin],
+            end: points[begin + command.len() - 1],
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -904,6 +947,34 @@ pub(super) enum Provider {
 #[cfg(test)]
 mod document_source_tests {
     use super::*;
+    #[test]
+    fn prompt_items_use_osc_input_marks_then_patterns() {
+        let patterns = crate::config::prompts::Patterns::default();
+        let row = |text: &str, wraps_to_next| TextRow {
+            text: text.into(),
+            columns: (0..text.len() as u32).collect(),
+            wraps_to_next,
+        };
+        let marked = |input_column| ghostty_ffi::RowPrompt {
+            primary: true,
+            marked: true,
+            input_column,
+        };
+        // Rows 0-1: a wrapped command at a custom prompt only OSC 133 finds.
+        // Row 2: a debugger prompt found by its pattern. Row 3: a marked
+        // prompt with nothing typed.
+        let prompts = [marked(Some(3)), Default::default(), Default::default(), marked(None)];
+        let item = |rows: &[(u64, TextRow)]| prompt_item(rows, &prompts, &patterns);
+        let (text, range) = item(&[(0, row("λ git log", true)), (1, row(" -3", false))]).unwrap();
+        assert_eq!(text, "git log -3");
+        assert_eq!((range.start, range.end), (
+            SnapshotCell { x: 3, y: 0 },
+            SnapshotCell { x: 2, y: 1 },
+        ));
+        assert_eq!(item(&[(2, row("0:000> k", false))]).unwrap().0, "k");
+        assert!(item(&[(3, row("PS C:\\> ", false))]).is_none());
+        assert!(item(&[(2, row("plain output", false))]).is_none());
+    }
     #[test]
     fn failed_document_load_publishes_an_empty_completed_source() {
         let store = SnapshotStore::<DocumentItems>::new_append_only();

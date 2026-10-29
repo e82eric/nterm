@@ -68,8 +68,8 @@ the command, for example `10j` moves down ten rows.
 ### Moving through output
 
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Up</kbd>/<kbd>Down</kbd> also enter copy
-mode and move to the previous/next command prompt matched by the
-[prompt patterns](configuration.md#prompt-patterns). In copy mode,
+mode and move to the previous/next command prompt, marked by OSC 133 or matched
+by a [prompt pattern](configuration.md#prompt-patterns). In copy mode,
 the same shortcuts navigate commands; a count such as <kbd>3</kbd> followed
 by <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Up</kbd> skips three prompts. Navigation
 stops at the first or last command without wrapping.
@@ -174,10 +174,10 @@ selection and switches to characterwise visual mode; use motions to extend it
 or <kbd>y</kbd> to copy it and stay in copy mode. Repeated text objects do not
 yet expand existing selections as Vim does.
 <kbd>yic</kbd>/<kbd>yac</kbd> copy a command's output or the prompt and output
-using the [prompt patterns](configuration.md#prompt-patterns) over the frozen
-scrollback.
-Like WezTerm, a command block ends immediately before the next matching
-prompt line. Text that resembles a prompt can create a false boundary.
+using the prompt boundaries in the frozen scrollback: OSC 133 prompt marks and
+lines matching the [prompt patterns](configuration.md#prompt-patterns).
+Like WezTerm, a command block ends immediately before the next prompt line.
+Text that resembles a prompt can create a false boundary.
 Every successful yank briefly highlights the copied cells for 250 ms; a new
 yank replaces and restarts the highlight.
 ### Canceling and exiting

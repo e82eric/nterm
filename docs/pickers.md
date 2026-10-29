@@ -8,7 +8,7 @@ and Ctrl+Shift+/ opens picker keybinding help.
 
 ## Built-in pickers
 
-The four named built-ins are always available. With the default keybindings,
+The five named built-ins are always available. With the default keybindings,
 use the shortcuts below; theme selection is also available in the command palette.
 
 | Built-in name | Purpose and acceptance behavior | Default presentation / shortcut |
@@ -17,10 +17,11 @@ use the shortcuts below; theme selection is also available in the command palett
 | `words` | Unique whitespace-delimited scrollback words (`\S+`); Enter pastes the word without submitting it. | Bottom, preview hidden; no default shortcut ([nterm.lua](../nterm.lua) binds Ctrl+Shift+P, [nterm.example.lua](../nterm.example.lua) Ctrl+Shift+.). |
 | `themes` | Installed user and bundled Ghostty themes; Enter applies the selected theme for the session. | Cursor, score sorting, preview hidden; choose **Choose theme** in the palette. |
 | `command_palette` | Application actions and configured pickers; Enter dispatches the selected action. | Center, workspace scope, preview hidden; Ctrl+Shift+Space. |
+| `prompts` | Commands entered at prompts, found by OSC 133 marks and [prompt patterns](configuration.md#prompt-patterns); Enter enters copy mode at the selected command. | Bottom, scrollback preview visible; no default shortcut ([nterm.example.lua](../nterm.example.lua) binds Ctrl+Shift+Z). |
 
 The line-split picker is a contextual built-in: Ctrl+B opens it for the selected
 scrollback result or copy mode cursor row. Its `line_break` settings control
-presentation; it is not one of the four named `builtin_picker` binding targets.
+presentation; it is not one of the five named `builtin_picker` binding targets.
 See [Splitting a scrollback result](#splitting-a-scrollback-result) for its actions.
 Error history and Messages are also available through the command palette;
 [Messages and error history](configuration.md#messages-and-error-history) explains them.
@@ -49,12 +50,13 @@ keys = {
     { key = "f", mods = "CTRL|SHIFT", builtin_picker = "lines" },
     { key = "p", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
     { key = ".", mods = "CTRL|SHIFT", builtin_picker = "words" },
+    { key = "z", mods = "CTRL|SHIFT", builtin_picker = "prompts" },
 }
 ```
 
-Themes, command palette, lines, and words always exist, even when omitted from
-the config. Their overrides accept the corresponding picker options except
-`type` and `regex`, which are built in. The source defaults are Themes,
+Themes, command palette, lines, words, and prompts always exist, even when
+omitted from the config. Their overrides accept the corresponding picker options
+except `type`, `regex`, and `prompts`, which are built in. The source defaults are Themes,
 CommandPalette, nonblank logical lines/Navigate, and unique `\S+` words/SendInput.
 Lines preview starts visible; words preview starts hidden. The theme picker
 defaults to Cursor position and the command palette to Center, both with
@@ -108,8 +110,8 @@ physical rows on either side and requires consistent gutters in at least three
 rows. One-cell gutters also require an aligned next field and varying occupied
 width of the preceding value; short detected fields such as `0` remain selectable.
 Payloads preserve grapheme cell ranges for preview highlights.
-Common PowerShell/debugger prompt prefixes are excluded by pattern; this adapter
-does not yet use semantic prompt ranges. Soft-wrapped rows are split individually.
+Prompt text is split like the rest of the row, so the working directory in a
+prompt is a candidate. Soft-wrapped rows are split individually.
 
 ## Command palette
 

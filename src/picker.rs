@@ -50,7 +50,6 @@ pub(crate) struct Picker {
     line_split: bool,
     /// Overrides the source's label; see `config::Options::label`.
     label: Option<&'static str>,
-    prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     host: usize,
     #[cfg(test)]
     session_id: u64,
@@ -187,6 +186,8 @@ impl Picker {
             self.label.unwrap_or_else(|| self.source.label())
         }
     }
+    /// Starts a picker with no prompt patterns, so a `prompts` source lists
+    /// only OSC 133 marked commands; the pane uses `start_replacing`.
     pub(crate) fn start(
         host: *mut Host,
         generation: Option<u64>,
@@ -195,7 +196,16 @@ impl Picker {
         ctx: egui::Context,
         options: config::Options,
     ) -> Self {
-        Self::start_replacing(host, generation, from_copy, rows, ctx, options, None)
+        Self::start_replacing(
+            host,
+            generation,
+            from_copy,
+            rows,
+            ctx,
+            options,
+            &Default::default(),
+            None,
+        )
     }
 
     pub(crate) fn start_replacing(
@@ -205,6 +215,7 @@ impl Picker {
         rows: u64,
         ctx: egui::Context,
         mut options: config::Options,
+        prompt_patterns: &crate::config::prompts::Patterns,
         previous: Option<Self>,
     ) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -214,8 +225,14 @@ impl Picker {
             .get("query")
             .map(|query| query.chars().take(4096).collect())
             .unwrap_or_default();
-        let (source, error) =
-            PickerSource::start(host, generation, rows, ctx.clone(), &mut options);
+        let (source, error) = PickerSource::start(
+            host,
+            generation,
+            rows,
+            ctx.clone(),
+            &mut options,
+            prompt_patterns,
+        );
         let preview_rows = options
             .preview
             .as_ref()
@@ -370,7 +387,6 @@ impl Picker {
             preview_rows,
             line_split: false,
             label: options.label,
-            prompt_patterns: Default::default(),
             host: host as usize,
             #[cfg(test)]
             session_id,
@@ -398,12 +414,6 @@ impl Picker {
         loading
     }
 
-    pub(crate) fn set_prompt_patterns(
-        &mut self,
-        patterns: std::rc::Rc<crate::config::prompts::Patterns>,
-    ) {
-        self.prompt_patterns = patterns;
-    }
     pub(crate) fn set_cursor_scroll_padding(&mut self, rows: u32) {
         self.shared.set_cursor_scroll_padding(rows);
     }
@@ -597,7 +607,6 @@ impl Picker {
                             range.start.y,
                             view.total_rows,
                             view.columns as usize,
-                            &self.prompt_patterns,
                         ) {
                             Ok(source) => {
                                 self.enter_line_split(ctx, source);
@@ -829,7 +838,6 @@ impl Picker {
         row: u64,
         ctx: egui::Context,
         builtin_pickers: config::BuiltinPickers,
-        prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     ) -> Result<Self, String> {
         let source = PickerSource::split_line(
             host,
@@ -837,7 +845,6 @@ impl Picker {
             row,
             view.total_rows,
             view.columns as usize,
-            &prompt_patterns,
         )?;
         // An empty source avoids starting a whole-scrollback scan. The completed
         // split source uses the same frozen snapshot and preview lifetime.
@@ -859,7 +866,6 @@ impl Picker {
         picker.source = source;
         picker.line_split = true;
         picker.builtin_pickers = builtin_pickers;
-        picker.prompt_patterns = prompt_patterns;
         picker.apply_line_break_presentation();
         Ok(picker)
     }

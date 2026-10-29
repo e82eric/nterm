@@ -45,8 +45,11 @@ Use the command palette's Reload configuration action to apply supported Lua set
 
 ## Prompt patterns
 
-`prompt_patterns` configures prompt detection for pane copy-mode command navigation
-and the line splitter. It replaces the default patterns; an empty list disables
+`prompt_patterns` configures prompt detection for copy-mode command navigation,
+the `yic`/`yac` text objects, and the built-in `prompts` picker.
+Prompts a shell marks with OSC 133 (shell integration) are found from the marks
+whether or not a pattern matches; the patterns find prompts in programs that print
+no marks, such as debuggers, nested shells, and AI CLIs. The list replaces the default patterns; an empty list disables
 detection. Patterns match the beginning of a logical line and include the prompt
 text to exclude when splitting. They use Rust regex syntax and are compiled when
 the config loads; invalid expressions report the pattern index and reject the config.

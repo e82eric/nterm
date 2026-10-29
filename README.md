@@ -19,7 +19,7 @@ keys.
   already on the target:
   - Ctrl+Shift+M: at the terminal cursor.
   - Ctrl+Shift+Up / Down: at the previous or next command prompt, found by
-    [prompt patterns](docs/configuration.md#prompt-patterns). Inside copy mode
+    OSC 133 marks or [prompt patterns](docs/configuration.md#prompt-patterns). Inside copy mode
     the same keys move between commands, and a count such as `3` first skips
     several.
   - Ctrl+Shift+/ then Enter: at the selected search match.
@@ -88,24 +88,26 @@ keys.
 
   <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/scrollback-pickers.gif" width="800" alt="Captioned scrollback pickers demo: the lines picker finds a commit far up in git log output and opens copy mode scrolled back to it, the words picker completes src/ter to src/terminal/pane.rs, and Ctrl+B splits a build error line so workspaces.default_layout is inserted into an rg command that is then run">
 
-- **[Prompt patterns](docs/configuration.md#prompt-patterns):** regexes that
-  find where each command starts in the scrollback. They enable:
+- **Prompts:** nterm finds where each command starts in the scrollback from two
+  sources: shell integration marks (OSC 133), when the shell prints them, and
+  [prompt patterns](docs/configuration.md#prompt-patterns), regexes that match
+  the prompt text. Both kinds of prompt work the same way:
   - Ctrl+Shift+Up / Down to jump between prompts, from the terminal or in copy
     mode.
   - The `ic` and `ac` text objects: `yic` / `vic` copy or select a command's
     output, and `yac` / `vac` include its prompt.
-  - A prompt picker: [nterm.example.lua](nterm.example.lua) binds
-    Ctrl+Shift+Z to a Scrollback picker whose `regex` matches the same prompts.
-    It lists recent commands with a scrollback preview, and Enter opens copy
-    mode at the chosen one.
+  - The built-in `prompts` picker, which [nterm.example.lua](nterm.example.lua)
+    binds to Ctrl+Shift+Z. It lists the commands entered at every prompt with a
+    scrollback preview, and Enter opens copy mode at the chosen one.
 
-  Matching text is less exact than shell integration marks (OSC 133), which
-  shells print to mark each prompt, but it also works in programs that don't
-  print those marks. The defaults match PowerShell, CDB and WinDbg (`0:000>`),
-  Codex (`›`), and Claude Code's input box. For others, such as GDB, set
-  `prompt_patterns` to the defaults plus your own, like `[[^\(gdb\)\s*]]`; the
-  list replaces the defaults. In practice the matches are accurate, but output
-  that looks like a prompt can create a false boundary.
+  Marks are exact, but only shells configured to print them send them. Patterns
+  cover programs that don't: the defaults match PowerShell, CDB and WinDbg
+  (`0:000>`), Codex (`›`), and Claude Code's input box. For others, such as GDB,
+  set `prompt_patterns` to the defaults plus your own, like `[[^\(gdb\)\s*]]`;
+  the list replaces the defaults. In practice the matches are accurate, but
+  output that looks like a prompt can create a false boundary.
+
+  <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/prompts.gif" width="800" alt="Captioned prompts demo: Ctrl+Shift+Up steps through prompts from a shell that sends OSC 133 marks and from a nested PowerShell matched by a pattern, yic copies a command's output, and the prompts picker lists the commands from both and opens copy mode at git status">
 
 ### Building a custom workflow in Lua
 

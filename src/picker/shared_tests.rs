@@ -1665,6 +1665,7 @@ fn replace_picker_from_accept_and_local_key_resets_source_and_callbacks() {
             0,
             ctx.clone(),
             target,
+            &Default::default(),
             Some(previous),
         );
         assert!(!replacement.is_closed());

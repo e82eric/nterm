@@ -411,13 +411,6 @@ return {
         "--no-session-persistence", prompt,
       }
     end),
-    command_history = {
-      type = "Scrollback",
-      regex = [[(?m)^(?:PS [^>\r\n]*>|\d+:\d+>|›)\s*(.+)$]],
-      enter_action = "Navigate",
-      preview = { type = "Scrollback", rows = 12 },
-      preview_visible = false,
-    },
     Snippets = function(context)
       local input = context.line_before_cursor:match("^PS [^>]*>%s?(.*)$")
         or context.line_before_cursor
@@ -493,6 +486,6 @@ return {
     { key = "f", mods = "CTRL|SHIFT", builtin_picker = "lines" },
     { key = ".", mods = "CTRL|SHIFT", builtin_picker = "words" },
     { key = "p", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
-    { key = "z", mods = "CTRL|SHIFT", picker = "command_history" },
+    { key = "z", mods = "CTRL|SHIFT", builtin_picker = "prompts" },
   },
 }
