@@ -72,6 +72,25 @@ keys.
 
   <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/scrollback-pickers.gif" width="800" alt="Captioned scrollback pickers demo: the lines picker finds a commit far up in git log output and opens copy mode scrolled back to it, the words picker completes src/ter to src/terminal/pane.rs, and Ctrl+B splits a build error line so workspaces.default_layout is inserted into an rg command that is then run">
 
+- **[Prompt patterns](docs/configuration.md#prompt-patterns):** regexes that
+  find where each command starts in the scrollback. They enable:
+  - Ctrl+Shift+Up / Down to jump between prompts, from the terminal or in copy
+    mode.
+  - The `ic` and `ac` text objects: `yic` / `vic` copy or select a command's
+    output, and `yac` / `vac` include its prompt.
+  - A prompt picker: [nterm.example.lua](nterm.example.lua) binds
+    Ctrl+Shift+Z to a Scrollback picker whose `regex` matches the same prompts.
+    It lists recent commands with a scrollback preview, and Enter opens copy
+    mode at the chosen one.
+
+  Matching text is less exact than shell integration marks (OSC 133), which
+  shells print to mark each prompt, but it also works in programs that don't
+  print those marks. The defaults match PowerShell, CDB and WinDbg (`0:000>`),
+  Codex (`›`), and Claude Code's input box. For others, such as GDB, set
+  `prompt_patterns` to the defaults plus your own, like `[[^\(gdb\)\s*]]`; the
+  list replaces the defaults. In practice the matches are accurate, but output
+  that looks like a prompt can create a false boundary.
+
 ### Building a custom workflow in Lua
 
 A workflow is a few entries in your [Lua configuration](docs/configuration.md):
@@ -335,19 +354,75 @@ These ship with nterm or its samples and are built from the same parts:
     layout. Each workspace keeps its own floats: create several, name them,
     cycle between them, and hide one to get back to the tiled panes. Hidden
     floats keep running, and the command palette can restore any of them.
+  - **[Lua automation](docs/workspaces.md#lua-automation-and-appearance):**
+    a `startup` function runs when each window opens, and actions can run the
+    same code from a key or the command palette. Through `app` they create
+    workspaces and panes with a command and working directory, set layouts and
+    the main pane's share, and move, float, or close panes. This one opens a
+    project with an editor as the main pane and a build and a shell beside it:
 
-  Workspaces and layouts can be scripted from Lua. See the
-  [workspace guide](docs/workspaces.md) and
-  [example Lua configuration](workspaces.example.lua).
+    ```lua
+    local function open_project(app, dir)
+      local ws = app:create_workspace { layout = "tile" }
+      local first = ws.focused -- a new workspace starts with one default shell
+      app:create_pane { workspace = ws.id, cwd = dir, command = "nvim README.md" }
+      app:create_pane { workspace = ws.id, cwd = dir, command = "pwsh -NoExit -Command cargo build" }
+      app:create_pane { workspace = ws.id, cwd = dir, command = "pwsh -NoExit -Command git status" }
+      app:close_pane(first)
+      app:set_main_ratio(ws.id, 0.6)
+      app:select_workspace(ws.id)
+    end
+
+    return {
+      actions = {
+        OpenNterm = {
+          label = "Open the nterm project",
+          action = function(app) open_project(app, "C:/src/nterm") end,
+        },
+      },
+      keys = {
+        { key = "o", mods = "CTRL|ALT|SHIFT", action = "OpenNterm" },
+      },
+      -- Runs once when each window opens; reloading does not rerun it.
+      startup = function(app) open_project(app, "C:/src/nterm") end,
+    }
+    ```
+
+    A `keys` table replaces the default bindings, so merge these entries into
+    your own. [workspaces.example.lua](workspaces.example.lua) has more,
+    including gaps, borders, and shadows.
 
   <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/tour.gif" width="800" alt="Captioned tour: panes tile as they are added and closed, the workspace switches through each layout, a floating nvim pane takes scratch notes and is hidden and restored, a second workspace is created with its own layout, and the scratch pane is tiled, floated again, and moved to a workspace of its own from the command palette">
 
 ## Getting started
 
+### Requirements
+
+| Tool | Version | Used for |
+| --- | --- | --- |
+| [Git](https://git-scm.com) | any | Cloning with submodules; on Windows, Git for Windows also supplies `tic` for the terminfo database |
+| [Zig](https://ziglang.org/download/) | 0.17.0 | Building the Ghostty libraries from the submodule |
+| [Rust](https://rustup.rs) | stable, 1.85 or newer (Rust 2024 edition) | Building nterm with Cargo |
+| C compiler | MSVC Build Tools on Windows; gcc or clang on Linux | The C shim and the bundled Lua, compiled through Cargo |
+| [.NET SDK](https://dotnet.microsoft.com/download) | any current SDK, Windows only | Verifying the signature of the pinned ConPTY package |
+
+Running nterm needs a GPU with Vulkan drivers (or another
+[wgpu backend](#rendering)). The sample configurations also use
+[PowerShell 7.4+](https://github.com/PowerShell/PowerShell),
+[ripgrep](https://github.com/BurntSushi/ripgrep),
+[bat](https://github.com/sharkdp/bat), [ffmpeg](https://ffmpeg.org), and
+[Neovim](https://neovim.io) for some pickers and previews, and the Claude
+Code or Codex CLI for command suggestions; nterm itself does not need them.
+
+### Building
+
 Ghostty is built from the `ghostty` submodule, a fork that adds the embedding
 APIs nterm uses. Clone with `--recursive`, or run `git submodule update --init`
-in an existing clone. Building needs Zig and Cargo, plus the .NET SDK on
-Windows.
+in an existing clone:
+
+```sh
+git clone --recursive https://github.com/e82eric/nterm.git
+```
 
 On Windows:
 

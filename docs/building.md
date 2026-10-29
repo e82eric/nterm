@@ -1,9 +1,25 @@
 # Building and installing
 
+## Requirements
+
+- **Git**, to clone the repository and its `ghostty` submodule. On Windows,
+  Git for Windows also supplies the `tic` used for the terminfo database.
+- **Zig 0.17.0**, the `minimum_zig_version` in `ghostty/build.zig.zon`.
+- **Rust** stable, 1.85 or newer for the 2024 edition, with Cargo. On Windows
+  use the MSVC toolchain (`x86_64-pc-windows-msvc`).
+- **A C compiler** for the `cc` build dependency, which compiles
+  `src/host_shim.c` and the vendored Lua 5.4: the MSVC Build Tools on Windows,
+  gcc or clang on Linux.
+- **The .NET SDK** on Windows only, for `dotnet nuget verify` on the pinned
+  ConPTY package (see below).
+
+The development builds use Zig 0.17.0, Rust 1.95.0, and .NET SDK 10.0.
+
+## Building
+
 Ghostty is built from the `ghostty` submodule, a fork that adds the embedding
 APIs this app uses. Clone with `--recursive`, or run
-`git submodule update --init` in an existing clone. Building needs Zig and
-Cargo, plus the .NET SDK on Windows (see ConPTY below).
+`git submodule update --init` in an existing clone.
 
 ```powershell
 .\build.ps1
