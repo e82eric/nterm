@@ -278,8 +278,8 @@ Named actions and picker selection callbacks support:
 
 ```lua
 actions = {
-  {
-    name = "ToolsPane",
+  ToolsPane = {
+    label = "Tools pane",
     action = function(app)
       local pane = app:get_floating_pane("tools")
       if pane then

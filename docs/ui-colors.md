@@ -76,7 +76,7 @@ The manager applies theme-derived colors, global overrides, then theme-specific
 overrides. The same precedence applies at startup and after theme selection;
 overrides from the previous theme do not carry over. Keys are case-sensitive,
 and each table accepts the same roles and RGB formats as `colors.ui`.
-Configuration changes require restarting the app.
+Reload configuration applies changes without restarting.
 
 Fallback defaults use the existing Gruvbox-like colors. Similar per-component shades have
 been consolidated into the shared roles. Match highlight keeps the previous red

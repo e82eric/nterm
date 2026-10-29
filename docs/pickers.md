@@ -14,9 +14,9 @@ use the shortcuts below; theme selection is also available in the command palett
 | Built-in name | Purpose and acceptance behavior | Default presentation / shortcut |
 | --- | --- | --- |
 | `lines` | Nonblank logical scrollback lines; Enter enters copy mode at the selected line. | Bottom, scrollback preview visible; Ctrl+Shift+F. |
-| `words` | Unique whitespace-delimited scrollback words (`\S+`); Enter pastes the word without submitting it. | Bottom, preview hidden; Ctrl+Shift+P. |
+| `words` | Unique whitespace-delimited scrollback words (`\S+`); Enter pastes the word without submitting it. | Bottom, preview hidden; no default shortcut ([nterm.lua](../nterm.lua) binds Ctrl+Shift+P, [nterm.example.lua](../nterm.example.lua) Ctrl+Shift+.). |
 | `themes` | Installed user and bundled Ghostty themes; Enter applies the selected theme for the session. | Cursor, score sorting, preview hidden; choose **Choose theme** in the palette. |
-| `command_palette` | Application actions and configured pickers; Enter dispatches the selected action. | Cursor, preview hidden; Ctrl+Shift+Space. |
+| `command_palette` | Application actions and configured pickers; Enter dispatches the selected action. | Center, workspace scope, preview hidden; Ctrl+Shift+Space. |
 
 The line-split picker is a contextual built-in: Ctrl+B opens it for the selected
 scrollback result or copy mode cursor row. Its `line_break` settings control
@@ -56,8 +56,9 @@ Themes, command palette, lines, and words always exist, even when omitted from
 the config. Their overrides accept the corresponding picker options except
 `type` and `regex`, which are built in. The source defaults are Themes,
 CommandPalette, nonblank logical lines/Navigate, and unique `\S+` words/SendInput.
-Lines preview starts visible; words preview starts hidden. Theme and command
-palette pickers default to Cursor position with previews hidden. A built-in
+Lines preview starts visible; words preview starts hidden. The theme picker
+defaults to Cursor position and the command palette to Center, both with
+previews hidden. A built-in
 override may also be a function of the same cursor context as custom picker
 factories; its returned table is merged with defaults each time it opens.
 For example, a words factory can seed `initial_query` and install a callback
@@ -80,7 +81,7 @@ Unmodified arrow and page keys continue to navigate the results.
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> to open the scrollback fuzzy
 picker from terminal or copy mode. Nonblank logical lines stream newest first
-from a frozen snapshot into `nfm-search-core`. Type to filter; Ctrl+N/P, arrows,
+from a frozen snapshot into `nfm-search-core`. Type to filter; Ctrl+N, arrows,
 and Page Up/Down move through results. Enter enters copy mode at the first
 nonblank cell of the selected line. Escape returns to the originating mode.
 Results fill upward from the query, with the first result at the bottom.
@@ -113,7 +114,8 @@ does not yet use semantic prompt ranges. Soft-wrapped rows are split individuall
 ## Command palette
 
 The command palette is a named picker with `type = "CommandPalette"`. The default
-configuration and sample bind it to **Ctrl+Shift+Space**. Type to filter actions,
+bindings and [nterm.lua](../nterm.lua) bind it to **Ctrl+Shift+Space**;
+[nterm.example.lua](../nterm.example.lua) uses **Ctrl+Shift+P**. Type to filter actions,
 use the arrow keys to select one, and press Enter to run it. Escape closes the
 palette and preserves the terminal's current copy mode and cursor.
 
@@ -185,9 +187,10 @@ and built-in picker bindings you still want.
 | Source type | Candidates | Acceptance |
 | --- | --- | --- |
 | `Scrollback` | Frozen logical lines, or matches extracted with `regex`. | `Navigate` enters copy mode; `SendInput` pastes text. |
-| `FileSystem` | Paths under configured `roots`, with depth and file/directory filters (Windows only). | Paste the raw path without quoting or Enter. |
+| `FileSystem` | Paths under configured `roots`, with depth and file/directory filters. | Paste the raw path without quoting or Enter. |
 | `Items` | An `items` Lua provider or JSON items from a named pipe request. | Paste the selected value by default. |
 | `Command` | Lines streamed from an executable's stdout. | Paste the selected line by default. |
+| `File` | Lines of a text file, optionally newest first. | Paste the selected line. |
 | `Themes` | Installed themes. | Apply the selected theme. |
 | `CommandPalette` | Application actions and configured pickers. | Dispatch the selected action. |
 | `ErrorLog` | Session error history. | Close the picker; the preview shows the full message. |
@@ -579,9 +582,7 @@ allowlisted named picker for Dynamic previews; inline stream previews remain
 restricted to Text/Ansi.
 
 `nterm.example.lua` demonstrates host-owned image/video extension routing and
-configurable FFmpeg/FFprobe paths. SimpleWindowManager's Rust configuration uses
-`file_preview_resolver`, a worker closure returning the same typed `PreviewPlan`;
-its `file_preview::MediaPreviewSettings` helper owns media routing and video probes.
+configurable FFmpeg/FFprobe paths.
 
 Every picker type accepts an optional preview. `preview = { type = "Text",
 text = "{item}" }` displays literal text; `type = "Ansi"` interprets terminal
@@ -606,13 +607,13 @@ Return `nil` to leave that item's preview blank. `item.value` is the selected va
 filesystem items also provide `item.path`. The resolver runs on the Lua worker
 when the selected item changes. All Lua preview callbacks use `Dynamic.resolve`.
 
-Command preview limits can be configured globally:
-
 Set `cursor_scroll_padding = 2` in the top-level Lua table to control the rows
 kept above and below the cursor in terminal copy/search mode and picker previews.
 The default is two rows. Zero disables the margin; short viewports reduce it
 automatically. Configuration reload applies the value to existing panes and
 picker previews.
+
+Command preview limits can be configured globally:
 
 ```lua
 picker_defaults = {
@@ -772,10 +773,10 @@ in order only after a successful return; errors discard them and are printed to
 stderr. App handles expire when the callback returns. Navigation requires an
 active snapshot; perform it before any action that returns to the live terminal.
 
-Windows uses `nfm_file_system` from [npicker](https://github.com/e82eric/npicker),
-pinned to `b0a21d3f1d0c8f9e6c4f68f7dcf68eb126d1c1f7`. Filesystem pickers are currently Windows-only;
-Linux support will use NFM when it becomes available. Filesystem scans do not
-capture or read terminal snapshots, and cancellation leaves existing copy mode intact.
+Filesystem pickers use `nfm_file_system` from
+[npicker](https://github.com/e82eric/npicker), at the revision pinned in
+`Cargo.toml`, on Windows and Linux. Filesystem scans do not capture or read
+terminal snapshots, and cancellation leaves existing copy mode intact.
 
 
 ## Codex suggestions

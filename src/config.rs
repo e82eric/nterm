@@ -1,6 +1,7 @@
 pub(crate) mod keybindings;
 pub(crate) mod model;
 pub(crate) mod prompts;
+pub(crate) mod quick_selects;
 
 use mlua::{Lua, LuaSerdeExt};
 use serde::Deserialize;
@@ -297,6 +298,8 @@ struct AppConfig {
     prompt_patterns: Vec<String>,
     #[serde(skip)]
     compiled_prompts: std::rc::Rc<prompts::Patterns>,
+    #[serde(skip)]
+    quick_selects: quick_selects::Definitions,
     picker_pipe: crate::picker::pipe::Policy,
     // TODO(picker-defaults): `None` used to select default custom pickers;
     // it now means the same as an empty table, so this can be a plain map.
@@ -576,9 +579,14 @@ impl AppConfig {
                 }
             }
         }
+        let parsed_quick_selects = match &value {
+            mlua::Value::Table(root) => quick_selects::parse(&lua, root)?,
+            _ => Default::default(),
+        };
         let mut config: Self = lua.from_value(value).map_err(|error| error.to_string())?;
         config.compiled_prompts =
             std::rc::Rc::new(prompts::Patterns::compile(&config.prompt_patterns)?);
+        config.quick_selects = parsed_quick_selects;
         config.builtin_pickers.validate()?;
         config.workspaces.appearance.validate()?;
         config.picker_defaults.validate()?;
@@ -714,6 +722,7 @@ impl ReloadSource {
                 .with_builtin_pickers(config.builtin_pickers)
                 .with_pipe_policy(config.picker_pipe)
                 .with_prompt_patterns(config.compiled_prompts)
+                .with_quick_selects(config.quick_selects)?
                 .with_cursor_scroll_padding(
                     config
                         .cursor_scroll_padding
@@ -817,6 +826,7 @@ pub(crate) fn prepare_with_reload(
                         .with_builtin_pickers(config.builtin_pickers)
                         .with_pipe_policy(config.picker_pipe)
                         .with_prompt_patterns(config.compiled_prompts)
+                        .with_quick_selects(config.quick_selects)?
                         .with_cursor_scroll_padding(
                             config
                                 .cursor_scroll_padding
@@ -1738,6 +1748,8 @@ mod tests {
         .with_builtin_pickers(config.builtin_pickers)
         .with_pipe_policy(config.picker_pipe)
         .with_prompt_patterns(config.compiled_prompts)
+        .with_quick_selects(config.quick_selects)
+        .unwrap()
         .with_cursor_scroll_padding(
             config
                 .cursor_scroll_padding
@@ -2212,6 +2224,122 @@ mod tests {
     }
 
     #[test]
+    fn quick_selects_compile_bind_and_appear_in_the_palette() {
+        let bindings = |source: &str| {
+            let config = parse(source)?;
+            crate::picker::config::Bindings::compile_with_actions(
+                config.pickers,
+                config.keys,
+                config.picker_defaults,
+                config.actions,
+            )?
+            .with_quick_selects(config.quick_selects)
+        };
+        let compiled = bindings(
+            r#"return {
+                quick_selects = {
+                    addresses = { patterns = { [[0x[0-9a-fA-F]+]] }, action = "Copy" },
+                    hashes = { patterns = { [[\b[0-9a-f]{7,40}\b]], [[sha:(\w+)]] }, label = "Pick a hash", alphabet = "JKL" },
+                    urls = { patterns = { [[https?://\S+]] }, action = function(app, item) app:paste("<" .. item.text .. ">") end },
+                },
+                quick_select_defaults = { alphabet = "fjdk", patterns = { [[\w+\.\w+]] } },
+                keys = { { key = "a", mods = "ALT|SHIFT", quick_select = "addresses" } },
+            }"#,
+        )
+        .unwrap();
+        use nfm_egui::quick_select::Alphabet;
+        let named = &compiled.quick_selects.named;
+        let addresses = &named["addresses"];
+        assert!(matches!(addresses.action, quick_selects::Accept::Copy));
+        assert_eq!(addresses.label, "Quick select: addresses");
+        // Without its own alphabet a quick select uses the default one.
+        assert_eq!(addresses.alphabet, Alphabet::new("fjdk").unwrap());
+        assert_eq!(named["hashes"].patterns.len(), 2);
+        assert!(matches!(
+            named["hashes"].action,
+            quick_selects::Accept::Navigate
+        ));
+        assert_eq!(named["hashes"].alphabet, Alphabet::new("jkl").unwrap());
+        let default = &compiled.quick_selects.default;
+        assert!(default.patterns[0].is_match("main.rs"));
+        assert!(!default.patterns[0].is_match("main"));
+        // Linewise yanks keep hinting words with the default alphabet.
+        let words = &compiled.quick_selects.words;
+        assert!(words.patterns[0].is_match("main"));
+        assert_eq!(words.alphabet, Alphabet::new("fjdk").unwrap());
+        let quick_selects::Accept::Lua(callback) = &named["urls"].action else {
+            panic!("urls action should be a Lua callback");
+        };
+        let url = "https://example.com";
+        let commands = callback
+            .call_with_selection(
+                url,
+                url,
+                false,
+                Some(1),
+                None,
+                &Default::default(),
+                String::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            commands.as_slice(),
+            [crate::lua_callbacks::Command::Paste(text)] if text == "<https://example.com>"
+        ));
+        // Without patterns the built-in quick select keeps hinting words.
+        let plain = bindings("return { quick_select_defaults = { alphabet = 'ab' } }").unwrap();
+        let default = &plain.quick_selects.default;
+        assert!(std::rc::Rc::ptr_eq(default, &plain.quick_selects.words));
+        assert_eq!(default.alphabet, Alphabet::new("ab").unwrap());
+        let action = crate::actions::AppAction::OpenQuickSelect(Some("addresses".into()));
+        assert!(compiled.shortcut_for(&action).is_some());
+        let palette = crate::actions::catalog(&compiled, false, false);
+        let entry = palette
+            .iter()
+            .find(|entry| entry.id == "quick_select.hashes")
+            .unwrap();
+        assert_eq!(entry.label, "Pick a hash");
+
+        for (source, error) in [
+            (
+                "return { quick_selects = { bad = { patterns = { '[' } } } }",
+                "quick_selects.bad.patterns[1]",
+            ),
+            (
+                "return { quick_selects = { bad = { patterns = {} } } }",
+                "quick_selects.bad.patterns must not be empty",
+            ),
+            (
+                "return { quick_selects = { bad = { patterns = { 'x' }, action = 'Run' } } }",
+                "Run",
+            ),
+            (
+                "return { quick_selects = { bad = { patterns = { 'x' }, alphabet = 'aa' } } }",
+                "quick_selects.bad.alphabet: alphabet repeats",
+            ),
+            (
+                "return { quick_select_defaults = { patterns = {} } }",
+                "quick_select_defaults.patterns must not be empty",
+            ),
+            (
+                "return { quick_select_defaults = { alphabet = 'a1' } }",
+                "quick_select_defaults.alphabet",
+            ),
+            (
+                "return { keys = { { key = 'a', mods = 'ALT', quick_select = 'missing' } } }",
+                "unknown quick select \"missing\"",
+            ),
+            (
+                "return { quick_selects = { q = { patterns = { 'x' } } }, keys = { { key = 'a', mods = 'ALT', quick_select = 'q', action = 'ReloadConfig' } } }",
+                "exactly one of",
+            ),
+        ] {
+            let message = bindings(source).err().unwrap();
+            assert!(message.contains(error), "{source}: {message}");
+        }
+    }
+
+    #[test]
     fn picker_pipe_permissions_are_opt_in_and_strict() {
         assert!(!parse("return {}").unwrap().picker_pipe.enabled);
         let config =
@@ -2487,6 +2615,8 @@ mod tests {
             config.picker_defaults,
             config.actions,
         )
+        .unwrap()
+        .with_quick_selects(config.quick_selects)
         .unwrap();
     }
     #[test]

@@ -26,7 +26,8 @@ pub(crate) enum AppAction {
     OpenSearch,
     EnterCopyMode,
     ExitCopyMode,
-    OpenQuickSelect,
+    /// Open a quick select: the built-in one, or a `quick_selects` entry by name.
+    OpenQuickSelect(Option<String>),
     PreviousCommand,
     NextCommand,
     Lua(String),
@@ -55,7 +56,7 @@ impl AppAction {
             "OpenSearch" => Self::OpenSearch,
             "EnterCopyMode" => Self::EnterCopyMode,
             "ExitCopyMode" => Self::ExitCopyMode,
-            "OpenQuickSelect" => Self::OpenQuickSelect,
+            "OpenQuickSelect" => Self::OpenQuickSelect(None),
             "PreviousCommand" => Self::PreviousCommand,
             "NextCommand" => Self::NextCommand,
             _ => return None,
@@ -108,7 +109,8 @@ impl ActionContext {
             return false;
         }
         if self.quick_select {
-            return *action == AppAction::OpenQuickSelect;
+            // The same shortcut closes it again.
+            return matches!(action, AppAction::OpenQuickSelect(_));
         }
         if self.search {
             return *action == AppAction::OpenSearch;
@@ -275,7 +277,7 @@ pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) ->
         (
             "quick_select.open",
             "Quick select",
-            AppAction::OpenQuickSelect,
+            AppAction::OpenQuickSelect(None),
             true,
         ),
         (
@@ -315,6 +317,21 @@ pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) ->
         shortcut,
         action: AppAction::OpenPicker(name.to_owned()),
     }));
+    entries.extend(
+        bindings
+            .quick_selects
+            .named
+            .iter()
+            .map(|(name, definition)| {
+                let action = AppAction::OpenQuickSelect(Some(name.clone()));
+                Entry {
+                    id: format!("quick_select.{name}"),
+                    label: definition.label.clone(),
+                    shortcut: bindings.shortcut_for(&action),
+                    action,
+                }
+            }),
+    );
     entries.extend(bindings.lua_actions().map(|(name, action)| Entry {
         id: format!("action.{name}"),
         label: action.label.clone(),

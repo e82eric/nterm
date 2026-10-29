@@ -56,6 +56,22 @@ keys.
   - In copy mode, Shift+Y shows the hints again and copies every line from the
     cursor through the hinted line.
   - Hints also work in picker previews.
+  - [Custom quick selects](docs/copy-mode.md#custom-quick-selects) hint the
+    matches of your own regexes instead of words, each on its own key, for
+    text a workflow keeps reaching for, such as GDB or CDB memory addresses.
+    A label can enter copy mode at the match, copy it, paste it, or call a
+    Lua function with it, and a capture group narrows a match to just that
+    group. `quick_select_defaults` sets the hint alphabet and can replace the
+    words Alt+Space hints:
+
+    ```lua
+    quick_selects = {
+      addresses = { patterns = { [[\b0x[0-9a-fA-F]+\b]] }, action = "Copy" },
+    },
+    keys = {
+      { key = "x", mods = "ALT|SHIFT", quick_select = "addresses" },
+    },
+    ```
 
   <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/quick-select.gif" width="800" alt="Captioned quick select demo: hints over git log output, pasting a commit hash into git show with Shift on the last hint letter, jumping into copy mode at a word, and yanking lines through a hinted line with Shift+Y">
 
@@ -319,8 +335,9 @@ place of `claude`.
 These ship with nterm or its samples and are built from the same parts:
 
 - **Lines and words:** Scrollback sources. Lines enters copy mode at the
-  selected line; words pastes the selected word. Ctrl+B splits a result into
-  pieces.
+  selected line; the built-in words picker pastes the selected word, and
+  `nterm.example.lua` overrides it to replace the word before the cursor.
+  Ctrl+B splits a result into pieces.
 - **[Git](docs/pickers.md#lua-modules)** (`require("nterm.git")`): commits,
   branches, status, stashes, reflog, tags, and file history, as git Command
   sources with Lua actions such as `git switch`.

@@ -50,15 +50,16 @@ supported. Ctrl+P/Ctrl+Space toggle previews, Ctrl+Page Up/Down page previews,
 Ctrl+C copies the selected row, and Ctrl+Shift+/ opens keybinding help.
 
 The sample uses `nfm_search_core` and the other NFM crates from
-[npicker](https://github.com/e82eric/npicker), pinned to
-`b0a21d3f1d0c8f9e6c4f68f7dcf68eb126d1c1f7` in Cargo.toml.
+[npicker](https://github.com/e82eric/npicker), at the revision pinned in
+`Cargo.toml`.
 
 The text renderer and preview-plan provider come directly from the pinned NFM
 revision; no local NFM checkout or copied preview crates are required.
 
 The picker imports Ghostty's resolved primary regular and bold fonts and uses the current
 terminal cell dimensions to size its text and rows, including zoom and DPI changes.
-Matched positions use bold red text; selection uses a background highlight.
+Matched positions use bold text in the `picker_match_highlight` color (see
+[UI colors](ui-colors.md)); selection uses a background highlight.
 Unsupported non-SFNT font formats use egui's monospace fallback.
 
 Copy mode uses the shared `nfm-egui::copy_mode` engine. Ghostty supplies native

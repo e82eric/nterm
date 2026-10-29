@@ -219,6 +219,26 @@ impl SpawnOptions {
     }
 }
 
+/// Who opens a picker, which decides where closing it returns to.
+enum PickerOpen {
+    /// The user, from the live terminal or from copy mode; closing returns
+    /// there. Copy mode being active tells them apart, since nothing else can
+    /// hold it open while the user opens a picker.
+    Direct,
+    /// A callback, in place of the picker or quick select that ran it, which
+    /// it replaces. Closing returns where that one was opened. Copy mode being
+    /// active says nothing here: a quick select holds its snapshot in copy mode
+    /// even when opened from the live terminal.
+    FromCallback { from_copy: bool },
+}
+
+/// An open quick select and the definition its hints came from. Paging and
+/// resizing rebuild the hints with its patterns; a label runs its action.
+struct ActiveQuickSelect {
+    state: QuickSelect,
+    definition: std::rc::Rc<crate::config::quick_selects::Definition>,
+}
+
 pub(super) struct TerminalPane {
     pub(super) workspace_bounds: Option<egui::Rect>,
     host: *mut Host,
@@ -234,7 +254,7 @@ pub(super) struct TerminalPane {
     next_search_open: u64,
     search_worker: SnapshotSearchAdapter,
     copy_mode: CopyMode,
-    quick_select: Option<QuickSelect>,
+    quick_select: Option<ActiveQuickSelect>,
     picker: Option<crate::picker::Picker>,
     picker_font: crate::picker::font::PickerFont,
     toasts: crate::toast::Toasts,
@@ -559,7 +579,9 @@ impl TerminalPane {
 
     pub(super) fn refresh_decorations(&mut self) {
         let refresh = snapshot_decoration_refresh(
-            self.quick_select.as_ref().map(|quick| quick.generation),
+            self.quick_select
+                .as_ref()
+                .map(|quick| quick.state.generation),
             self.search.snapshot_generation,
             self.copy_mode.generation,
             |generation| {
@@ -838,7 +860,7 @@ impl TerminalPane {
         let label = if let Some(picker) = &self.picker {
             picker.label()
         } else if let Some(quick) = &self.quick_select {
-            if matches!(quick.purpose(), QuickSelectPurpose::YankLines { .. }) {
+            if matches!(quick.state.purpose(), QuickSelectPurpose::YankLines { .. }) {
                 "YANK LINES"
             } else {
                 "QUICK SELECT"
@@ -871,7 +893,7 @@ impl TerminalPane {
         let detail = self
             .quick_select
             .as_ref()
-            .map(QuickSelect::status_text)
+            .map(|quick| quick.state.status_text())
             .or_else(|| {
                 copying.then(|| {
                     format!(
@@ -939,6 +961,7 @@ impl TerminalPane {
                 .quick_select
                 .as_mut()
                 .expect("quick select is active")
+                .state
                 .input(&events, index);
             match action {
                 quick_select::InputAction::Cancel => {
@@ -956,14 +979,32 @@ impl TerminalPane {
                 }
                 quick_select::InputAction::Select { cell, shifted } => {
                     if matches!(
-                        self.quick_select.as_ref().map(|quick| quick.purpose()),
+                        self.quick_select
+                            .as_ref()
+                            .map(|quick| quick.state.purpose()),
                         Some(QuickSelectPurpose::YankLines { .. })
                     ) {
                         self.complete_quick_select(ui.ctx(), cell);
                     } else if shifted {
                         self.paste_quick_select(cell);
                     } else {
-                        self.complete_quick_select(ui.ctx(), cell);
+                        use crate::config::quick_selects::Accept;
+                        let action = self
+                            .quick_select
+                            .as_ref()
+                            .expect("quick select is active")
+                            .definition
+                            .action
+                            .clone();
+                        match action {
+                            Accept::Navigate => self.complete_quick_select(ui.ctx(), cell),
+                            Accept::Copy => self.copy_quick_select(ui.ctx(), cell),
+                            Accept::Paste => self.paste_quick_select(cell),
+                            Accept::Lua(callback) => {
+                                self.call_quick_select(callback, cell);
+                                ui.ctx().request_repaint();
+                            }
+                        }
                     }
                     break;
                 }
@@ -1048,7 +1089,14 @@ impl TerminalPane {
         bindings: &crate::picker::config::Bindings,
         palette: &super::PaletteContext,
     ) {
-        self.open_picker_impl(ctx, entry, request_params, bindings, palette, false);
+        self.open_picker_impl(
+            ctx,
+            entry,
+            request_params,
+            bindings,
+            palette,
+            PickerOpen::Direct,
+        );
     }
 
     fn open_picker_impl(
@@ -1058,7 +1106,7 @@ impl TerminalPane {
         request_params: Option<std::collections::BTreeMap<String, String>>,
         bindings: &crate::picker::config::Bindings,
         palette: &super::PaletteContext,
-        replace: bool,
+        open: PickerOpen,
     ) {
         let host = self.host;
         let context = if entry.needs_context() {
@@ -1135,13 +1183,11 @@ impl TerminalPane {
             }
         }
         let copy_generation = self.copy_mode.generation;
-        let from_copy = if replace {
-            self.picker
-                .as_ref()
-                .map_or(copy_generation.is_some(), |picker| picker.from_copy)
-        } else {
-            copy_generation.is_some()
+        let from_copy = match open {
+            PickerOpen::Direct => copy_generation.is_some(),
+            PickerOpen::FromCallback { from_copy } => from_copy,
         };
+        let replace = matches!(open, PickerOpen::FromCallback { .. });
         let cursor_row = if options.position == crate::picker::config::Position::Cursor {
             self.picker_cursor_row()
         } else {
@@ -1426,13 +1472,6 @@ impl TerminalPane {
                     self.navigate_copy_command(matches!(action, AppAction::NextCommand), count);
                 }
             }
-            AppAction::OpenQuickSelect => {
-                if self.quick_select.is_some() {
-                    self.cancel_quick_select();
-                } else {
-                    self.open_quick_select();
-                }
-            }
             _ => {}
         }
         ctx.request_repaint();
@@ -1704,7 +1743,7 @@ impl TerminalPane {
                                     Some(params),
                                     bindings,
                                     palette,
-                                    true,
+                                    PickerOpen::FromCallback { from_copy },
                                 );
                             } else {
                                 self.show_error(
@@ -1816,7 +1855,26 @@ impl TerminalPane {
         self.apply_copy_target(generation, Motion::CharacterJump, target, false);
     }
 
-    fn open_quick_select(&mut self) {
+    /// The same shortcut opens a quick select and closes it again. The window
+    /// resolves which one from the bindings.
+    pub(super) fn toggle_quick_select(
+        &mut self,
+        definition: Result<std::rc::Rc<crate::config::quick_selects::Definition>, String>,
+    ) {
+        if self.quick_select.is_some() {
+            self.cancel_quick_select();
+            return;
+        }
+        match definition {
+            Ok(definition) => self.open_quick_select(definition),
+            Err(error) => self.show_error("Quick select unavailable", error),
+        }
+    }
+
+    fn open_quick_select(
+        &mut self,
+        definition: std::rc::Rc<crate::config::quick_selects::Definition>,
+    ) {
         let host = self.host;
         let copy_generation = self.copy_mode.generation;
         let from_copy = copy_generation.is_some();
@@ -1847,7 +1905,7 @@ impl TerminalPane {
         if !from_copy {
             self.copy_mode.start(generation, view);
         }
-        self.quick_select = self.build_quick_select(generation, from_copy, view, false);
+        self.quick_select = self.build_quick_select(definition, generation, from_copy, view, false);
         if self.quick_select.is_none() {
             if !from_copy {
                 self.close_quick_copy_mode();
@@ -1870,20 +1928,31 @@ impl TerminalPane {
 
     fn build_quick_select(
         &self,
+        definition: std::rc::Rc<crate::config::quick_selects::Definition>,
         generation: u64,
         from_copy: bool,
         view: SnapshotView,
         _paged: bool,
-    ) -> Option<QuickSelect> {
-        QuickSelect::new(generation, from_copy, view, |row| {
-            Self::read_snapshot_row_from(self.quick_host(), generation, row)
-        })
+    ) -> Option<ActiveQuickSelect> {
+        let read = |row| Self::read_snapshot_row_from(self.quick_host(), generation, row);
+        let state = QuickSelect::new_matching(
+            generation,
+            from_copy,
+            view,
+            &definition.patterns,
+            &definition.alphabet,
+            read,
+            |_| true,
+        )?;
+        Some(ActiveQuickSelect { state, definition })
     }
 
     fn page_quick_select(&mut self, down: bool) -> bool {
         let Some(quick) = &self.quick_select else {
             return false;
         };
+        let definition = quick.definition.clone();
+        let quick = &quick.state;
         let (generation, from_copy, purpose) = (quick.generation, quick.from_copy, quick.purpose());
         let host = self.quick_host();
         let mut view = SnapshotView::default();
@@ -1896,10 +1965,12 @@ impl TerminalPane {
             return false;
         }
         let view = QuickSelect::paged_view(view, down);
-        let Some(mut quick) = self.build_quick_select(generation, from_copy, view, true) else {
+        let Some(mut quick) =
+            self.build_quick_select(definition, generation, from_copy, view, true)
+        else {
             return false;
         };
-        quick.set_purpose(purpose);
+        quick.state.set_purpose(purpose);
         self.quick_select = Some(quick);
         // Move the viewport and replace labels in the same Ghostty operation.
         let viewport = SnapshotViewportOptions {
@@ -1912,7 +1983,7 @@ impl TerminalPane {
     }
 
     fn publish_quick_select_with_viewport(&self, viewport: *const SnapshotViewportOptions) -> bool {
-        let Some(quick) = &self.quick_select else {
+        let Some(quick) = &self.quick_select.as_ref().map(|quick| &quick.state) else {
             return false;
         };
         let palette = crate::colors::palette();
@@ -1982,7 +2053,7 @@ impl TerminalPane {
     }
 
     fn cancel_quick_select(&mut self) {
-        let Some(quick) = self.quick_select.take() else {
+        let Some(quick) = self.quick_select.take().map(|quick| quick.state) else {
             return;
         };
         if quick.from_copy {
@@ -1994,7 +2065,7 @@ impl TerminalPane {
     }
 
     fn complete_quick_select(&mut self, ctx: &egui::Context, target: SnapshotCell) {
-        let Some(quick) = self.quick_select.take() else {
+        let Some(quick) = self.quick_select.take().map(|quick| quick.state) else {
             return;
         };
         let mut view = SnapshotView::default();
@@ -2019,18 +2090,15 @@ impl TerminalPane {
         }
     }
 
-    fn paste_quick_select(&mut self, target: SnapshotCell) {
-        let Some(quick) = &self.quick_select else {
-            return;
-        };
-        let Some(hint) = quick.hints.iter().find(|hint| hint.range.start == target) else {
-            return;
-        };
+    /// The text of the hint starting at `target`. On failure the quick select
+    /// is canceled and an error titled `failure` is shown.
+    fn quick_select_text(&mut self, target: SnapshotCell, failure: &str) -> Option<Vec<u8>> {
+        let quick = &self.quick_select.as_ref()?.state;
+        let hint = quick.hints.iter().find(|hint| hint.range.start == target)?;
         let mut result = ghostty_ffi::SnapshotSelectionText::default();
-        let host = self.quick_host();
         if !unsafe {
             ghostty_ffi::nterm_host_snapshot_selection_text(
-                host,
+                self.quick_host(),
                 quick.generation,
                 hint.range,
                 false,
@@ -2039,11 +2107,8 @@ impl TerminalPane {
             )
         } {
             self.cancel_quick_select();
-            self.show_error(
-                "Quick select paste failed",
-                "Unable to read the selected text".into(),
-            );
-            return;
+            self.show_error(failure, "Unable to read the selected text".into());
+            return None;
         }
         // Own the original text before releasing the snapshot. Ghostty's
         // selection formatter handles Unicode and joins soft-wrapped rows.
@@ -2053,10 +2118,73 @@ impl TerminalPane {
             unsafe { std::slice::from_raw_parts(result.text, result.len) }.to_vec()
         };
         unsafe { ghostty_ffi::nterm_host_snapshot_selection_text_free(&mut result) };
+        Some(text)
+    }
+
+    fn paste_quick_select(&mut self, target: SnapshotCell) {
+        let Some(text) = self.quick_select_text(target, "Quick select paste failed") else {
+            return;
+        };
         self.quick_select = None;
         self.close_quick_copy_mode();
+        let host = self.quick_host();
         unsafe { ghostty_ffi::nterm_host_text(host, text.as_ptr().cast(), text.len()) };
         self.wake.context.request_repaint();
+    }
+
+    /// Copy the match and leave quick select; a quick select opened from copy
+    /// mode returns to it.
+    fn copy_quick_select(&mut self, ctx: &egui::Context, target: SnapshotCell) {
+        let Some(text) = self.quick_select_text(target, "Quick select copy failed") else {
+            return;
+        };
+        ctx.copy_text(String::from_utf8_lossy(&text).into_owned());
+        self.cancel_quick_select();
+    }
+
+    /// Hand the match to a Lua action, which runs like a picker callback:
+    /// `item.text` is the match and `app:navigate(item)` enters copy mode
+    /// there. The snapshot stays open until the callback finishes.
+    fn call_quick_select(
+        &mut self,
+        callback: std::rc::Rc<crate::lua_callbacks::Callback>,
+        target: SnapshotCell,
+    ) {
+        let Some(text) = self.quick_select_text(target, "Quick select action failed") else {
+            return;
+        };
+        let Some(quick) = self.quick_select.take().map(|quick| quick.state) else {
+            return;
+        };
+        let range = quick
+            .hints
+            .iter()
+            .find(|hint| hint.range.start == target)
+            .map(|hint| hint.range);
+        // Remove the labels; a picker the callback opens shows the snapshot.
+        if quick.from_copy {
+            self.publish_copy_decoration(quick.generation, self.copy_mode.cursor, false);
+        } else {
+            unsafe {
+                ghostty_ffi::nterm_host_snapshot_apply_decorations(
+                    self.host,
+                    quick.generation,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+        }
+        let text = String::from_utf8_lossy(&text).into_owned();
+        let action = crate::picker::Action::Custom(
+            callback,
+            text.clone(),
+            false,
+            range,
+            text,
+            Default::default(),
+        );
+        self.pending_callback = Some((action, Some(quick.generation), quick.from_copy));
     }
 
     fn quick_host(&self) -> *mut Host {
@@ -2455,9 +2583,19 @@ impl TerminalPane {
                     }
                 }
                 CopyEffect::QuickSelect { origin } => {
-                    self.open_quick_select();
+                    let Some(bindings) = bindings else {
+                        self.show_error(
+                            "Quick select unavailable",
+                            "Picker bindings unavailable".into(),
+                        );
+                        return false;
+                    };
+                    // Linewise yanks hint words: every row with text gets a label.
+                    self.open_quick_select(bindings.quick_selects.words.clone());
                     if let Some(quick) = &mut self.quick_select {
-                        quick.set_purpose(QuickSelectPurpose::YankLines { origin });
+                        quick
+                            .state
+                            .set_purpose(QuickSelectPurpose::YankLines { origin });
                         // open_quick_select published before the purpose was
                         // known; republish so the origin row is decorated.
                         if !self.publish_quick_select() {

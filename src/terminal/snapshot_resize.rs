@@ -169,7 +169,7 @@ impl TerminalPane {
             .quick_select
             .as_ref()
             .map(|quick| {
-                if let QuickSelectPurpose::YankLines { origin } = quick.purpose() {
+                if let QuickSelectPurpose::YankLines { origin } = quick.state.purpose() {
                     let index = cells.len();
                     cells.push(origin);
                     Some(index)
@@ -215,10 +215,11 @@ impl TerminalPane {
         }
         self.prompt_boundaries = None;
         if let Some(quick) = &self.quick_select {
-            let from_copy = quick.from_copy;
-            let mut rebuilt = self.build_quick_select(generation, from_copy, view, false);
+            let (definition, from_copy) = (quick.definition.clone(), quick.state.from_copy);
+            let mut rebuilt =
+                self.build_quick_select(definition, generation, from_copy, view, false);
             if let (Some(quick), Some(index)) = (&mut rebuilt, purpose) {
-                quick.set_purpose(QuickSelectPurpose::YankLines {
+                quick.state.set_purpose(QuickSelectPurpose::YankLines {
                     origin: cells[index],
                 });
             }

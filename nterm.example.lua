@@ -445,7 +445,36 @@ return {
       }
     end,
   },
+  -- Quick selects over custom regexes instead of words. Typing a label runs
+  -- `action` (Navigate, the default, enters copy mode at the match; Copy and
+  -- Paste use the text; a function gets the match as item.text); Shift on
+  -- the last letter always pastes. A capture group selects only that group.
+  quick_selects = {
+    -- Debugger addresses, such as GDB's 0x00007ff6a2b1c4d0 or CDB's 00007ff6`a2b1c4d0.
+    addresses = {
+      patterns = { [[\b0x[0-9a-fA-F]+\b]], [[\b[0-9a-fA-F]{8}`[0-9a-fA-F]{8}\b]] },
+      action = "Copy",
+      label = "Copy a memory address",
+    },
+    -- Abbreviated and full git hashes.
+    hashes = {
+      patterns = { [[\b[0-9a-f]{7,40}\b]] },
+      action = "Paste",
+      label = "Paste a git hash",
+    },
+    -- Show a commit from git log or blame output.
+    commits = {
+      patterns = { [[\b[0-9a-f]{7,40}\b]] },
+      action = function(app, item)
+        app:send_text("git show " .. item.text .. "\r")
+      end,
+      label = "Show a git commit",
+    },
+  },
   keys = {
+    { key = "x", mods = "ALT|SHIFT", quick_select = "addresses" },
+    { key = "h", mods = "ALT|SHIFT", quick_select = "hashes" },
+    { key = "g", mods = "ALT|SHIFT", quick_select = "commits" },
     { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
     { key = "a", mods = "CTRL|SHIFT", picker = "CodexSuggestions" },
     { key = "l", mods = "CTRL|SHIFT", picker = "ClaudeSuggestions" },

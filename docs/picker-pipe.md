@@ -15,7 +15,8 @@ picker_pipe = {
 },
 ```
 
-`named` is an exact allowlist. `files` refers to the custom Lua picker above;
+`named` is an exact allowlist. `files` is a custom picker defined in Lua `pickers`,
+such as the FileSystem example in [Custom pickers in Lua](pickers.md#custom-pickers-in-lua);
 built-ins use their `builtin.` names. `allow_stream` permits candidates sent
 directly from the shell.
 
@@ -188,9 +189,10 @@ The script does nothing outside an nterm pane: it returns unless
 File and directory bindings use nterm's builtin FileWalker through the named
 FileSystem pickers, passing the selected roots and current directory; no `fd` or
 custom history-reader executable is required.
-History and text search open the ProfileHistory and ProfileRipgrep Command
-pickers, so nterm runs the command and results appear as they arrive. History
-passes PSReadLine's `HistorySavePath` as `params.history`. Completions pipe
+History opens the ProfileHistory File picker, which reads PSReadLine's history
+file directly, newest first; the profile passes its `HistorySavePath` as
+`params.history`. Text search opens the ProfileRipgrep Command picker, so nterm
+runs `rg` and results appear as they arrive. Completions pipe
 PowerShell's matches into the ProfileCompletions Items picker (a named stream,
 see [Requests](#requests)), so the Lua configuration supplies the preview and
 there is no item cap below the stream limits. Command previews are optional in
@@ -206,7 +208,7 @@ Add this to the table returned by your nterm Lua configuration:
 picker_pipe = {
   enabled = true,
   allow_stream = true,
-  named = { "files", "lines", "words" }, -- exact configured picker names
+  named = { "files", "builtin.lines", "builtin.words" }, -- exact picker names
 },
 ```
 
@@ -276,9 +278,10 @@ the connection. Ctrl+C, transport errors, and incomplete requests discard it.
 The next call reconnects if the cached connection has ended or the endpoint/token
 has changed. A submitted request is never automatically replayed.
 
-When the pipe is enabled, the terminal status area shows `Pipe: connected` for
-an authenticated client, including between requests, and `Pipe: disconnected`
-otherwise. To explicitly release the pane's connection slot:
+When the pipe is enabled, the status bar shows a two-arrow pipe icon: in the
+accent color while an authenticated client is connected, including between
+requests, and muted otherwise. Hovering it shows the state. To explicitly
+release the pane's connection slot:
 
 ```powershell
 Disconnect-NtermPicker

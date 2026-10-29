@@ -15,15 +15,16 @@ back to another file. A persistent configuration indicator remains until restart
 See `nterm.lua` in this repository for a starting configuration:
 
 [nterm.example.lua](../nterm.example.lua) is an extended Windows sample with
-custom picker callbacks, command previews, snippets, and a Codex suggestion
-picker. Its filesystem roots default to `.` and tools are resolved from `PATH`.
-Read its header for dependencies and optional integrations. Snippets use
-`GHOSTTY_SNIPPETS_FILE` or `~/ghostty-snippets.json`; initialize the file with
-`{"snippets": []}`. The Codex picker sends terminal context to `codex exec`.
-Run it with `--lua-config=nterm.example.lua`.
+custom picker callbacks, command previews, snippets, and Codex and Claude
+command suggestion pickers. Its filesystem roots default to `.` and tools are
+resolved from `PATH`. Read its header for dependencies and optional
+integrations. Snippets use `GHOSTTY_SNIPPETS_FILE` or `~/ghostty-snippets.json`;
+initialize the file with `{"snippets": []}`. The suggestion pickers send
+terminal context to `codex exec` and `claude --print`. Run it with
+`--lua-config`:
 
 ```powershell
-.\out\bin\nterm.exe --lua-config=nterm.lua
+.\out\bin\nterm.exe --lua-config=nterm.example.lua
 ```
 
 ## Settings
@@ -62,6 +63,13 @@ return {
 }
 ```
 
+## Quick selects
+
+`quick_selects` defines named quick selects over your own regexes, each bound to
+a key and listed in the command palette, and `quick_select_defaults` sets the
+hint alphabet and the patterns Alt+Space hints. See
+[Custom quick selects](copy-mode.md#custom-quick-selects).
+
 ## Colors
 
 The UI follows Ghostty's resolved theme colors. Optional `colors.ui` overrides
@@ -78,8 +86,8 @@ theme_colors = {
 },
 ```
 
-Overrides accept `#RRGGBB` or `RRGGBB`. See [UI-COLORS.md](ui-colors.md) for all
-sixteen roles and derivation rules. Invalid overrides use configuration Messages.
+Overrides accept `#RRGGBB` or `RRGGBB`. See [UI colors](ui-colors.md) for all
+eighteen roles and derivation rules. Invalid overrides use configuration Messages.
 Colors are derived from the resolved Ghostty theme, then global `colors.ui`
 overrides are applied, followed by `theme_colors` overrides for that exact,
 case-sensitive theme name. This applies at startup and when selecting a theme;
@@ -104,22 +112,22 @@ floating terminal panes and the shared UI palette for this session only. Explici
 Lua UI overrides continue to take precedence; picker choices replace explicit
 native terminal colors for the session. To save a choice, set `colors.theme` in
 Lua and remove conflicting explicit native color settings, then restart. You can also bind the
-`OpenThemePicker` action in `keys`.
+`OpenThemePicker` action, or `builtin_picker = "themes"`, in `keys`.
 
-To configure its placement, define a named theme picker instead:
+Both open the built-in `themes` picker, which defaults to Cursor placement with
+score sorting. Change its placement through `builtin_pickers`:
 
 ```lua
-pickers = {
-  themes = { type = "Themes", position = "Cursor", sort = "Score" },
+builtin_pickers = {
+  themes = { position = "Center", sort = "Score" },
 },
 keys = {
-  { key = "t", mods = "CTRL|SHIFT", picker = "themes" },
+  { key = "t", mods = "CTRL|SHIFT", builtin_picker = "themes" },
 },
 ```
 
-Add these entries to the tables in your config. Named theme pickers also support
-`initial_query` and work in the main and floating panes. The built-in
-`OpenThemePicker` action keeps its centered placement.
+Add these entries to the tables in your config. The overrides also accept
+`initial_query`, and the picker works in the main and floating panes.
 
 ## Key bindings
 
@@ -137,7 +145,7 @@ Explicit `keys` replace the default bindings. There are no default custom
 pickers; `picker = "lines"` requires a `lines` entry in `pickers`.
 
 The same `keys` table accepts top-level application actions. Each binding must
-specify exactly one of `action`, `picker`, or `builtin_picker`:
+specify exactly one of `action`, `picker`, `builtin_picker`, or `quick_select`:
 
 ```lua
 keys = {
@@ -148,9 +156,14 @@ keys = {
 },
 ```
 
-Supported action names are `NewWindow`, `ToggleFloatingPane`, `CloseFloatingPane`,
-`OpenSearch`, `EnterCopyMode`, `ExitCopyMode`, `OpenQuickSelect`, `PreviousCommand`,
-and `NextCommand`. Use `picker = "name"` to open a named picker. Multiple different
+Supported action names are `NewWindow`, `ReloadConfig`, `ShowMessages`,
+`OpenErrorLog`, `OpenThemePicker`, `ToggleFloatingPane`, `CreateFloatingPane`,
+`NextFloatingPane`, `PreviousFloatingPane`, `CloseFloatingPane`, `OpenSearch`,
+`EnterCopyMode`, `ExitCopyMode`, `OpenQuickSelect`, `PreviousCommand`, and
+`NextCommand`, plus the workspace and layout actions listed in
+[Workspaces](workspaces.md#default-bindings) and the names of your Lua
+`actions`. Use `picker = "name"` to open a named picker, and
+`quick_select = "name"` to open a [custom quick select](copy-mode.md#custom-quick-selects). Multiple different
 shortcuts may invoke the same action; the command palette displays their actual
 configured bindings. Actions without bindings remain available in the palette.
 

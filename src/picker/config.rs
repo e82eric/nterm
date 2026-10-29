@@ -975,6 +975,7 @@ pub(crate) struct Bindings {
     pub(crate) builtin_pickers: BuiltinPickers,
     pub(crate) cursor_scroll_padding: u32,
     pub(crate) prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
+    pub(crate) quick_selects: crate::config::quick_selects::Definitions,
     bindings: Vec<Binding>,
     model: std::rc::Rc<crate::config::model::Model>,
 }
@@ -998,6 +999,21 @@ impl Bindings {
     ) -> Self {
         self.prompt_patterns = patterns;
         self
+    }
+
+    pub(crate) fn with_quick_selects(
+        mut self,
+        quick_selects: crate::config::quick_selects::Definitions,
+    ) -> Result<Self, String> {
+        for binding in &self.bindings {
+            if let crate::actions::AppAction::OpenQuickSelect(Some(name)) = &binding.action {
+                if !quick_selects.named.contains_key(name) {
+                    return Err(format!("unknown quick select {name:?} in key binding"));
+                }
+            }
+        }
+        self.quick_selects = quick_selects;
+        Ok(self)
     }
 
     pub(crate) fn with_pipe_policy(mut self, policy: super::pipe::Policy) -> Self {
@@ -1146,6 +1162,7 @@ impl Bindings {
             builtin_pickers: BuiltinPickers::default(),
             cursor_scroll_padding: nfm_egui::copy_mode::SCROLL_PADDING_ROWS,
             prompt_patterns: Default::default(),
+            quick_selects: Default::default(),
         })
     }
 
@@ -1165,6 +1182,22 @@ impl Bindings {
 
     pub(crate) fn lua_action(&self, name: &str) -> Option<std::rc::Rc<crate::actions::LuaAction>> {
         self.model.action(name)
+    }
+
+    /// What `OpenQuickSelect(name)` opens: a `quick_selects` entry, or the
+    /// built-in quick select without a name.
+    pub(crate) fn quick_select(
+        &self,
+        name: Option<&str>,
+    ) -> Result<std::rc::Rc<crate::config::quick_selects::Definition>, String> {
+        match name {
+            Some(name) => self
+                .quick_selects
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("No quick select named {name:?}")),
+            None => Ok(self.quick_selects.default.clone()),
+        }
     }
 
     pub(crate) fn lua_actions(&self) -> impl Iterator<Item = (&str, &crate::actions::LuaAction)> {
@@ -1419,7 +1452,7 @@ mod tests {
             (
                 egui::Key::Space,
                 egui::Modifiers::ALT,
-                AppAction::OpenQuickSelect,
+                AppAction::OpenQuickSelect(None),
             ),
             (egui::Key::ArrowUp, ctrl_shift, AppAction::PreviousCommand),
             (egui::Key::ArrowDown, ctrl_shift, AppAction::NextCommand),
@@ -1615,7 +1648,7 @@ mod tests {
                 quick_select: true,
                 ..Default::default()
             }
-            .allows(&AppAction::OpenQuickSelect, egui::Modifiers::ALT)
+            .allows(&AppAction::OpenQuickSelect(None), egui::Modifiers::ALT)
         );
         assert!(!ActionContext::default().allows(&AppAction::ExitCopyMode, egui::Modifiers::CTRL));
         assert!(

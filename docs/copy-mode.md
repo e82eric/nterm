@@ -38,9 +38,10 @@ Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> to enter copy
 mode. Ghostty freezes the visible terminal and scrollback while the live PTY
 keeps running. A steady, styled cell marks the terminal's insertion point.
 With a floating pane visible, copy mode freezes and controls that pane instead.
-A permanent 24-point status row below the terminal shows `TERMINAL` in live
-mode and a yellow `COPY` label in copy mode. Visual selection changes the
-label and top separator to orange and shows `VISUAL`, `V-LINE`, or `V-BLOCK`.
+A permanent 24-point status row below the terminal shows the pane's command
+name (such as `PWSH.EXE`) in live mode and a `COPY` label in the accent color in
+copy mode. Visual selection shows `VISUAL`, `V-LINE`, or `V-BLOCK` instead, in
+the same color.
 The right side shows the copy cursor's one-based scrollback row and column.
 The status row never covers terminal content or changes size when switching modes.
 Keyboard motions and selection commands control the saved output while this mode
@@ -56,7 +57,7 @@ you exit. Copying writes to the clipboard; it does not paste or run a command.
    included. For complete logical lines, use Shift+V (`V-LINE`) instead.
 4. Press `y`. The selected text goes to the system clipboard and briefly
    flashes; the selection clears and copy mode remains open.
-5. Press Escape until the status row says `TERMINAL`. You can now paste the
+5. Press Escape until the status row shows the command name again. You can now paste the
    clipboard into the terminal or another application.
 
 For a whole line without selecting first, move to it and type `yy`.
@@ -67,7 +68,8 @@ the command, for example `10j` moves down ten rows.
 ### Moving through output
 
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Up</kbd>/<kbd>Down</kbd> also enter copy
-mode and move to the previous/next regex-matched command prompt. In copy mode,
+mode and move to the previous/next command prompt matched by the
+[prompt patterns](configuration.md#prompt-patterns). In copy mode,
 the same shortcuts navigate commands; a count such as <kbd>3</kbd> followed
 by <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Up</kbd> skips three prompts. Navigation
 stops at the first or last command without wrapping.
@@ -93,7 +95,8 @@ Use <kbd>zt</kbd>, <kbd>zz</kbd>, or <kbd>zb</kbd> to place the copy cursor's
 row at the top, center, or bottom of the viewport without moving the cursor
 or changing the selection. Placement clamps at the scrollback boundaries.
 Copy motions, search-match navigation, and <kbd>zt</kbd>/<kbd>zb</kbd> keep
-three rows of padding above and below the cursor when possible. Short viewports
+two rows of padding above and below the cursor when possible (set
+`cursor_scroll_padding` to change it). Short viewports
 reduce the padding; <kbd>zz</kbd> keeps the cursor centered.
 Prefix a motion with a count, such as <kbd>10j</kbd>, <kbd>3w</kbd>, or
 <kbd>2f:</kbd>. <kbd>3gg</kbd>/<kbd>3G</kbd> go to the third snapshot row;
@@ -171,9 +174,8 @@ selection and switches to characterwise visual mode; use motions to extend it
 or <kbd>y</kbd> to copy it and stay in copy mode. Repeated text objects do not
 yet expand existing selections as Vim does.
 <kbd>yic</kbd>/<kbd>yac</kbd> copy a command's output or the prompt and output
-using prompt regexes over the frozen scrollback. The four patterns copied
-from the reference WezTerm configuration are hardcoded in
-`nfm-egui/src/copy_mode.rs`.
+using the [prompt patterns](configuration.md#prompt-patterns) over the frozen
+scrollback.
 Like WezTerm, a command block ends immediately before the next matching
 prompt line. Text that resembles a prompt can create a false boundary.
 Every successful yank briefly highlights the copied cells for 250 ms; a new
@@ -184,7 +186,7 @@ Escape first cancels a pending yank, text object, or viewport-placement sequence
 With a visual selection, it clears the selection and keeps copy mode open.
 With retained search matches, it clears those matches and keeps copy mode open.
 Otherwise, it exits to the live terminal. Press Escape again as needed until
-the status row reads `TERMINAL`. Exiting does not stop the shell or clear the
+the status row shows the command name. Exiting does not stop the shell or clear the
 clipboard.
 
 For a direct exit binding, assign the `ExitCopyMode` application action in Lua
@@ -234,7 +236,8 @@ When the search field is focused, paste remains within the search query.
 
 Press <kbd>Alt</kbd>+<kbd>Space</kbd> in terminal or copy mode to enter quick
 select. When the floating pane is visible, it selects from that pane and places
-its copy cursor there. It labels visible big words using the hardcoded regex `\S+`, including
+its copy cursor there. It labels visible big words using the regex `\S+`
+([custom quick selects](#custom-quick-selects) use other patterns), including
 words across soft wraps. Type a label to enter copy mode at the word's first
 cell. Hold Shift on the final hint letter to leave the snapshot and paste the
 matched text into the live terminal without submitting it. Caps Lock alone
@@ -260,6 +263,78 @@ and clears the typed prefix. Other scrolling is blocked while labels are display
 Labels are rendered by
 Ghostty using generic printable-ASCII cell text overrides; the frozen terminal
 text stays unchanged.
+
+### Custom quick selects
+
+`quick_selects` defines named quick selects that label the matches of your own
+regexes instead of big words. Bind each one with `quick_select = "<name>"` in
+`keys`; each also appears in the command palette.
+
+```lua
+quick_selects = {
+  -- GDB's 0x00007ff6a2b1c4d0 and CDB's 00007ff6`a2b1c4d0.
+  addresses = {
+    patterns = { [[\b0x[0-9a-fA-F]+\b]], [[\b[0-9a-fA-F]{8}`[0-9a-fA-F]{8}\b]] },
+    action = "Copy",
+    label = "Copy a memory address",
+  },
+  -- Only the hash: the capture group is selected, "commit " is context.
+  commits = {
+    patterns = { [[commit ([0-9a-f]{7,40})\b]] },
+    action = function(app, item)
+      app:send_text("git show " .. item.text .. "\r")
+    end,
+  },
+},
+keys = {
+  { key = "x", mods = "ALT|SHIFT", quick_select = "addresses" },
+  { key = "h", mods = "ALT|SHIFT", quick_select = "commits" },
+},
+```
+
+| Field | Meaning |
+| --- | --- |
+| `patterns` | One or more Rust regexes, matched against each logical line, so a match can span a soft wrap. A pattern with capture groups labels the first group that participates in the match. Where matches of different patterns overlap, the earliest (then longest) wins. |
+| `action` | What typing a label does: `Navigate` (default) enters copy mode at the match, like Alt+Space; `Copy` copies the match to the clipboard; `Paste` pastes it into the live terminal without submitting it; or a function, described below. Shift on the final letter always pastes. |
+| `label` | The command palette entry. Defaults to `Quick select: <name>`. |
+| `alphabet` | The letters labels are made of, in the order they are handed out, such as `"fjdkslaghrueiwoqpty"`. Defaults to `quick_select_defaults.alphabet`. |
+
+A function `action` is called as `action(app, item)`, the same as a picker's
+[selection callback](pickers.md#custom-selection-callbacks): `item.text` and
+`item.value` are the match, and `item.range` holds its start and end cells. The
+`app` methods are the same, so `app:paste`, `app:send_text`,
+`app:replace_prompt`, `app:show_toast`, `app:replace_picker`, and the
+workspace and floating pane methods all work. `app:navigate(item)` enters copy
+mode at the match. If the callback does none of these, nterm returns to where it
+was: copy mode if the quick select was opened from it, otherwise the live
+terminal.
+
+Everything else matches Alt+Space: labels, Backspace, Page Up/Down (which keep
+the same patterns), and Escape or the same shortcut to cancel. Invalid regexes
+or alphabets and bindings to unknown names reject the config. Picker preview
+hints keep using big words and the default alphabet.
+
+### Quick select defaults
+
+`quick_select_defaults` changes Alt+Space and the alphabet every quick select
+uses:
+
+```lua
+quick_select_defaults = {
+  -- Labels from the home row only; longer labels when there are more hints.
+  alphabet = "fjdkslgh",
+  -- Hint URLs and paths instead of every word.
+  patterns = { [[https?://\S+]], [[(?:[A-Za-z]:)?[\\/]?(?:[\w.-]+[\\/])+[\w.-]+]] },
+},
+```
+
+| Field | Meaning |
+| --- | --- |
+| `patterns` | Replaces the big words that Alt+Space hints, with the same rules as a quick select's `patterns`. Listing `[[\S+]]` alongside other patterns mostly hides them, because the earliest match wins and a word usually starts first. |
+| `alphabet` | The default alphabet for Alt+Space, Shift+Y, and every quick select without its own. At least two distinct letters; letters are case-insensitive. Defaults to `asdfghjklqwertyuiopzxcvbnm`. |
+
+Copy mode's Shift+Y keeps hinting words regardless of `patterns`, since its
+labels mark rows.
 
 ## Mouse selection
 

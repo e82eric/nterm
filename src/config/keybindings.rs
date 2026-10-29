@@ -36,6 +36,7 @@ impl<'de> Deserialize<'de> for KeyBinding {
             mods: String,
             picker: Option<String>,
             builtin_picker: Option<String>,
+            quick_select: Option<String>,
             action: Option<String>,
         }
         let raw = RawBinding::deserialize(deserializer)?;
@@ -43,6 +44,7 @@ impl<'de> Deserialize<'de> for KeyBinding {
             raw.action,
             raw.picker,
             raw.builtin_picker,
+            raw.quick_select,
         )
         .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -230,19 +232,23 @@ pub(crate) fn application_target(
     action: Option<String>,
     picker: Option<String>,
     builtin: Option<String>,
+    quick_select: Option<String>,
 ) -> Result<crate::picker::config::BindingTarget, String> {
     use crate::picker::config::{BUILTIN_NAMES, BindingTarget};
-    match (action, picker, builtin) {
-        (Some(name), None, None) => Ok(BindingTarget::Action(
+    match (action, picker, builtin, quick_select) {
+        (Some(name), None, None, None) => Ok(BindingTarget::Action(
             crate::actions::AppAction::from_name(&name)
                 .unwrap_or(crate::actions::AppAction::Lua(name)),
         )),
-        (None, Some(name), None) => Ok(BindingTarget::Picker(name)),
-        (None, None, Some(name)) if BUILTIN_NAMES.contains(&name.as_str()) => {
+        (None, Some(name), None, None) => Ok(BindingTarget::Picker(name)),
+        (None, None, Some(name), None) if BUILTIN_NAMES.contains(&name.as_str()) => {
             Ok(BindingTarget::Picker(format!("builtin.{name}")))
         }
+        (None, None, None, Some(name)) => Ok(BindingTarget::Action(
+            crate::actions::AppAction::OpenQuickSelect(Some(name)),
+        )),
         _ => Err(
-            "key binding must specify exactly one of action, picker, or a known builtin_picker"
+            "key binding must specify exactly one of action, picker, quick_select, or a known builtin_picker"
                 .into(),
         ),
     }
@@ -256,7 +262,14 @@ pub(crate) fn parse_application_keys(
         lua,
         "keys",
         keys,
-        &["key", "mods", "action", "picker", "builtin_picker"],
+        &[
+            "key",
+            "mods",
+            "action",
+            "picker",
+            "builtin_picker",
+            "quick_select",
+        ],
         false,
         |binding, action, table| {
             let action = match action {
@@ -276,6 +289,9 @@ pub(crate) fn parse_application_keys(
                     table
                         .get("builtin_picker")
                         .map_err(|e| format!("keys.builtin_picker: {e}"))?,
+                    table
+                        .get("quick_select")
+                        .map_err(|e| format!("keys.quick_select: {e}"))?,
                 )?,
             })
         },

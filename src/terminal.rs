@@ -580,6 +580,11 @@ impl TerminalView {
                 } else {
                     None
                 };
+                let quick_select = if let AppAction::OpenQuickSelect(name) = &action {
+                    Some(self.picker_bindings.quick_select(name.as_deref()))
+                } else {
+                    None
+                };
                 let origin = if floating_target {
                     self.active_pane()
                 } else {
@@ -608,6 +613,8 @@ impl TerminalView {
                     if let Some(pane) = origin.and_then(|o| self.pane_mut(o)) {
                         if let Some(entry) = entry {
                             pane.open_picker(ctx, entry, None, &bindings, &palette);
+                        } else if let Some(definition) = quick_select {
+                            pane.toggle_quick_select(definition);
                         } else {
                             pane.execute_action(&action, ctx);
                         }
