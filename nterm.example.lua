@@ -5,7 +5,8 @@
 -- reads the PSReadLine history file directly, newest first.
 -- Snippets use GHOSTTY_SNIPPETS_FILE or ~/ghostty-snippets.json, with initial JSON:
 -- {"snippets": []}. SaveSnippet writes to that file.
--- CodexSuggestions invokes codex exec and sends the current terminal context.
+-- CodexSuggestions invokes codex exec and ClaudeSuggestions invokes claude --print
+-- with Haiku; both send the current terminal context.
 -- profile.example.ps1 uses the Profile* named pickers and streamed requests.
 
 -- Config lookup: --lua-config=PATH, then ~/nterm.lua, then nterm.lua beside
@@ -191,6 +192,50 @@ local function profile_preview(script, extra)
   end}
 end
 
+-- Command suggestions: type # and a description or partial command, then open
+-- the picker. args(prompt) returns the CLI that streams one suggestion per line;
+-- Enter replaces the # and the text after it with the selection.
+local function command_suggestions(label, args)
+  return function(context)
+    local cursor_row = context.line_before_cursor
+    local input_start = cursor_row:match(".*#()")
+    if not input_start then
+      error(label .. ": the current prompt does not contain a # marker")
+    end
+    local current_input = cursor_row:sub(input_start)
+    local erase_count = (utf8.len(current_input) or #current_input) + 1
+    local terminal_context = table.concat(context.recent_lines, "\n")
+    if terminal_context == "" then
+      error(label .. ": no terminal context is available")
+    end
+    local prompt = table.concat({
+      "Generate exactly 10 likely command completions or alternatives.",
+      "",
+      "In the current cursor row, # marks the beginning of editable input.",
+      "Everything before and including # is non-editable prompt text.",
+      "Return only the completed editable command.",
+      "Never include the prompt or the # marker.",
+      "Return one command per line.",
+      "Do not number the commands.",
+      "Do not use Markdown or code fences.",
+      "",
+      "Current cursor row:", cursor_row,
+      "",
+      "Terminal context:", terminal_context,
+    }, "\n")
+    return {
+      type = "Command",
+      args = args(prompt),
+      position = "Cursor",
+      sort = "SourceOrder",
+      preview_visible = false,
+      action = function(app, item)
+        app:replace_prompt(item.value, erase_count, 0)
+      end,
+    }
+  end
+end
+
 return {
   font = {
     size = 12,
@@ -352,48 +397,20 @@ return {
       preview=profile_preview(pipe_help_preview,"commandName"),
     },
 
-    CodexSuggestions = function(context)
-      local cursor_row = context.line_before_cursor
-      local input_start = cursor_row:match(".*#()")
-      if not input_start then
-        error("Codex suggestions: the current prompt does not contain a # marker")
-      end
-      local current_input = cursor_row:sub(input_start)
-      local erase_count = (utf8.len(current_input) or #current_input) + 1
-      local terminal_context = table.concat(context.recent_lines, "\n")
-      if terminal_context == "" then
-        error("Codex suggestions: no terminal context is available")
-      end
-      local prompt = table.concat({
-        "Generate exactly 10 likely command completions or alternatives.",
-        "",
-        "In the current cursor row, # marks the beginning of editable input.",
-        "Everything before and including # is non-editable prompt text.",
-        "Return only the completed editable command.",
-        "Never include the prompt or the # marker.",
-        "Return one command per line.",
-        "Do not number the commands.",
-        "Do not use Markdown or code fences.",
-        "",
-        "Current cursor row:", cursor_row,
-        "",
-        "Terminal context:", terminal_context,
-      }, "\n")
+    CodexSuggestions = command_suggestions("Codex suggestions", function(prompt)
       return {
-        type = "Command",
-        args = {
-          "codex", "exec", "--ephemeral", "--skip-git-repo-check",
-          "--color", "never", "--model", "gpt-5.6-luna",
-          "--config", 'model_reasoning_effort="none"', prompt,
-        },
-        position = "Cursor",
-        sort = "SourceOrder",
-        preview_visible = false,
-        action = function(app, item)
-          app:replace_prompt(item.value, erase_count, 0)
-        end,
+        "codex", "exec", "--ephemeral", "--skip-git-repo-check",
+        "--color", "never", "--model", "gpt-5.6-luna",
+        "--config", 'model_reasoning_effort="none"', prompt,
       }
-    end,
+    end),
+    ClaudeSuggestions = command_suggestions("Claude suggestions", function(prompt)
+      return {
+        "claude", "--print", "--model", "claude-haiku-5-5",
+        "--output-format", "text", "--tools", "",
+        "--no-session-persistence", prompt,
+      }
+    end),
     command_history = {
       type = "Scrollback",
       regex = [[(?m)^(?:PS [^>\r\n]*>|\d+:\d+>|›)\s*(.+)$]],
@@ -431,6 +448,7 @@ return {
   keys = {
     { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
     { key = "a", mods = "CTRL|SHIFT", picker = "CodexSuggestions" },
+    { key = "l", mods = "CTRL|SHIFT", picker = "ClaudeSuggestions" },
     { key = "n", mods = "CTRL|SHIFT", action = "NewWindow" },
     { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },
     { key = "e", mods = "CTRL|ALT|SHIFT", action = "CreateFloatingPane" },

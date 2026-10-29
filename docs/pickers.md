@@ -787,6 +787,12 @@ streams ten suggestions into a cursor-positioned picker. Enter replaces the inpu
 before the cursor with the selected suggestion; it does not execute the command.
 The model and CLI arguments are configured in the Lua factory.
 
+[nterm.example.lua](../nterm.example.lua) also defines `ClaudeSuggestions`
+(**Ctrl+Shift+L**), which sends the same prompt to Claude Haiku with
+`claude --print --model claude-haiku-5-5 --tools ""`. Both pickers come from
+its `command_suggestions(label, args)` helper, where `args` turns the prompt
+into the command line to run.
+
 Picker factories receive `context.recent_lines`: up to ten recent nonblank terminal
 rows, in chronological order, read from at most the last 256 snapshot rows.
 Pickers use the original seven-row layout. All picker definitions accept `sort`.

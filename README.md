@@ -1,23 +1,322 @@
 # NTerm
 
-NTerm is a terminal built on [Ghostty](https://ghostty.org) that runs on
-Windows and Linux. It embeds Ghostty's terminal emulation in a Rust and egui
-shell.
-
-It renders with wgpu, using Vulkan by default on both Windows and Linux.
-Ghostty and egui share one GPU device, so finished terminal frames are
-textures that egui draws directly, without a copy. Set `WGPU_BACKEND` (for
-example `dx12`) to choose another backend. Without a hardware adapter, as in a
-virtual machine, it falls back to software rendering if a software adapter is
-available (such as WARP with `dx12`) and reports that as a warning.
+NTerm is a terminal built on [Ghostty](https://ghostty.org) for Windows and
+Linux. It has two goals: make moving around the scrollback and copying text out
+of it as frictionless as possible, and be hackable enough that you can add or
+remove your own quality-of-life workflows with a few lines of Lua.
 
 ## Features
+
+### Scrollback navigation and copying
+
+Copy mode, search, quick select, and the scrollback pickers all work on a frozen
+snapshot of the full scrollback, so output stays still while you move through
+it and the shell keeps running behind it. Each one can hand off to copy mode at
+the place it found, so finding text and copying it is one continuous sequence of
+keys.
+
+- **Getting to the text.** Each entry point opens copy mode with the cursor
+  already on the target:
+  - Ctrl+Shift+M: at the terminal cursor.
+  - Ctrl+Shift+Up / Down: at the previous or next command prompt, found by
+    [prompt patterns](docs/configuration.md#prompt-patterns). Inside copy mode
+    the same keys move between commands, and a count such as `3` first skips
+    several.
+  - Ctrl+Shift+/ then Enter: at the selected search match.
+  - Ctrl+Shift+F then Enter: at the line chosen in a fuzzy picker over the
+    scrollback.
+  - Alt+Space then a hint: at the hinted word (see quick select below).
+
+- **[Copy mode](docs/copy-mode.md):** Vim motions and yanks over the snapshot.
+  - Motions: `hjkl`, `w`/`b`/`e`, `0`/`^`/`$`, `f`/`t` with `;` and `,`, `%`,
+    `gg`/`G`, `H`/`M`/`L`, Ctrl+U/D, and counts such as `10j`.
+  - Text objects: `yiw`, `yi(`, `ya"`, and the same for brackets, braces,
+    quotes, and backticks. `yic` copies the output of the command under the
+    cursor and `yac` includes its prompt, using the prompt boundaries.
+  - Selections: `v` for characters, `V` for lines, and Ctrl+Q for a rectangular
+    block, such as one column of a table. `y` copies and stays in copy mode.
+  - Search inside copy mode: `/` and `?`, `n`/`N`, and `*`/`#` for the word
+    under the cursor.
+  - Ctrl+B opens a picker over the pieces of the current line and inserts the
+    chosen piece at the prompt.
+
+  <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/copy-mode.gif" width="800" alt="Captioned copy mode demo: hjkl and word motions, f and percent jumps, yanking inside brackets and quotes, visual, line, and block selections, searching, and pasting the last yank at the prompt">
+
+- **[Search](docs/copy-mode.md#search):** Ctrl+Shift+/ searches the whole
+  scrollback, literal by default or regex with Ctrl+R. Ctrl+N and Ctrl+P move
+  between matches, and Enter continues in copy mode with the matches kept for
+  `n` and `N`.
+
+- **[Quick select](docs/copy-mode.md#quick-select):** Alt+Space labels every
+  visible word with a short hint.
+  - Typing a hint enters copy mode at that word.
+  - Holding Shift on the hint's last letter pastes the word at the prompt
+    instead, without entering copy mode, such as a commit hash from `git log`
+    into `git show`.
+  - In copy mode, Shift+Y shows the hints again and copies every line from the
+    cursor through the hinted line.
+  - Hints also work in picker previews.
+
+  <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/quick-select.gif" width="800" alt="Captioned quick select demo: hints over git log output, pasting a commit hash into git show with Shift on the last hint letter, jumping into copy mode at a word, and yanking lines through a hinted line with Shift+Y">
+
+- **[Scrollback pickers](docs/pickers.md#built-in-pickers):** fuzzy find over
+  everything in the scrollback, not only what is on screen.
+  - **Lines** (Ctrl+Shift+F): each result previews the line in context, and
+    Enter opens copy mode at that line, scrolled back to it.
+  - **Words:** completes the word before the cursor from words anywhere in the
+    scrollback, like Ctrl+N in Vim, and replaces it with the selection.
+    `nterm.example.lua` binds it to Ctrl+Shift+.
+  - **Line split** (Ctrl+B in a lines result or in copy mode): breaks a line
+    into pieces, such as table fields, quoted or bracketed values, and paths,
+    and inserts the chosen piece at the prompt.
+
+  <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/scrollback-pickers.gif" width="800" alt="Captioned scrollback pickers demo: the lines picker finds a commit far up in git log output and opens copy mode scrolled back to it, the words picker completes src/ter to src/terminal/pane.rs, and Ctrl+B splits a build error line so workspaces.default_layout is inserted into an rg command that is then run">
+
+### Building a custom workflow in Lua
+
+A workflow is a few entries in your [Lua configuration](docs/configuration.md):
+an action or a picker that does the work, and a key binding that runs it.
+Choose **Reload configuration** in the command palette to try a change without
+restarting.
+
+- **[Actions](docs/configuration.md#actions-and-toasts)** are Lua functions
+  that receive an `app` handle. Through it they can read the selection, paste or
+  send text to the shell, show a toast, and create, move, or close panes,
+  floats, and workspaces.
+- **[Key bindings](docs/configuration.md#key-bindings)** map a key to an action
+  or a picker. Every action and picker also appears in the
+  [command palette](docs/pickers.md#command-palette) (Ctrl+Shift+Space), with
+  or without a key.
+- **[Pickers](docs/pickers.md)** are a fuzzy finder with an optional preview,
+  defined from these parts:
+  - **[Sources](docs/pickers.md#picker-sources-and-common-options):** scrollback
+    lines or regex matches, files and directories, lines of a file, a command's
+    stdout as it streams, or items returned by a Lua function.
+  - **[Previews](docs/pickers.md#preview-configuration):** text with syntax
+    highlighting, a command's ANSI output, or an image. A Lua resolver can pick
+    the preview per item. Previews support copy mode motions, search, text
+    objects, and yanks.
+  - **[Picker actions](docs/pickers.md#custom-selection-callbacks):** Enter and
+    other keys can paste, enter copy mode at the item, replace text at the
+    prompt, open another picker, or call a Lua function.
+  - **[Factories](docs/pickers.md#dynamic-lua-picker-factories):** a Lua function
+    that returns the picker definition when it opens, with the text before the
+    cursor, the shell's working directory, and recent output as input.
+- **[The shell pipe](docs/picker-pipe.md)** opens a picker from the command
+  line. `Get-ChildItem | Invoke-NtermPicker` shows the piped objects and returns
+  the selection to the pipeline. Piping into a named picker uses its Lua preview
+  and actions. On Linux, use `npick`. The pipe is disabled until enabled in Lua.
+
+#### Example: fzf-style shell pickers
+
+[profile.example.ps1](profile.example.ps1) binds PSReadLine keys that open
+named pickers from [nterm.example.lua](nterm.example.lua) through the
+[shell pipe](docs/picker-pipe.md), then edit the command line with the result:
+
+| Key | Picker | Result |
+| --- | --- | --- |
+| Ctrl+O | Directories under the current directory | Runs `Set-Location` to the chosen directory |
+| Ctrl+T | Files under the current directory, with a preview | Inserts the quoted path at the cursor |
+| Alt+R | PowerShell history, newest first, filtered by the current line | Replaces the line with the chosen command |
+| Ctrl+Shift+G | `rg` matches for the current line, previewed at the matching line | Replaces the line with `nvim +LINE 'PATH'` |
+
+Alt+O and Alt+T do the same as Ctrl+O and Ctrl+T over the roots passed to the
+profile, and Ctrl+Space picks from PowerShell's tab completions, with
+`Get-Help` as the preview. To use them as they are, start nterm with
+`nterm.example.lua` and dot-source the profile from your `$PROFILE`:
+`. C:\path\to\nterm\profile.example.ps1`.
+
+<img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/fzf.gif" width="800" alt="Captioned fzf-style pickers demo: Ctrl+O changes to src\terminal, Ctrl+T inserts the path of workspace.rs after showing its preview, Alt+R finds cargo test in the history, and Ctrl+Shift+G ripgreps for default_layout, previews a match, and opens it in nvim at that line">
+
+Each binding has two halves. In Lua, a named picker and the pipe allowlist:
+
+```lua
+return {
+  picker_pipe = {
+    enabled = true,
+    named = { "ProfileDirectories" },
+  },
+  pickers = {
+    ProfileDirectories = {
+      type = "FileSystem", roots = { "." }, directories_only = true,
+      max_depth = 0, position = "Cursor",
+    },
+  },
+}
+```
+
+In the PowerShell profile, a key handler that opens it by name and uses the
+result:
+
+```powershell
+. C:\path\to\nterm\Invoke-NtermPicker.ps1
+
+Set-PSReadLineKeyHandler -Chord Ctrl+o -ScriptBlock {
+    $result = Invoke-NtermPicker -Name ProfileDirectories -Parameters @{
+        roots = (ConvertTo-Json -InputObject @($PWD.Path) -Compress)
+        cwd = $PWD.Path
+    }
+    if ($null -ne $result) {
+        $quoted = "'" + ([string]$result).Replace("'", "''") + "'"
+        [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert("Set-Location -LiteralPath $quoted")
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+    }
+}
+```
+
+The other bindings follow the same pattern: the ripgrep picker is a Command
+source that runs `rg` with the typed text, and the history picker is a File
+source over PSReadLine's history file. On Linux, `npick` opens named pickers
+from bash; see [Opening pickers from the shell](docs/picker-pipe.md).
+
+#### Example: snippets
+
+[nterm.example.lua](nterm.example.lua) adds command snippets with one action
+and one picker. In copy mode, select a command and press Ctrl+Shift+S: the
+`SaveSnippet` action appends the selection to a JSON file. Later, type part of
+a command and press Ctrl+Shift+B: the `Snippets` picker lists the saved
+snippets, filtered by the word at the cursor, and Enter replaces that word with
+the selected snippet.
+
+<img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/snippets.gif" width="800" alt="Captioned snippets demo: a git log command is selected in copy mode and saved with Ctrl+Shift+S, then typing git and pressing Ctrl+Shift+B opens the snippets picker, filtering by search selects the saved command, and Enter puts it at the prompt and runs it">
+
+A trimmed version, without the sample's error handling:
+
+```lua
+local snippets_path = os.getenv("USERPROFILE") .. "/ghostty-snippets.json"
+
+local function load_snippets()
+  local file = assert(io.open(snippets_path, "rb"))
+  local data = nterm.json_parse(file:read("*a"))
+  file:close()
+  return data
+end
+
+return {
+  actions = {
+    SaveSnippet = {
+      label = "Save selection as snippet",
+      action = function(app)
+        local selection = app:get_selection_text()
+        local data = load_snippets()
+        table.insert(data.snippets, { input = selection })
+        local file = assert(io.open(snippets_path, "wb"))
+        file:write(nterm.json_encode_pretty(data) .. "\n")
+        file:close()
+        app:show_toast("Snippet saved", selection, 2000)
+      end,
+    },
+  },
+  pickers = {
+    -- A factory: runs when the picker opens, with the text before the cursor.
+    Snippets = function(context)
+      local word = context.line_before_cursor:match("(%S+)$") or ""
+      return {
+        type = "Items",
+        initial_query = word,
+        position = "Cursor",
+        items = function()
+          local items = {}
+          for _, snippet in ipairs(load_snippets().snippets) do
+            items[#items + 1] = { text = snippet.input, value = snippet.input }
+          end
+          return items
+        end,
+        -- Replace the typed word with the snippet, without running it.
+        action = function(app, item)
+          app:replace_prompt(item.value, utf8.len(word), 0)
+        end,
+      }
+    end,
+  },
+  keys = {
+    { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
+    { key = "b", mods = "CTRL|SHIFT", picker = "Snippets" },
+  },
+}
+```
+
+The snippets file must exist first; start it as `{"snippets": []}`.
+
+#### Example: command suggestions from Claude Code
+
+[nterm.example.lua](nterm.example.lua) has a `ClaudeSuggestions` picker that
+asks Claude Haiku for commands. At the prompt, type `#` and describe the command
+or start writing it, then press Ctrl+Shift+L. The picker sends the text after
+the `#` and recent terminal output to `claude --print`, which streams ten
+suggestions into the picker as they arrive. Enter replaces the `#` and your text
+with the selected command; it does not run it.
+
+<img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/claude-suggestions.gif" width="800" alt="Captioned Claude suggestions demo: after some directory output, typing #find the 5 largest rust files under src and pressing Ctrl+Shift+L fills a picker with ten PowerShell commands from Claude Haiku, Enter replaces the # text with the selected command, and a second Enter runs it and lists the five largest files">
+
+The picker is a factory, so it builds the prompt and the command line each time
+it opens:
+
+```lua
+pickers = {
+  ClaudeSuggestions = function(context)
+    -- The editable input starts after the last # before the cursor.
+    local row = context.line_before_cursor
+    local input_start = assert(row:match(".*#()"), "type # before the request")
+    local erase_count = utf8.len(row:sub(input_start)) + 1
+    local prompt = table.concat({
+      "Generate exactly 10 likely command completions or alternatives.",
+      "# marks the beginning of editable input in the current cursor row.",
+      "Return one complete command per line, without the prompt or the #.",
+      "Do not number the commands or use Markdown.",
+      "",
+      "Current cursor row:", row,
+      "",
+      "Terminal context:", table.concat(context.recent_lines, "\n"),
+    }, "\n")
+    return {
+      type = "Command",
+      args = {
+        "claude", "--print", "--model", "claude-haiku-5-5",
+        "--output-format", "text", "--tools", "",
+        "--no-session-persistence", prompt,
+      },
+      position = "Cursor",
+      sort = "Source",
+      action = function(app, item)
+        app:replace_prompt(item.value, erase_count, 0)
+      end,
+    }
+  end,
+},
+keys = {
+  { key = "l", mods = "CTRL|SHIFT", picker = "ClaudeSuggestions" },
+},
+```
+
+`context.recent_lines` holds up to ten recent nonblank rows, and the Command
+source shows each line of `claude`'s output as it arrives. The sample builds
+`CodexSuggestions` (Ctrl+Shift+A) with the same function and `codex exec` in
+place of `claude`.
+
+#### Included workflows
+
+These ship with nterm or its samples and are built from the same parts:
+
+- **Lines and words:** Scrollback sources. Lines enters copy mode at the
+  selected line; words pastes the selected word. Ctrl+B splits a result into
+  pieces.
+- **[Git](docs/pickers.md#lua-modules)** (`require("nterm.git")`): commits,
+  branches, status, stashes, reflog, tags, and file history, as git Command
+  sources with Lua actions such as `git switch`.
+- **Themes, error log, and command palette.**
+
+<img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/pickers.gif" width="800" alt="Captioned pickers demo: completing a word from the scrollback, changing directory and inserting a file with a preview, searching PowerShell history, piping files into Invoke-NtermPicker, opening the git commits picker from the command palette, finding a scrollback line and splitting it, and ripgrepping it with a copy mode preview before opening the match in nvim">
+
+### Tiling windows, panes, and workspaces
 
 - **[Windows, panes, workspaces, and layouts](docs/workspaces.md):** Instead of
   splits and tabs, nterm arranges terminals like a tiling window manager.
   - A **window** is an independent nterm window. Press Ctrl+Shift+N to open
     another in the same process, sharing configuration, fonts, and theme
-    settings.
+    settings. Any tiled or floating pane can also move into a new window
+    without restarting its shell.
   - A **pane** is one terminal. Panes are tiled automatically, or can float
     above the tiled panes.
   - A **workspace** is a numbered set of panes with its own focus and layout.
@@ -42,47 +341,6 @@ available (such as WARP with `dx12`) and reports that as a warning.
   [example Lua configuration](workspaces.example.lua).
 
   <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/tour.gif" width="800" alt="Captioned tour: panes tile as they are added and closed, the workspace switches through each layout, a floating nvim pane takes scratch notes and is hidden and restored, a second workspace is created with its own layout, and the scratch pane is tiled, floated again, and moved to a workspace of its own from the command palette">
-
-- **[Vim Copy Mode](docs/copy-mode.md):** Press Ctrl+Shift+M to browse a frozen copy of
-  terminal output with Vim-style motions, search, text objects such as `yi(` and
-  `ya"`, and character, line, or block selections. Press `v`, move to select
-  text, then press `y` to copy it to the clipboard. Escape clears an active
-  selection or search before exiting.
-
-  <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/copy-mode.gif" width="800" alt="Captioned copy mode demo: hjkl and word motions, f and percent jumps, yanking inside brackets and quotes, visual, line, and block selections, searching, and pasting the last yank at the prompt">
-- **Search:** Search scrollback with literal or regex queries, or filter lines
-  in a fuzzy picker.
-- **Quick select:** A really convenient way to jump to any point on screen, or
-  to send the text there to the terminal. Press Alt+Space and every visible word
-  gets a keyboard hint. Type a hint to jump into copy mode at that word, or hold
-  Shift on its last letter to paste the word at the prompt, such as a commit
-  hash from `git log` into `git show`. In copy mode, Shift+Y shows the same hints
-  and yanks every line from the cursor through the hinted line.
-
-  <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/quick-select.gif" width="800" alt="Captioned quick select demo: hints over git log output, pasting a commit hash into git show with Shift on the last hint letter, jumping into copy mode at a word, and yanking lines through a hinted line with Shift+Y">
-- **[Pickers](docs/pickers.md):** Fuzzy find anything, with a preview. Pickers are
-  hackable: sources, previews, and actions are all Lua. nterm also ships with
-  plenty of built-in pickers and sources, built from those same pieces.
-  - **Scrollback:** fuzzy find a line and jump to it, or complete the word at the
-    cursor from anything on screen. Ctrl+B splits a result so you can grab one
-    piece of a line.
-  - **fzf-style workflows** from [profile.example.ps1](profile.example.ps1):
-    change directory, insert a file path, search PowerShell history, or ripgrep
-    and open the match in nvim.
-  - **Previews** support all of copy mode: motions, search, text objects, and
-    yanks.
-  - **[The command palette](docs/pickers.md#command-palette)** finds application actions and
-    pickers from one searchable menu. It is a picker too, and custom pickers
-    like the [Codex suggestions](docs/pickers.md#codex-suggestions) build on the same
-    infrastructure.
-  - **Ad-hoc pickers:** pipe anything from the shell, as in
-    `Get-ChildItem | Invoke-NtermPicker`, and the chosen object comes back down
-    the pipeline.
-  - **Samples** cover git (commits, branches, status, stashes, and more), themes,
-    error logs, and more.
-
-  <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/pickers.gif" width="800" alt="Captioned pickers demo: completing a word from the scrollback, changing directory and inserting a file with a preview, searching PowerShell history, piping files into Invoke-NtermPicker, opening the git commits picker from the command palette, finding a scrollback line and splitting it, and ripgrepping it with a copy mode preview before opening the match in nvim">
-- **[Lua customization](docs/configuration.md):** Configure keybindings,
 
 ## Getting started
 
@@ -117,8 +375,8 @@ nterm reads a Lua file from the first of these that exists:
 3. `nterm.lua` beside the executable
 
 Start from [nterm.lua](nterm.lua), or from [nterm.example.lua](nterm.example.lua)
-for the extended sample with custom pickers, previews, snippets, and Codex
-suggestions. [profile.example.ps1](profile.example.ps1) adds the PowerShell
+for the extended sample with custom pickers, previews, snippets, and Claude and
+Codex suggestions. [profile.example.ps1](profile.example.ps1) adds the PowerShell
 picker bindings shown in the pickers clip. Choose **Reload configuration** in
 the command palette to apply changes without restarting. See
 [Configuration](docs/configuration.md) for every setting.
@@ -144,6 +402,16 @@ A `keys` table in your Lua configuration replaces these defaults, so the samples
 bind some actions differently: `nterm.example.lua` opens the palette with
 Ctrl+Shift+P and the words picker with Ctrl+Shift+. instead. Every action is
 also in the command palette, whether or not it has a key.
+
+## Rendering
+
+nterm embeds Ghostty's terminal emulation in a Rust and egui shell and renders
+with wgpu, using Vulkan by default on both Windows and Linux. Ghostty and egui
+share one GPU device, so finished terminal frames are textures that egui draws
+directly, without a copy. Set `WGPU_BACKEND` (for example `dx12`) to choose
+another backend. Without a hardware adapter, as in a virtual machine, it falls
+back to software rendering if a software adapter is available (such as WARP
+with `dx12`) and reports that as a warning.
 
 ## Documentation
 
