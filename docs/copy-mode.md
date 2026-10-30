@@ -26,6 +26,7 @@ query field first, or use its acceptance action to enter copy mode.
 | --- | --- |
 | Ctrl+Shift+M | Enter at the terminal cursor. The Lua action is `EnterCopyMode`. |
 | Ctrl+Shift+Up / Ctrl+Shift+Down | Enter at the previous / next recognized command prompt. |
+| Ctrl+Up / Ctrl+Down | Enter at the terminal cursor and scroll up / down one row, like Ctrl+Y / Ctrl+E. Holding the key keeps scrolling; inside copy mode the same keys scroll too. The Lua actions are `ScrollLineUp` and `ScrollLineDown`. |
 | Search: Ctrl+Shift+/, type a query, then Enter | Enter at the selected match, retaining the search results. |
 | Scrollback picker: Ctrl+Shift+F, select a line, then Enter | Enter at the first nonblank cell of that line. |
 | Quick select: Alt+Space, then type a displayed hint | Enter at the hinted word. Holding Shift on the final letter pastes the word into the live terminal instead. |

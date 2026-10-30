@@ -236,6 +236,7 @@ pub(crate) fn application_target(
 ) -> Result<crate::picker::config::BindingTarget, String> {
     use crate::picker::config::{BUILTIN_NAMES, BindingTarget};
     match (action, picker, builtin, quick_select) {
+        (Some(name), None, None, None) if name == "None" => Ok(BindingTarget::Unbind),
         (Some(name), None, None, None) => Ok(BindingTarget::Action(
             crate::actions::AppAction::from_name(&name)
                 .unwrap_or(crate::actions::AppAction::Lua(name)),

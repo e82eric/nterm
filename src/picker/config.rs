@@ -791,6 +791,25 @@ pub(crate) use crate::config::keybindings::{BindingTrigger, KeyBinding};
 pub(crate) enum BindingTarget {
     Action(crate::actions::AppAction),
     Picker(String),
+    /// `action = "None"`: remove the default binding on this chord.
+    Unbind,
+}
+
+/// Application shortcuts from `keys`. They are merged over the default
+/// bindings by chord unless `disable_default_keys` is set.
+#[derive(Clone, Default)]
+pub(crate) struct Keys {
+    pub(crate) bindings: Vec<KeyBinding>,
+    pub(crate) disable_defaults: bool,
+}
+
+impl From<Option<Vec<KeyBinding>>> for Keys {
+    fn from(bindings: Option<Vec<KeyBinding>>) -> Self {
+        Self {
+            bindings: bindings.unwrap_or_default(),
+            disable_defaults: false,
+        }
+    }
 }
 
 pub(crate) const BUILTIN_NAMES: [&str; 5] =
@@ -1063,14 +1082,14 @@ impl Bindings {
     }
     pub(crate) fn compile(
         definitions: Option<BTreeMap<String, Definition>>,
-        keys: Option<Vec<KeyBinding>>,
+        keys: impl Into<Keys>,
     ) -> Result<Self, String> {
         Self::compile_with_defaults(definitions, keys, PickerDefaults::default())
     }
 
     pub(crate) fn compile_with_defaults(
         definitions: Option<BTreeMap<String, Definition>>,
-        keys: Option<Vec<KeyBinding>>,
+        keys: impl Into<Keys>,
         defaults: PickerDefaults,
     ) -> Result<Self, String> {
         Self::compile_with_actions(definitions, keys, defaults, BTreeMap::new())
@@ -1078,10 +1097,11 @@ impl Bindings {
 
     pub(crate) fn compile_with_actions(
         definitions: Option<BTreeMap<String, Definition>>,
-        keys: Option<Vec<KeyBinding>>,
+        keys: impl Into<Keys>,
         defaults: PickerDefaults,
         actions: BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
     ) -> Result<Self, String> {
+        let keys = keys.into();
         let model = std::rc::Rc::new(crate::config::model::Model::compile(
             definitions,
             defaults,
@@ -1095,7 +1115,7 @@ impl Bindings {
         // pickers; now it only rebinds a default shortcut when a user happens
         // to use one of those names. Always bind `builtin.*` here instead and
         // let users rebind through `keys`.
-        let keys = keys.unwrap_or_else(|| {
+        let default_keys = || {
             let mut keys = crate::actions::default_bindings();
             {
                 keys.push(KeyBinding {
@@ -1137,22 +1157,39 @@ impl Bindings {
                 });
             }
             keys
-        });
-        let mut bindings: Vec<Binding> = Vec::new();
-        for binding in keys {
+        };
+        let same_chord =
+            |a: &KeyBinding, b: &KeyBinding| a.trigger == b.trigger && same_mods(a.mods, b.mods);
+        for (index, binding) in keys.bindings.iter().enumerate() {
             let BindingTrigger::Key(key) = binding.trigger else {
                 return Err("application bindings require a keyboard trigger".into());
             };
-            let mods = binding.mods;
-            if bindings.iter().any(|existing| {
-                existing.trigger == binding.trigger && same_mods(existing.mods, mods)
-            }) {
+            if keys.bindings[..index]
+                .iter()
+                .any(|earlier| same_chord(earlier, binding))
+            {
                 return Err(format!(
                     "duplicate key binding {}",
-                    crate::actions::shortcut_label(key, mods)
+                    crate::actions::shortcut_label(key, binding.mods)
                 ));
             }
+        }
+        // User bindings come first so the palette lists their shortcuts first.
+        // A user binding on a default's chord replaces that default.
+        let mut merged = keys.bindings.clone();
+        if !keys.disable_defaults {
+            merged.extend(default_keys().into_iter().filter(|default| {
+                !keys
+                    .bindings
+                    .iter()
+                    .any(|binding| same_chord(binding, default))
+            }));
+        }
+        let mut bindings: Vec<Binding> = Vec::new();
+        for binding in merged {
+            let mods = binding.mods;
             let action = match binding.action {
+                BindingTarget::Unbind => continue,
                 BindingTarget::Action(action) => {
                     if let crate::actions::AppAction::Lua(name) = &action {
                         if !actions.contains_key(name) {
@@ -1479,6 +1516,16 @@ mod tests {
             ),
             (egui::Key::ArrowUp, ctrl_shift, AppAction::PreviousCommand),
             (egui::Key::ArrowDown, ctrl_shift, AppAction::NextCommand),
+            (
+                egui::Key::ArrowUp,
+                egui::Modifiers::CTRL,
+                AppAction::ScrollLineUp,
+            ),
+            (
+                egui::Key::ArrowDown,
+                egui::Modifiers::CTRL,
+                AppAction::ScrollLineDown,
+            ),
         ] {
             let mut events = vec![key_event(key, mods, true, false)];
             assert_eq!(bindings.consume(&mut events), (Some(expected), true));
@@ -1502,12 +1549,13 @@ mod tests {
     }
 
     #[test]
-    fn action_rebinding_replaces_defaults_and_updates_palette_shortcuts() {
+    fn action_rebinding_overrides_defaults_by_chord_and_updates_palette_shortcuts() {
         let keys = serde_json::from_value(serde_json::json!([
             { "key": "k", "mods": "CTRL", "action": "ToggleFloatingPane" },
             { "key": "k", "mods": "ALT", "action": "ToggleFloatingPane" },
             { "key": "e", "mods": "CTRL|SHIFT", "picker": "builtin.lines" },
-            { "key": "x", "mods": "CTRL|SHIFT", "action": "ExitCopyMode" }
+            { "key": "x", "mods": "CTRL|SHIFT", "action": "ExitCopyMode" },
+            { "key": "/", "mods": "CTRL|SHIFT", "action": "None" }
         ]))
         .unwrap();
         let bindings = Bindings::compile(None, Some(keys)).unwrap();
@@ -1526,8 +1574,20 @@ mod tests {
             bindings.consume(&mut events),
             (Some(AppAction::OpenPicker("builtin.lines".into())), true)
         );
+        // Defaults on other chords remain.
         let mut events = vec![key_event(
             egui::Key::N,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            true,
+            false,
+        )];
+        assert_eq!(
+            bindings.consume(&mut events),
+            (Some(AppAction::NewWindow), true)
+        );
+        // "None" removes the default and passes the key through.
+        let mut events = vec![key_event(
+            egui::Key::Slash,
             egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
             true,
             false,
@@ -1564,8 +1624,97 @@ mod tests {
     }
 
     #[test]
-    fn explicit_empty_keys_leave_every_action_unbound() {
+    fn disabled_default_keys_leave_only_user_bindings() {
+        let keys: Vec<KeyBinding> = serde_json::from_value(serde_json::json!([
+            { "key": "x", "mods": "CTRL|SHIFT", "action": "NewWindow" }
+        ]))
+        .unwrap();
+        let bindings = Bindings::compile(
+            None,
+            Keys {
+                bindings: keys,
+                disable_defaults: true,
+            },
+        )
+        .unwrap();
+        let catalog = crate::actions::catalog(&bindings, true, false);
+        assert!(
+            catalog
+                .iter()
+                .all(|entry| { entry.action == AppAction::NewWindow || entry.shortcut.is_none() })
+        );
+        let mut events = vec![key_event(
+            egui::Key::X,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            true,
+            false,
+        )];
+        assert_eq!(
+            bindings.consume(&mut events),
+            (Some(AppAction::NewWindow), true)
+        );
+        for (key, mods) in [
+            (egui::Key::N, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+            (egui::Key::M, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+            (egui::Key::Space, egui::Modifiers::ALT),
+            (egui::Key::F, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+        ] {
+            let mut events = vec![key_event(key, mods, true, false)];
+            assert_eq!(bindings.consume(&mut events), (None, false));
+            assert_eq!(events.len(), 1);
+        }
+    }
+
+    #[test]
+    fn explicit_empty_keys_keep_the_defaults() {
         let bindings = Bindings::compile(None, Some(Vec::new())).unwrap();
+        let mut events = vec![key_event(
+            egui::Key::M,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            true,
+            false,
+        )];
+        assert_eq!(
+            bindings.consume(&mut events),
+            (Some(AppAction::EnterCopyMode), true)
+        );
+    }
+
+    #[test]
+    fn duplicate_user_bindings_are_rejected_but_may_reuse_default_chords() {
+        let duplicate: Vec<KeyBinding> = serde_json::from_value(serde_json::json!([
+            { "key": "m", "mods": "CTRL|SHIFT", "action": "NewWindow" },
+            { "key": "m", "mods": "CTRL|SHIFT", "action": "None" }
+        ]))
+        .unwrap();
+        assert!(Bindings::compile(None, Some(duplicate)).is_err());
+        let rebound: Vec<KeyBinding> = serde_json::from_value(serde_json::json!([
+            { "key": "m", "mods": "CTRL|SHIFT", "action": "NewWindow" }
+        ]))
+        .unwrap();
+        let bindings = Bindings::compile(None, Some(rebound)).unwrap();
+        let mut events = vec![key_event(
+            egui::Key::M,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            true,
+            false,
+        )];
+        assert_eq!(
+            bindings.consume(&mut events),
+            (Some(AppAction::NewWindow), true)
+        );
+    }
+
+    #[test]
+    fn explicit_empty_keys_with_disabled_defaults_leave_every_action_unbound() {
+        let bindings = Bindings::compile(
+            None,
+            Keys {
+                bindings: Vec::new(),
+                disable_defaults: true,
+            },
+        )
+        .unwrap();
         assert!(
             crate::actions::catalog(&bindings, true, false)
                 .iter()

@@ -112,8 +112,9 @@ To use other keys or modifiers, add bindings such as:
 ```
 
 `nterm.workspace_keys("ALT")` generates the SWM-style bindings with a
-different modifier. Supplying `keys` replaces default bindings, so append the
-other application shortcuts you want. See [workspaces.example.lua](../workspaces.example.lua).
+different modifier. They are added to the default Ctrl+Alt bindings, which stay
+active; set `disable_default_keys = true` to use only your `keys`. See
+[workspaces.example.lua](../workspaces.example.lua).
 
 ## Layout behavior
 

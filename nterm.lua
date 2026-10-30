@@ -160,7 +160,8 @@ return {
   },
   keys = {
     { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
-    -- An explicit keys table replaces all top-level action and picker defaults.
+    -- Entries are merged over the defaults by chord; action = "None" removes
+    -- a default, and disable_default_keys = true drops them all.
     { key = "n", mods = "CTRL|SHIFT", action = "NewWindow" },
     { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },
     { key = "e", mods = "CTRL|ALT|SHIFT", action = "CreateFloatingPane" },
@@ -172,6 +173,8 @@ return {
     { key = "Space", mods = "ALT", action = "OpenQuickSelect" },
     { key = "ArrowUp", mods = "CTRL|SHIFT", action = "PreviousCommand" },
     { key = "ArrowDown", mods = "CTRL|SHIFT", action = "NextCommand" },
+    { key = "ArrowUp", mods = "CTRL", action = "ScrollLineUp" },
+    { key = "ArrowDown", mods = "CTRL", action = "ScrollLineDown" },
     -- On macOS you can also bind { key = "f", mods = "CMD", action = "OpenSearch" }.
     { key = "Space", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
     { key = "f", mods = "CTRL|SHIFT", builtin_picker = "lines" },

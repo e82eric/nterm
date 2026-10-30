@@ -30,13 +30,20 @@ pub(crate) enum AppAction {
     OpenQuickSelect(Option<String>),
     PreviousCommand,
     NextCommand,
+    /// Enter copy mode if needed and scroll one row, like Ctrl+Y / Ctrl+E.
+    ScrollLineUp,
+    ScrollLineDown,
     Lua(String),
 }
 
 impl AppAction {
     /// Whether a held key runs this action again on each auto-repeat.
     pub(crate) fn allows_key_repeat(&self) -> bool {
-        matches!(self, Self::Workspace(action) if action.allows_key_repeat())
+        match self {
+            Self::Workspace(action) => action.allows_key_repeat(),
+            Self::ScrollLineUp | Self::ScrollLineDown => true,
+            _ => false,
+        }
     }
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         if let Some(action) = WorkspaceAction::parse(name) {
@@ -59,6 +66,8 @@ impl AppAction {
             "OpenQuickSelect" => Self::OpenQuickSelect(None),
             "PreviousCommand" => Self::PreviousCommand,
             "NextCommand" => Self::NextCommand,
+            "ScrollLineUp" => Self::ScrollLineUp,
+            "ScrollLineDown" => Self::ScrollLineDown,
             _ => return None,
         })
     }
@@ -135,6 +144,8 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
         ("Space", "ALT", "OpenQuickSelect"),
         ("ArrowUp", "CTRL|SHIFT", "PreviousCommand"),
         ("ArrowDown", "CTRL|SHIFT", "NextCommand"),
+        ("ArrowUp", "CTRL", "ScrollLineUp"),
+        ("ArrowDown", "CTRL", "ScrollLineDown"),
     ]
     .into_iter()
     .map(|(key, mods, action)| KeyBinding {

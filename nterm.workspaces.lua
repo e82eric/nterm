@@ -449,6 +449,8 @@ local config = {
     { key = "Space", mods = "ALT", action = "OpenQuickSelect" },
     { key = "ArrowUp", mods = "CTRL|SHIFT", action = "PreviousCommand" },
     { key = "ArrowDown", mods = "CTRL|SHIFT", action = "NextCommand" },
+    { key = "ArrowUp", mods = "CTRL", action = "ScrollLineUp" },
+    { key = "ArrowDown", mods = "CTRL", action = "ScrollLineDown" },
     { key = "b", mods = "CTRL|SHIFT", picker = "Snippets" },
     { key = "f", mods = "CTRL|SHIFT", builtin_picker = "lines" },
     { key = ".", mods = "CTRL|SHIFT", builtin_picker = "words" },

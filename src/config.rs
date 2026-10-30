@@ -303,10 +303,12 @@ struct AppConfig {
     picker_pipe: crate::picker::pipe::Policy,
     // TODO(picker-defaults): `None` used to select default custom pickers;
     // it now means the same as an empty table, so this can be a plain map.
-    // `keys` stays optional: `None` keeps the default bindings and `{}`
-    // removes them.
     pickers: Option<std::collections::BTreeMap<String, crate::picker::config::Definition>>,
-    keys: Option<Vec<crate::picker::config::KeyBinding>>,
+    /// Parsed separately because Lua actions need the interpreter.
+    #[serde(skip)]
+    keys: crate::picker::config::Keys,
+    /// Use only `keys`, without the default bindings.
+    disable_default_keys: bool,
     #[serde(skip)]
     actions: std::collections::BTreeMap<String, std::rc::Rc<crate::actions::LuaAction>>,
 }
@@ -590,7 +592,10 @@ impl AppConfig {
         config.builtin_pickers.validate()?;
         config.workspaces.appearance.validate()?;
         config.picker_defaults.validate()?;
-        config.keys = parsed_keys;
+        config.keys = crate::picker::config::Keys {
+            bindings: parsed_keys.unwrap_or_default(),
+            disable_defaults: config.disable_default_keys,
+        };
         config.pickers = parsed_pickers;
         config.actions = actions;
         config.startup = startup;
@@ -1906,7 +1911,7 @@ mod tests {
         };
         assert_eq!(command.line_continuation.as_deref(), Some("`"));
         assert!(parse("return {pickers={x={enter_action='Bad'}}}").is_err());
-        let empty = parse("return {keys={}}").unwrap();
+        let empty = parse("return {keys={}, disable_default_keys=true}").unwrap();
         let bindings = crate::picker::config::Bindings::compile_with_actions(
             empty.pickers,
             empty.keys,

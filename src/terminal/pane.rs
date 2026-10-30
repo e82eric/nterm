@@ -1501,6 +1501,15 @@ impl TerminalPane {
                     self.navigate_copy_command(matches!(action, AppAction::NextCommand), count);
                 }
             }
+            AppAction::ScrollLineUp | AppAction::ScrollLineDown => {
+                if !self.copying() {
+                    self.open_copy_mode();
+                }
+                if self.copying() {
+                    let count = self.copy_mode.command_navigation_count();
+                    self.scroll_copy_lines(matches!(action, AppAction::ScrollLineDown), count, ctx);
+                }
+            }
             _ => {}
         }
         ctx.request_repaint();
@@ -2762,6 +2771,33 @@ impl TerminalPane {
         // All configured prompt patterns are anchored at column zero. Reset
         // the preferred column just as a row-start motion does.
         target.is_none_or(|cell| self.apply_copy_target(generation, Motion::RowStart, cell, false))
+    }
+
+    /// Scroll the copy-mode viewport by rows, moving the cursor only to keep
+    /// it visible, as Ctrl+Y / Ctrl+E do.
+    fn scroll_copy_lines(&mut self, down: bool, count: u32, ctx: &egui::Context) {
+        let Some(generation) = self.copy_mode.generation else {
+            return;
+        };
+        let mut view = SnapshotView::default();
+        if !unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view) } {
+            self.copy_controller_error("The copy-mode snapshot is no longer available".into());
+            return;
+        }
+        let document = SnapshotNavigationDocument {
+            host: self.host,
+            generation,
+            rows: view.total_rows,
+            commands: None,
+        };
+        match nfm_egui::copy_controller::CopyController::new(&mut self.copy_mode, &document, view)
+            .execute(nfm_egui::copy_mode::CopyAction::Scroll { down, count })
+        {
+            Ok(update) => {
+                self.apply_copy_update(update, generation, ctx, None);
+            }
+            Err(error) => self.copy_controller_error(error),
+        }
     }
 
     fn queue_search(&mut self) {

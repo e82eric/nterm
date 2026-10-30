@@ -22,6 +22,8 @@ keys.
     OSC 133 marks or [prompt patterns](docs/configuration.md#prompt-patterns). Inside copy mode
     the same keys move between commands, and a count such as `3` first skips
     several.
+  - Ctrl+Up / Down: at the terminal cursor, scrolled up or down one row.
+    Hold the key to keep scrolling, as with Ctrl+Y / Ctrl+E in copy mode.
   - Ctrl+Shift+/ then Enter: at the selected search match.
   - Ctrl+Shift+F then Enter: at the line chosen in a fuzzy picker over the
     scrollback.
@@ -407,8 +409,8 @@ These ship with nterm or its samples and are built from the same parts:
     }
     ```
 
-    A `keys` table replaces the default bindings, so merge these entries into
-    your own. [workspaces.example.lua](workspaces.example.lua) has more,
+    These entries are added to the default bindings; see
+    [Key bindings](docs/configuration.md#key-bindings). [workspaces.example.lua](workspaces.example.lua) has more,
     including gaps, borders, and shadows.
 
   <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/tour.gif" width="800" alt="Captioned tour: panes tile as they are added and closed, the workspace switches through each layout, a floating nvim pane takes scratch notes and is hidden and restored, a second workspace is created with its own layout, and the scratch pane is tiled, floated again, and moved to a workspace of its own from the command palette">

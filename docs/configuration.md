@@ -140,12 +140,25 @@ at startup; unknown action or picker names, invalid patterns, ambiguous targets,
 and duplicate bindings report configuration errors. Picker bindings trigger from
 terminal or copy mode, leaving modal query input unaffected.
 Without `pickers`, all four named built-ins remain available.
-Without `keys`, built-in action bindings are retained, Ctrl+Shift+F opens built-in
-`lines`, and Ctrl+Shift+Space opens the built-in command palette. The built-in
-`words` picker has no default key.
-An explicit empty `keys = {}` disables top-level action and picker shortcuts.
-Explicit `keys` replace the default bindings. There are no default custom
-pickers; `picker = "lines"` requires a `lines` entry in `pickers`.
+The default bindings include the built-in actions, Ctrl+Shift+F for built-in
+`lines`, and Ctrl+Shift+Space for the built-in command palette. The built-in
+`words` picker has no default key. There are no default custom pickers;
+`picker = "lines"` requires a `lines` entry in `pickers`.
+
+`keys` is merged over the defaults by chord. An entry on a chord that has a
+default binding replaces it, entries on other chords are added, and every
+other default remains. `action = "None"` removes the default on its chord, so
+the key reaches the terminal application again:
+
+```lua
+keys = {
+  { key = "m", mods = "CTRL|SHIFT", action = "NewWindow" }, -- replaces EnterCopyMode
+  { key = "Space", mods = "ALT", action = "None" },         -- removes quick select
+},
+```
+
+Set `disable_default_keys = true` to use only your `keys`, with no defaults;
+with an empty `keys = {}` it disables every top-level shortcut.
 
 The same `keys` table accepts top-level application actions. Each binding must
 specify exactly one of `action`, `picker`, `builtin_picker`, or `quick_select`:
@@ -162,17 +175,16 @@ keys = {
 Supported action names are `NewWindow`, `ReloadConfig`, `ShowMessages`,
 `OpenErrorLog`, `OpenThemePicker`, `ToggleFloatingPane`, `CreateFloatingPane`,
 `NextFloatingPane`, `PreviousFloatingPane`, `CloseFloatingPane`, `OpenSearch`,
-`EnterCopyMode`, `ExitCopyMode`, `OpenQuickSelect`, `PreviousCommand`, and
-`NextCommand`, plus the workspace and layout actions listed in
-[Workspaces](workspaces.md#default-bindings) and the names of your Lua
+`EnterCopyMode`, `ExitCopyMode`, `OpenQuickSelect`, `PreviousCommand`,
+`NextCommand`, `ScrollLineUp`, and `ScrollLineDown`, plus the workspace and
+layout actions listed in [Workspaces](workspaces.md#default-bindings) and the names of your Lua
 `actions`. Use `picker = "name"` to open a named picker, and
 `quick_select = "name"` to open a [custom quick select](copy-mode.md#custom-quick-selects). Multiple different
 shortcuts may invoke the same action; the command palette displays their actual
 configured bindings. Actions without bindings remain available in the palette.
 
-Omitting `keys` preserves the built-in shortcuts and default picker bindings.
-Providing `keys` replaces the complete list; `keys = {}` disables all top-level
-shortcuts. The sample configs list all of their bindings.
+A default action bound to a new chord keeps its default chord as well; remove
+that with `action = "None"`. The sample configs list all of their bindings.
 Unknown actions, missing or ambiguous targets, and duplicate shortcuts fail
 configuration validation.
 
