@@ -1,4 +1,6 @@
 use crate::app::UserEvent;
+#[path = "command_blocks.rs"]
+mod command_blocks;
 #[path = "snapshot_resize.rs"]
 mod snapshot_resize;
 
@@ -10,14 +12,13 @@ use crate::graphics as glow;
 use crate::input;
 use crate::painter::TerminalPainter;
 use crate::search::{SearchUi, SnapshotSearchAdapter};
-use nfm_egui::copy_mode::{
-    CopyAction, CopyMode, CopySelection, CopyTextObject, Motion, TextRow, VisualMode, YankCommand,
-};
 #[cfg(test)]
 use nfm_egui::copy_mode::{
-    ViewportPosition, copy_digit, copy_jump_prefix, copy_motion, copy_motion_with_prefix,
-    copy_scroll_direction, copy_text_object_key, copy_viewport_position_key, is_copy_modifier_key,
+    CopyAction, CopyTextObject, ViewportPosition, copy_digit, copy_jump_prefix, copy_motion,
+    copy_motion_with_prefix, copy_scroll_direction, copy_text_object_key,
+    copy_viewport_position_key, is_copy_modifier_key,
 };
+use nfm_egui::copy_mode::{CopyMode, CopySelection, Motion, TextRow, VisualMode};
 use nfm_egui::quick_select::{self, Purpose as QuickSelectPurpose, QuickSelect};
 use std::ffi::{c_char, c_void};
 use std::sync::{
@@ -32,9 +33,29 @@ struct SnapshotNavigationDocument<'a> {
     host: *mut Host,
     generation: u64,
     rows: u64,
-    boundaries: Option<&'a [u64]>,
+    /// Present while handling copy input, where `ic`/`ac` select commands.
+    commands: Option<command_blocks::Commands<'a>>,
 }
 impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDocument<'_> {
+    fn host_object(
+        &self,
+        key: char,
+        object: nfm_egui::copy_mode::WordObject,
+        count: u32,
+        cursor: SnapshotCell,
+    ) -> Result<Option<CopySelection>, String> {
+        match (&self.commands, key) {
+            (Some(commands), command_blocks::OBJECT_KEY) => commands.selection(
+                self.host,
+                self.generation,
+                self.rows,
+                object,
+                count,
+                cursor.y,
+            ),
+            _ => Ok(None),
+        }
+    }
     fn text_row(&self, row: u64) -> Result<Option<TextRow>, String> {
         if row >= self.rows {
             return Ok(None);
@@ -77,11 +98,6 @@ impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDoc
             text.push('\n');
         }
         Ok(text)
-    }
-    fn prompt_boundaries(&self, _rows: u64) -> Result<Vec<u64>, String> {
-        self.boundaries
-            .map(|rows| rows.to_vec())
-            .ok_or_else(|| "Command boundaries unavailable".into())
     }
 }
 
@@ -261,7 +277,7 @@ pub(super) struct TerminalPane {
     copy_search_cursor: usize,
     copy_search_query: Option<(String, bool)>,
     copy_search_refresh: Option<u64>,
-    prompt_boundaries: Option<(u64, Vec<u64>)>,
+    prompt_boundaries: command_blocks::Boundaries,
     /// Snapshot generation, viewport top and viewport rows when decorations
     /// were last applied. Decorations only cover that viewport, so they must
     /// be reapplied once it scrolls.
@@ -456,7 +472,7 @@ impl TerminalPane {
             pending_search_snapshot: None,
             next_search_open: 0,
             search_worker,
-            copy_mode: CopyMode::default(),
+            copy_mode: command_blocks::copy_mode(),
             quick_select: None,
             picker: None,
             picker_font,
@@ -464,7 +480,7 @@ impl TerminalPane {
             copy_search_cursor: 0,
             copy_search_query: None,
             copy_search_refresh: None,
-            prompt_boundaries: None,
+            prompt_boundaries: Default::default(),
             decorated_viewport: std::cell::Cell::new(None),
             prompt_patterns: Default::default(),
             pending_callback: None,
@@ -933,7 +949,7 @@ impl TerminalPane {
     ) -> PaneInput {
         if !std::rc::Rc::ptr_eq(&self.prompt_patterns, &bindings.prompt_patterns) {
             self.prompt_patterns = bindings.prompt_patterns.clone();
-            self.prompt_boundaries = None;
+            self.prompt_boundaries.clear();
         }
         self.copy_mode
             .set_scroll_padding(bindings.cursor_scroll_padding);
@@ -1349,7 +1365,7 @@ impl TerminalPane {
                 host: self.host,
                 generation,
                 rows: self.copy_mode.total_rows(),
-                boundaries: None,
+                commands: None,
             };
             let selection = self
                 .copy_mode
@@ -2079,7 +2095,7 @@ impl TerminalPane {
             host: self.host,
             generation: quick.generation,
             rows: view.total_rows,
-            boundaries: None,
+            commands: None,
         };
         match nfm_egui::copy_controller::CopyController::new(&mut self.copy_mode, &document, view)
             .select_quick(quick.purpose(), target)
@@ -2344,7 +2360,7 @@ impl TerminalPane {
         }
         state.cursor = actual;
         self.copy_mode.start(generation, state);
-        self.prompt_boundaries = None;
+        self.prompt_boundaries.clear();
         self.wake.context.request_repaint();
     }
 
@@ -2401,7 +2417,7 @@ impl TerminalPane {
                 .adopt_search(search.query_revision, search.matches);
         }
         self.pending_search_snapshot = None;
-        self.prompt_boundaries = None;
+        self.prompt_boundaries.clear();
         self.wake.context.memory_mut(|memory| {
             if let Some(id) = memory.focused() {
                 memory.surrender_focus(id);
@@ -2425,12 +2441,12 @@ impl TerminalPane {
             }
             unsafe { ghostty_ffi::nterm_host_snapshot_end(self.host, generation) };
             let padding = self.copy_mode.scroll_padding();
-            self.copy_mode = CopyMode::default();
+            self.copy_mode = command_blocks::copy_mode();
             self.copy_mode.set_scroll_padding(padding);
             self.copy_search_cursor = 0;
             self.copy_search_query = None;
             self.copy_search_refresh = None;
-            self.prompt_boundaries = None;
+            self.prompt_boundaries.clear();
             self.wake.context.request_repaint();
         }
     }
@@ -2457,28 +2473,15 @@ impl TerminalPane {
                 self.copy_controller_error("The copy-mode snapshot is no longer available".into());
                 break;
             }
-            if matches!(
-                &action,
-                CopyAction::SelectObject {
-                    kind: CopyTextObject::Command,
-                    ..
-                } | CopyAction::Yank(YankCommand::Object {
-                    kind: CopyTextObject::Command,
-                    ..
-                })
-            ) && !self.ensure_prompt_boundaries(generation)
-            {
-                self.copy_controller_error("Unable to read command boundaries".into());
-                break;
-            }
             let document = SnapshotNavigationDocument {
                 host: self.host,
                 generation,
                 rows: view.total_rows,
-                boundaries: self
-                    .prompt_boundaries
-                    .as_ref()
-                    .map(|(_, rows)| rows.as_slice()),
+                commands: Some(command_blocks::Commands {
+                    boundaries: &self.prompt_boundaries,
+                    patterns: &self.prompt_patterns,
+                    columns: view.columns,
+                }),
             };
             let update = match nfm_egui::copy_controller::CopyController::new(
                 &mut self.copy_mode,
@@ -2717,48 +2720,20 @@ impl TerminalPane {
         })
     }
 
-    fn ensure_prompt_boundaries(&mut self, generation: u64) -> bool {
-        if self
-            .prompt_boundaries
-            .as_ref()
-            .is_some_and(|(cached, _)| *cached == generation)
-        {
-            return true;
-        }
-        let host = self.host;
-        let Some(rows) = self
-            .prompt_patterns
-            .boundaries(self.copy_mode.total_rows(), |row| {
-                let data = ghostty_ffi::read_snapshot_row(host, generation, row, false)?;
-                let prompt = data.prompt;
-                Some((
-                    TextRow {
-                        text: String::from_utf8(data.text).ok()?,
-                        columns: data.columns,
-                        wraps_to_next: data.wraps_to_next,
-                    },
-                    prompt,
-                ))
-            })
-        else {
-            return false;
-        };
-        self.prompt_boundaries = Some((generation, rows));
-        true
-    }
-
     fn navigate_copy_command(&mut self, forward: bool, count: u32) -> bool {
         let Some(generation) = self.copy_mode.generation else {
             return false;
         };
-        if !self.ensure_prompt_boundaries(generation) {
+        let Some(boundaries) = self.prompt_boundaries.get(
+            self.host,
+            generation,
+            self.copy_mode.total_rows(),
+            &self.prompt_patterns,
+        ) else {
             return false;
-        }
-        let target = self.copy_mode.command_target(
-            forward,
-            count,
-            &self.prompt_boundaries.as_ref().unwrap().1,
-        );
+        };
+        let target =
+            command_blocks::jump_target(&boundaries, self.copy_mode.cursor.y, forward, count);
         // All configured prompt patterns are anchored at column zero. Reset
         // the preferred column just as a row-start motion does.
         target.is_none_or(|cell| self.apply_copy_target(generation, Motion::RowStart, cell, false))
@@ -2855,7 +2830,7 @@ impl TerminalPane {
             host: self.host,
             generation: result.document_revision,
             rows: view.total_rows,
-            boundaries: None,
+            commands: None,
         };
         let update =
             nfm_egui::copy_controller::CopyController::new(&mut self.copy_mode, &document, view)
@@ -3385,10 +3360,8 @@ mod copy_shortcut_tests {
             copy_text_object_key(egui::Key::OpenCurlyBracket, shift),
             Some(CopyTextObject::Delimiter('{', '}'))
         ));
-        assert!(matches!(
-            copy_text_object_key(egui::Key::C, egui::Modifiers::NONE),
-            Some(CopyTextObject::Command)
-        ));
+        // The pane registers `c` for commands; nfm has no built-in for it.
+        assert!(copy_text_object_key(egui::Key::C, egui::Modifiers::NONE).is_none());
     }
 
     #[test]

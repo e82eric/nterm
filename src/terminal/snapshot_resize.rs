@@ -151,7 +151,7 @@ impl TerminalPane {
             host: self.host,
             generation,
             rows: before.total_rows,
-            boundaries: None,
+            commands: None,
         };
         let mut cells = Vec::new();
         let mode = self
@@ -199,7 +199,7 @@ impl TerminalPane {
             host: self.host,
             generation,
             rows: view.total_rows,
-            boundaries: None,
+            commands: None,
         };
         if let Some(anchors) = mode {
             restore(&mut self.copy_mode, anchors, &cells, view, &document)?;
@@ -213,7 +213,7 @@ impl TerminalPane {
                 &document,
             )?;
         }
-        self.prompt_boundaries = None;
+        self.prompt_boundaries.clear();
         if let Some(quick) = &self.quick_select {
             let (definition, from_copy) = (quick.definition.clone(), quick.state.from_copy);
             let mut rebuilt =
