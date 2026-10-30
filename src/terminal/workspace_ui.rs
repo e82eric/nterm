@@ -64,6 +64,7 @@ pub(crate) enum WorkspaceAction {
     /// Moves the focused pane to the 1-based workspace index.
     MoveToWorkspace(usize),
     CreatePane,
+    /// Closes the visible float, or else the focused tiled pane.
     ClosePane,
     FocusLeft,
     FocusRight,
@@ -279,7 +280,6 @@ pub(crate) fn default_bindings() -> Vec<crate::picker::config::KeyBinding> {
         ("k", MoveUp),
         ("l", MoveRight),
         ("w", CreateWorkspace),
-        ("c", ClosePane),
         ("y", SetHorizontalGrid),
         ("Left", ResizeLeft),
         ("Right", ResizeRight),
@@ -395,9 +395,6 @@ impl TerminalView {
     pub(super) fn floats_mut(&mut self) -> &mut floating::Floats {
         &mut self.workspace_mut().floats
     }
-    pub(super) fn has_floating(&self) -> bool {
-        !self.floats().is_empty()
-    }
     /// The current workspace's floats and every workspace, for a command
     /// palette about to open. Labels capture float titles at this moment.
     pub(super) fn palette_context(&self) -> super::PaletteContext {
@@ -422,7 +419,6 @@ impl TerminalView {
             action: AppAction::SelectWorkspaceId(w.id),
         }));
         super::PaletteContext {
-            has_floating: self.has_floating(),
             entries,
             config_issues: self.messages.config_issues().to_vec(),
         }
@@ -798,6 +794,24 @@ impl TerminalView {
                 self.workspace_mut().focus(id);
                 Ok(Value::Null)
             }
+            Request::FocusDirection(direction) | Request::MovePaneDirection(direction) => {
+                use super::workspace::Direction::*;
+                use WorkspaceAction::*;
+                let moving = matches!(request, Request::MovePaneDirection(_));
+                let action = match (direction, moving) {
+                    (Left, false) => FocusLeft,
+                    (Right, false) => FocusRight,
+                    (Up, false) => FocusUp,
+                    (Down, false) => FocusDown,
+                    (Left, true) => MoveLeft,
+                    (Right, true) => MoveRight,
+                    (Up, true) => MoveUp,
+                    (Down, true) => MoveDown,
+                };
+                let ctx = self.context.clone();
+                self.navigate(action, &ctx);
+                Ok(Value::Null)
+            }
             Request::ListPanes => Ok(json!(
                 self.workspaces
                     .iter()
@@ -903,7 +917,9 @@ impl TerminalView {
                     }
                 }
                 ClosePane => {
-                    if let Some(id) = self.focused_id() {
+                    if let Some(id) = self.floats().visible() {
+                        self.close_floats([id]);
+                    } else if let Some(id) = self.focused_id() {
                         self.close_tiled(id)?;
                     }
                 }

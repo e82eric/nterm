@@ -63,7 +63,6 @@ pub(crate) enum WindowRequest {
 /// the window when a picker opens, not kept on each pane.
 #[derive(Default)]
 struct PaletteContext {
-    has_floating: bool,
     entries: Vec<crate::actions::Entry>,
     config_issues: Vec<String>,
 }
@@ -432,10 +431,6 @@ impl TerminalView {
                 ))
                 .unwrap()
             }
-            Request::Next | Request::Previous => {
-                self.floats_mut().cycle(matches!(request, Request::Next));
-                serde_json::Value::Null
-            }
             Request::Close(target) => {
                 if let Some(id) = target_id(self, target)? {
                     self.close_floats([id]);
@@ -555,17 +550,11 @@ impl TerminalView {
                     );
                 }
             }
-            AppAction::CreateFloatingPane
-            | AppAction::ToggleFloatingPane
-            | AppAction::NextFloatingPane
-            | AppAction::PreviousFloatingPane
-            | AppAction::CloseFloatingPane => {
-                let request = match action {
-                    AppAction::CreateFloatingPane => floating::Request::Create(Default::default()),
-                    AppAction::ToggleFloatingPane => floating::Request::Toggle,
-                    AppAction::NextFloatingPane => floating::Request::Next,
-                    AppAction::PreviousFloatingPane => floating::Request::Previous,
-                    _ => floating::Request::Close(None),
+            AppAction::CreateFloatingPane | AppAction::ToggleFloatingPane => {
+                let request = if action == AppAction::CreateFloatingPane {
+                    floating::Request::Create(Default::default())
+                } else {
+                    floating::Request::Toggle
                 };
                 if let Err(error) = self.floating_request(request, gl) {
                     self.show_error("Floating pane action failed", error);

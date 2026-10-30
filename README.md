@@ -489,9 +489,7 @@ the command palette to apply changes without restarting. See
 | Ctrl+Shift+F | Fuzzy find a scrollback line |
 | Alt+Space | Quick select |
 | Ctrl+Shift+E | Show or hide the floating pane |
-| Ctrl+Alt+Shift+E | New floating pane |
-| Ctrl+Alt+] / [ | Next / previous floating pane |
-| Ctrl+Shift+W | Close the floating pane |
+| Ctrl+Shift+W | Close the visible floating pane, or else the focused pane |
 
 Workspace and layout keys are listed in [Workspaces](docs/workspaces.md#default-bindings).
 A `keys` table in your Lua configuration replaces these defaults, so the samples

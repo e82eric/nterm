@@ -166,15 +166,14 @@ specify exactly one of `action`, `picker`, `builtin_picker`, or `quick_select`:
 ```lua
 keys = {
   { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },
-  { key = "w", mods = "CTRL|SHIFT", action = "CloseFloatingPane" },
+  { key = "w", mods = "CTRL|SHIFT", action = "ClosePane" },
   { key = "f", mods = "CTRL|SHIFT", action = "OpenSearch" },
   { key = "Space", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
 },
 ```
 
 Supported action names are `NewWindow`, `ReloadConfig`, `ShowMessages`,
-`OpenErrorLog`, `OpenThemePicker`, `ToggleFloatingPane`, `CreateFloatingPane`,
-`NextFloatingPane`, `PreviousFloatingPane`, `CloseFloatingPane`, `OpenSearch`,
+`OpenErrorLog`, `OpenThemePicker`, `ToggleFloatingPane`, `CreateFloatingPane`, `OpenSearch`,
 `EnterCopyMode`, `ExitCopyMode`, `OpenQuickSelect`, `PreviousCommand`,
 `NextCommand`, `ScrollLineUp`, and `ScrollLineDown`, plus the workspace and
 layout actions listed in [Workspaces](workspaces.md#default-bindings) and the names of your Lua

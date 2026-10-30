@@ -38,7 +38,7 @@ floating panes, copy mode, and pickers remain available.
 | Ctrl+Alt+W | Workspace picker; type an index, arrows and Enter to select |
 | Ctrl+Alt+Shift+W | Create a workspace |
 | Ctrl+Alt+C | Create terminal pane (a float while a float is visible) |
-| Ctrl+Alt+Shift+C | Close focused terminal pane |
+| Ctrl+Shift+W | Close the visible float, or else the focused terminal pane (`ClosePane`) |
 | Ctrl+Alt+H/J/K/L | Focus left/down/up/right |
 | Ctrl+Alt+Shift+H/J/K/L | Move pane left/down/up/right |
 | Ctrl+Alt+Shift+arrows | Resize panes by moving a shared divider |
@@ -208,6 +208,8 @@ workspace and of workspaces created without an explicit `layout`, including
 | `app:create_pane {workspace=?,command=?,cwd=?}` | `{id,workspace}`; focuses pane within destination workspace |
 | `app:get_panes()` | Pane IDs, workspace IDs, and remembered focus flags |
 | `app:focus_pane(id)` | Switch workspace and focus pane |
+| `app:focus_direction(dir)` | Same as `FocusLeft`/`Right`/`Up`/`Down`; `dir` is `"left"`, `"right"`, `"up"`, or `"down"` |
+| `app:move_pane_direction(dir)` | Same as `MoveLeft`/`Right`/`Up`/`Down` |
 | `app:move_pane(id,workspace_id)` | Move without restarting; stay on current workspace |
 | `app:move_float(id,workspace_id)` | Move a floating pane; it becomes the destination's visible float; stay on current workspace |
 | `app:move_pane_to_new_window(id)` | Move a tiled pane into a new window without restarting |
@@ -263,15 +265,15 @@ shells running. Floats close with their workspace. The default shortcuts are:
 | Shortcut | Action |
 | --- | --- |
 | Ctrl+Shift+E | `ToggleFloatingPane` |
-| Ctrl+Alt+Shift+E | `CreateFloatingPane` |
-| Ctrl+Alt+] | `NextFloatingPane` |
-| Ctrl+Alt+[ | `PreviousFloatingPane` |
-| Ctrl+Shift+W | `CloseFloatingPane` |
+| Ctrl+Shift+W | `ClosePane` (closes the visible float) |
 
 These action names can also be assigned in Lua `keys`. Toggle hides the visible
-pane or restores the last focused pane, creating one if none exist. Next and
-previous follow creation order, wrap around, and restore a hidden pane. With no
-panes, cycling does nothing. Closing the visible pane restores the most recently
+pane or restores the last focused pane, creating one if none exist. `CreatePane`
+adds another float while one is shown; `CreateFloatingPane` (command palette,
+no default shortcut) adds one at any time. While a float is
+shown, the focus actions and `app:focus_direction` treat the floats like a
+Monocle layout: down or right shows the next float in creation order, up or
+left the previous one, wrapping around. Closing the visible pane restores the most recently
 focused remaining pane; closing a hidden pane leaves the current visibility
 unchanged. A shell exiting removes its pane in the same way.
 
@@ -313,8 +315,7 @@ workspace's descriptions in creation order. Descriptions are snapshots; `focused
 means the pane is the window's terminal input target, even if the OS window
 itself is unfocused.
 
-`app:restore_floating_pane(id_or_name)`, `app:toggle_floating_pane()`,
-`app:next_floating_pane()`, `app:previous_floating_pane()`, and
+`app:restore_floating_pane(id_or_name)`, `app:toggle_floating_pane()`, and
 `app:close_floating_pane(id_or_name)` change pane state immediately and act on
 the current workspace's floats. `app:tile_floating_pane` and `app:float_pane`
 move terminals between floating and tiled; see

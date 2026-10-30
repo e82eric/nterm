@@ -164,10 +164,7 @@ return {
     -- a default, and disable_default_keys = true drops them all.
     { key = "n", mods = "CTRL|SHIFT", action = "NewWindow" },
     { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },
-    { key = "e", mods = "CTRL|ALT|SHIFT", action = "CreateFloatingPane" },
-    { key = "]", mods = "CTRL|ALT", action = "NextFloatingPane" },
-    { key = "[", mods = "CTRL|ALT", action = "PreviousFloatingPane" },
-    { key = "w", mods = "CTRL|SHIFT", action = "CloseFloatingPane" },
+    { key = "w", mods = "CTRL|SHIFT", action = "ClosePane" },
     { key = "/", mods = "CTRL|SHIFT", action = "OpenSearch" },
     { key = "m", mods = "CTRL|SHIFT", action = "EnterCopyMode" },
     { key = "Space", mods = "ALT", action = "OpenQuickSelect" },

@@ -1681,7 +1681,7 @@ fn replace_picker_from_accept_and_local_key_resets_source_and_callbacks() {
 #[test]
 fn command_palette_reload_entry_returns_reload_action() {
     let ctx = egui::Context::default();
-    let entries = crate::actions::catalog(&config::Bindings::default(), false, false);
+    let entries = crate::actions::catalog(&config::Bindings::default(), false);
     let mut picker = Picker::start(
         std::ptr::null_mut(),
         None,

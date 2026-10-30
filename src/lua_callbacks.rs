@@ -271,6 +271,9 @@ mod tests {
                 app:move_pane(pane.id,w.id)
                 app:move_float(3,w.id)
                 app:focus_pane(pane.id)
+                app:focus_direction("down")
+                app:move_pane_direction("left")
+                assert(not pcall(function() app:focus_direction("sideways") end))
                 assert(#app:get_panes()==1)
                 app:close_pane(pane.id)
                 app:remove_workspace(w.id)
@@ -308,7 +311,10 @@ mod tests {
                 || callback.call_action(String::new()),
             )
             .unwrap();
-        assert_eq!(calls.len(), 15);
+        assert_eq!(calls.len(), 17);
+        use crate::terminal::workspace::Direction;
+        assert!(matches!(calls[12], Request::FocusDirection(Direction::Down)));
+        assert!(matches!(calls[13], Request::MovePaneDirection(Direction::Left)));
         let result = callback
             .with_host(&mut |_| panic!("expired handle reached controller"), || {
                 callback.call_action(String::new())
@@ -353,9 +359,6 @@ mod tests {
             app:toggle_floating_pane()
             assert(not app:get_floating_pane().visible)
             app:toggle_floating_pane()
-            app:next_floating_pane()
-            assert(app:get_floating_pane().id == b.id)
-            app:previous_floating_pane()
             app:close_floating_pane('tools')
             assert(app:get_floating_pane('tools') == nil)
             assert(app:get_floating_pane().id == b.id)
@@ -402,10 +405,6 @@ mod tests {
                     } else if let Some(id) = floats.last() {
                         floats.show(id);
                     }
-                    serde_json::Value::Null
-                }
-                Request::Next | Request::Previous => {
-                    floats.cycle(matches!(request, Request::Next));
                     serde_json::Value::Null
                 }
                 Request::Close(target) => {
@@ -706,6 +705,8 @@ impl UserData for App {
             ("move_float_to_new_window", "MoveFloatToNewWindow"),
             ("close_pane", "ClosePane"),
             ("focus_pane", "FocusPane"),
+            ("focus_direction", "FocusDirection"),
+            ("move_pane_direction", "MovePaneDirection"),
             ("get_panes", "ListPanes"),
             ("set_workspace_appearance", "Appearance"),
         ] {
@@ -782,12 +783,6 @@ impl UserData for App {
                 )
             },
         );
-        methods.add_method("next_floating_pane", |lua, app, ()| {
-            app.floating(lua, Request::Next)
-        });
-        methods.add_method("previous_floating_pane", |lua, app, ()| {
-            app.floating(lua, Request::Previous)
-        });
         methods.add_method(
             "close_floating_pane",
             |lua, app, target: Option<mlua::Value>| {

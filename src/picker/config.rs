@@ -1506,7 +1506,11 @@ mod tests {
         for (key, mods, expected) in [
             (egui::Key::N, ctrl_shift, AppAction::NewWindow),
             (egui::Key::E, ctrl_shift, AppAction::ToggleFloatingPane),
-            (egui::Key::W, ctrl_shift, AppAction::CloseFloatingPane),
+            (
+                egui::Key::W,
+                ctrl_shift,
+                AppAction::Workspace(crate::terminal::workspace_ui::WorkspaceAction::ClosePane),
+            ),
             (egui::Key::Slash, ctrl_shift, AppAction::OpenSearch),
             (egui::Key::M, ctrl_shift, AppAction::EnterCopyMode),
             (
@@ -1594,7 +1598,7 @@ mod tests {
         )];
         assert_eq!(bindings.consume(&mut events), (None, false));
         assert_eq!(events.len(), 1);
-        let catalog = crate::actions::catalog(&bindings, true, true);
+        let catalog = crate::actions::catalog(&bindings, true);
         assert_eq!(
             catalog
                 .iter()
@@ -1637,7 +1641,7 @@ mod tests {
             },
         )
         .unwrap();
-        let catalog = crate::actions::catalog(&bindings, true, false);
+        let catalog = crate::actions::catalog(&bindings, false);
         assert!(
             catalog
                 .iter()
@@ -1716,7 +1720,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            crate::actions::catalog(&bindings, true, false)
+            crate::actions::catalog(&bindings, false)
                 .iter()
                 .all(|entry| entry.shortcut.is_none())
         );
@@ -1915,7 +1919,7 @@ mod tests {
                     Some(Vec::new()),
                 )
                 .unwrap();
-                let entries = crate::actions::catalog(&bindings, false, false);
+                let entries = crate::actions::catalog(&bindings, false);
                 for (configured, builtin, name) in [
                     (themes, AppAction::OpenThemePicker, "appearance"),
                     (errors, AppAction::OpenErrorLog, "diagnostics"),

@@ -18,10 +18,7 @@ pub(crate) enum AppAction {
     ApplyTheme(String),
     RestoreFloatingPane(u64),
     CreateFloatingPane,
-    NextFloatingPane,
-    PreviousFloatingPane,
     ToggleFloatingPane,
-    CloseFloatingPane,
     OpenPicker(String),
     OpenSearch,
     EnterCopyMode,
@@ -56,10 +53,7 @@ impl AppAction {
             "OpenErrorLog" => Self::OpenErrorLog,
             "OpenThemePicker" => Self::OpenThemePicker,
             "CreateFloatingPane" => Self::CreateFloatingPane,
-            "NextFloatingPane" => Self::NextFloatingPane,
-            "PreviousFloatingPane" => Self::PreviousFloatingPane,
             "ToggleFloatingPane" => Self::ToggleFloatingPane,
-            "CloseFloatingPane" => Self::CloseFloatingPane,
             "OpenSearch" => Self::OpenSearch,
             "EnterCopyMode" => Self::EnterCopyMode,
             "ExitCopyMode" => Self::ExitCopyMode,
@@ -86,10 +80,7 @@ impl AppAction {
                 | Self::ApplyTheme(_)
                 | Self::RestoreFloatingPane(_)
                 | Self::CreateFloatingPane
-                | Self::NextFloatingPane
-                | Self::PreviousFloatingPane
                 | Self::ToggleFloatingPane
-                | Self::CloseFloatingPane
         )
     }
 }
@@ -135,10 +126,7 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     let keys = [
         ("n", "CTRL|SHIFT", "NewWindow"),
         ("e", "CTRL|SHIFT", "ToggleFloatingPane"),
-        ("e", "CTRL|ALT|SHIFT", "CreateFloatingPane"),
-        ("]", "CTRL|ALT", "NextFloatingPane"),
-        ("[", "CTRL|ALT", "PreviousFloatingPane"),
-        ("w", "CTRL|SHIFT", "CloseFloatingPane"),
+        ("w", "CTRL|SHIFT", "ClosePane"),
         ("/", "CTRL|SHIFT", "OpenSearch"),
         ("m", "CTRL|SHIFT", "EnterCopyMode"),
         ("Space", "ALT", "OpenQuickSelect"),
@@ -209,7 +197,7 @@ pub(crate) fn floating_pane_entry(id: u64, name: Option<&str>, title: &str, acti
     }
 }
 
-pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) -> Vec<Entry> {
+pub(crate) fn catalog(bindings: &Bindings, copying: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
     for (id, label, action, available) in [
         (
@@ -248,24 +236,6 @@ pub(crate) fn catalog(bindings: &Bindings, has_floating: bool, copying: bool) ->
             "Create floating pane",
             AppAction::CreateFloatingPane,
             true,
-        ),
-        (
-            "floating.next",
-            "Next floating pane",
-            AppAction::NextFloatingPane,
-            has_floating,
-        ),
-        (
-            "floating.previous",
-            "Previous floating pane",
-            AppAction::PreviousFloatingPane,
-            has_floating,
-        ),
-        (
-            "floating.close",
-            "Close floating pane",
-            AppAction::CloseFloatingPane,
-            has_floating,
         ),
         (
             "search.open",
@@ -395,7 +365,7 @@ mod tests {
         ]))
         .unwrap();
         let bindings = Bindings::compile(Some(definitions), Some(keys)).unwrap();
-        let entries = catalog(&bindings, false, false);
+        let entries = catalog(&bindings, false);
         assert!(entries.iter().any(|entry| entry.action
             == AppAction::OpenPicker("unbound".into())
             && entry.shortcut.is_none()));
@@ -406,14 +376,9 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.id == "picker.command"));
         assert!(!entries.iter().any(|entry| matches!(
             entry.id.as_str(),
-            "picker.completion" | "picker.ripgrep" | "floating.close" | "copy.exit"
+            "picker.completion" | "picker.ripgrep" | "copy.exit"
         )));
-        let active = catalog(&bindings, true, true);
-        assert!(
-            active
-                .iter()
-                .any(|entry| entry.action == AppAction::CloseFloatingPane)
-        );
+        let active = catalog(&bindings, true);
         assert!(
             active
                 .iter()

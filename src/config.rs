@@ -1058,7 +1058,7 @@ mod tests {
         assert!(
             matches!(&old.bindings.lua_action("Old").unwrap().callback.call_action(String::new()).unwrap()[0], crate::lua_callbacks::Command::Paste(text) if text == "old")
         );
-        let entry = crate::actions::catalog(&new.bindings, false, false)
+        let entry = crate::actions::catalog(&new.bindings, false)
             .into_iter()
             .find(|entry| entry.action == crate::actions::AppAction::ReloadConfig)
             .unwrap();
@@ -1172,7 +1172,7 @@ mod tests {
             config.actions,
         )
         .unwrap();
-        let catalog = crate::actions::catalog(&bindings, false, false);
+        let catalog = crate::actions::catalog(&bindings, false);
         assert!(catalog.iter().any(|entry| entry.id == "action.Save"
             && entry.label == "Save selection"
             && entry.shortcut.as_deref() == Some("Ctrl+Shift+S")));
@@ -1415,7 +1415,7 @@ mod tests {
         ));
         assert_eq!(options.position, crate::picker::config::Position::Center);
         assert!(!options.preview_visible);
-        let entries = crate::actions::catalog(&bindings, false, false);
+        let entries = crate::actions::catalog(&bindings, false);
         assert!(
             entries.iter().any(
                 |entry| entry.action == crate::actions::AppAction::OpenPicker("dynamic".into())
@@ -1786,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_config_includes_multiple_floating_pane_shortcuts() {
+    fn sample_config_includes_floating_pane_shortcut() {
         let config = parse(include_str!("../nterm.lua")).unwrap();
         let bindings = crate::picker::config::Bindings::compile_with_actions(
             config.pickers,
@@ -1795,16 +1795,11 @@ mod tests {
             config.actions,
         )
         .unwrap();
-        for action in [
-            crate::actions::AppAction::CreateFloatingPane,
-            crate::actions::AppAction::NextFloatingPane,
-            crate::actions::AppAction::PreviousFloatingPane,
-        ] {
-            assert!(
-                bindings.shortcut_for(&action).is_some(),
-                "missing {action:?}"
-            );
-        }
+        assert!(
+            bindings
+                .shortcut_for(&crate::actions::AppAction::ToggleFloatingPane)
+                .is_some()
+        );
     }
     #[test]
     fn named_pickers_compile_and_reject_bad_bindings_and_regexes() {
@@ -2303,7 +2298,7 @@ mod tests {
         assert_eq!(default.alphabet, Alphabet::new("ab").unwrap());
         let action = crate::actions::AppAction::OpenQuickSelect(Some("addresses".into()));
         assert!(compiled.shortcut_for(&action).is_some());
-        let palette = crate::actions::catalog(&compiled, false, false);
+        let palette = crate::actions::catalog(&compiled, false);
         let entry = palette
             .iter()
             .find(|entry| entry.id == "quick_select.hashes")

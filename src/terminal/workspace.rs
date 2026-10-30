@@ -338,6 +338,14 @@ pub(super) fn prune_empty(
     renumber(workspaces);
     orphaned
 }
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", content = "args")]
 pub(crate) enum Request {
@@ -359,6 +367,10 @@ pub(crate) enum Request {
     MoveFloatToNewWindow(u64),
     ClosePane(u64),
     FocusPane(u64),
+    /// Runs `FocusLeft`/`Right`/`Up`/`Down`, as the key bindings do.
+    FocusDirection(Direction),
+    /// Runs `MoveLeft`/`Right`/`Up`/`Down`, as the key bindings do.
+    MovePaneDirection(Direction),
     ListPanes,
     Appearance(Appearance),
     SetAppearance(u64, Appearance),

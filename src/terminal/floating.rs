@@ -46,8 +46,6 @@ pub(crate) enum Request {
     List {
         workspace: Option<u64>,
     },
-    Next,
-    Previous,
     Close(Option<Target>),
     /// Turns a tiled pane into a float in its workspace.
     Float(u64),

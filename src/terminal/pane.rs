@@ -1201,7 +1201,7 @@ impl TerminalPane {
             };
             options.source = crate::themes::picker_options(names).source;
         } else if let crate::picker::config::Source::CommandPalette(entries) = &mut options.source {
-            *entries = crate::actions::catalog(bindings, palette.has_floating, self.copying());
+            *entries = crate::actions::catalog(bindings, self.copying());
             entries.extend(palette.entries.iter().cloned());
             // A factory's source is only known after resolving it. Exclude
             // the current factory too, without evaluating other factories.
