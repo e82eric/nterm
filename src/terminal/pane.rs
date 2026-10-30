@@ -3122,8 +3122,8 @@ fn copy_selection_style() -> SnapshotDecorationStyle {
         background_rgb: crate::colors::rgb(
             nfm_egui::Palette::default().preview_selection_background,
         ),
-        // Background only: let Ghostty retain each cell's syntax/ANSI foreground.
-        flags: 2,
+        // Invert original colors on non-default backgrounds.
+        flags: 2 | 16,
     }
 }
 
