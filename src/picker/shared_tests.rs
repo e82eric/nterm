@@ -759,11 +759,7 @@ fn preview_appearance_receives_configured_copy_colors() {
         appearance.palette.search_match_text,
         Some(palette.search_match_text)
     );
-    assert_eq!(
-        appearance.palette.yank_background,
-        Some(palette.yank_background)
-    );
-    assert_eq!(appearance.palette.yank_text, Some(palette.yank_text));
+    assert_eq!(appearance.palette.yank_background, palette.yank_background);
 }
 
 fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {

@@ -24,7 +24,6 @@ pub(crate) struct UiOverrides {
     pub search_match_background: Option<UiColor>,
     pub search_match_text: Option<UiColor>,
     pub yank_background: Option<UiColor>,
-    pub yank_text: Option<UiColor>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -105,10 +104,7 @@ impl UiOverrides {
             palette.search_match_text = color.0;
         }
         if let Some(color) = self.yank_background {
-            palette.yank_background = color.0;
-        }
-        if let Some(color) = self.yank_text {
-            palette.yank_text = color.0;
+            palette.yank_background = Some(color.0);
         }
         palette
     }
@@ -146,7 +142,7 @@ fn luminance(color: Color32) -> f32 {
     0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
 }
 
-fn contrast(a: Color32, b: Color32) -> f32 {
+pub(crate) fn contrast(a: Color32, b: Color32) -> f32 {
     let a = luminance(a);
     let b = luminance(b);
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
@@ -175,7 +171,6 @@ impl UiPalette {
         let background = unpack(theme.background);
         let text = unpack(theme.foreground);
         let panel_background = blend(background, text, 0.06);
-        let yank_background = unpack(theme.ansi[5]);
         let search_match_background = blend(background, unpack(theme.ansi[3]), 0.30);
         let selection_background = if theme.selection_flags & 1 != 0 {
             unpack(theme.selection_background)
@@ -204,8 +199,7 @@ impl UiPalette {
             copy_cursor_background: None,
             search_match_background,
             search_match_text: readable(text, search_match_background),
-            yank_background,
-            yank_text: readable(background, yank_background),
+            yank_background: None,
         }
     }
 }
@@ -228,8 +222,8 @@ pub(crate) struct UiPalette {
     pub picker_match_highlight: Option<Color32>,
     pub search_match_background: Color32,
     pub search_match_text: Color32,
-    pub yank_background: Color32,
-    pub yank_text: Color32,
+    /// Peak of the picker preview yank pulse; None follows its selection.
+    pub yank_background: Option<Color32>,
 }
 
 impl UiPalette {
@@ -250,8 +244,7 @@ impl UiPalette {
         picker_match_highlight: None,
         search_match_background: Color32::from_rgb(0x67, 0x55, 0x2a),
         search_match_text: Color32::from_rgb(0xeb, 0xdb, 0xb2),
-        yank_background: Color32::from_rgb(0xd3, 0x86, 0x9b),
-        yank_text: Color32::from_rgb(0x1d, 0x20, 0x21),
+        yank_background: None,
     };
 }
 
@@ -305,7 +298,6 @@ pub(crate) static COLORS: ColorManager = ColorManager {
             search_match_background: None,
             search_match_text: None,
             yank_background: None,
-            yank_text: None,
         },
     }),
 };
@@ -453,16 +445,12 @@ mod tests {
 
     #[test]
     fn yank_colors_are_independent_and_theme_overrides_do_not_leak() {
-        let mut theme = theme(0x1d2021, 0xebdbb2);
-        theme.ansi[5] = 0xd3869b;
-        let base = UiPalette::from_theme(&theme);
-        assert_eq!(rgb(base.yank_background), 0xd3869b);
-        assert!(contrast(base.yank_text, base.yank_background) >= 4.5);
+        let base = UiPalette::from_theme(&theme(0x1d2021, 0xebdbb2));
+        // Without an override the preview pulse follows its selection.
+        assert_eq!(base.yank_background, None);
         let overrides = ColorOverrides {
-            global: serde_json::from_str(
-                r##"{"accent":"#fabd2f","yank_background":"#83a598","yank_text":"#1d2021"}"##,
-            )
-            .unwrap(),
+            global: serde_json::from_str(r##"{"accent":"#fabd2f","yank_background":"#83a598"}"##)
+                .unwrap(),
             themes: std::collections::BTreeMap::from([(
                 "Gruvbox Dark".into(),
                 serde_json::from_str(r##"{"yank_background":"#d3869b"}"##).unwrap(),
@@ -470,11 +458,13 @@ mod tests {
         };
         let selected = overrides.apply(base, Some("Gruvbox Dark"));
         assert_eq!(rgb(selected.accent), 0xfabd2f);
-        assert_eq!(rgb(selected.yank_background), 0xd3869b);
-        assert_eq!(rgb(selected.yank_text), 0x1d2021);
+        assert_eq!(selected.yank_background.map(rgb), Some(0xd3869b));
         assert_eq!(
-            rgb(overrides.apply(base, Some("Other")).yank_background),
-            0x83a598
+            overrides
+                .apply(base, Some("Other"))
+                .yank_background
+                .map(rgb),
+            Some(0x83a598)
         );
         assert_eq!(selected.selection_background, base.selection_background);
     }

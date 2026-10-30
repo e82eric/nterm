@@ -47,3 +47,12 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+
+# Temporary: build against the local nfm until the yank pulse change is pushed.
+[patch."https://github.com/e82eric/npicker"]
+nfm_search_core = { path = "G:/src/RustWin32Host/nfm-search-core" }
+nfm-picker-sources = { path = "G:/src/RustWin32Host/nfm-picker-sources" }
+nfm-egui = { path = "G:/src/RustWin32Host/nfm-egui" }
+nfm-preview-file = { path = "G:/src/RustWin32Host/nfm-preview-file" }
+nfm-preview-command = { path = "G:/src/RustWin32Host/nfm-preview-command" }
+nfm_file_system = { path = "G:/src/RustWin32Host/nfm-file-system" }

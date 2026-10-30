@@ -60,8 +60,20 @@ foreground because there is no individual terminal cell to resolve against.
 | picker_match_highlight | Picker matched characters only; defaults to `match_highlight` when omitted |
 | search_match_background | Secondary search matches; defaults to ANSI yellow blended 30% into terminal background |
 | search_match_text | Text in secondary search matches; defaults to readable terminal foreground |
-| yank_background | Temporary copy-mode yank highlight background; defaults to theme ANSI magenta |
-| yank_text | Text in the yank highlight; defaults to a readable backdrop color |
+| yank_background | Peak of the picker preview yank pulse; defaults to the preview selection pushed toward the text color |
+
+Copy-mode yanks in the terminal and the picker preview pulse the background of
+the copied text for 250 ms. The pulse uses the selection background pushed
+toward the text color, so it is lighter than the selection on dark themes and
+darker on light ones. It holds steady and softens once just before it clears.
+This applies to every yank, including `yy`, `y$`, and `Y` line hints. Only the
+background changes, so the copied text keeps its colors. In the terminal, cells
+with a colored background invert instead, as they do in the selection, and stay
+inverted until the pulse clears.
+The terminal pulse follows the theme's selection background, including
+`selection_background` overrides in `colors.ui` or `theme_colors`, and does not
+use `yank_background`. Setting `yank_background` replaces the peak of the
+picker preview pulse only.
 
 Global overrides live in Lua `colors.ui`. Theme-specific overrides live in
 `theme_colors`, keyed by the exact resolved Ghostty theme name:

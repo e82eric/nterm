@@ -251,7 +251,6 @@ local config = {
       selection_background = "#3d3937",
       selection_text = "#ebdbb2",
       yank_background = "#fe8019",
-      yank_text = "#1d2021",
     },
   },
   colors = {

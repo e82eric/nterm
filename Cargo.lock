@@ -1391,7 +1391,6 @@ dependencies = [
 [[package]]
 name = "nfm-egui"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=306762ab0df897b1cf43884d4e0354ad31fbafe9#306762ab0df897b1cf43884d4e0354ad31fbafe9"
 dependencies = [
  "crossbeam-channel",
  "egui",
@@ -1406,7 +1405,6 @@ dependencies = [
 [[package]]
 name = "nfm-picker-sources"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=306762ab0df897b1cf43884d4e0354ad31fbafe9#306762ab0df897b1cf43884d4e0354ad31fbafe9"
 dependencies = [
  "chrono",
  "csv",
@@ -1419,12 +1417,10 @@ dependencies = [
 [[package]]
 name = "nfm-preview-command"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=306762ab0df897b1cf43884d4e0354ad31fbafe9#306762ab0df897b1cf43884d4e0354ad31fbafe9"
 
 [[package]]
 name = "nfm-preview-file"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=306762ab0df897b1cf43884d4e0354ad31fbafe9#306762ab0df897b1cf43884d4e0354ad31fbafe9"
 dependencies = [
  "image",
  "nfm-egui",
@@ -1435,7 +1431,6 @@ dependencies = [
 [[package]]
 name = "nfm-preview-text"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=306762ab0df897b1cf43884d4e0354ad31fbafe9#306762ab0df897b1cf43884d4e0354ad31fbafe9"
 dependencies = [
  "nfm-egui",
  "two-face",
@@ -1446,7 +1441,6 @@ dependencies = [
 [[package]]
 name = "nfm-preview-vt"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=306762ab0df897b1cf43884d4e0354ad31fbafe9#306762ab0df897b1cf43884d4e0354ad31fbafe9"
 dependencies = [
  "cc",
 ]
@@ -1454,7 +1448,6 @@ dependencies = [
 [[package]]
 name = "nfm_file_system"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=306762ab0df897b1cf43884d4e0354ad31fbafe9#306762ab0df897b1cf43884d4e0354ad31fbafe9"
 dependencies = [
  "crossbeam-channel",
  "hashbrown 0.17.1",
@@ -1465,7 +1458,6 @@ dependencies = [
 [[package]]
 name = "nfm_search_core"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=306762ab0df897b1cf43884d4e0354ad31fbafe9#306762ab0df897b1cf43884d4e0354ad31fbafe9"
 dependencies = [
  "crossbeam-channel",
  "memchr",

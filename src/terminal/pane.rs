@@ -277,6 +277,8 @@ pub(super) struct TerminalPane {
     copy_search_cursor: usize,
     copy_search_query: Option<(String, bool)>,
     copy_search_refresh: Option<u64>,
+    /// The step of the current yank pulse; the copy mode holds its range and expiry.
+    yank_pulse_step: Option<usize>,
     prompt_boundaries: command_blocks::Boundaries,
     /// Snapshot generation, viewport top and viewport rows when decorations
     /// were last applied. Decorations only cover that viewport, so they must
@@ -480,6 +482,7 @@ impl TerminalPane {
             copy_search_cursor: 0,
             copy_search_query: None,
             copy_search_refresh: None,
+            yank_pulse_step: None,
             prompt_boundaries: Default::default(),
             decorated_viewport: std::cell::Cell::new(None),
             prompt_patterns: Default::default(),
@@ -586,9 +589,17 @@ impl TerminalPane {
         {
             let now = Instant::now();
             if self.copy_mode.clear_expired_yank_highlight(now) {
+                self.yank_pulse_step = None;
                 self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
             } else if let Some(remaining) = self.copy_mode.yank_highlight_remaining(now) {
-                ctx.request_repaint_after(remaining);
+                let (step, next) = nfm_egui::copy_mode::yank_pulse_timing(remaining);
+                if let Some(current) = &mut self.yank_pulse_step
+                    && *current != step
+                {
+                    *current = step;
+                    self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+                }
+                ctx.request_repaint_after(next);
             }
         }
     }
@@ -2101,6 +2112,7 @@ impl TerminalPane {
             .select_quick(quick.purpose(), target)
         {
             Ok(update) => {
+                self.start_yank_pulse(&update);
                 self.apply_copy_update(update, quick.generation, ctx, None);
             }
             Err(error) => self.copy_controller_error(error),
@@ -2496,6 +2508,7 @@ impl TerminalPane {
                     break;
                 }
             };
+            self.start_yank_pulse(&update);
             let begins_search = update.effects.iter().any(|effect| {
                 matches!(
                     effect,
@@ -2521,6 +2534,18 @@ impl TerminalPane {
             }
         }
         was_active || self.copy_mode.generation.is_some()
+    }
+
+    /// Start the pulse for a yank in `update`.
+    fn start_yank_pulse(&mut self, update: &nfm_egui::copy_controller::CopyUpdate) {
+        use nfm_egui::copy_controller::CopyEffect;
+        if update
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CopyEffect::CopyText { .. }))
+        {
+            self.yank_pulse_step = Some(0);
+        }
     }
 
     fn copy_controller_error(&mut self, error: String) {
@@ -2955,11 +2980,9 @@ impl TerminalPane {
         let yank_layer = yank.map(|_| SnapshotDecorationLayer {
             ranges: yank_ranges.as_ptr(),
             range_count: yank_ranges.len(),
-            style: SnapshotDecorationStyle {
-                foreground_rgb: crate::colors::rgb(crate::colors::palette().yank_text),
-                background_rgb: crate::colors::rgb(crate::colors::palette().yank_background),
-                flags: 3,
-            },
+            style: copy_yank_style(nfm_egui::copy_mode::yank_pulse_strength(
+                self.yank_pulse_step.unwrap_or(0),
+            )),
         });
         let active_match = self.copy_mode.search_matches().iter().find(|range| {
             (range.start.y, range.start.x) <= (cell.y, cell.x)
@@ -3094,10 +3117,29 @@ impl TerminalPane {
 fn copy_selection_style() -> SnapshotDecorationStyle {
     SnapshotDecorationStyle {
         foreground_rgb: 0,
-        background_rgb: crate::colors::rgb(
-            nfm_egui::Palette::default().preview_selection_background,
-        ),
+        background_rgb: crate::colors::rgb(crate::colors::palette().selection_background),
         // Invert original colors on non-default backgrounds.
+        flags: 2 | 16,
+    }
+}
+
+/// The yank pulse background at `strength`, from the terminal background up to
+/// the selection color pushed toward the text color: lighter on dark themes and
+/// darker on light ones, so it always stands out from the selection.
+fn yank_pulse_background(palette: &crate::colors::UiPalette, strength: f32) -> egui::Color32 {
+    let peak = crate::colors::blend(palette.selection_background, palette.text, 0.30);
+    crate::colors::blend(palette.background, peak, strength)
+}
+
+fn copy_yank_style(strength: f32) -> SnapshotDecorationStyle {
+    SnapshotDecorationStyle {
+        foreground_rgb: 0,
+        background_rgb: crate::colors::rgb(yank_pulse_background(
+            &crate::colors::palette(),
+            strength,
+        )),
+        // Only the background changes, so the copied text keeps its colors;
+        // cells with a colored background invert, as in the selection.
         flags: 2 | 16,
     }
 }
@@ -3235,6 +3277,36 @@ mod copy_shortcut_tests {
             layer.style.foreground_rgb,
             crate::colors::rgb(crate::colors::palette().background)
         );
+    }
+
+    #[test]
+    fn yank_pulse_stands_out_from_the_selection_and_fades() {
+        use super::*;
+        use crate::colors::{ThemeColors, UiPalette, contrast};
+        let theme = |background, foreground, selection_background| {
+            UiPalette::from_theme(&ThemeColors {
+                background,
+                foreground,
+                selection_background,
+                selection_foreground: 0,
+                selection_flags: 1,
+                ansi: [0; 16],
+            })
+        };
+        // Dark, light, and light with a white selection.
+        for palette in [
+            theme(0x1e1e1e, 0xd4d4d4, 0x264f78),
+            theme(0xffffff, 0x333333, 0xadd6ff),
+            theme(0xffffff, 0x333333, 0xffffff),
+        ] {
+            let stand_out = |color| contrast(color, palette.background);
+            let peak = yank_pulse_background(&palette, 1.0);
+            assert!(stand_out(peak) > stand_out(palette.selection_background));
+            let faded = yank_pulse_background(&palette, nfm_egui::copy_mode::YANK_PULSE[4]);
+            assert!(stand_out(faded) < stand_out(peak));
+        }
+        // Only the background changes, and colored cells invert like the selection.
+        assert_eq!(copy_yank_style(1.0).flags, copy_selection_style().flags);
     }
 
     #[test]

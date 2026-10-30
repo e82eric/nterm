@@ -439,8 +439,7 @@ impl Picker {
                 search_match_text: Some(p.search_match_text),
                 search_active_background: Some(p.match_highlight),
                 search_active_text: Some(p.background),
-                yank_background: Some(p.yank_background),
-                yank_text: Some(p.yank_text),
+                yank_background: p.yank_background,
             },
             typography: nfm_egui::Typography {
                 normal: self.typography.font.clone(),
