@@ -182,7 +182,9 @@ pub(crate) enum UserEvent {
     Repaint(Instant),
     GhosttyWake,
     FrameReady(winit::window::WindowId),
-    PickerWake { window_id: winit::window::WindowId },
+    PickerWake {
+        window_id: winit::window::WindowId,
+    },
     /// A window's frame queued requests, or left it with no panes. Posted so
     /// they are handled after the frame, with the event loop and every window
     /// available.
@@ -373,7 +375,10 @@ impl NativeApp {
             Ok(window) => window,
             Err(error) => return Err((pane, error)),
         };
-        let origin = self.windows[&origin].shell.as_ref().expect("origin terminal");
+        let origin = self.windows[&origin]
+            .shell
+            .as_ref()
+            .expect("origin terminal");
         let terminal = origin
             .terminal
             .adopt_window(pane, window.surface.pane_window());

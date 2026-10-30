@@ -1109,7 +1109,7 @@ impl Bindings {
         )?);
         let compiled = &model.pickers;
         let actions = &model.actions;
-        // TODO(picker-defaults): the default Ctrl+Shift+F and Ctrl+Shift+Space
+        // TODO(picker-defaults): the default Ctrl+Shift+F and Ctrl+Shift+P
         // bindings prefer custom pickers named `lines` and `commands` over
         // the built-ins. This existed for the removed implicit default
         // pickers; now it only rebinds a default shortcut when a user happens
@@ -1143,7 +1143,7 @@ impl Bindings {
             });
             {
                 keys.push(KeyBinding {
-                    trigger: BindingTrigger::Key(egui::Key::Space),
+                    trigger: BindingTrigger::Key(egui::Key::P),
                     description: String::new(),
                     mods: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
                     action: BindingTarget::Picker(

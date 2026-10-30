@@ -113,7 +113,10 @@ mod tests {
             },
         ];
         assert_eq!(
-            patterns.boundaries(2, |y| Some((rows[y as usize].clone(), RowPrompt::default()))),
+            patterns.boundaries(2, |y| Some((
+                rows[y as usize].clone(),
+                RowPrompt::default()
+            ))),
             Some(vec![0])
         );
         assert_eq!(patterns.prefix_end("PS C:>"), None);
@@ -164,10 +167,19 @@ mod tests {
         let patterns = Patterns::default();
         let start = |text: &str, prompt| {
             let columns: Vec<u32> = (0..text.len() as u32).collect();
-            patterns.command_start(text, &[LineRow { columns: &columns, prompt }])
+            patterns.command_start(
+                text,
+                &[LineRow {
+                    columns: &columns,
+                    prompt,
+                }],
+            )
         };
         // The test rows map each byte to its own column, so "ls" is at 9.
-        assert_eq!(start("~/src λ ls", marked(Some(9))).map(|i| &"~/src λ ls"[i..]), Some("ls"));
+        assert_eq!(
+            start("~/src λ ls", marked(Some(9))).map(|i| &"~/src λ ls"[i..]),
+            Some("ls")
+        );
         // The pattern would stop after "> "; the mark says the command starts later.
         assert_eq!(start("PS C:\\> x> y", marked(Some(11))), Some(11));
         // A marked prompt with nothing typed has no command.

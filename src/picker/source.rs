@@ -963,14 +963,19 @@ mod document_source_tests {
         // Rows 0-1: a wrapped command at a custom prompt only OSC 133 finds.
         // Row 2: a debugger prompt found by its pattern. Row 3: a marked
         // prompt with nothing typed.
-        let prompts = [marked(Some(3)), Default::default(), Default::default(), marked(None)];
+        let prompts = [
+            marked(Some(3)),
+            Default::default(),
+            Default::default(),
+            marked(None),
+        ];
         let item = |rows: &[(u64, TextRow)]| prompt_item(rows, &prompts, &patterns);
         let (text, range) = item(&[(0, row("λ git log", true)), (1, row(" -3", false))]).unwrap();
         assert_eq!(text, "git log -3");
-        assert_eq!((range.start, range.end), (
-            SnapshotCell { x: 3, y: 0 },
-            SnapshotCell { x: 2, y: 1 },
-        ));
+        assert_eq!(
+            (range.start, range.end),
+            (SnapshotCell { x: 3, y: 0 }, SnapshotCell { x: 2, y: 1 },)
+        );
         assert_eq!(item(&[(2, row("0:000> k", false))]).unwrap().0, "k");
         assert!(item(&[(3, row("PS C:\\> ", false))]).is_none());
         assert!(item(&[(2, row("plain output", false))]).is_none());

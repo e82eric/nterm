@@ -2044,8 +2044,8 @@ impl TerminalPane {
             background_rgb: crate::colors::rgb(palette.selection_background),
             flags: 3,
         };
-        // Linewise yanks start from the origin row, so tint that whole row.
-        // It sits after the hints because earlier layers win.
+        // Linewise yanks start from the origin row, so mark it with a
+        // cursorline bar. It sits after the hints because earlier layers win.
         let origin_row = quick.origin_row().map(|y| SnapshotCellRange {
             start: SnapshotCell { x: 0, y },
             end: SnapshotCell {
@@ -2062,16 +2062,10 @@ impl TerminalPane {
             layers.push(SnapshotDecorationLayer {
                 ranges: range,
                 range_count: 1,
-                // Background only, like a cursorline, so the row keeps its
-                // own text colors.
                 style: SnapshotDecorationStyle {
-                    foreground_rgb: 0,
-                    background_rgb: crate::colors::rgb(crate::colors::blend(
-                        palette.background,
-                        palette.accent,
-                        0.15,
-                    )),
-                    flags: 2,
+                    foreground_rgb: crate::colors::rgb(palette.cursor_line_text),
+                    background_rgb: crate::colors::rgb(palette.cursor_line_background),
+                    flags: 3,
                 },
             });
         }

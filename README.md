@@ -124,7 +124,7 @@ restarting.
   floats, and workspaces.
 - **[Key bindings](docs/configuration.md#key-bindings)** map a key to an action
   or a picker. Every action and picker also appears in the
-  [command palette](docs/pickers.md#command-palette) (Ctrl+Shift+Space), with
+  [command palette](docs/pickers.md#command-palette) (Ctrl+Shift+P), with
   or without a key.
 - **[Pickers](docs/pickers.md)** are a fuzzy finder with an optional preview,
   defined from these parts:
@@ -481,7 +481,7 @@ the command palette to apply changes without restarting. See
 
 | Keys | Action |
 | --- | --- |
-| Ctrl+Shift+Space | Command palette |
+| Ctrl+Shift+P | Command palette |
 | Ctrl+Shift+N | New window |
 | Ctrl+Shift+M | Copy mode |
 | Ctrl+Shift+Up / Down | Copy mode at the previous / next command prompt |

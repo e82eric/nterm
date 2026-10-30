@@ -16,7 +16,7 @@ use the shortcuts below; theme selection is also available in the command palett
 | `lines` | Nonblank logical scrollback lines; Enter enters copy mode at the selected line. | Bottom, scrollback preview visible; Ctrl+Shift+F. |
 | `words` | Unique whitespace-delimited scrollback words (`\S+`); Enter pastes the word without submitting it. | Bottom, preview hidden; no default shortcut ([nterm.lua](../nterm.lua) binds Ctrl+Shift+P, [nterm.example.lua](../nterm.example.lua) Ctrl+Shift+.). |
 | `themes` | Installed user and bundled Ghostty themes; Enter applies the selected theme for the session. | Cursor, score sorting, preview hidden; choose **Choose theme** in the palette. |
-| `command_palette` | Application actions and configured pickers; Enter dispatches the selected action. | Center, workspace scope, preview hidden; Ctrl+Shift+Space. |
+| `command_palette` | Application actions and configured pickers; Enter dispatches the selected action. | Center, workspace scope, preview hidden; Ctrl+Shift+P. |
 | `prompts` | Commands entered at prompts, found by OSC 133 marks and [prompt patterns](configuration.md#prompt-patterns); Enter enters copy mode at the selected command. | Bottom, scrollback preview visible; no default shortcut ([nterm.example.lua](../nterm.example.lua) binds Ctrl+Shift+Z). |
 
 The line-split picker is a contextual built-in: Ctrl+B opens it for the selected
@@ -116,8 +116,8 @@ prompt is a candidate. Soft-wrapped rows are split individually.
 ## Command palette
 
 The command palette is a named picker with `type = "CommandPalette"`. The default
-bindings and [nterm.lua](../nterm.lua) bind it to **Ctrl+Shift+Space**;
-[nterm.example.lua](../nterm.example.lua) uses **Ctrl+Shift+P**. Type to filter actions,
+bindings and [nterm.example.lua](../nterm.example.lua) bind it to **Ctrl+Shift+P**;
+[nterm.lua](../nterm.lua) uses **Ctrl+Shift+Space**. Type to filter actions,
 use the arrow keys to select one, and press Enter to run it. Escape closes the
 palette and preserves the terminal's current copy mode and cursor.
 

@@ -24,6 +24,8 @@ pub(crate) struct UiOverrides {
     pub search_match_background: Option<UiColor>,
     pub search_match_text: Option<UiColor>,
     pub yank_background: Option<UiColor>,
+    pub cursor_line_background: Option<UiColor>,
+    pub cursor_line_text: Option<UiColor>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -106,6 +108,12 @@ impl UiOverrides {
         if let Some(color) = self.yank_background {
             palette.yank_background = Some(color.0);
         }
+        if let Some(color) = self.cursor_line_background {
+            palette.cursor_line_background = color.0;
+        }
+        if let Some(color) = self.cursor_line_text {
+            palette.cursor_line_text = color.0;
+        }
         palette
     }
 }
@@ -182,6 +190,7 @@ impl UiPalette {
         } else {
             readable(text, selection_background)
         };
+        let cursor_line_background = blend(background, text, 0.60);
         Self {
             background,
             text,
@@ -200,6 +209,8 @@ impl UiPalette {
             search_match_background,
             search_match_text: readable(text, search_match_background),
             yank_background: None,
+            cursor_line_background,
+            cursor_line_text: readable(background, cursor_line_background),
         }
     }
 }
@@ -224,6 +235,9 @@ pub(crate) struct UiPalette {
     pub search_match_text: Color32,
     /// Peak of the picker preview yank pulse; None follows its selection.
     pub yank_background: Option<Color32>,
+    /// Line-yank origin row (`Y` hints): a muted bar with background-colored text.
+    pub cursor_line_background: Color32,
+    pub cursor_line_text: Color32,
 }
 
 impl UiPalette {
@@ -245,6 +259,8 @@ impl UiPalette {
         search_match_background: Color32::from_rgb(0x67, 0x55, 0x2a),
         search_match_text: Color32::from_rgb(0xeb, 0xdb, 0xb2),
         yank_background: None,
+        cursor_line_background: Color32::from_rgb(0xa8, 0x99, 0x84),
+        cursor_line_text: Color32::from_rgb(0x1d, 0x20, 0x21),
     };
 }
 
@@ -298,6 +314,8 @@ pub(crate) static COLORS: ColorManager = ColorManager {
             search_match_background: None,
             search_match_text: None,
             yank_background: None,
+            cursor_line_background: None,
+            cursor_line_text: None,
         },
     }),
 };
@@ -441,6 +459,28 @@ mod tests {
         let picker = picker_only.apply(base);
         assert_eq!(picker.search_match_background, base.search_match_background);
         assert_eq!(picker.search_match_text, base.search_match_text);
+    }
+
+    #[test]
+    fn cursor_line_follows_the_theme_and_accepts_overrides() {
+        let base = UiPalette::from_theme(&theme(0x282828, 0xebdbb2));
+        assert_eq!(
+            base.cursor_line_background,
+            blend(base.background, base.text, 0.60)
+        );
+        assert!(contrast(base.cursor_line_text, base.cursor_line_background) >= 4.5);
+        let overrides = ColorOverrides {
+            global: serde_json::from_str(r##"{"cursor_line_background":"#a89984"}"##).unwrap(),
+            themes: std::collections::BTreeMap::from([(
+                "Gruvbox Dark".into(),
+                serde_json::from_str(r##"{"cursor_line_text":"#1d2021"}"##).unwrap(),
+            )]),
+        };
+        let selected = overrides.apply(base, Some("Gruvbox Dark"));
+        assert_eq!(rgb(selected.cursor_line_background), 0xa89984);
+        assert_eq!(rgb(selected.cursor_line_text), 0x1d2021);
+        let other = overrides.apply(base, Some("Other"));
+        assert_eq!(other.cursor_line_text, base.cursor_line_text);
     }
 
     #[test]

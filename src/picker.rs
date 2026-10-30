@@ -440,6 +440,8 @@ impl Picker {
                 search_active_background: Some(p.match_highlight),
                 search_active_text: Some(p.background),
                 yank_background: p.yank_background,
+                cursor_line_background: Some(p.cursor_line_background),
+                cursor_line_text: Some(p.cursor_line_text),
             },
             typography: nfm_egui::Typography {
                 normal: self.typography.font.clone(),

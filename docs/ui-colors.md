@@ -53,6 +53,8 @@ foreground because there is no individual terminal cell to resolve against.
 | selection_text | Text on selection backgrounds |
 | accent | Active status, caret, picker indicator, quick-select hint |
 | copy_cursor_background | Copy-mode cursor fill in the terminal and NFM preview; defaults to accent |
+| cursor_line_background | Origin row of copy mode's `Y` line hints, in the terminal and NFM preview; defaults to the terminal background blended 60% toward its foreground |
+| cursor_line_text | Text on `cursor_line_background`; defaults to the terminal background, adjusted for contrast |
 | success | Copied confirmation |
 | warning | Persistent configuration issue indicator |
 | error | Picker failures, invalid search, egui error text |

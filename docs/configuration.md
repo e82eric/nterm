@@ -141,7 +141,7 @@ and duplicate bindings report configuration errors. Picker bindings trigger from
 terminal or copy mode, leaving modal query input unaffected.
 Without `pickers`, all four named built-ins remain available.
 The default bindings include the built-in actions, Ctrl+Shift+F for built-in
-`lines`, and Ctrl+Shift+Space for the built-in command palette. The built-in
+`lines`, and Ctrl+Shift+P for the built-in command palette. The built-in
 `words` picker has no default key. There are no default custom pickers;
 `picker = "lines"` requires a `lines` entry in `pickers`.
 

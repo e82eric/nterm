@@ -102,7 +102,9 @@ pub(crate) enum PaneRef {
 
 impl TerminalView {
     pub(crate) fn apply_theme(&mut self, name: &str) -> Result<(), String> {
-        self.app_pane().ok_or("no terminal is open")?.apply_theme(name)
+        self.app_pane()
+            .ok_or("no terminal is open")?
+            .apply_theme(name)
     }
     /// Any terminal in this window. Every terminal shares one native app, so
     /// app-wide work (ticks, settings, and new terminals) can go through any

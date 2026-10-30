@@ -597,7 +597,9 @@ impl TerminalView {
         };
         pane.cancel_workspace_picker();
         self.requests
-            .push(super::WindowRequest::MovePaneToNewWindow(super::MovedPane(pane)));
+            .push(super::WindowRequest::MovePaneToNewWindow(super::MovedPane(
+                pane,
+            )));
         self.context.request_repaint();
         Ok(())
     }
