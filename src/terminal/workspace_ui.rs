@@ -1307,6 +1307,18 @@ impl TerminalView {
                 });
             }
         }
+        // Layouts that hide panes show where the focused one sits among them.
+        let w = self.workspace();
+        let hides_panes = match w.layout {
+            Layout::Monocle => w.panes.len() > 1,
+            Layout::Deck => w.panes.len() > 2,
+            _ => false,
+        };
+        if hides_panes && !floating_active {
+            if let Some((_, r)) = rects.iter().find(|(id, _)| focus == Some(*id)) {
+                Self::paint_pane_dots(ui.painter(), *r, w.pane_number(), w.panes.len());
+            }
+        }
         for (id, r) in &rects {
             if floating_active || focus != Some(*id) {
                 if let Some(p) = self.tiled_mut(*id) {

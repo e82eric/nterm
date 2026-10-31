@@ -639,6 +639,54 @@ impl TerminalView {
         egui::Rect::from_center_size(content.center(), size)
     }
 
+    /// Shows where the visible pane sits among panes the layout hides:
+    /// pagination dots set into the right of its top border, the current one
+    /// in the accent colour. Past `MAX_DOTS` panes it shows "N / M" instead.
+    pub(super) fn paint_pane_dots(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        position: usize,
+        count: usize,
+    ) {
+        const MAX_DOTS: usize = 9;
+        const RADIUS: f32 = 3.0;
+        const SPACING: f32 = 11.0;
+        let palette = crate::colors::palette();
+        let y = rect.top();
+        let galley = (count > MAX_DOTS).then(|| {
+            painter.layout_no_wrap(
+                format!("{position} / {count}"),
+                egui::FontId::monospace(11.0),
+                palette.accent,
+            )
+        });
+        let width = galley
+            .as_ref()
+            .map_or(SPACING * (count - 1) as f32 + RADIUS * 2.0, |galley| {
+                galley.size().x
+            });
+        // Cut the border behind the indicator so it sits in the line, clear
+        // of the rounded corner.
+        let size = egui::vec2(width + 14.0, RADIUS * 2.0 + 4.0);
+        let gap =
+            egui::Rect::from_center_size(egui::pos2(rect.right() - 18.0 - size.x / 2.0, y), size);
+        painter.rect_filled(gap, 0.0, palette.background);
+        if let Some(galley) = galley {
+            let at = gap.center() - galley.size() / 2.0;
+            painter.galley(at, galley, palette.accent);
+            return;
+        }
+        let first = gap.center().x - SPACING * (count - 1) as f32 / 2.0;
+        for index in 0..count {
+            let center = egui::pos2(first + SPACING * index as f32, y);
+            if index + 1 == position {
+                painter.circle_filled(center, RADIUS, palette.accent);
+            } else {
+                painter.circle_filled(center, RADIUS - 0.5, palette.muted_text);
+            }
+        }
+    }
+
     fn show_floating(
         &self,
         ui: &egui::Ui,
@@ -658,23 +706,23 @@ impl TerminalView {
             .show(ui.ctx(), |floating_ui| {
                 floating_ui.set_min_size(content.size());
                 let painter = floating_ui.painter();
+                let palette = crate::colors::palette();
                 painter.rect_filled(
                     content,
                     0.0,
-                    crate::colors::palette()
-                        .background
-                        .gamma_multiply(90.0 / 255.0),
+                    palette.background.gamma_multiply(90.0 / 255.0),
                 );
                 style.paint_frame(painter, rect, true);
-                painter.rect_filled(
-                    rect,
-                    style.corner_radius,
-                    crate::colors::palette().background,
-                );
+                painter.rect_filled(rect, style.corner_radius, palette.background);
                 painter.add(egui::PaintCallback {
                     rect: style.content_rect(rect),
                     callback: floating.paint_callback(),
                 });
+                let ids = self.floats().ids();
+                if ids.len() > 1 {
+                    let position = ids.iter().position(|id| *id == floating.id).unwrap_or(0) + 1;
+                    Self::paint_pane_dots(painter, rect, position, ids.len());
+                }
             });
         ui.ctx().move_to_top(layer_id);
     }

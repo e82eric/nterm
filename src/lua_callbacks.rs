@@ -313,8 +313,14 @@ mod tests {
             .unwrap();
         assert_eq!(calls.len(), 17);
         use crate::terminal::workspace::Direction;
-        assert!(matches!(calls[12], Request::FocusDirection(Direction::Down)));
-        assert!(matches!(calls[13], Request::MovePaneDirection(Direction::Left)));
+        assert!(matches!(
+            calls[12],
+            Request::FocusDirection(Direction::Down)
+        ));
+        assert!(matches!(
+            calls[13],
+            Request::MovePaneDirection(Direction::Left)
+        ));
         let result = callback
             .with_host(&mut |_| panic!("expired handle reached controller"), || {
                 callback.call_action(String::new())
