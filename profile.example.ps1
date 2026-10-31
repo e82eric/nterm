@@ -109,3 +109,44 @@ Set-PSReadLineKeyHandler -Chord 'Ctrl+@', 'Ctrl+Spacebar' -ScriptBlock {
         )
     }
 }
+
+# # Report the working directory to the terminal (OSC 7) so pickers run in it.
+# # The guard keeps a re-sourced profile from wrapping the wrapper.
+# if (-not $global:__ntermOriginalPrompt) {
+#     $global:__ntermOriginalPrompt = $function:prompt
+# }
+# $global:__ntermLastHistoryId = -1
+# function prompt {
+#     # Read the status before anything else overwrites $?.
+#     $succeeded = $?
+#     # OSC 133 semantic prompt marks: D = previous command finished,
+#     # A = prompt start, B = input start (C is written by the Enter handler).
+#     $last = Get-History -Count 1
+#     if ($global:__ntermLastHistoryId -ne -1) {
+#         if ($last.Id -eq $global:__ntermLastHistoryId) {
+#             # Blank line or Ctrl+C: no command ran.
+#             [Console]::Write("`e]133;D`a")
+#         } else {
+#             $code = if ($succeeded) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+#             [Console]::Write("`e]133;D;$code`a")
+#         }
+#     }
+#     $global:__ntermLastHistoryId = if ($last) { $last.Id } else { 0 }
+#     if ($PWD.Provider.Name -eq 'FileSystem') {
+#         $path = $PWD.ProviderPath -replace '\\', '/'
+#         [Console]::Write("`e]7;kitty-shell-cwd://localhost/$path`a")
+#     }
+#     # Programs such as nvim can exit without restoring the cursor shape.
+#     # DECSCUSR 5 (blinking bar) is a no-op when the cursor already is one.
+#     [Console]::Write("`e[5 q")
+#     # redraw=0: PSReadLine doesn't redraw the prompt on resize, so the
+#     # terminal must not clear it.
+#     [Console]::Write("`e]133;A;redraw=0`a")
+#     "$(& $global:__ntermOriginalPrompt)`e]133;B`a"
+# }
+#
+# # Mark where command output begins when Enter accepts the line.
+# Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+#     [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+#     [Console]::Write("`e]133;C`a")
+# }
