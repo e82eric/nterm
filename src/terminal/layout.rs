@@ -14,7 +14,7 @@ pub(super) enum Axis {
     Y,
 }
 impl Axis {
-    fn cross(self) -> Self {
+    pub(super) fn cross(self) -> Self {
         match self {
             Self::X => Self::Y,
             Self::Y => Self::X,
@@ -49,10 +49,27 @@ impl Motion {
     }
 }
 
+/// The smallest a pane gets along a divided axis, when it fits.
+const MINIMUM: f32 = 48.0;
+
+fn length(rect: Rect, axis: Axis) -> f32 {
+    match axis {
+        Axis::X => rect.width(),
+        Axis::Y => rect.height(),
+    }
+}
+/// The left (X) or top (Y) edge of `rect`.
+fn start(rect: Rect, axis: Axis) -> f32 {
+    match axis {
+        Axis::X => rect.left(),
+        Axis::Y => rect.top(),
+    }
+}
+
 /// The workspace area inside the outer gap, and the gap between panes.
 pub(super) struct Area {
     pub(super) rect: Rect,
-    gap: f32,
+    pub(super) gap: f32,
 }
 impl Area {
     /// Gaps shrink when the area is too small for them; `panes` is at least 1.
@@ -66,16 +83,16 @@ impl Area {
             .min((rect.width().min(rect.height()) / panes as f32 - 1.0).max(0.0));
         Self { rect, gap }
     }
+    /// The space `split` divides along `axis`: everything but one gap.
+    fn split_space(&self, axis: Axis) -> f32 {
+        (length(self.rect, axis) - self.gap).max(0.0)
+    }
     /// Splits along `axis`, giving the first part `ratio` (0.1 to 0.9) of the
-    /// space, with at least 48 pixels on each side when it fits.
+    /// space, with at least `MINIMUM` pixels on each side when it fits.
     fn split(&self, axis: Axis, ratio: f32) -> (Rect, Rect) {
         let (b, gap) = (self.rect, self.gap);
-        let length = match axis {
-            Axis::X => b.width(),
-            Axis::Y => b.height(),
-        };
-        let available = (length - gap).max(0.0);
-        let minimum = 48.0_f32.min(available / 2.0);
+        let available = self.split_space(axis);
+        let minimum = MINIMUM.min(available / 2.0);
         let first = (available * ratio.clamp(0.1, 0.9)).clamp(minimum, available - minimum);
         match axis {
             Axis::X => (
@@ -88,8 +105,16 @@ impl Area {
             ),
         }
     }
+    /// Each pane's guaranteed minimum, and the space shared out by weight,
+    /// when `partition` divides `rect` among `panes` along `axis`.
+    fn partition_space(&self, rect: Rect, panes: usize, axis: Axis) -> (f32, f32) {
+        let panes = panes.max(1);
+        let available = (length(rect, axis) - self.gap * (panes - 1) as f32).max(0.0);
+        let minimum = MINIMUM.min(available / panes as f32);
+        (minimum, (available - minimum * panes as f32).max(0.0))
+    }
     /// Divides `rect` among `ids` along `axis` in proportion to their weights,
-    /// keeping a 48-pixel minimum per pane when it fits.
+    /// keeping a `MINIMUM` per pane when it fits.
     fn partition(
         &self,
         rect: Rect,
@@ -98,16 +123,9 @@ impl Area {
         weights: &BTreeMap<u64, f32>,
     ) -> Vec<(u64, Rect)> {
         let horizontal = axis == Axis::X;
-        let available = ((if horizontal {
-            rect.width()
-        } else {
-            rect.height()
-        }) - self.gap * ids.len().saturating_sub(1) as f32)
-            .max(0.0);
-        let minimum = 48.0_f32.min(available / ids.len().max(1) as f32);
-        let extra = (available - minimum * ids.len() as f32).max(0.0);
-        let weight = |id: &u64| weights.get(id).copied().unwrap_or(1.0);
-        let total = ids.iter().map(weight).sum::<f32>();
+        let (minimum, extra) = self.partition_space(rect, ids.len(), axis);
+        let weight = |id: &u64| weight(weights, *id);
+        let total = total_weight(weights, ids);
         let mut start = if horizontal { rect.left() } else { rect.top() };
         ids.iter()
             .enumerate()
@@ -133,18 +151,195 @@ impl Area {
     }
 }
 
+/// A pane's weight within its stack; panes without one weigh 1.
+fn weight(weights: &BTreeMap<u64, f32>, id: u64) -> f32 {
+    weights.get(&id).copied().unwrap_or(1.0)
+}
+fn total_weight(weights: &BTreeMap<u64, f32>, ids: &[u64]) -> f32 {
+    ids.iter().map(|id| weight(weights, *id)).sum()
+}
+
+/// How a layout divides space: one split along `axis`, then each side's
+/// panes stacked across it. Drawing, keyboard resizing and mouse resizing all
+/// follow this, so they agree on which panes share a divider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Splits {
+    axis: Axis,
+    /// The side whose share `main_ratio` is.
+    main: Side,
+    /// Positions in `panes` on each side, in screen order (left or top first).
+    groups: [Range<usize>; 2],
+}
+
+/// A movable divider. Identified by the panes it separates rather than its
+/// position, so it stays the same divider while the window or other panes
+/// change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DividerId {
+    /// The outer split.
+    Main,
+    /// Between two neighbors in a stack.
+    Between(u64, u64),
+}
+/// Where a divider is on screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct DividerAt {
+    pub(super) id: DividerId,
+    /// The direction it moves: `X` for a vertical line.
+    pub(super) axis: Axis,
+    /// Its position along `axis`, in the middle of the gap.
+    pub(super) at: f32,
+    /// The gap it sits in.
+    pub(super) gap: f32,
+    /// The rectangle it runs across, end to end.
+    pub(super) span: Rect,
+}
+
+impl Splits {
+    fn pair_group(&self, w: &Workspace, a: u64, b: u64) -> Option<Range<usize>> {
+        self.groups
+            .iter()
+            .find(|g| w.panes[(*g).clone()].windows(2).any(|p| p == [a, b]))
+            .cloned()
+    }
+    /// The dividers that can move: the outer split when there is space to
+    /// divide, and those between neighbors in a stack with room above the
+    /// minimum. `rects` are this layout's rectangles.
+    pub(super) fn dividers(
+        &self,
+        w: &Workspace,
+        area: &Area,
+        rects: &[(u64, Rect)],
+    ) -> Vec<DividerAt> {
+        let rect = |id| rects.iter().find(|(i, _)| *i == id).unwrap().1;
+        let span = |ids: &[u64]| ids.iter().fold(Rect::NOTHING, |r, id| r.union(rect(*id)));
+        let end = |r: Rect, axis| start(r, axis) + length(r, axis) + area.gap / 2.0;
+        let mut result = Vec::new();
+        if area.split_space(self.axis) > 0.0 {
+            let first = span(&w.panes[self.groups[0].clone()]);
+            result.push(DividerAt {
+                id: DividerId::Main,
+                axis: self.axis,
+                at: end(first, self.axis),
+                gap: area.gap,
+                span: area.rect,
+            });
+        }
+        let across = self.axis.cross();
+        for group in &self.groups {
+            let ids = &w.panes[group.clone()];
+            let whole = span(ids);
+            if ids.len() < 2 || area.partition_space(whole, ids.len(), across).1 <= 0.0 {
+                continue;
+            }
+            for pair in ids.windows(2) {
+                result.push(DividerAt {
+                    id: DividerId::Between(pair[0], pair[1]),
+                    axis: across,
+                    at: end(rect(pair[0]), across),
+                    gap: area.gap,
+                    span: whole,
+                });
+            }
+        }
+        result
+    }
+    /// Moves a divider so its center is at `to`, as far as the limits allow.
+    /// Solves `split` or `partition` for the ratio or weights that put it
+    /// there. `rects` are this layout's rectangles before the move.
+    pub(super) fn move_divider(
+        &self,
+        w: &mut Workspace,
+        area: &Area,
+        rects: &[(u64, Rect)],
+        id: DividerId,
+        to: f32,
+    ) {
+        let edge = to - area.gap / 2.0;
+        match id {
+            DividerId::Main => {
+                let available = area.split_space(self.axis);
+                if available <= 0.0 {
+                    return;
+                }
+                let first = (edge - start(area.rect, self.axis)) / available;
+                let ratio = match self.main {
+                    Side::First => first,
+                    Side::Second => 1.0 - first,
+                };
+                w.main_ratio = ratio.clamp(0.1, 0.9);
+            }
+            DividerId::Between(a, b) => {
+                let Some(group) = self.pair_group(w, a, b) else {
+                    return;
+                };
+                let rect = |id| rects.iter().find(|(i, _)| *i == id).unwrap().1;
+                let (ra, rb) = (rect(a), rect(b));
+                let across = self.axis.cross();
+                let whole = w.panes[group.clone()]
+                    .iter()
+                    .fold(Rect::NOTHING, |r, id| r.union(rect(*id)));
+                // `partition` gives each pane the minimum plus a share of the
+                // rest by weight, so `a`'s share of the pair's room above the
+                // minimum is its share of their combined weight.
+                let (minimum, _) = area.partition_space(whole, group.len(), across);
+                let room = length(ra, across) + length(rb, across) - 2.0 * minimum;
+                if room <= 0.0 {
+                    return;
+                }
+                let share = ((edge - start(ra, across) - minimum) / room).clamp(0.05, 0.95);
+                let total = weight(w.weights(), a) + weight(w.weights(), b);
+                let weights = w.weights_mut();
+                weights.insert(a, total * share);
+                weights.insert(b, total * (1.0 - share));
+            }
+        }
+    }
+    fn rectangles(&self, w: &Workspace, area: &Area) -> Vec<(u64, Rect)> {
+        let ratio = match self.main {
+            Side::First => w.main_ratio,
+            Side::Second => 1.0 - w.main_ratio,
+        };
+        let (first, second) = area.split(self.axis, ratio);
+        let across = self.axis.cross();
+        let [a, b] = &self.groups;
+        let mut result = area.partition(first, &w.panes[a.clone()], across, w.weights());
+        result.extend(area.partition(second, &w.panes[b.clone()], across, w.weights()));
+        result
+    }
+}
+
 /// A layout's behavior. `Workspace` checks the shared preconditions first:
 /// every method sees at least two panes, and `index` is the focused pane's
 /// position in `w.panes`.
 pub(super) trait Arrange {
-    /// Where each visible pane goes.
-    fn rectangles(&self, w: &Workspace, area: &Area) -> Vec<(u64, Rect)>;
+    /// How the layout divides space, or `None` when nothing is split. The
+    /// default `rectangles` and `resize` follow it.
+    fn splits(&self, _w: &Workspace) -> Option<Splits> {
+        None
+    }
+    /// Where each visible pane goes. The default lays out `splits`.
+    fn rectangles(&self, w: &Workspace, area: &Area) -> Vec<(u64, Rect)> {
+        match self.splits(w) {
+            Some(splits) => splits.rectangles(w, area),
+            None => vec![(w.panes[0], area.rect)],
+        }
+    }
     /// Reorders panes so the focused one is on screen, after focus, layout,
     /// or pane order changes. The default does nothing.
     fn reveal(&self, _w: &mut Workspace) {}
-    /// Moves the divider nearest the focused pane along `axis`. The default
-    /// does nothing.
-    fn resize(&self, _w: &mut Workspace, _index: usize, _axis: Axis, _forward: bool) {}
+    /// Moves the divider nearest the focused pane along `axis`: the outer
+    /// split, or one within the focused pane's side of `splits`.
+    fn resize(&self, w: &mut Workspace, index: usize, axis: Axis, forward: bool) {
+        let Some(splits) = self.splits(w) else {
+            return;
+        };
+        if axis == splits.axis {
+            resize_main(w, forward, splits.main == Side::Second);
+        } else if let Some(group) = splits.groups.into_iter().find(|g| g.contains(&index)) {
+            resize_within(w, index, group, forward);
+        }
+    }
     /// The pane a motion from the focused pane reaches. The default is the
     /// nearest visible pane in that direction.
     fn target(
@@ -211,26 +406,16 @@ struct Tile {
     main: Side,
 }
 impl Arrange for Tile {
-    fn rectangles(&self, w: &Workspace, area: &Area) -> Vec<(u64, Rect)> {
-        // `main_ratio` is the main pane's share, whichever side it is on.
-        let ratio = match self.main {
-            Side::First => w.main_ratio,
-            Side::Second => 1.0 - w.main_ratio,
-        };
-        let (first, second) = area.split(Axis::X, ratio);
-        let (main, stack) = match self.main {
-            Side::First => (first, second),
-            Side::Second => (second, first),
-        };
-        let mut result = vec![(w.panes[0], main)];
-        result.extend(area.partition(stack, &w.panes[1..], Axis::Y, w.weights()));
-        result
-    }
-    fn resize(&self, w: &mut Workspace, index: usize, axis: Axis, forward: bool) {
-        match axis {
-            Axis::X => resize_main(w, forward, self.main == Side::Second),
-            Axis::Y => resize_within(w, index, 1..w.panes.len(), forward),
-        }
+    fn splits(&self, w: &Workspace) -> Option<Splits> {
+        let (main, stack) = (0..1, 1..w.panes.len());
+        Some(Splits {
+            axis: Axis::X,
+            main: self.main,
+            groups: match self.main {
+                Side::First => [main, stack],
+                Side::Second => [stack, main],
+            },
+        })
     }
 }
 
@@ -240,25 +425,13 @@ struct Grid {
     split: Axis,
 }
 impl Arrange for Grid {
-    fn rectangles(&self, w: &Workspace, area: &Area) -> Vec<(u64, Rect)> {
-        let (first, second) = area.split(self.split, w.main_ratio);
+    fn splits(&self, w: &Workspace) -> Option<Splits> {
         let half = w.panes.len() / 2;
-        let across = self.split.cross();
-        let mut result = area.partition(first, &w.panes[..half], across, w.weights());
-        result.extend(area.partition(second, &w.panes[half..], across, w.weights()));
-        result
-    }
-    fn resize(&self, w: &mut Workspace, index: usize, axis: Axis, forward: bool) {
-        if axis == self.split {
-            return resize_main(w, forward, false);
-        }
-        let half = w.panes.len() / 2;
-        let group = if index < half {
-            0..half
-        } else {
-            half..w.panes.len()
-        };
-        resize_within(w, index, group, forward);
+        Some(Splits {
+            axis: self.split,
+            main: Side::First,
+            groups: [0..half, half..w.panes.len()],
+        })
     }
 }
 
@@ -314,9 +487,14 @@ impl Deck {
     }
 }
 impl Arrange for Deck {
-    fn rectangles(&self, w: &Workspace, area: &Area) -> Vec<(u64, Rect)> {
-        let (main, stack) = area.split(Axis::X, w.main_ratio);
-        vec![(w.panes[0], main), (w.panes[1], stack)]
+    /// Only the main pane and the visible stack pane are laid out, one per
+    /// side, so only the outer split resizes.
+    fn splits(&self, _w: &Workspace) -> Option<Splits> {
+        Some(Splits {
+            axis: Axis::X,
+            main: Side::First,
+            groups: [0..1, 1..2],
+        })
     }
     /// Rotates the stack so a focused hidden pane comes to slot 1, as SWM
     /// does on arrange. Rotating keeps the stack's cyclic order.
@@ -325,12 +503,6 @@ impl Arrange for Deck {
             && position > 1
         {
             w.panes[1..].rotate_left(position - 1);
-        }
-    }
-    /// Only the outer split resizes; the stack shows one pane.
-    fn resize(&self, w: &mut Workspace, _index: usize, axis: Axis, forward: bool) {
-        if axis == Axis::X {
-            resize_main(w, forward, false);
         }
     }
     /// As in SWM: right from the main pane and left from the stack swap the
@@ -445,8 +617,8 @@ fn resize_within(w: &mut Workspace, index: usize, group: Range<usize>, forward: 
         w.panes[group.start + boundary + 1],
     );
     let delta = if forward { 0.05 } else { -0.05 };
-    let before = w.weights().get(&a).copied().unwrap_or(1.0);
-    let after = w.weights().get(&b).copied().unwrap_or(1.0);
+    let before = weight(w.weights(), a);
+    let after = weight(w.weights(), b);
     let total = before + after;
     let resized = (before + delta * total).clamp(total * 0.05, total * 0.95);
     let weights = w.weights_mut();

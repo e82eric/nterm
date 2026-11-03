@@ -6,6 +6,7 @@ use std::ffi::c_char;
 pub(crate) mod floating;
 mod layout;
 mod pane;
+mod pane_resize;
 pub(crate) mod workspace;
 pub(crate) mod workspace_ui;
 use pane::TerminalPane;
@@ -39,6 +40,7 @@ pub(crate) struct TerminalView {
     window_id: egui_winit::winit::window::WindowId,
     /// Set by the status bar's close button; the app then closes this window.
     close_requested: bool,
+    pane_drag: Option<pane_resize::Drag>,
 }
 
 struct FloatingTerminal {
@@ -242,6 +244,7 @@ impl TerminalView {
             command_label,
             reload_source,
             close_requested: false,
+            pane_drag: None,
             picker_bindings,
             floating_padding,
             floating: Default::default(),

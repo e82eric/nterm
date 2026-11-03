@@ -1,5 +1,5 @@
 //! Window-local workspaces. Layout geometry and behavior live in `layout`.
-use super::layout::{Area, Axis, Motion};
+use super::layout::{Area, Axis, DividerAt, DividerId, Motion, Splits};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -229,6 +229,36 @@ impl Workspace {
             return vec![(only, area.rect)];
         }
         self.layout.arrange().rectangles(self, &area)
+    }
+    /// The dividers the mouse can move, in screen order.
+    pub(super) fn dividers(&self, bounds: egui::Rect, style: &Appearance) -> Vec<DividerAt> {
+        let Some(splits) = self.splits() else {
+            return Vec::new();
+        };
+        let area = Area::new(bounds, style, self.panes.len());
+        splits.dividers(self, &area, &self.rectangles(bounds, style))
+    }
+    /// Moves a divider so its center is at `to` along its axis, as far as
+    /// minimum sizes allow. Does nothing if the divider no longer exists.
+    pub(super) fn move_divider(
+        &mut self,
+        bounds: egui::Rect,
+        style: &Appearance,
+        id: DividerId,
+        to: f32,
+    ) {
+        let Some(splits) = self.splits() else {
+            return;
+        };
+        let area = Area::new(bounds, style, self.panes.len());
+        let rects = self.rectangles(bounds, style);
+        splits.move_divider(self, &area, &rects, id, to);
+    }
+    fn splits(&self) -> Option<Splits> {
+        if self.panes.len() < 2 {
+            return None;
+        }
+        self.layout.arrange().splits(self)
     }
     /// Move the focused pane's nearest shared divider in the requested direction.
     pub fn resize(&mut self, horizontal: bool, forward: bool) {

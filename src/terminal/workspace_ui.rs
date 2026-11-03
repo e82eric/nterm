@@ -345,13 +345,13 @@ impl TerminalView {
             );
         }
     }
-    fn workspace(&self) -> &Workspace {
+    pub(super) fn workspace(&self) -> &Workspace {
         self.workspaces
             .iter()
             .find(|w| w.id == self.current)
             .expect("current workspace")
     }
-    fn workspace_mut(&mut self) -> &mut Workspace {
+    pub(super) fn workspace_mut(&mut self) -> &mut Workspace {
         self.workspaces
             .iter_mut()
             .find(|w| w.id == self.current)
@@ -1246,11 +1246,13 @@ impl TerminalView {
             style.corner_radius = 0.0;
             style.shadow_size = 0.0;
         }
-        let rects = self.workspace().rectangles(content, &style);
         let scale = ctx.pixels_per_point();
         let floating_active = self.floats().visible().is_some();
         let focused_window = ui.input(|i| i.viewport().focused.unwrap_or(false));
-        if !floating_active && !self.active_pane_ref().workspace_picker_active() {
+        let resize_enabled = !floating_active && !self.active_pane_ref().workspace_picker_active();
+        let resizing = self.resize_panes_with_mouse(ui, content, &style, resize_enabled);
+        let rects = self.workspace().rectangles(content, &style);
+        if resize_enabled && !resizing {
             if let Some(pos) = ui.input(|i| {
                 if i.pointer.any_pressed() {
                     i.pointer.interact_pos()
