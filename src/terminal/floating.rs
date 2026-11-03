@@ -78,7 +78,8 @@ impl<T> std::ops::DerefMut for Entry<T> {
     }
 }
 /// One workspace's floating panes: IDs in creation order, the one shown
-/// while the workspace is current, and focus history for toggle and close.
+/// while the workspace is current, focus history for toggle and close, and
+/// the size the mouse gave them.
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct Floats {
     #[serde(rename = "floats")]
@@ -87,8 +88,19 @@ pub(crate) struct Floats {
     visible: Option<u64>,
     #[serde(skip)]
     recent: Vec<u64>,
+    /// Set by resizing with the mouse, as percentages of the workspace like
+    /// the configured padding; `None` uses the configured or default size.
+    #[serde(skip)]
+    size: Option<crate::config::FloatingPadding>,
 }
 impl Floats {
+    /// This workspace's floating size, if the mouse has set one.
+    pub fn size(&self) -> Option<crate::config::FloatingPadding> {
+        self.size
+    }
+    pub fn set_size(&mut self, size: Option<crate::config::FloatingPadding>) {
+        self.size = size;
+    }
     pub fn ids(&self) -> &[u64] {
         &self.ids
     }

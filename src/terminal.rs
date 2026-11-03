@@ -619,6 +619,13 @@ impl TerminalView {
         ctx.request_repaint();
     }
 
+    /// Where the current workspace's floating pane goes: the size the mouse
+    /// gave it, or else the configured padding or default size.
+    fn floating_rect_for(&self, content: egui::Rect) -> egui::Rect {
+        let w = self.workspace();
+        Self::floating_rect(content, w.floats.size().or(self.floating_padding))
+    }
+
     fn floating_rect(
         content: egui::Rect,
         padding: Option<crate::config::FloatingPadding>,

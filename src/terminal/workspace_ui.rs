@@ -1,5 +1,5 @@
 use super::{
-    PaneRef, TerminalView, floating,
+    PaneRef, TerminalView, floating, pane_resize,
     workspace::{self, Layout, Request, Workspace},
 };
 use crate::{actions::AppAction, graphics as glow};
@@ -941,6 +941,7 @@ impl TerminalView {
                     let w = self.workspace_mut();
                     w.main_ratio = 0.5;
                     w.weights_mut().clear();
+                    w.floats.set_size(None);
                 }
                 ResizeLeft | ResizeRight | ResizeUp | ResizeDown => {
                     self.workspace_mut().resize(
@@ -1249,10 +1250,20 @@ impl TerminalView {
         let scale = ctx.pixels_per_point();
         let floating_active = self.floats().visible().is_some();
         let focused_window = ui.input(|i| i.viewport().focused.unwrap_or(false));
-        let resize_enabled = !floating_active && !self.active_pane_ref().workspace_picker_active();
-        let resizing = self.resize_panes_with_mouse(ui, content, &style, resize_enabled);
+        let picker_active = self.active_pane_ref().workspace_picker_active();
+        // A shown float covers the tiled panes, so only its edges resize.
+        let resizable = if floating_active {
+            let rect = self.floating_rect_for(content);
+            pane_resize::Resizable::Float {
+                rect,
+                inner: floating_style.content_rect(rect),
+            }
+        } else {
+            pane_resize::Resizable::Panes
+        };
+        let resizing = self.resize_with_mouse(ui, content, &style, resizable, !picker_active);
         let rects = self.workspace().rectangles(content, &style);
-        if resize_enabled && !resizing {
+        if !floating_active && !picker_active && !resizing {
             if let Some(pos) = ui.input(|i| {
                 if i.pointer.any_pressed() {
                     i.pointer.interact_pos()
@@ -1328,7 +1339,7 @@ impl TerminalView {
                 }
             }
         }
-        let floating_rect = Self::floating_rect(content, self.floating_padding);
+        let floating_rect = self.floating_rect_for(content);
         let floating_inner = floating_style.content_rect(floating_rect);
         let visible = self.floats().visible();
         for p in &mut self.floating.entries {
