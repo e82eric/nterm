@@ -270,12 +270,32 @@ fn parse_builtin_table(
     let mlua::Value::Table(base) = lua.to_value(&defaults).map_err(|e| e.to_string())? else {
         unreachable!("builtin defaults are a table")
     };
+    let mut line_numbers = None;
     for pair in overrides.clone().pairs::<String, mlua::Value>() {
         let (field, value) = pair.map_err(|e| e.to_string())?;
         if field == "type" || field == "regex" || field == "prompts" {
             return Err(format!("builtin_pickers.{name}.{field} is built in"));
         }
+        // The built-in picker's preview is not spelled out in the config,
+        // so its `line_numbers` is set from beside it.
+        if field == "preview_line_numbers" {
+            line_numbers = Some(value);
+            continue;
+        }
         base.raw_set(field, value).map_err(|e| e.to_string())?;
+    }
+    if let Some(line_numbers) = line_numbers {
+        let Some(preview) = base
+            .get::<_, Option<mlua::Table>>("preview")
+            .map_err(|e| e.to_string())?
+        else {
+            return Err(format!(
+                "builtin_pickers.{name}.preview_line_numbers: {name} has no preview"
+            ));
+        };
+        preview
+            .raw_set("line_numbers", line_numbers)
+            .map_err(|e| e.to_string())?;
     }
     parse_picker_table(lua, &format!("builtin.{name}"), &base)
 }
@@ -628,6 +648,12 @@ impl AppConfig {
         config.builtin_pickers.validate()?;
         config.workspaces.appearance.validate()?;
         config.picker_defaults.validate()?;
+        // `line_break` is laid out apart from the pickers that resolve
+        // `picker_defaults`, so it takes the default here.
+        let line_break = &mut config.builtin_pickers.line_break;
+        line_break.preview_line_numbers = line_break
+            .preview_line_numbers
+            .or(config.picker_defaults.preview_line_numbers);
         config.keys = crate::picker::config::Keys {
             bindings: parsed_keys.unwrap_or_default(),
             disable_defaults: config.disable_default_keys,
@@ -1831,6 +1857,95 @@ mod tests {
     }
 
     #[test]
+    fn preview_line_numbers_come_from_the_preview_then_picker_defaults() {
+        use super::PickerContext;
+        use crate::picker::config::{Bindings, LineNumbers};
+        let line_numbers = |source: &str, picker: &str| -> Result<Option<LineNumbers>, String> {
+            let config = parse(source)?;
+            let bindings = Bindings::compile_with_actions(
+                config.pickers,
+                config.keys,
+                config.picker_defaults,
+                config.actions,
+            )?;
+            let options = bindings
+                .named(picker)
+                .ok_or("missing picker")?
+                .resolve(&PickerContext::default())?;
+            Ok(options.preview.as_ref().and_then(|p| p.line_numbers()))
+        };
+        let custom = |preview: &str, defaults: &str| {
+            format!(
+                "return {{picker_defaults={{{defaults}}}, pickers={{x={{type='Items',items=nterm.json_parse('[]'),preview={{type='Text',text='{{item}}'{preview}}}}}}}}}"
+            )
+        };
+        // Unset everywhere: no numbers.
+        assert_eq!(line_numbers(&custom("", ""), "x"), Ok(None));
+        // The preview's own setting.
+        assert_eq!(
+            line_numbers(&custom(",line_numbers='Relative'", ""), "x"),
+            Ok(Some(LineNumbers::Relative))
+        );
+        // picker_defaults fills it in, and the preview's own wins.
+        let defaults = "preview_line_numbers='Absolute'";
+        assert_eq!(
+            line_numbers(&custom("", defaults), "x"),
+            Ok(Some(LineNumbers::Absolute))
+        );
+        assert_eq!(
+            line_numbers(&custom(",line_numbers='Hybrid'", defaults), "x"),
+            Ok(Some(LineNumbers::Hybrid))
+        );
+        // Built-in pickers take it from beside their preview.
+        assert_eq!(
+            line_numbers(
+                "return {builtin_pickers={lines={preview_line_numbers='Hybrid'}}}",
+                "builtin.lines"
+            ),
+            Ok(Some(LineNumbers::Hybrid))
+        );
+        assert_eq!(
+            line_numbers(
+                "return {picker_defaults={preview_line_numbers='Relative'}}",
+                "builtin.lines"
+            ),
+            Ok(Some(LineNumbers::Relative))
+        );
+        // line_break has its own setting, defaulting to picker_defaults.
+        let config = parse(
+            "return {picker_defaults={preview_line_numbers='Relative'}, builtin_pickers={line_break={preview_visible=false}}}",
+        )
+        .unwrap();
+        assert_eq!(
+            config.builtin_pickers.line_break.preview_line_numbers,
+            Some(LineNumbers::Relative)
+        );
+        let config = parse(
+            "return {picker_defaults={preview_line_numbers='Relative'}, builtin_pickers={line_break={preview_line_numbers='Off'}}}",
+        )
+        .unwrap();
+        assert_eq!(
+            config.builtin_pickers.line_break.preview_line_numbers,
+            Some(LineNumbers::Off)
+        );
+        // Unknown styles, and built-in pickers without a preview, are errors.
+        for (source, message) in [
+            (custom(",line_numbers='Sideways'", ""), "Sideways"),
+            (
+                "return {picker_defaults={preview_line_numbers='Sideways'}}".into(),
+                "Sideways",
+            ),
+            (
+                "return {builtin_pickers={themes={preview_line_numbers='Absolute'}}}".into(),
+                "themes has no preview",
+            ),
+        ] {
+            let error = line_numbers(&source, "x").unwrap_err();
+            assert!(error.contains(message), "{source}: {error}");
+        }
+    }
+
+    #[test]
     fn builtin_picker_overrides_are_partial_and_validated() {
         let config = parse("return { builtin_pickers = { line_break = { preview_visible = false, position = 'Center', result_rows = 5, preview_rows = 8 } } }").unwrap();
         let settings = config.builtin_pickers.line_break;
@@ -2192,7 +2307,7 @@ mod tests {
                 .resolve(&PickerContext::default())
                 .unwrap()
                 .preview,
-            Some(crate::picker::config::Preview::Scrollback { rows: 12 })
+            Some(crate::picker::config::Preview::Scrollback { rows: 12, .. })
         ));
         assert!(bindings.named("missing").is_none());
         // Without pickers or keys, the default shortcuts open the built-ins.
@@ -3220,7 +3335,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             options.preview,
-            Some(crate::picker::config::Preview::Scrollback { rows: 8 })
+            Some(crate::picker::config::Preview::Scrollback { rows: 8, .. })
         ));
         for source in [
             "return {pickers={x={type='FileSystem', preview={type='Scrollback'}}}}",

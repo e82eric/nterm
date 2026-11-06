@@ -672,6 +672,44 @@ Set `preview_visible = false` on any picker definition to start with its
 preview hidden. The default is `true`. While the picker is open, Ctrl+P
 toggles the preview, and Ctrl+PageUp or Ctrl+PageDown scrolls it by half a page.
 
+### Line numbers
+
+Set `line_numbers` inside a picker's preview table to show line numbers in a
+gutter beside the preview:
+
+```lua
+preview = {
+  type = "Command",
+  args = { "bat", "--color=always", "{item}" },
+  line_numbers = "Relative",
+},
+```
+
+| `line_numbers` | Gutter |
+|---|---|
+| `"Off"` | none (the default) |
+| `"Absolute"` | one-based line numbers |
+| `"Relative"` | each line's distance from the copy cursor while the preview is focused; absolute numbers otherwise |
+| `"Hybrid"` | relative numbers with the cursor line's own number, like Vim's `number` and `relativenumber` together |
+
+Numbers count logical lines: rows a long line wraps onto are left blank.
+Every preview type accepts it. Previews that leave it unset use
+`picker_defaults.preview_line_numbers`. Built-in pickers with a preview
+(`lines`, `words`, `prompts`) and `line_break` take a flat
+`preview_line_numbers` instead, since their preview is not spelled out in the
+config:
+
+```lua
+picker_defaults = { preview_line_numbers = "Absolute" },
+builtin_pickers = {
+  lines = { preview_line_numbers = "Hybrid" },
+  line_break = { preview_line_numbers = "Off" },
+},
+```
+
+Ctrl+Shift+L toggles line numbers in an open picker, starting from its
+configured style, unless the picker binds that key itself.
+
 ## Custom selection callbacks
 
 A picker can define local Lua keybindings in `keys`. They take precedence over

@@ -37,6 +37,7 @@ pub(crate) struct BuiltinPresentation {
     pub(crate) preview_visible: Option<bool>,
     pub(crate) result_rows: Option<usize>,
     pub(crate) preview_rows: Option<usize>,
+    pub(crate) preview_line_numbers: Option<LineNumbers>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -79,19 +80,52 @@ impl Sort {
     }
 }
 
+/// How a preview numbers its lines in a gutter: `line_numbers` in a
+/// `preview` table. Numbers count logical lines; wrapped rows are blank.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) enum LineNumbers {
+    #[default]
+    Off,
+    /// One-based line numbers.
+    Absolute,
+    /// Distance from the copy cursor's line while the preview is focused,
+    /// absolute numbers otherwise.
+    Relative,
+    /// Relative numbers with the cursor line's own number, like Vim's
+    /// `number` and `relativenumber` together.
+    Hybrid,
+}
+
+impl LineNumbers {
+    pub(crate) fn style(self) -> nfm_egui::PreviewLineNumbers {
+        match self {
+            Self::Off => nfm_egui::PreviewLineNumbers::Off,
+            Self::Absolute => nfm_egui::PreviewLineNumbers::Absolute,
+            Self::Relative => nfm_egui::PreviewLineNumbers::Relative,
+            Self::Hybrid => nfm_egui::PreviewLineNumbers::Hybrid,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub(crate) enum Preview {
     Text {
+        #[serde(default)]
+        line_numbers: Option<LineNumbers>,
         text: String,
         /// Wrap at the preview width without inserting hard line breaks.
         #[serde(default)]
         wrap: bool,
     },
     Ansi {
+        #[serde(default)]
+        line_numbers: Option<LineNumbers>,
         text: String,
     },
     Dynamic {
+        #[serde(default)]
+        line_numbers: Option<LineNumbers>,
         #[serde(skip)]
         resolve: Option<std::rc::Rc<crate::lua_callbacks::PreviewResolver>>,
         #[serde(default)]
@@ -100,10 +134,14 @@ pub(crate) enum Preview {
         max_scrollback_lines: Option<usize>,
     },
     Scrollback {
+        #[serde(default)]
+        line_numbers: Option<LineNumbers>,
         #[serde(default = "default_preview_rows")]
         rows: usize,
     },
     Command {
+        #[serde(default)]
+        line_numbers: Option<LineNumbers>,
         #[serde(default)]
         args: Vec<String>,
         #[serde(default)]
@@ -130,11 +168,33 @@ pub(crate) fn file_syntax(value: &str) -> nfm_preview_file::SyntaxChoice {
 }
 
 impl Preview {
+    /// The preview's `line_numbers`, or `None` when unset.
+    pub(crate) fn line_numbers(&self) -> Option<LineNumbers> {
+        match self {
+            Self::Text { line_numbers, .. }
+            | Self::Ansi { line_numbers, .. }
+            | Self::Dynamic { line_numbers, .. }
+            | Self::Scrollback { line_numbers, .. }
+            | Self::Command { line_numbers, .. } => *line_numbers,
+        }
+    }
+
+    fn line_numbers_mut(&mut self) -> &mut Option<LineNumbers> {
+        match self {
+            Self::Text { line_numbers, .. }
+            | Self::Ansi { line_numbers, .. }
+            | Self::Dynamic { line_numbers, .. }
+            | Self::Scrollback { line_numbers, .. }
+            | Self::Command { line_numbers, .. } => line_numbers,
+        }
+    }
+
     fn validate(&self) -> Result<(), String> {
         if let Self::Dynamic {
             resolve,
             max_bytes,
             max_scrollback_lines,
+            ..
         } = self
         {
             validate_preview_limits(*max_bytes, *max_scrollback_lines)?;
@@ -145,7 +205,7 @@ impl Preview {
                 return Err("Dynamic preview requires a resolve function".into());
             }
         }
-        if let Self::Scrollback { rows } = self {
+        if let Self::Scrollback { rows, .. } = self {
             if !(1..=12).contains(rows) {
                 return Err("scrollback preview rows must be between 1 and 12".into());
             }
@@ -155,6 +215,7 @@ impl Preview {
             cwd,
             max_bytes,
             max_scrollback_lines,
+            ..
         } = self
         {
             validate_preview_limits(*max_bytes, *max_scrollback_lines)?;
@@ -186,6 +247,8 @@ pub(crate) struct PickerDefaults {
     pub(crate) unique: bool,
     pub(crate) preview_max_bytes: Option<usize>,
     pub(crate) preview_max_scrollback_lines: Option<usize>,
+    /// `line_numbers` for previews that do not set it.
+    pub(crate) preview_line_numbers: Option<LineNumbers>,
 }
 
 fn validate_preview_limits(bytes: Option<usize>, lines: Option<usize>) -> Result<(), String> {
@@ -443,6 +506,10 @@ impl Definition {
                     .or(defaults.preview_max_scrollback_lines)
                     .unwrap_or(8192),
             );
+        }
+        if let Some(preview) = &mut preview {
+            let line_numbers = preview.line_numbers_mut();
+            *line_numbers = line_numbers.or(defaults.preview_line_numbers);
         }
         if let Some(preview) = &preview {
             preview

@@ -140,6 +140,7 @@ fn options_from_records(
     options.enter_action = config::EnterAction::Close;
     options.label = Some("MESSAGES");
     options.preview = Some(config::Preview::Text {
+        line_numbers: None,
         text: "{item}".into(),
         wrap: true,
     });

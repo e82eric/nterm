@@ -43,7 +43,13 @@ pub(crate) struct Picker {
     enter_action: config::EnterAction,
     source: PickerSource,
     split_parent: Option<(PickerSource, String)>,
-    split_parent_presentation: Option<(config::Position, usize, usize, bool)>,
+    split_parent_presentation: Option<(
+        config::Position,
+        usize,
+        usize,
+        bool,
+        nfm_egui::PreviewLineNumbers,
+    )>,
     pub(crate) builtin_pickers: config::BuiltinPickers,
     result_rows: usize,
     preview_rows: usize,
@@ -237,10 +243,16 @@ impl Picker {
             .preview
             .as_ref()
             .map_or(12, |preview| match preview {
-                config::Preview::Scrollback { rows } => *rows,
+                config::Preview::Scrollback { rows, .. } => *rows,
                 _ => 12,
             });
         let sort = options.sort.mode();
+        let line_numbers = options
+            .preview
+            .as_ref()
+            .and_then(config::Preview::line_numbers)
+            .unwrap_or_default()
+            .style();
         let result_rows = options.result_rows;
         let label = options.label.unwrap_or_else(|| source.label());
         let accept_on_click = label == "GHOSTTY THEMES";
@@ -254,10 +266,11 @@ impl Picker {
                 result_rows,
                 accept_on_click,
                 preview_rows: options.preview.as_ref().map_or(12, |p| match p {
-                    config::Preview::Scrollback { rows } => *rows,
+                    config::Preview::Scrollback { rows, .. } => *rows,
                     _ => 12,
                 }),
                 preview_visible: options.preview_visible,
+                preview_line_numbers: line_numbers,
                 sort: options.sort.mode(),
                 ..Default::default()
             },
@@ -269,6 +282,7 @@ impl Picker {
                 std::mem::swap(&mut shared, &mut previous.shared);
                 shared.replace_source(&ctx, source.provider(), initial_query);
                 shared.set_presentation(result_rows, preview_rows, options.preview_visible);
+                shared.set_preview_line_numbers(line_numbers);
                 shared.set_external_preview(false);
                 shared.set_keybinding_help(Vec::new());
                 shared.set_preview_provider(
@@ -289,8 +303,10 @@ impl Picker {
                 None
             };
         let complete_preview = match &options.preview {
-            Some(config::Preview::Text { text, wrap: true }) => Some((text.clone(), true)),
-            Some(config::Preview::Ansi { text }) => Some((text.clone(), false)),
+            Some(config::Preview::Text {
+                text, wrap: true, ..
+            }) => Some((text.clone(), true)),
+            Some(config::Preview::Ansi { text, .. }) => Some((text.clone(), false)),
             _ => None,
         };
         let nfm_preview = snapshot_preview.is_some() || complete_preview.is_some();
@@ -315,7 +331,10 @@ impl Picker {
                 )),
             );
         }
-        if let Some(config::Preview::Text { text, wrap: false }) = &options.preview {
+        if let Some(config::Preview::Text {
+            text, wrap: false, ..
+        }) = &options.preview
+        {
             let text = text.clone();
             let value = source.preview_value_resolver();
             shared.set_preview_provider(
@@ -573,13 +592,14 @@ impl Picker {
                 self.shared.replace_source(ctx, source.provider(), query);
                 self.source = source;
                 self.line_split = false;
-                if let Some((position, results, previews, visible)) =
+                if let Some((position, results, previews, visible, line_numbers)) =
                     self.split_parent_presentation.take()
                 {
                     self.position = position;
                     self.result_rows = results;
                     self.preview_rows = previews;
                     self.shared.set_presentation(results, previews, visible);
+                    self.shared.set_preview_line_numbers(line_numbers);
                 }
                 self.refresh_scrollback_preview(ctx);
                 self.set_keybinding_help(vec![("Ctrl+B".into(), "Split selected line".into())]);
@@ -790,6 +810,7 @@ impl Picker {
             self.result_rows,
             self.preview_rows,
             self.shared.preview_visible(),
+            self.shared.preview_line_numbers(),
         ));
         let query = self.shared.query().to_owned();
         self.shared.replace_source(ctx, source.provider(), "");
@@ -817,6 +838,8 @@ impl Picker {
             self.preview_rows,
             settings.preview_visible.unwrap_or(true),
         );
+        self.shared
+            .set_preview_line_numbers(settings.preview_line_numbers.unwrap_or_default().style());
     }
     fn refresh_scrollback_preview(&mut self, ctx: &egui::Context) {
         if let Some(previous) = self.snapshot_preview.take() {
@@ -858,7 +881,10 @@ impl Picker {
             config::Options {
                 keys: Vec::new(),
                 source: config::Source::CommandPalette(vec![]),
-                preview: Some(config::Preview::Scrollback { rows: 12 }),
+                preview: Some(config::Preview::Scrollback {
+                    rows: 12,
+                    line_numbers: None,
+                }),
                 enter_action: config::EnterAction::SendInput,
                 ..Default::default()
             },

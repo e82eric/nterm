@@ -111,6 +111,7 @@ impl ResolvedPreview {
             resolve: Some(resolve),
             max_bytes,
             max_scrollback_lines,
+            ..
         } = &self.source
         {
             if let Some(worker) = &resolve.worker {
@@ -200,6 +201,7 @@ impl CommandPreview {
             cwd,
             max_bytes,
             max_scrollback_lines,
+            ..
         } = &self.source
         else {
             return;

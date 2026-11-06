@@ -170,6 +170,7 @@ fn text_preview_wrap_copy_preserves_hard_breaks_and_unicode() {
                     provider: None,
                 }),
                 preview: Some(config::Preview::Text {
+                    line_numbers: None,
                     text: text.clone(),
                     wrap,
                 }),
@@ -293,6 +294,7 @@ fn git_module_preview(
                 provider: None,
             }),
             preview: Some(config::Preview::Dynamic {
+                line_numbers: None,
                 resolve: Some(resolver),
                 max_bytes: None,
                 max_scrollback_lines: None,
@@ -434,6 +436,7 @@ fn lua_preview_worker_cancels_busy_lua_and_retains_helpers_and_closures() {
                 provider: None,
             }),
             preview: Some(config::Preview::Dynamic {
+                line_numbers: None,
                 resolve: Some(resolver),
                 max_bytes: Some(4096),
                 max_scrollback_lines: Some(100),
@@ -529,6 +532,7 @@ fn dynamic_preview_survives_stream_publications_before_completion() {
                 provider: None,
             }),
             preview: Some(config::Preview::Dynamic {
+                line_numbers: None,
                 resolve: Some(worker_resolver(
                     "function(item) calls=(calls or 0)+1; return {type='Text',text='preview call '..calls} end",
                 )),
@@ -643,6 +647,7 @@ fn named_stream_feeds_configured_preview_and_returns_item() {
                 provider: None,
             }),
             preview: Some(config::Preview::Dynamic {
+                line_numbers: None,
                 resolve: Some(worker_resolver(
                     "function(item) return {type='Text',text='help for '..item.value} end",
                 )),
@@ -883,6 +888,7 @@ fn command_preview_runs_through_nfm_using_the_accepted_value_and_cwd() {
                 provider: None,
             }),
             preview: Some(config::Preview::Command {
+                line_numbers: None,
                 max_bytes: None,
                 max_scrollback_lines: None,
                 args: vec![
@@ -936,6 +942,7 @@ fn lua_command_preview_resolves_once_and_nfm_owns_centering_paging_and_selection
                 provider: None,
             }),
             preview: Some(config::Preview::Dynamic {
+                line_numbers: None,
                 resolve: Some(command),
                 max_bytes: None,
                 max_scrollback_lines: None,
@@ -1032,6 +1039,7 @@ fn complete_preview_uses_accepted_value_and_nfm_paging_and_copy() {
                 provider: None,
             }),
             preview: Some(config::Preview::Ansi {
+                line_numbers: None,
                 text: "\x1b[31m{item}\nsecond".into(),
             }),
             ..Default::default()
@@ -1145,6 +1153,7 @@ fn native_file_preview_callback_centers_pages_caches_and_copies_original_text() 
                 provider: None,
             }),
             preview: Some(config::Preview::Dynamic {
+                line_numbers: None,
                 resolve: Some(file),
                 max_bytes: None,
                 max_scrollback_lines: None,
@@ -1227,6 +1236,7 @@ fn dynamic_preview_switches_between_native_file_image_and_text_and_caches_comman
                 provider: None,
             }),
             preview: Some(config::Preview::Dynamic {
+                line_numbers: None,
                 resolve: Some(resolve),
                 max_bytes: Some(1024 * 1024),
                 max_scrollback_lines: Some(100),
@@ -1647,6 +1657,7 @@ fn replace_picker_from_accept_and_local_key_resets_source_and_callbacks() {
             }),
             enter_action: config::EnterAction::SendInput,
             preview: Some(config::Preview::Text {
+                line_numbers: None,
                 text: "new preview".into(),
                 wrap: true,
             }),
@@ -1719,8 +1730,11 @@ fn line_split_search_copy_accept_and_return_keep_document_coordinates() {
         preview_visible: Some(false),
         result_rows: Some(5),
         preview_rows: Some(8),
+        preview_line_numbers: Some(config::LineNumbers::Hybrid),
     };
     let original_preview_visible = picker.shared.preview_visible();
+    let original_line_numbers = picker.shared.preview_line_numbers();
+    assert_eq!(original_line_numbers, nfm_egui::PreviewLineNumbers::Off);
     let source = PickerSource::split_candidates(vec![SplitCandidate {
         text: "file name.txt".into(),
         row: 31,
@@ -1730,6 +1744,10 @@ fn line_split_search_copy_accept_and_return_keep_document_coordinates() {
     picker.enter_line_split(&ctx, source);
     assert_eq!(picker.position, config::Position::Center);
     assert!(!picker.shared.preview_visible());
+    assert_eq!(
+        picker.shared.preview_line_numbers(),
+        nfm_egui::PreviewLineNumbers::Hybrid
+    );
     assert_eq!((picker.result_rows, picker.preview_rows), (5, 8));
     let selected = wait_selection(&ctx, &mut picker);
     assert_eq!(selected.text, "file name.txt");
@@ -1758,6 +1776,7 @@ fn line_split_search_copy_accept_and_return_keep_document_coordinates() {
     assert!(picker.split_parent.is_none());
     assert_eq!(picker.position, config::Position::Top);
     assert_eq!(picker.shared.preview_visible(), original_preview_visible);
+    assert_eq!(picker.shared.preview_line_numbers(), original_line_numbers);
     assert_eq!((picker.result_rows, picker.preview_rows), (RESULT_ROWS, 12));
     assert_eq!(picker.shared.query(), original_query);
 }
@@ -2010,6 +2029,7 @@ fn preview_toggle_and_help_use_shared_control() {
                 provider: None,
             }),
             preview: Some(config::Preview::Text {
+                line_numbers: None,
                 text: "Preview {item}".into(),
                 wrap: false,
             }),
@@ -2235,4 +2255,53 @@ fn picker_double_click_override_receives_item_and_stays_open() {
             assert!(picker.shared.is_closed());
         }
     }
+}
+
+#[test]
+fn preview_line_numbers_apply_when_a_picker_opens_or_is_replaced() {
+    let ctx = egui::Context::default();
+    let options = |line_numbers| config::Options {
+        source: config::Source::Items(config::ItemsOptions {
+            values: vec![wire::Item {
+                text: "item".into(),
+                value: "item".into(),
+            }],
+            provider: None,
+        }),
+        preview: Some(config::Preview::Text {
+            line_numbers,
+            text: "{item}".into(),
+            wrap: false,
+        }),
+        ..Default::default()
+    };
+    let start = |line_numbers, previous| {
+        Picker::start_replacing(
+            std::ptr::null_mut(),
+            None,
+            false,
+            0,
+            ctx.clone(),
+            options(line_numbers),
+            &Default::default(),
+            previous,
+        )
+    };
+    let first = start(Some(config::LineNumbers::Relative), None);
+    assert_eq!(
+        first.shared.preview_line_numbers(),
+        nfm_egui::PreviewLineNumbers::Relative
+    );
+    // A replacement that reuses the control takes the new picker's style,
+    // and an unset one turns numbers off.
+    let second = start(Some(config::LineNumbers::Absolute), Some(first));
+    assert_eq!(
+        second.shared.preview_line_numbers(),
+        nfm_egui::PreviewLineNumbers::Absolute
+    );
+    let third = start(None, Some(second));
+    assert_eq!(
+        third.shared.preview_line_numbers(),
+        nfm_egui::PreviewLineNumbers::Off
+    );
 }
