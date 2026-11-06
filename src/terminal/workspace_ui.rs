@@ -1,5 +1,6 @@
 use super::{
     PaneRef, TerminalView, floating, pane_resize,
+    resize_keys::{self, KeyOverlay},
     workspace::{self, Layout, Request, Workspace},
 };
 use crate::{actions::AppAction, graphics as glow};
@@ -74,6 +75,14 @@ pub(crate) enum WorkspaceAction {
     MoveRight,
     MoveUp,
     MoveDown,
+    /// Moves the focused pane as far as it goes that way; with a float shown,
+    /// moves the float to that edge of the workspace.
+    MoveFarLeft,
+    MoveFarRight,
+    MoveFarUp,
+    MoveFarDown,
+    /// Centres the shown float in the workspace, keeping its size.
+    CenterFloat,
     MoveToMain,
     /// Floats the focused tiled pane, or tiles the visible float.
     FloatOrTilePane,
@@ -84,10 +93,16 @@ pub(crate) enum WorkspaceAction {
     SetGrid,
     SetHorizontalGrid,
     ResetLayout,
+    /// Moves a divider; with a float shown, its left or top edge.
     ResizeLeft,
     ResizeRight,
     ResizeUp,
     ResizeDown,
+    /// Like `Resize*`, but with a float shown, moves its right or bottom edge.
+    ResizeFarLeft,
+    ResizeFarRight,
+    ResizeFarUp,
+    ResizeFarDown,
 }
 impl WorkspaceAction {
     /// The actions without an index argument, in command palette order.
@@ -111,6 +126,11 @@ impl WorkspaceAction {
         Self::MoveRight,
         Self::MoveUp,
         Self::MoveDown,
+        Self::MoveFarLeft,
+        Self::MoveFarRight,
+        Self::MoveFarUp,
+        Self::MoveFarDown,
+        Self::CenterFloat,
         Self::MoveToMain,
         Self::FloatOrTilePane,
         Self::SetTile,
@@ -124,6 +144,10 @@ impl WorkspaceAction {
         Self::ResizeRight,
         Self::ResizeUp,
         Self::ResizeDown,
+        Self::ResizeFarLeft,
+        Self::ResizeFarRight,
+        Self::ResizeFarUp,
+        Self::ResizeFarDown,
     ];
     /// Parses a config name, including `SelectWorkspace:N` and
     /// `MoveToWorkspace:N` with N >= 1, and the old `SetHorizontalDeck` name.
@@ -170,6 +194,11 @@ impl WorkspaceAction {
             MoveRight => "MoveRight".into(),
             MoveUp => "MoveUp".into(),
             MoveDown => "MoveDown".into(),
+            MoveFarLeft => "MoveFarLeft".into(),
+            MoveFarRight => "MoveFarRight".into(),
+            MoveFarUp => "MoveFarUp".into(),
+            MoveFarDown => "MoveFarDown".into(),
+            CenterFloat => "CenterFloat".into(),
             MoveToMain => "MoveToMain".into(),
             FloatOrTilePane => "FloatOrTilePane".into(),
             SetTile => "SetTile".into(),
@@ -183,6 +212,10 @@ impl WorkspaceAction {
             ResizeRight => "ResizeRight".into(),
             ResizeUp => "ResizeUp".into(),
             ResizeDown => "ResizeDown".into(),
+            ResizeFarLeft => "ResizeFarLeft".into(),
+            ResizeFarRight => "ResizeFarRight".into(),
+            ResizeFarUp => "ResizeFarUp".into(),
+            ResizeFarDown => "ResizeFarDown".into(),
         }
     }
     /// The name in sentence case, matching the other palette entries, e.g.
@@ -201,6 +234,52 @@ impl WorkspaceAction {
         }
         label
     }
+    /// The `Far` version of a `Resize*` or `Move*` action, which a key
+    /// table's `far` modifier runs in its place.
+    pub(crate) fn far(self) -> Option<Self> {
+        use WorkspaceAction::*;
+        Some(match self {
+            ResizeLeft => ResizeFarLeft,
+            ResizeRight => ResizeFarRight,
+            ResizeUp => ResizeFarUp,
+            ResizeDown => ResizeFarDown,
+            MoveLeft => MoveFarLeft,
+            MoveRight => MoveFarRight,
+            MoveUp => MoveFarUp,
+            MoveDown => MoveFarDown,
+            _ => return None,
+        })
+    }
+    /// Whether this is one of the `Resize*` or `ResizeFar*` actions.
+    pub(crate) fn is_resize(self) -> bool {
+        use WorkspaceAction::*;
+        matches!(
+            self,
+            ResizeLeft
+                | ResizeRight
+                | ResizeUp
+                | ResizeDown
+                | ResizeFarLeft
+                | ResizeFarRight
+                | ResizeFarUp
+                | ResizeFarDown
+        )
+    }
+    /// Whether this is one of the `Move*` or `MoveFar*` actions.
+    pub(crate) fn is_move(self) -> bool {
+        use WorkspaceAction::*;
+        matches!(
+            self,
+            MoveLeft
+                | MoveRight
+                | MoveUp
+                | MoveDown
+                | MoveFarLeft
+                | MoveFarRight
+                | MoveFarUp
+                | MoveFarDown
+        )
+    }
     /// Whether holding the key runs the action again on each auto-repeat.
     /// Navigation and resizing repeat; creating, closing and switching do
     /// not. Every variant is listed so a new action must choose.
@@ -208,7 +287,9 @@ impl WorkspaceAction {
         use WorkspaceAction::*;
         match self {
             FocusLeft | FocusRight | FocusUp | FocusDown | MoveLeft | MoveRight | MoveUp
-            | MoveDown | ResizeLeft | ResizeRight | ResizeUp | ResizeDown => true,
+            | MoveDown | MoveFarLeft | MoveFarRight | MoveFarUp | MoveFarDown | ResizeLeft
+            | ResizeRight | ResizeUp | ResizeDown | ResizeFarLeft | ResizeFarRight
+            | ResizeFarUp | ResizeFarDown => true,
             CreateWorkspace
             | RemoveWorkspace
             | WorkspacePicker
@@ -230,7 +311,8 @@ impl WorkspaceAction {
             | SetDeck
             | SetGrid
             | SetHorizontalGrid
-            | ResetLayout => false,
+            | ResetLayout
+            | CenterFloat => false,
         }
     }
 }
@@ -294,6 +376,72 @@ pub(crate) fn default_bindings() -> Vec<crate::picker::config::KeyBinding> {
         add(&key, true, MoveToWorkspace(index));
     }
     keys
+}
+/// The default `key_tables`, `resize` and `move`. Each leaves on Enter or
+/// Escape, and a config's table of the same name merges over it.
+///
+/// `resize`, entered with Ctrl+Shift+R: h/j/k/l or the arrows resize like
+/// `Resize*`, which with a float shown moves its left and top edges. Its
+/// `far` modifier is Shift, which makes them `ResizeFar*`, moving the right
+/// and bottom edges. `=` resets sizes like `ResetLayout`, and `m` switches
+/// to `move`.
+///
+/// `move`, entered with Ctrl+Shift+G: the same keys move like `Move*`,
+/// swapping the focused pane with its neighbour or moving the shown float;
+/// with Shift, `MoveFar*` moves it as far as it goes. `c` centres a float
+/// like `CenterFloat`, and `r` switches to `resize`.
+///
+/// In both, Ctrl is the `nudge` modifier, for a much smaller step, and Alt
+/// with those keys moves focus like `Focus*`, to pick another pane, or with
+/// a float shown, cycles the floats.
+pub(crate) fn default_key_tables()
+-> std::collections::BTreeMap<String, crate::picker::config::KeyTable> {
+    use crate::config::keybindings::{BindingTrigger, KeyBinding, parse_key};
+    use crate::picker::config::{BindingTarget, KeyTable};
+    use WorkspaceAction::*;
+    let binding = |key: &str, mods: egui::Modifiers, action: AppAction| KeyBinding {
+        trigger: BindingTrigger::Key(parse_key(key).unwrap()),
+        mods,
+        description: String::new(),
+        action: BindingTarget::Action(action),
+    };
+    let none = egui::Modifiers::NONE;
+    let alt = egui::Modifiers::ALT;
+    let enter = |name: &str| AppAction::EnterKeyTable(name.to_owned());
+    let mut resize = vec![
+        binding("Enter", none, AppAction::ExitKeyTable),
+        binding("=", none, AppAction::Workspace(ResetLayout)),
+        binding("m", none, enter("move")),
+    ];
+    let mut moving = vec![
+        binding("Enter", none, AppAction::ExitKeyTable),
+        binding("c", none, AppAction::Workspace(CenterFloat)),
+        binding("r", none, enter("resize")),
+    ];
+    for (keys, focus, size, step) in [
+        (["h", "Left"], FocusLeft, ResizeLeft, MoveLeft),
+        (["j", "Down"], FocusDown, ResizeDown, MoveDown),
+        (["k", "Up"], FocusUp, ResizeUp, MoveUp),
+        (["l", "Right"], FocusRight, ResizeRight, MoveRight),
+    ] {
+        for key in keys {
+            resize.push(binding(key, none, AppAction::Workspace(size)));
+            moving.push(binding(key, none, AppAction::Workspace(step)));
+            for table in [&mut resize, &mut moving] {
+                table.push(binding(key, alt, AppAction::Workspace(focus)));
+            }
+        }
+    }
+    let table = |keys| KeyTable {
+        keys,
+        far: Some(egui::Modifiers::SHIFT),
+        nudge: Some(egui::Modifiers::CTRL),
+    };
+    [
+        ("resize".to_owned(), table(resize)),
+        ("move".to_owned(), table(moving)),
+    ]
+    .into()
 }
 pub(crate) fn install_lua_helpers(lua: &mlua::Lua, nterm: &mlua::Table) -> mlua::Result<()> {
     nterm.set(
@@ -943,11 +1091,27 @@ impl TerminalView {
                     w.weights_mut().clear();
                     w.floats.set_size(None);
                 }
-                ResizeLeft | ResizeRight | ResizeUp | ResizeDown => {
-                    self.workspace_mut().resize(
-                        matches!(action, ResizeLeft | ResizeRight),
-                        matches!(action, ResizeRight | ResizeDown),
+                ResizeLeft | ResizeRight | ResizeUp | ResizeDown | ResizeFarLeft
+                | ResizeFarRight | ResizeFarUp | ResizeFarDown => {
+                    let horizontal = matches!(
+                        action,
+                        ResizeLeft | ResizeRight | ResizeFarLeft | ResizeFarRight
                     );
+                    let forward = matches!(
+                        action,
+                        ResizeRight | ResizeDown | ResizeFarRight | ResizeFarDown
+                    );
+                    let far = matches!(
+                        action,
+                        ResizeFarLeft | ResizeFarRight | ResizeFarUp | ResizeFarDown
+                    );
+                    // A shown float covers the tiled panes, so its edges move.
+                    // A key table's nudge modifier makes a small step.
+                    let nudge = std::mem::take(&mut self.nudge_step);
+                    if !self.resize_float_with_keys(horizontal, far, forward, nudge) {
+                        self.workspace_mut()
+                            .resize_by(horizontal, far, forward, nudge);
+                    }
                 }
                 SetTile => self.workspace_mut().set_layout(Layout::Tile),
                 SetTileReversed => self.workspace_mut().set_layout(Layout::TileReversed),
@@ -955,8 +1119,11 @@ impl TerminalView {
                 SetDeck => self.workspace_mut().set_layout(Layout::Deck),
                 SetGrid => self.workspace_mut().set_layout(Layout::Grid),
                 SetHorizontalGrid => self.workspace_mut().set_layout(Layout::HorizontalGrid),
+                CenterFloat => self.center_float(),
                 FocusLeft | FocusRight | FocusUp | FocusDown | MoveLeft | MoveRight | MoveUp
-                | MoveDown => self.navigate(action, ctx),
+                | MoveDown | MoveFarLeft | MoveFarRight | MoveFarUp | MoveFarDown => {
+                    self.navigate(action, ctx)
+                }
             }
             Ok(())
         })();
@@ -968,29 +1135,41 @@ impl TerminalView {
     fn navigate(&mut self, action: WorkspaceAction, ctx: &egui::Context) {
         use super::layout::Motion;
         use WorkspaceAction::*;
-        let (motion, moving) = match action {
-            FocusLeft => (Motion::Left, false),
-            FocusRight => (Motion::Right, false),
-            FocusUp => (Motion::Up, false),
-            FocusDown => (Motion::Down, false),
-            MoveLeft => (Motion::Left, true),
-            MoveRight => (Motion::Right, true),
-            MoveUp => (Motion::Up, true),
-            MoveDown => (Motion::Down, true),
+        let (motion, moving, far) = match action {
+            FocusLeft => (Motion::Left, false, false),
+            FocusRight => (Motion::Right, false, false),
+            FocusUp => (Motion::Up, false, false),
+            FocusDown => (Motion::Down, false, false),
+            MoveLeft => (Motion::Left, true, false),
+            MoveRight => (Motion::Right, true, false),
+            MoveUp => (Motion::Up, true, false),
+            MoveDown => (Motion::Down, true, false),
+            MoveFarLeft => (Motion::Left, true, true),
+            MoveFarRight => (Motion::Right, true, true),
+            MoveFarUp => (Motion::Up, true, true),
+            MoveFarDown => (Motion::Down, true, true),
             _ => return,
         };
-        // While a float is shown, focus keys cycle the workspace's floats.
-        if !moving && self.floats().visible().is_some() {
-            let next = matches!(motion, Motion::Down | Motion::Right);
-            return self.floats_mut().cycle(next);
+        // While a float is shown, focus keys cycle the workspace's floats and
+        // move keys move it, as resize keys resize it.
+        if self.floats().visible().is_some() {
+            if moving {
+                let nudge = std::mem::take(&mut self.nudge_step);
+                self.move_float_with_keys(motion, far, nudge);
+            } else {
+                let next = matches!(motion, Motion::Down | Motion::Right);
+                self.floats_mut().cycle(next);
+            }
+            return;
         }
-        let rects = self.workspace().rectangles(
-            ctx.content_rect(),
-            &self.picker_bindings.workspace_appearance,
-        );
-        if self.workspace_mut().navigate(motion, moving, &rects) {
-            self.floats_mut().hide();
+        let bounds = ctx.content_rect();
+        let style = self.picker_bindings.workspace_appearance.clone();
+        if far {
+            self.workspace_mut().move_far(motion, bounds, &style);
+            return;
         }
+        let rects = self.workspace().rectangles(bounds, &style);
+        self.workspace_mut().navigate(motion, moving, &rects);
     }
     fn workspace_bar_detail(&self, font: &egui::FontId) -> egui::text::LayoutJob {
         let palette = crate::colors::palette();
@@ -1204,11 +1383,26 @@ impl TerminalView {
         if self.should_close() {
             return;
         }
-        let context = self.active_pane_ref().action_context();
-        let (shortcut, consumed) = ui.input_mut(|i| {
-            self.picker_bindings
-                .consume_when(&mut i.events, |a, m| context.allows(a, m))
-        });
+        // Leaving the window leaves a key table, so returning to it does not
+        // swallow typing unexpectedly.
+        if ui.input(|i| i.viewport().focused == Some(false)) {
+            self.key_table = None;
+        }
+        let (shortcut, consumed) = if let Some(table) = self.key_table.clone() {
+            let input = ui.input_mut(|i| self.picker_bindings.consume_table(&table, &mut i.events));
+            if input.exit {
+                self.key_table = None;
+            }
+            self.nudge_step = input.nudge;
+            (input.action, true)
+        } else {
+            self.nudge_step = false;
+            let context = self.active_pane_ref().action_context();
+            ui.input_mut(|i| {
+                self.picker_bindings
+                    .consume_when(&mut i.events, |a, m| context.allows(a, m))
+            })
+        };
         let shortcut = match shortcut {
             Some(a) if a.is_global() => {
                 self.execute_action(a, false, &ctx, gl);
@@ -1295,12 +1489,51 @@ impl TerminalView {
                 p.set_active(&ctx, false, focused_window);
             }
         }
+        // A key table that resizes or moves marks what its keys act on: the
+        // shown float, drawn with it, or else the focused pane. For resizing,
+        // the edges its keys move, the table's `far` modifier picking between
+        // two on the same axis; for moving, the sides it can move toward.
+        let modifiers = self
+            .key_table
+            .as_deref()
+            .map(|name| self.picker_bindings.key_table_modifiers(name))
+            .unwrap_or_default();
+        let held = ui.input(|i| i.modifiers);
+        let far = modifiers
+            .far
+            .is_some_and(|far| crate::config::keybindings::holds(held, far));
+        let focused_rect = rects.iter().find(|(id, _)| focus == Some(*id));
+        let floating_rect = self.floating_rect_for(content);
+        let overlay = if self.key_table_resizes() {
+            let edges = if floating_active {
+                resize_keys::float_resize_edges(far)
+            } else if let Some((id, r)) = focused_rect {
+                let dividers = self.workspace().dividers(content, &style);
+                resize_keys::tile_resize_edges(*r, *id, &dividers, far)
+            } else {
+                Vec::new()
+            };
+            KeyOverlay::Resize { edges, far }
+        } else if self.key_table_moves() {
+            let sides = if floating_active {
+                resize_keys::float_sides(floating_rect, content)
+            } else {
+                self.workspace().move_sides(&rects)
+            };
+            KeyOverlay::Move { sides }
+        } else {
+            KeyOverlay::None
+        };
+        // The resize and move overlay replaces the focus highlight, which is the same colour
+        // in some themes and would compete with them.
+        let overlaid = !overlay.is_none();
         for (id, r) in &rects {
             if r.width() < 1.0 || r.height() < 1.0 {
                 continue;
             }
             if style.inner_gap > 0.0 || style.outer_gap > 0.0 {
-                style.paint_frame(ui.painter(), *r, focus == Some(*id) && !floating_active);
+                let highlight = focus == Some(*id) && !floating_active && !overlaid;
+                style.paint_frame(ui.painter(), *r, highlight);
             }
             let padding = style
                 .padding
@@ -1320,6 +1553,19 @@ impl TerminalView {
                 });
             }
         }
+        if !overlay.is_none()
+            && !floating_active
+            && let Some((id, r)) = focused_rect
+        {
+            // Everything else recedes behind the pane the keys act on.
+            let others = rects.iter().filter(|(i, _)| i != id).map(|(_, r)| *r);
+            resize_keys::dim_others(ui.painter(), others, style.corner_radius);
+            overlay.paint(ui.painter(), *r, style.corner_radius, style.border_width);
+        }
+        let key_hints = self.key_table.as_deref().map_or_else(Vec::new, |name| {
+            let table = self.picker_bindings.key_table_keys(name);
+            resize_keys::hints(&table, modifiers, overlay.edges(), far, floating_active)
+        });
         // Layouts that hide panes show where the focused one sits among them.
         let w = self.workspace();
         let hides_panes = match w.layout {
@@ -1328,7 +1574,7 @@ impl TerminalView {
             _ => false,
         };
         if hides_panes && !floating_active {
-            if let Some((_, r)) = rects.iter().find(|(id, _)| focus == Some(*id)) {
+            if let Some((_, r)) = focused_rect {
                 Self::paint_pane_dots(ui.painter(), *r, w.pane_number(), w.panes.len());
             }
         }
@@ -1339,7 +1585,6 @@ impl TerminalView {
                 }
             }
         }
-        let floating_rect = self.floating_rect_for(content);
         let floating_inner = floating_style.content_rect(floating_rect);
         let visible = self.floats().visible();
         for p in &mut self.floating.entries {
@@ -1412,8 +1657,13 @@ impl TerminalView {
         if let Some(action) = action {
             self.execute_action(action, self.floats().visible().is_some(), &ctx, gl);
         }
-        self.show_mode_status(ui, status);
-        self.show_floating(ui, content, floating_rect, &floating_style);
+        self.show_mode_status(ui, status, &key_hints);
+        let float_overlay = if floating_active {
+            overlay
+        } else {
+            KeyOverlay::None
+        };
+        self.show_floating(ui, content, floating_rect, &floating_style, &float_overlay);
         for (_, p) in &self.tiled {
             p.drain_clipboard(&ctx);
         }

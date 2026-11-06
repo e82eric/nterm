@@ -544,6 +544,12 @@ impl TerminalPane {
         }
     }
 
+    /// The terminal's size in cells: columns, then rows.
+    pub(super) fn grid_size(&self) -> (u16, u16) {
+        let size = unsafe { ghostty_ffi::nterm_host_surface_size(self.host) };
+        (size.columns, size.rows)
+    }
+
     pub(super) fn resize(&mut self, rect: egui::Rect, scale: f32) -> bool {
         let size = [
             (rect.width() * scale).round().max(1.0) as u32,

@@ -30,6 +30,10 @@ pub(crate) enum AppAction {
     /// Enter copy mode if needed and scroll one row, like Ctrl+Y / Ctrl+E.
     ScrollLineUp,
     ScrollLineDown,
+    /// Make a `key_tables` entry the active keys until `ExitKeyTable` or
+    /// Escape: its keys run their actions and other keys are ignored.
+    EnterKeyTable(String),
+    ExitKeyTable,
     Lua(String),
 }
 
@@ -46,7 +50,11 @@ impl AppAction {
         if let Some(action) = WorkspaceAction::parse(name) {
             return Some(Self::Workspace(action));
         }
+        if let Some(table) = name.strip_prefix("EnterKeyTable:") {
+            return Some(Self::EnterKeyTable(table.to_owned()));
+        }
         Some(match name {
+            "ExitKeyTable" => Self::ExitKeyTable,
             "ReloadConfig" => Self::ReloadConfig,
             "NewWindow" => Self::NewWindow,
             "ShowMessages" => Self::ShowMessages,
@@ -81,6 +89,8 @@ impl AppAction {
                 | Self::RestoreFloatingPane(_)
                 | Self::CreateFloatingPane
                 | Self::ToggleFloatingPane
+                | Self::EnterKeyTable(_)
+                | Self::ExitKeyTable
         )
     }
 }
@@ -129,6 +139,8 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
         ("w", "CTRL|SHIFT", "ClosePane"),
         ("/", "CTRL|SHIFT", "OpenSearch"),
         ("m", "CTRL|SHIFT", "EnterCopyMode"),
+        ("r", "CTRL|SHIFT", "EnterKeyTable:resize"),
+        ("g", "CTRL|SHIFT", "EnterKeyTable:move"),
         ("Space", "ALT", "OpenQuickSelect"),
         ("ArrowUp", "CTRL|SHIFT", "PreviousCommand"),
         ("ArrowDown", "CTRL|SHIFT", "NextCommand"),
@@ -297,6 +309,15 @@ pub(crate) fn catalog(bindings: &Bindings, copying: bool) -> Vec<Entry> {
         },
         shortcut,
         action: AppAction::OpenPicker(name.to_owned()),
+    }));
+    entries.extend(bindings.key_table_names().map(|name| {
+        let action = AppAction::EnterKeyTable(name.to_owned());
+        Entry {
+            id: format!("key_table.{name}"),
+            label: format!("Enter key table: {name}"),
+            shortcut: bindings.shortcut_for(&action),
+            action,
+        }
     }));
     entries.extend(
         bindings

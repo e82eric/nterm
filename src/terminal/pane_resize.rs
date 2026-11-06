@@ -3,7 +3,7 @@
 //! and what moving one does; this module follows the pointer.
 use super::{
     TerminalView,
-    layout::{Axis, DividerAt, DividerId},
+    layout::{Axis, DividerAt, DividerId, Motion},
     workspace::Appearance,
 };
 use crate::config::FloatingPadding;
@@ -13,8 +13,13 @@ use egui::{CursorIcon, Pos2, Rect, Vec2, pos2};
 const FLOAT_GRIP_OUTSIDE: f32 = 6.0;
 /// How far along an edge from a corner grabs the corner.
 const FLOAT_CORNER: f32 = 16.0;
-/// The smallest the mouse makes a floating pane, when the workspace fits it.
+/// The smallest the mouse or keys make a floating pane, when the workspace
+/// fits it.
 const FLOAT_MINIMUM: Vec2 = egui::vec2(160.0, 80.0);
+/// How far one key press moves a floating pane's edge, as a share of the
+/// workspace along that axis, and how far when nudged.
+const FLOAT_KEY_STEP: f32 = 0.05;
+const FLOAT_NUDGE_KEY_STEP: f32 = 0.01;
 
 /// What the mouse can resize this frame.
 #[derive(Clone, Copy, Debug)]
@@ -55,7 +60,8 @@ fn hit(d: &DividerAt) -> Rect {
     }
 }
 
-/// The edges of a floating pane a grab moves: one, or two at a corner.
+/// Some edges of a pane: those a grab moves (one, or two at a corner), or
+/// those the resize keys move.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Edges {
     left: bool,
@@ -128,6 +134,80 @@ fn padding_for(rect: Rect, bounds: Rect) -> FloatingPadding {
         left: (rect.left() - bounds.left()) / width * 100.0,
         right: (bounds.right() - rect.right()) / width * 100.0,
     }
+}
+
+/// Moves one edge of `rect` one key step within `bounds`: the left or top
+/// edge, or with `far` the right or bottom one, `forward` meaning right or
+/// down, and with `nudge` a much smaller step. The same limits as dragging
+/// apply.
+fn step_float(
+    rect: Rect,
+    bounds: Rect,
+    horizontal: bool,
+    far: bool,
+    forward: bool,
+    nudge: bool,
+) -> Rect {
+    let edges = Edges {
+        left: horizontal && !far,
+        right: horizontal && far,
+        top: !horizontal && !far,
+        bottom: !horizontal && far,
+    };
+    let length = if horizontal {
+        bounds.width()
+    } else {
+        bounds.height()
+    };
+    let share = if nudge {
+        FLOAT_NUDGE_KEY_STEP
+    } else {
+        FLOAT_KEY_STEP
+    };
+    let step = share * length * if forward { 1.0 } else { -1.0 };
+    let offset = if horizontal {
+        egui::vec2(step, 0.0)
+    } else {
+        egui::vec2(0.0, step)
+    };
+    resize_float(rect, bounds, edges, edges.anchor(rect) + offset)
+}
+
+/// `rect` moved by the least that puts it inside `bounds`; it must fit.
+fn keep_inside(rect: Rect, bounds: Rect) -> Rect {
+    let push =
+        |low: f32, high: f32, min: f32, max: f32| (min - low).max(0.0) + (max - high).min(0.0);
+    rect.translate(egui::vec2(
+        push(rect.left(), rect.right(), bounds.left(), bounds.right()),
+        push(rect.top(), rect.bottom(), bounds.top(), bounds.bottom()),
+    ))
+}
+
+/// Moves `rect`, keeping its size, one key step toward `motion` within
+/// `bounds`, with `nudge` a much smaller step, or with `far` against that
+/// edge of `bounds`.
+fn shift_float(rect: Rect, bounds: Rect, motion: Motion, far: bool, nudge: bool) -> Rect {
+    let rect = Rect::from_min_size(rect.min, rect.size().min(bounds.size()));
+    let horizontal = matches!(motion, Motion::Left | Motion::Right);
+    let length = if horizontal {
+        bounds.width()
+    } else {
+        bounds.height()
+    };
+    let share = if nudge {
+        FLOAT_NUDGE_KEY_STEP
+    } else {
+        FLOAT_KEY_STEP
+    };
+    // Far enough to reach the edge from anywhere; `keep_inside` stops it.
+    let step = if far { length } else { share * length };
+    let step = if motion.backwards() { -step } else { step };
+    let offset = if horizontal {
+        egui::vec2(step, 0.0)
+    } else {
+        egui::vec2(0.0, step)
+    };
+    keep_inside(rect.translate(offset), bounds)
 }
 
 /// What a drag holds, and where on it the pointer grabbed, so it does not
@@ -209,6 +289,53 @@ impl TerminalView {
             });
         }
         owned
+    }
+
+    /// Moves an edge of the shown floating pane one key step, or with
+    /// `nudge` a small one, as the `Resize*` and `ResizeFar*` actions do.
+    /// Returns whether a float is shown; if not, the keys resize the tiled
+    /// panes instead.
+    pub(super) fn resize_float_with_keys(
+        &mut self,
+        horizontal: bool,
+        far: bool,
+        forward: bool,
+        nudge: bool,
+    ) -> bool {
+        if self.floats().visible().is_none() {
+            return false;
+        }
+        self.place_float(|rect, bounds| step_float(rect, bounds, horizontal, far, forward, nudge));
+        true
+    }
+
+    /// Moves the shown floating pane, keeping its size, as the `Move*` and
+    /// `MoveFar*` actions do with a float shown: one key step, with `nudge` a
+    /// small one, or with `far` against that edge of the workspace.
+    pub(super) fn move_float_with_keys(&mut self, motion: Motion, far: bool, nudge: bool) {
+        self.place_float(|rect, bounds| shift_float(rect, bounds, motion, far, nudge));
+    }
+
+    /// Centres the shown floating pane in the workspace, keeping its size.
+    pub(super) fn center_float(&mut self) {
+        self.place_float(|rect, bounds| Rect::from_center_size(bounds.center(), rect.size()));
+    }
+
+    /// Sets the shown float's frame to `place` of its frame and the
+    /// workspace's bounds.
+    fn place_float(&mut self, place: impl FnOnce(Rect, Rect) -> Rect) {
+        let Some(id) = self.floats().visible() else {
+            return;
+        };
+        // Bounds are set when the float is first laid out; before that there
+        // is nothing on screen to move or resize.
+        let Some(bounds) = self.floating.get(id).and_then(|f| f.pane.workspace_bounds) else {
+            return;
+        };
+        let rect = place(self.floating_rect_for(bounds), bounds);
+        self.workspace_mut()
+            .floats
+            .set_size(Some(padding_for(rect, bounds)));
     }
 
     /// What the pointer would grab at `pos`, and the cursor that shows it.
@@ -446,6 +573,69 @@ mod tests {
             scaled,
             Rect::from_min_max(pos2(200.0, 200.0), pos2(1800.0, 1400.0))
         );
+    }
+
+    #[test]
+    fn float_key_steps_move_one_edge_and_reverse_exactly() {
+        let (rect, _) = float();
+        // 5% of the 1000x800 workspace: 50px across, 40px down.
+        let r = step_float(rect, bounds(), true, false, false, false);
+        assert_eq!(r, Rect::from_min_max(pos2(50.0, 100.0), rect.max));
+        let r = step_float(rect, bounds(), true, true, true, false);
+        assert_eq!(r, Rect::from_min_max(rect.min, pos2(950.0, 700.0)));
+        let r = step_float(rect, bounds(), false, false, true, false);
+        assert_eq!(r, Rect::from_min_max(pos2(100.0, 140.0), rect.max));
+        let r = step_float(rect, bounds(), false, true, false, false);
+        assert_eq!(r, Rect::from_min_max(rect.min, pos2(900.0, 660.0)));
+        // Back and forth returns to the start.
+        let there = step_float(rect, bounds(), true, true, false, false);
+        assert_eq!(step_float(there, bounds(), true, true, true, false), rect);
+        // Repeated steps stop at the window and the minimum size.
+        let mut r = rect;
+        for _ in 0..100 {
+            r = step_float(r, bounds(), true, false, false, false);
+        }
+        assert_eq!(r.left(), 0.0);
+        for _ in 0..100 {
+            r = step_float(r, bounds(), true, false, true, false);
+        }
+        assert_eq!(r.width(), FLOAT_MINIMUM.x);
+        // A nudge is 1%: 10px across.
+        let r = step_float(rect, bounds(), true, false, false, true);
+        assert_eq!(r, Rect::from_min_max(pos2(90.0, 100.0), rect.max));
+    }
+
+    #[test]
+    fn moving_a_float_keeps_its_size_and_stops_at_the_window() {
+        let (rect, _) = float();
+        let moved = |motion, far, nudge| shift_float(rect, bounds(), motion, far, nudge);
+        // 5% of the 1000x800 workspace, or 1% nudged.
+        assert_eq!(
+            moved(Motion::Left, false, false),
+            rect.translate(egui::vec2(-50.0, 0.0))
+        );
+        assert_eq!(
+            moved(Motion::Down, false, false),
+            rect.translate(egui::vec2(0.0, 40.0))
+        );
+        assert_eq!(
+            moved(Motion::Right, false, true),
+            rect.translate(egui::vec2(10.0, 0.0))
+        );
+        // Far moves it against that edge.
+        assert_eq!(moved(Motion::Up, true, false).top(), 0.0);
+        assert_eq!(moved(Motion::Right, true, false).right(), 1000.0);
+        assert_eq!(moved(Motion::Right, true, false).size(), rect.size());
+        // Steps stop at the window rather than shrinking it.
+        let mut r = rect;
+        for _ in 0..10 {
+            r = shift_float(r, bounds(), Motion::Left, false, false);
+        }
+        assert_eq!(r, Rect::from_min_size(pos2(0.0, 100.0), rect.size()));
+        // A float bigger than the window is cut down to fit.
+        let big = Rect::from_min_size(pos2(-50.0, 0.0), egui::vec2(2000.0, 100.0));
+        let fitted = shift_float(big, bounds(), Motion::Down, false, false);
+        assert!(bounds().contains_rect(fitted));
     }
 
     #[test]

@@ -436,6 +436,7 @@ impl AppConfig {
             None
         };
         let mut parsed_keys = None;
+        let mut parsed_tables = std::collections::BTreeMap::new();
         let mut parsed_pickers = None;
         let mut actions = std::collections::BTreeMap::new();
         if let mlua::Value::Table(root) = &value {
@@ -445,6 +446,41 @@ impl AppConfig {
             {
                 parsed_keys = Some(keybindings::parse_application_keys(&lua, keys)?);
                 root.raw_set("keys", mlua::Value::Nil)
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(tables) = root
+                .get::<_, Option<mlua::Table>>("key_tables")
+                .map_err(|e| format!("key_tables: {e}"))?
+            {
+                for pair in tables.pairs::<String, mlua::Table>() {
+                    let (name, table) = pair.map_err(|e| format!("key_tables: {e}"))?;
+                    // Besides its list of keys, a table may name its `far`
+                    // and `nudge` modifiers.
+                    for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
+                        let (field, _) = pair.map_err(|e| format!("key_tables.{name}: {e}"))?;
+                        if let mlua::Value::String(field) = field {
+                            let field = field.to_str().unwrap_or_default();
+                            if field != "far" && field != "nudge" {
+                                return Err(format!("key_tables.{name}: unknown field {field}"));
+                            }
+                        }
+                    }
+                    let modifier = |field: &str| -> Result<Option<egui::Modifiers>, String> {
+                        table
+                            .get::<_, Option<String>>(field)
+                            .map_err(|e| format!("key_tables.{name}.{field}: {e}"))?
+                            .map(|value| keybindings::parse_table_modifier(&value))
+                            .transpose()
+                            .map_err(|e| format!("key_tables.{name}.{field}: {e}"))
+                    };
+                    let far = modifier("far")?;
+                    let nudge = modifier("nudge")?;
+                    let keys = keybindings::parse_application_keys(&lua, table)
+                        .map_err(|e| format!("key_tables.{name}: {e}"))?;
+                    parsed_tables
+                        .insert(name, crate::picker::config::KeyTable { keys, far, nudge });
+                }
+                root.raw_set("key_tables", mlua::Value::Nil)
                     .map_err(|e| e.to_string())?;
             }
             if let Some(configured) = root
@@ -595,6 +631,7 @@ impl AppConfig {
         config.keys = crate::picker::config::Keys {
             bindings: parsed_keys.unwrap_or_default(),
             disable_defaults: config.disable_default_keys,
+            tables: parsed_tables,
         };
         config.pickers = parsed_pickers;
         config.actions = actions;
@@ -912,6 +949,32 @@ fn prepare_args(args: Vec<String>) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copied_workspace_configuration_keeps_the_default_resize_table() {
+        let config = AppConfig::parse(
+            include_str!("../nterm.workspaces.lua"),
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/nterm.workspaces.lua")),
+        )
+        .unwrap();
+        let bindings = try_compile(config).unwrap();
+        let resize = crate::actions::AppAction::EnterKeyTable("resize".into());
+        assert_eq!(
+            bindings.shortcut_for(&resize).as_deref(),
+            Some("Ctrl+Shift+R")
+        );
+        let mut events = vec![egui::Event::Key {
+            key: egui::Key::ArrowLeft,
+            physical_key: None,
+            modifiers: egui::Modifiers::SHIFT,
+            pressed: true,
+            repeat: false,
+        }];
+        assert_eq!(
+            bindings.consume_table("resize", &mut events).action,
+            crate::actions::AppAction::from_name("ResizeFarLeft")
+        );
+    }
+
     #[test]
     fn workspace_configuration_compiles_helpers_startup_and_appearance() {
         let config = parse(include_str!("../workspaces.example.lua")).unwrap();
@@ -1559,6 +1622,212 @@ mod tests {
 
     fn parse(source: &str) -> Result<AppConfig, String> {
         AppConfig::parse(source, Path::new("test-config.lua"))
+    }
+
+    fn try_compile(config: AppConfig) -> Result<crate::picker::config::Bindings, String> {
+        crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+    }
+
+    /// The action key `key` with `mods` runs in table `name`, if any.
+    fn table_action(
+        bindings: &crate::picker::config::Bindings,
+        name: &str,
+        key: egui::Key,
+        mods: egui::Modifiers,
+    ) -> Option<String> {
+        let mut events = vec![egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            modifiers: mods,
+            pressed: true,
+            repeat: false,
+        }];
+        let action = bindings.consume_table(name, &mut events).action?;
+        Some(match action {
+            crate::actions::AppAction::Workspace(action) => action.name().into_owned(),
+            other => format!("{other:?}"),
+        })
+    }
+
+    #[test]
+    fn default_resize_table_merges_with_configured_tables() {
+        use egui::{Key, Modifiers};
+        let (none, shift) = (Modifiers::NONE, Modifiers::SHIFT);
+        let action = |b: &_, key, mods| table_action(b, "resize", key, mods);
+        // With no config, Ctrl+Shift+R enters the built-in resize table.
+        let defaults = try_compile(parse("return {}").unwrap()).unwrap();
+        assert_eq!(
+            defaults.key_table_names().collect::<Vec<_>>(),
+            ["move", "resize"]
+        );
+        let enter = |name: &str| crate::actions::AppAction::EnterKeyTable(name.into());
+        assert_eq!(
+            defaults.shortcut_for(&enter("resize")).as_deref(),
+            Some("Ctrl+Shift+R")
+        );
+        // Ctrl+Shift+G enters the built-in move table.
+        assert_eq!(
+            defaults.shortcut_for(&enter("move")).as_deref(),
+            Some("Ctrl+Shift+G")
+        );
+        let alt = Modifiers::ALT;
+        for (key, mods, expected) in [
+            (Key::H, none, "ResizeLeft"),
+            (Key::L, shift, "ResizeFarRight"),
+            (Key::ArrowDown, none, "ResizeDown"),
+            (Key::ArrowUp, shift, "ResizeFarUp"),
+            (Key::K, alt, "FocusUp"),
+            (Key::Enter, none, "ExitKeyTable"),
+            (Key::M, none, "EnterKeyTable(\"move\")"),
+        ] {
+            assert_eq!(action(&defaults, key, mods).as_deref(), Some(expected));
+        }
+        for (key, mods, expected) in [
+            (Key::H, none, "MoveLeft"),
+            (Key::ArrowRight, shift, "MoveFarRight"),
+            (Key::J, alt, "FocusDown"),
+            (Key::C, none, "CenterFloat"),
+            (Key::Enter, none, "ExitKeyTable"),
+            (Key::R, none, "EnterKeyTable(\"resize\")"),
+        ] {
+            let found = table_action(&defaults, "move", key, mods);
+            assert_eq!(found.as_deref(), Some(expected));
+        }
+        // Only the tables with move keys and no resize keys mark a pane to move.
+        assert!(defaults.key_table_moves("move"));
+        assert!(!defaults.key_table_resizes("move"));
+        // A configured table of the same name adds keys, replaces the
+        // defaults it shares a key with, and `None` removes a default.
+        let merged = try_compile(
+            parse(
+                "return {key_tables={resize={
+                    {key='w', action='ResizeUp'},
+                    {key='h', action='ResizeRight'},
+                    {key='j', action='None'},
+                }}}",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(action(&merged, Key::W, none).as_deref(), Some("ResizeUp"));
+        assert_eq!(
+            action(&merged, Key::H, none).as_deref(),
+            Some("ResizeRight")
+        );
+        assert_eq!(action(&merged, Key::J, none), None);
+        assert_eq!(action(&merged, Key::K, none).as_deref(), Some("ResizeUp"));
+        // The far modifier follows the key's own action, rebound or not.
+        assert_eq!(
+            action(&merged, Key::H, shift).as_deref(),
+            Some("ResizeFarRight")
+        );
+        // A table can set its far and nudge modifiers; unset ones keep the
+        // built-in table's, and NONE turns one off.
+        let ctrl = Modifiers::CTRL;
+        let rebound = try_compile(
+            parse(
+                "return {key_tables={move={far='CTRL|ALT', nudge='NONE'}, resize={nudge='ALT',
+                    {key='h', mods='ALT', action='None'}, {key='j', mods='ALT', action='None'},
+                    {key='k', mods='ALT', action='None'}, {key='l', mods='ALT', action='None'},
+                    {key='Left', mods='ALT', action='None'}, {key='Down', mods='ALT', action='None'},
+                    {key='Up', mods='ALT', action='None'}, {key='Right', mods='ALT', action='None'},
+                }}}",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let modifiers = rebound.key_table_modifiers("resize");
+        assert_eq!(modifiers.far, Some(shift));
+        assert_eq!(modifiers.nudge, Some(alt));
+        let modifiers = rebound.key_table_modifiers("move");
+        assert_eq!(modifiers.far, Some(ctrl | alt));
+        assert_eq!(modifiers.nudge, None);
+        assert_eq!(
+            table_action(&rebound, "move", Key::H, ctrl | alt).as_deref(),
+            Some("MoveFarLeft")
+        );
+        assert_eq!(table_action(&rebound, "move", Key::H, ctrl), None);
+        assert_eq!(
+            table_action(&rebound, "move", Key::H, shift).as_deref(),
+            None
+        );
+        // Other names are new tables beside the default one.
+        let added = try_compile(
+            parse("return {key_tables={swap={{key='h', action='MoveLeft'}}}}").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            added.key_table_names().collect::<Vec<_>>(),
+            ["move", "resize", "swap"]
+        );
+        assert_eq!(
+            table_action(&added, "swap", Key::H, none).as_deref(),
+            Some("MoveLeft")
+        );
+        // Only tables with resize keys mark the edges those keys move.
+        assert!(added.key_table_resizes("resize"));
+        assert!(!added.key_table_resizes("swap"));
+        assert!(added.key_table_moves("swap"));
+        assert!(!added.key_table_resizes("missing"));
+        // Without default keys there is no default table or shortcut.
+        let bare = try_compile(parse("return {disable_default_keys=true}").unwrap()).unwrap();
+        assert_eq!(bare.key_table_names().count(), 0);
+        let only = try_compile(
+            parse(
+                "return {disable_default_keys=true, key_tables={resize={{key='h', action='ResizeLeft'}}}}",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(action(&only, Key::H, none).as_deref(), Some("ResizeLeft"));
+        assert_eq!(action(&only, Key::L, none), None);
+        // Tables are checked like keys: unknown names, actions, duplicates.
+        for (source, message) in [
+            (
+                "return {keys={{key='r',mods='CTRL',action='EnterKeyTable:missing'}}}",
+                "unknown key table \"missing\"",
+            ),
+            (
+                "return {key_tables={t={{key='h',action='EnterKeyTable:other'}}}}",
+                "unknown key table \"other\"",
+            ),
+            (
+                "return {disable_default_keys=true, keys={{key='r',mods='CTRL',action='EnterKeyTable:resize'}}}",
+                "unknown key table \"resize\"",
+            ),
+            (
+                "return {key_tables={t={{key='h',action='ResizeLeft'},{key='H',action='ResizeRight'}}}}",
+                "duplicate binding H",
+            ),
+            (
+                "return {key_tables={t={{key='h',action='NoSuchAction'}}}}",
+                "unknown action \"NoSuchAction\"",
+            ),
+            (
+                "return {key_tables={resize={far='ALT'}}}",
+                "\"resize\": H with ALT is bound, so far = \"ALT\" never applies",
+            ),
+            (
+                "return {key_tables={resize={far='CTRL'}}}",
+                "far and nudge share a modifier (CTRL and CTRL)",
+            ),
+            (
+                "return {key_tables={resize={fast='ALT'}}}",
+                "key_tables.resize: unknown field fast",
+            ),
+            (
+                "return {key_tables={resize={far='HYPER'}}}",
+                "key_tables.resize.far: unknown modifier HYPER",
+            ),
+        ] {
+            let error = parse(source).and_then(try_compile).err().unwrap();
+            assert!(error.contains(message), "{source}: {error}");
+        }
     }
 
     #[test]

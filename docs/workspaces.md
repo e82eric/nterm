@@ -40,7 +40,7 @@ floating panes, copy mode, and pickers remain available.
 | Ctrl+Alt+C | Create terminal pane (a float while a float is visible) |
 | Ctrl+Shift+W | Close the visible float, or else the focused terminal pane (`ClosePane`) |
 | Ctrl+Alt+H/J/K/L | Focus left/down/up/right |
-| Ctrl+Alt+Shift+H/J/K/L | Move pane left/down/up/right |
+| Ctrl+Alt+Shift+H/J/K/L | Move pane left/down/up/right, or the visible float |
 | Ctrl+Alt+Shift+arrows | Resize panes by moving a shared divider |
 | Ctrl+Alt+Enter | Promote focused pane to main |
 | Ctrl+Alt+F | Float the focused pane, or tile the visible floating pane |
@@ -100,16 +100,128 @@ vertical subdivision; monocle and single-pane workspaces do not resize.
 Sizes stay with the workspace and pane IDs through focus changes. The main
 split is shared by all layouts; individual pane sizes are kept per layout, so
 resizing the tile stack does not change grid rows. `ResetLayout` restores the
-default main ratio and equal pane sizes in the current layout. The layout reserves a
-48-pixel minimum per pane along each split when space permits.
+default main ratio and equal pane sizes in the current layout, and the default
+floating pane size. The layout reserves a 48-pixel minimum per pane along each
+split when space permits.
 
-The copied `nterm.workspaces.lua` binds **Alt+Shift+arrows** to these commands.
-To use other keys or modifiers, add bindings such as:
+While a floating pane is shown, the resize commands resize it instead: each
+press moves one edge by 5% of the workspace in the key's direction.
+`ResizeLeft`/`ResizeRight` move its left edge and `ResizeUp`/`ResizeDown` its top
+edge; `ResizeFarLeft`, `ResizeFarRight`, `ResizeFarUp`, and `ResizeFarDown` move
+its right and bottom edges. Tiled panes work the same way: where the focused
+pane has dividers on both sides, as in the middle of a stack, the plain
+commands move the one above or to the left and the `ResizeFar` commands the one
+below or to the right. Where it has a divider on only one side, both move it.
+Dividers and floating pane edges can also be
+dragged with the mouse. Floating pane sizes are kept per workspace as a share
+of the window, and do not change the configured `floating.padding`.
+
+**Ctrl+Shift+R** enters the built-in resize key table (see
+[Key tables](#key-tables)), and the copied `nterm.workspaces.lua` also binds
+**Alt+Shift+arrows** to these commands. To use other keys or modifiers, add
+bindings such as:
 
 ```lua
 {key="Left", mods="ALT|CTRL", action="ResizeLeft"},
 {key="Down", mods="ALT|CTRL", action="ResizeDown"},
 ```
+
+### Key tables
+
+A key table is a named set of keys that becomes the only active keys until you
+leave it, like a resize mode. The action `EnterKeyTable:<name>` enters one.
+
+nterm has two built-in tables. `resize`, entered with **Ctrl+Shift+R**:
+
+| Keys | Action |
+|---|---|
+| `h` `j` `k` `l`, or the arrows | `ResizeLeft`, `ResizeDown`, `ResizeUp`, `ResizeRight` |
+| the same with Shift (the table's `far` modifier) | `ResizeFarLeft`, `ResizeFarDown`, `ResizeFarUp`, `ResizeFarRight` |
+| any of these with Ctrl added (the `nudge` modifier) | the same, by a much smaller step (1% instead of 5%) |
+| the same with Alt | `FocusLeft`, `FocusDown`, `FocusUp`, `FocusRight`: pick another pane to resize, or with a float shown, cycle the floats |
+| `=` | `ResetLayout` |
+| `m` | switch to the `move` table |
+| `Enter` or `Escape` | leave the table |
+
+And `move`, entered with **Ctrl+Shift+G**:
+
+| Keys | Action |
+|---|---|
+| `h` `j` `k` `l`, or the arrows | `MoveLeft`, `MoveDown`, `MoveUp`, `MoveRight`: swap the focused pane with its neighbour that way, or move a shown float |
+| the same with Shift (`far`) | `MoveFarLeft`, `MoveFarDown`, `MoveFarUp`, `MoveFarRight`: move the pane as far as it goes, or a float against that edge of the window |
+| any of these with Ctrl added (`nudge`) | for a float, the same by a much smaller step |
+| the same with Alt | `FocusLeft`, `FocusDown`, `FocusUp`, `FocusRight` |
+| `c` | `CenterFloat`: centre a shown float, keeping its size |
+| `r` | switch to the `resize` table |
+| `Enter` or `Escape` | leave the table |
+
+Moving a tiled pane swaps it with the neighbour the layout puts that way, as
+the `Move*` shortcuts always have, so it changes the pane's place in the layout
+rather than its size. Moving as far as it goes repeats that until nothing lies
+further; in Monocle it moves the pane to the start or end of the stack, and in
+Deck it is the same as one move. With a float shown, `Move*` and `MoveFar*`
+move the float instead, keeping its size, as `Resize*` resizes it.
+
+Tables in `key_tables` use the same fields as `keys`, and merge with the
+built-in tables the same way: a table named `resize` adds its keys to the
+built-in one, replaces any built-in key it also binds, and removes one with
+`action = "None"`. Other names make new tables. `disable_default_keys = true`
+leaves out the built-in tables and their Ctrl+Shift+R and Ctrl+Shift+G bindings
+too.
+
+```lua
+key_tables = {
+  -- Add w/a/s/d to the built-in resize table and drop Enter.
+  resize = {
+    {key="w", action="ResizeUp"},   {key="s", action="ResizeDown"},
+    {key="a", action="ResizeLeft"}, {key="d", action="ResizeRight"},
+    {key="Enter", action="None"},
+  },
+},
+keys = {
+  -- Enter resize mode with Alt+R instead of Ctrl+Shift+R.
+  {key="r", mods="ALT", action="EnterKeyTable:resize"},
+  {key="r", mods="CTRL|SHIFT", action="None"},
+},
+```
+
+A table can also name a `far` and a `nudge` modifier. Held with a key the
+table does not bind with that modifier, `far` runs the `Far` version of the
+key's `Resize*` or `Move*` action, and `nudge` runs a resize or move by the
+much smaller step; both can be held at once. Other actions are left alone.
+The built-in tables use `far = "SHIFT"` and `nudge = "CTRL"`, which is all
+their Shift and Ctrl keys are. A configured table of the same name keeps those
+unless it sets its own, and `"NONE"` turns one off. A key bound with the
+modifier itself is an error when the modifier would change that key's action,
+since it could never take effect: unbind the key, or pick another modifier.
+
+```lua
+key_tables = {
+  -- Shift+Alt moves as far as it goes in the move table; no nudging.
+  move = { far = "SHIFT|ALT", nudge = "NONE" },
+},
+```
+
+While a table with resize or move keys is active, the focused pane, or a shown
+floating pane, is the only thing in focus: everything else is darkened, and the
+pane sits on a slightly larger backdrop tinted with the theme's warning colour.
+Its border is drawn in a dimmed warning colour, in place of the focus
+highlight. For resizing, a bright warning-coloured square sits on the corner
+whose edges the next key press moves. Holding the table's `far` modifier
+(Shift) switches a pane between two neighbours to its other edge, and a float
+from its left and top edges to its right and bottom ones. For moving, an arrow
+sits on each side the pane can move toward.
+
+While a table is active, the status bar's mode chip shows its name, followed by
+hints for its keys: what the keys move now, what the `far` modifier switches
+to, the `nudge` modifier, the keys that move focus, centring a float,
+switching to the other table, reset, and leaving. The hints use the table's
+own keys and modifiers, so they follow any rebinding. The
+focused terminal's size in columns×rows is shown on the right. The table's keys run their
+actions (held keys repeat for actions that repeat), and every other key is
+ignored, so nothing is typed into the terminal. Escape leaves the table unless
+the table binds it, as does `ExitKeyTable`, switching away from the window, or
+reloading the configuration. The command palette lists each table.
 
 `nterm.workspace_keys("ALT")` generates the SWM-style bindings with a
 different modifier. They are added to the default Ctrl+Alt bindings, which stay

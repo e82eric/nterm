@@ -1391,22 +1391,23 @@ dependencies = [
 [[package]]
 name = "nfm-egui"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=469832a86e561d229d2493f5bb27ba89e7aba6a0#469832a86e561d229d2493f5bb27ba89e7aba6a0"
+source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
 dependencies = [
  "crossbeam-channel",
  "egui",
+ "nfm-picker-sources",
  "nfm-preview-command",
- "nfm-preview-vt",
  "nfm_search_core",
  "regex",
  "unicode-segmentation",
  "unicode-width",
+ "vte",
 ]
 
 [[package]]
 name = "nfm-picker-sources"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=469832a86e561d229d2493f5bb27ba89e7aba6a0#469832a86e561d229d2493f5bb27ba89e7aba6a0"
+source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
 dependencies = [
  "chrono",
  "csv",
@@ -1419,12 +1420,12 @@ dependencies = [
 [[package]]
 name = "nfm-preview-command"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=469832a86e561d229d2493f5bb27ba89e7aba6a0#469832a86e561d229d2493f5bb27ba89e7aba6a0"
+source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
 
 [[package]]
 name = "nfm-preview-file"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=469832a86e561d229d2493f5bb27ba89e7aba6a0#469832a86e561d229d2493f5bb27ba89e7aba6a0"
+source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
 dependencies = [
  "image",
  "nfm-egui",
@@ -1435,7 +1436,7 @@ dependencies = [
 [[package]]
 name = "nfm-preview-text"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=469832a86e561d229d2493f5bb27ba89e7aba6a0#469832a86e561d229d2493f5bb27ba89e7aba6a0"
+source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
 dependencies = [
  "nfm-egui",
  "two-face",
@@ -1444,17 +1445,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "nfm-preview-vt"
-version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=469832a86e561d229d2493f5bb27ba89e7aba6a0#469832a86e561d229d2493f5bb27ba89e7aba6a0"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "nfm_file_system"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=469832a86e561d229d2493f5bb27ba89e7aba6a0#469832a86e561d229d2493f5bb27ba89e7aba6a0"
+source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
 dependencies = [
  "crossbeam-channel",
  "hashbrown 0.17.1",
@@ -1465,7 +1458,7 @@ dependencies = [
 [[package]]
 name = "nfm_search_core"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=469832a86e561d229d2493f5bb27ba89e7aba6a0#469832a86e561d229d2493f5bb27ba89e7aba6a0"
+source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
 dependencies = [
  "crossbeam-channel",
  "memchr",
@@ -2784,6 +2777,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
+]
 
 [[package]]
 name = "walkdir"

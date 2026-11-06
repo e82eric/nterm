@@ -299,9 +299,51 @@ pub(crate) fn parse_application_keys(
     )
 }
 
+/// The `far` or `nudge` modifiers of a key table: `NONE`, or no modifier,
+/// turns it off.
+pub(crate) fn parse_table_modifier(value: &str) -> Result<egui::Modifiers, String> {
+    if value.trim().eq_ignore_ascii_case("NONE") {
+        return Ok(egui::Modifiers::NONE);
+    }
+    parse_modifiers(value).map_err(|part| format!("unknown modifier {part}"))
+}
+
 pub(crate) fn same_mods(a: egui::Modifiers, b: egui::Modifiers) -> bool {
     // `command` mirrors Ctrl; compare the physical modifiers instead.
     (a.ctrl, a.shift, a.alt) == (b.ctrl, b.shift, b.alt)
+}
+
+/// Whether `mods` holds every modifier in `part`.
+pub(crate) fn holds(mods: egui::Modifiers, part: egui::Modifiers) -> bool {
+    (!part.ctrl || mods.ctrl) && (!part.shift || mods.shift) && (!part.alt || mods.alt)
+}
+
+/// `mods` with the modifiers in `part` released.
+pub(crate) fn without(mods: egui::Modifiers, part: egui::Modifiers) -> egui::Modifiers {
+    egui::Modifiers {
+        ctrl: mods.ctrl && !part.ctrl,
+        command: mods.command && !part.ctrl,
+        shift: mods.shift && !part.shift,
+        alt: mods.alt && !part.alt,
+        ..mods
+    }
+}
+
+/// `mods` as they are written in a config: `CTRL|SHIFT`, or `NONE`.
+pub(crate) fn modifiers_name(mods: egui::Modifiers) -> String {
+    let names: Vec<&str> = [
+        (mods.ctrl, "CTRL"),
+        (mods.shift, "SHIFT"),
+        (mods.alt, "ALT"),
+    ]
+    .into_iter()
+    .filter_map(|(held, name)| held.then_some(name))
+    .collect();
+    if names.is_empty() {
+        "NONE".into()
+    } else {
+        names.join("|")
+    }
 }
 
 #[cfg(test)]

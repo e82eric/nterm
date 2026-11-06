@@ -31,12 +31,12 @@ hmac = "0.12"
 sha2 = "0.10"
 mlua = { version = "0.9.9", features = ["lua54", "vendored", "serialize"] }
 serde = { version = "1", features = ["derive"] }
-nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "469832a86e561d229d2493f5bb27ba89e7aba6a0" }
-nfm-picker-sources = { git = "https://github.com/e82eric/npicker", rev = "469832a86e561d229d2493f5bb27ba89e7aba6a0" }
-nfm-egui = { git = "https://github.com/e82eric/npicker", rev = "469832a86e561d229d2493f5bb27ba89e7aba6a0" }
-nfm-preview-file = { git = "https://github.com/e82eric/npicker", rev = "469832a86e561d229d2493f5bb27ba89e7aba6a0" }
-nfm-preview-command = { git = "https://github.com/e82eric/npicker", rev = "469832a86e561d229d2493f5bb27ba89e7aba6a0" }
-nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "469832a86e561d229d2493f5bb27ba89e7aba6a0" }
+nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "d6c90085ee159c27ab93a786a64e515d295fa69d" }
+nfm-picker-sources = { git = "https://github.com/e82eric/npicker", rev = "d6c90085ee159c27ab93a786a64e515d295fa69d" }
+nfm-egui = { git = "https://github.com/e82eric/npicker", rev = "d6c90085ee159c27ab93a786a64e515d295fa69d" }
+nfm-preview-file = { git = "https://github.com/e82eric/npicker", rev = "d6c90085ee159c27ab93a786a64e515d295fa69d" }
+nfm-preview-command = { git = "https://github.com/e82eric/npicker", rev = "d6c90085ee159c27ab93a786a64e515d295fa69d" }
+nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "d6c90085ee159c27ab93a786a64e515d295fa69d" }
 csv = "1.3"
 
 [build-dependencies]

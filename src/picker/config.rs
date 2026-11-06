@@ -795,21 +795,161 @@ pub(crate) enum BindingTarget {
     Unbind,
 }
 
+/// A key table from `key_tables`: its keys, and the modifiers that make
+/// its resize and move keys go as far as they can or nudge.
+#[derive(Clone, Default)]
+pub(crate) struct KeyTable {
+    pub(crate) keys: Vec<KeyBinding>,
+    /// `far`: unset keeps the built-in table's, `NONE` turns it off.
+    pub(crate) far: Option<egui::Modifiers>,
+    /// `nudge`: unset keeps the built-in table's, `NONE` turns it off.
+    pub(crate) nudge: Option<egui::Modifiers>,
+}
+
+/// The modifiers a key table adds to its keys' actions. Held with a key
+/// that is not bound with them, the key runs its own action changed:
+/// with `far`, a `Resize*` or `Move*` action becomes its `Far` version;
+/// with `nudge`, a resize or move goes a much smaller step.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct TableModifiers {
+    pub(crate) far: Option<egui::Modifiers>,
+    pub(crate) nudge: Option<egui::Modifiers>,
+}
+
+/// A compiled key table.
+#[derive(Clone, Default)]
+struct CompiledTable {
+    bindings: Vec<Binding>,
+    modifiers: TableModifiers,
+}
+
+impl CompiledTable {
+    fn find(
+        &self,
+        key: egui::Key,
+        physical: Option<egui::Key>,
+        mods: egui::Modifiers,
+    ) -> Option<&Binding> {
+        self.bindings.iter().find(|binding| {
+            (binding.trigger == BindingTrigger::Key(key)
+                || physical.is_some_and(|key| binding.trigger == BindingTrigger::Key(key)))
+                && same_mods(binding.mods, mods)
+        })
+    }
+
+    /// What `key` with `mods` runs, and whether it nudges: its own binding,
+    /// or else the table's `far` and `nudge` modifiers applied to the
+    /// binding without them.
+    fn resolve(
+        &self,
+        key: egui::Key,
+        physical: Option<egui::Key>,
+        mods: egui::Modifiers,
+    ) -> Option<(crate::actions::AppAction, bool)> {
+        match self.find(key, physical, mods) {
+            Some(binding) => Some((binding.action.clone(), false)),
+            None => self.derived(key, physical, mods),
+        }
+    }
+
+    /// What the table's `far` and `nudge` modifiers in `mods` make of the
+    /// action `key` runs without them, and whether it nudges.
+    fn derived(
+        &self,
+        key: egui::Key,
+        physical: Option<egui::Key>,
+        mods: egui::Modifiers,
+    ) -> Option<(crate::actions::AppAction, bool)> {
+        use crate::config::keybindings::{holds, without};
+        let far = self.modifiers.far.filter(|far| holds(mods, *far));
+        let nudge = self.modifiers.nudge.filter(|nudge| holds(mods, *nudge));
+        if far.is_none() && nudge.is_none() {
+            return None;
+        }
+        let none = egui::Modifiers::NONE;
+        let base = without(without(mods, far.unwrap_or(none)), nudge.unwrap_or(none));
+        let crate::actions::AppAction::Workspace(action) = self.find(key, physical, base)?.action
+        else {
+            return None;
+        };
+        let action = if far.is_some() { action.far()? } else { action };
+        if nudge.is_some() && !(action.is_resize() || action.is_move()) {
+            return None;
+        }
+        Some((
+            crate::actions::AppAction::Workspace(action),
+            nudge.is_some(),
+        ))
+    }
+
+    /// Fails when a key bound with the table's `far` or `nudge` modifier
+    /// hides what that modifier would make of the key, so it is never
+    /// silently lost.
+    fn check_modifiers(&self, name: &str) -> Result<(), String> {
+        use crate::config::keybindings::modifiers_name;
+        let TableModifiers { far, nudge } = self.modifiers;
+        if let (Some(far), Some(nudge)) = (far, nudge)
+            && (far.ctrl && nudge.ctrl || far.shift && nudge.shift || far.alt && nudge.alt)
+        {
+            return Err(format!(
+                "key table {name:?}: far and nudge share a modifier ({} and {})",
+                modifiers_name(far),
+                modifiers_name(nudge)
+            ));
+        }
+        for binding in &self.bindings {
+            let BindingTrigger::Key(key) = binding.trigger else {
+                continue;
+            };
+            if let Some((action, nudging)) = self.derived(key, None, binding.mods)
+                && (nudging || action != binding.action)
+            {
+                let (field, mods) = if nudging {
+                    ("nudge", nudge)
+                } else {
+                    ("far", far)
+                };
+                return Err(format!(
+                    "key table {name:?}: {key:?} with {} is bound, so {field} = {:?} never applies to {key:?}; unbind it with action = \"None\" or pick another {field}",
+                    modifiers_name(binding.mods),
+                    modifiers_name(mods.unwrap_or_default()),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Application shortcuts from `keys`. They are merged over the default
 /// bindings by chord unless `disable_default_keys` is set.
 #[derive(Clone, Default)]
 pub(crate) struct Keys {
     pub(crate) bindings: Vec<KeyBinding>,
     pub(crate) disable_defaults: bool,
+    /// `key_tables`: named sets of keys that `EnterKeyTable:<name>` makes
+    /// the only active keys.
+    pub(crate) tables: BTreeMap<String, KeyTable>,
 }
 
 impl From<Option<Vec<KeyBinding>>> for Keys {
     fn from(bindings: Option<Vec<KeyBinding>>) -> Self {
         Self {
             bindings: bindings.unwrap_or_default(),
-            disable_defaults: false,
+            ..Default::default()
         }
     }
+}
+
+/// What the keys pressed this frame do while a key table is active.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct TableInput {
+    /// The last action a table key ran.
+    pub(crate) action: Option<crate::actions::AppAction>,
+    /// Escape was pressed without being bound in the table.
+    pub(crate) exit: bool,
+    /// The action came from a key pressed with the table's `nudge`
+    /// modifier, so it moves by a much smaller step.
+    pub(crate) nudge: bool,
 }
 
 pub(crate) const BUILTIN_NAMES: [&str; 5] =
@@ -1019,6 +1159,7 @@ pub(crate) struct Bindings {
     pub(crate) prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     pub(crate) quick_selects: crate::config::quick_selects::Definitions,
     bindings: Vec<Binding>,
+    key_tables: BTreeMap<String, CompiledTable>,
     model: std::rc::Rc<crate::config::model::Model>,
 }
 
@@ -1160,41 +1301,78 @@ impl Bindings {
         };
         let same_chord =
             |a: &KeyBinding, b: &KeyBinding| a.trigger == b.trigger && same_mods(a.mods, b.mods);
-        for (index, binding) in keys.bindings.iter().enumerate() {
-            let BindingTrigger::Key(key) = binding.trigger else {
-                return Err("application bindings require a keyboard trigger".into());
-            };
-            if keys.bindings[..index]
-                .iter()
-                .any(|earlier| same_chord(earlier, binding))
-            {
-                return Err(format!(
-                    "duplicate key binding {}",
-                    crate::actions::shortcut_label(key, binding.mods)
-                ));
-            }
-        }
-        // User bindings come first so the palette lists their shortcuts first.
-        // A user binding on a default's chord replaces that default.
-        let mut merged = keys.bindings.clone();
-        if !keys.disable_defaults {
-            merged.extend(default_keys().into_iter().filter(|default| {
-                !keys
-                    .bindings
+        let check_chords = |bindings: &[KeyBinding], context: &str| {
+            for (index, binding) in bindings.iter().enumerate() {
+                let BindingTrigger::Key(key) = binding.trigger else {
+                    return Err(format!("{context} require a keyboard trigger"));
+                };
+                if bindings[..index]
                     .iter()
-                    .any(|binding| same_chord(binding, default))
-            }));
+                    .any(|earlier| same_chord(earlier, binding))
+                {
+                    return Err(format!(
+                        "duplicate key binding {}{}",
+                        crate::actions::shortcut_label(key, binding.mods),
+                        if context == "application bindings" {
+                            String::new()
+                        } else {
+                            format!(" in {context}")
+                        }
+                    ));
+                }
+            }
+            Ok(())
+        };
+        // User bindings come first so the palette lists their shortcuts first.
+        // A user binding on a default's chord replaces that default, and
+        // `action = "None"` there removes it.
+        let merge =
+            |user: &[KeyBinding], defaults: Vec<KeyBinding>| {
+                let mut merged = user.to_vec();
+                if !keys.disable_defaults {
+                    merged.extend(defaults.into_iter().filter(|default| {
+                        !user.iter().any(|binding| same_chord(binding, default))
+                    }));
+                }
+                merged
+            };
+        check_chords(&keys.bindings, "application bindings")?;
+        let mut default_tables = if keys.disable_defaults {
+            BTreeMap::new()
+        } else {
+            crate::terminal::workspace_ui::default_key_tables()
+        };
+        let mut tables = BTreeMap::new();
+        for (name, table) in &keys.tables {
+            if name.trim().is_empty() {
+                return Err("key table names must not be empty".into());
+            }
+            check_chords(&table.keys, &format!("key table {name:?}"))?;
+            let defaults = default_tables.remove(name).unwrap_or_default();
+            // Modifiers left unset keep the built-in table's.
+            let merged = KeyTable {
+                keys: merge(&table.keys, defaults.keys),
+                far: table.far.or(defaults.far),
+                nudge: table.nudge.or(defaults.nudge),
+            };
+            tables.insert(name.clone(), merged);
         }
-        let mut bindings: Vec<Binding> = Vec::new();
-        for binding in merged {
-            let mods = binding.mods;
+        tables.extend(default_tables);
+        // Each binding's target as an action, or `None` when it unbinds.
+        let resolve = |binding: KeyBinding| -> Result<Option<Binding>, String> {
             let action = match binding.action {
-                BindingTarget::Unbind => continue,
+                BindingTarget::Unbind => return Ok(None),
                 BindingTarget::Action(action) => {
-                    if let crate::actions::AppAction::Lua(name) = &action {
-                        if !actions.contains_key(name) {
+                    match &action {
+                        crate::actions::AppAction::Lua(name) if !actions.contains_key(name) => {
                             return Err(format!("unknown action {name:?} in key binding"));
                         }
+                        crate::actions::AppAction::EnterKeyTable(name)
+                            if !tables.contains_key(name) =>
+                        {
+                            return Err(format!("unknown key table {name:?} in key binding"));
+                        }
+                        _ => {}
                     }
                     action
                 }
@@ -1205,15 +1383,40 @@ impl Bindings {
                     crate::actions::AppAction::OpenPicker(name)
                 }
             };
-            bindings.push(Binding {
+            Ok(Some(Binding {
                 action,
                 trigger: binding.trigger,
-                mods,
+                mods: binding.mods,
                 description: binding.description,
-            });
+            }))
+        };
+        let mut bindings: Vec<Binding> = Vec::new();
+        for binding in merge(&keys.bindings, default_keys()) {
+            bindings.extend(resolve(binding)?);
+        }
+        let mut key_tables = BTreeMap::new();
+        for (name, table) in &tables {
+            let mut bindings = Vec::new();
+            for binding in table.keys.iter().cloned() {
+                bindings.extend(resolve(binding)?);
+            }
+            // `NONE` turns a modifier off.
+            let set = |mods: Option<egui::Modifiers>| {
+                mods.filter(|mods| !same_mods(*mods, egui::Modifiers::NONE))
+            };
+            let compiled_table = CompiledTable {
+                bindings,
+                modifiers: TableModifiers {
+                    far: set(table.far),
+                    nudge: set(table.nudge),
+                },
+            };
+            compiled_table.check_modifiers(name)?;
+            key_tables.insert(name.clone(), compiled_table);
         }
         Ok(Self {
             bindings,
+            key_tables,
             workspace_appearance: Default::default(),
             default_layout: Default::default(),
             startup: None,
@@ -1374,6 +1577,121 @@ impl Bindings {
             }
         }
         (open, consumed)
+    }
+
+    /// The configured `key_tables`, by name.
+    pub(crate) fn key_table_names(&self) -> impl Iterator<Item = &str> {
+        self.key_tables.keys().map(String::as_str)
+    }
+
+    /// Whether key table `name` has any resize keys, so its edges to move
+    /// are worth marking while it is active.
+    pub(crate) fn key_table_resizes(&self, name: &str) -> bool {
+        self.key_table_has(
+            name,
+            crate::terminal::workspace_ui::WorkspaceAction::is_resize,
+        )
+    }
+
+    /// Whether key table `name` has any move keys, so the pane they move is
+    /// worth marking while it is active.
+    pub(crate) fn key_table_moves(&self, name: &str) -> bool {
+        self.key_table_has(
+            name,
+            crate::terminal::workspace_ui::WorkspaceAction::is_move,
+        )
+    }
+
+    fn key_table_has(
+        &self,
+        name: &str,
+        kind: fn(crate::terminal::workspace_ui::WorkspaceAction) -> bool,
+    ) -> bool {
+        self.key_tables.get(name).is_some_and(|table| {
+            table.bindings.iter().any(|binding| {
+                matches!(binding.action, crate::actions::AppAction::Workspace(action) if kind(action))
+            })
+        })
+    }
+
+    /// Key table `name`'s `far` and `nudge` modifiers.
+    pub(crate) fn key_table_modifiers(&self, name: &str) -> TableModifiers {
+        self.key_tables
+            .get(name)
+            .map(|table| table.modifiers)
+            .unwrap_or_default()
+    }
+
+    /// The keys in key table `name` and the actions they run, for hints:
+    /// its bindings, then its keys with its `far` modifier added, which run
+    /// the `Far` versions of their actions.
+    pub(crate) fn key_table_keys(
+        &self,
+        name: &str,
+    ) -> Vec<(egui::Key, egui::Modifiers, crate::actions::AppAction)> {
+        let Some(table) = self.key_tables.get(name) else {
+            return Vec::new();
+        };
+        let mut keys: Vec<_> = table
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding.trigger {
+                BindingTrigger::Key(key) => Some((key, binding.mods, binding.action.clone())),
+                BindingTrigger::DoubleClick => None,
+            })
+            .collect();
+        if let Some(far) = table.modifiers.far {
+            let derived: Vec<_> = keys
+                .iter()
+                .filter_map(|(key, mods, _)| {
+                    let mods = *mods | far;
+                    let bound = table.find(*key, None, mods).is_some();
+                    let (action, _) = table.derived(*key, None, mods)?;
+                    (!bound).then_some((*key, mods, action))
+                })
+                .collect();
+            keys.extend(derived);
+        }
+        keys
+    }
+
+    /// Handles this frame's keys while key table `name` is active. Its keys
+    /// run their actions, changed by the table's `far` and `nudge`
+    /// modifiers when held; Escape, unless the table binds it, asks to
+    /// leave. Every key and typed text is consumed either way, so nothing
+    /// reaches the terminal while the table is active. Pointer events are
+    /// kept.
+    pub(crate) fn consume_table(&self, name: &str, events: &mut Vec<egui::Event>) -> TableInput {
+        let empty = CompiledTable::default();
+        let table = self.key_tables.get(name).unwrap_or(&empty);
+        let mut input = TableInput::default();
+        events.retain(|event| match event {
+            egui::Event::Key {
+                key,
+                physical_key,
+                modifiers,
+                pressed,
+                repeat,
+                ..
+            } => {
+                match table.resolve(*key, *physical_key, *modifiers) {
+                    Some((action, nudge))
+                        if *pressed && (!repeat || action.allows_key_repeat()) =>
+                    {
+                        input.action = Some(action);
+                        input.nudge = nudge;
+                    }
+                    None if *pressed && *key == egui::Key::Escape => input.exit = true,
+                    _ => {}
+                }
+                false
+            }
+            egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut => {
+                false
+            }
+            _ => true,
+        });
+        input
     }
 }
 
@@ -1638,6 +1956,7 @@ mod tests {
             Keys {
                 bindings: keys,
                 disable_defaults: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1716,6 +2035,7 @@ mod tests {
             Keys {
                 bindings: Vec::new(),
                 disable_defaults: true,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2276,5 +2596,105 @@ mod tests {
             };
             assert!(error.contains(message), "{extra}: {error}");
         }
+    }
+
+    #[test]
+    fn active_key_tables_run_their_keys_and_swallow_the_rest() {
+        let action = |name: &str| BindingTarget::Action(AppAction::from_name(name).unwrap());
+        let binding = |key, mods, name: &str| KeyBinding {
+            trigger: BindingTrigger::Key(key),
+            mods,
+            description: String::new(),
+            action: action(name),
+        };
+        let bindings = super::Bindings::compile(
+            None,
+            Keys {
+                tables: [(
+                    "resize".to_owned(),
+                    super::KeyTable {
+                        keys: vec![
+                            binding(egui::Key::L, egui::Modifiers::NONE, "ResizeRight"),
+                            binding(egui::Key::C, egui::Modifiers::NONE, "CreatePane"),
+                        ],
+                        far: Some(egui::Modifiers::SHIFT),
+                        nudge: Some(egui::Modifiers::CTRL),
+                    },
+                )]
+                .into(),
+                disable_defaults: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let none = egui::Modifiers::NONE;
+        let resize = AppAction::Workspace(WorkspaceAction::ResizeRight);
+        // A table key runs its action and repeats if the action repeats; the
+        // text it would have typed is swallowed too.
+        for repeat in [false, true] {
+            let mut events = vec![
+                key_event(egui::Key::L, none, true, repeat),
+                egui::Event::Text("l".into()),
+            ];
+            let input = bindings.consume_table("resize", &mut events);
+            assert_eq!(input.action, Some(resize.clone()));
+            assert!(events.is_empty());
+        }
+        let mut events = vec![key_event(egui::Key::C, none, true, true)];
+        assert_eq!(bindings.consume_table("resize", &mut events).action, None);
+        // Other keys and text never reach the terminal; pointer events do.
+        let pointer = egui::Event::PointerMoved(egui::pos2(1.0, 2.0));
+        let mut events = vec![
+            key_event(egui::Key::X, none, true, false),
+            egui::Event::Text("x".into()),
+            // The nudge modifier only changes resizes and moves.
+            key_event(egui::Key::C, egui::Modifiers::CTRL, true, false),
+            pointer.clone(),
+        ];
+        let input = bindings.consume_table("resize", &mut events);
+        assert_eq!(input, super::TableInput::default());
+        assert_eq!(events, vec![pointer]);
+        // The table's far modifier makes a resize key its Far version, and
+        // its nudge modifier runs it with a small step; both can be held.
+        let far = AppAction::Workspace(WorkspaceAction::ResizeFarRight);
+        let shift = egui::Modifiers::SHIFT;
+        let ctrl = egui::Modifiers::CTRL;
+        for (mods, action, nudge) in [
+            (none, &resize, false),
+            (ctrl, &resize, true),
+            (shift, &far, false),
+            (ctrl | shift, &far, true),
+        ] {
+            let mut events = vec![key_event(egui::Key::L, mods, true, false)];
+            let input = bindings.consume_table("resize", &mut events);
+            assert_eq!(input.action.as_ref(), Some(action), "{mods:?}");
+            assert_eq!(input.nudge, nudge, "{mods:?}");
+        }
+        // Without far and nudge modifiers, other modifiers do nothing.
+        let plain = super::Bindings::compile(
+            None,
+            Keys {
+                tables: [(
+                    "resize".to_owned(),
+                    super::KeyTable {
+                        keys: vec![binding(egui::Key::L, none, "ResizeRight")],
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                disable_defaults: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for mods in [ctrl, shift] {
+            let mut events = vec![key_event(egui::Key::L, mods, true, false)];
+            assert_eq!(plain.consume_table("resize", &mut events).action, None);
+        }
+        // Escape leaves unless the table binds it.
+        let mut events = vec![key_event(egui::Key::Escape, none, true, false)];
+        assert!(bindings.consume_table("resize", &mut events).exit);
+        let mut events = vec![key_event(egui::Key::Escape, none, false, false)];
+        assert!(!bindings.consume_table("resize", &mut events).exit);
     }
 }

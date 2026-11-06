@@ -7,6 +7,7 @@ pub(crate) mod floating;
 mod layout;
 mod pane;
 mod pane_resize;
+mod resize_keys;
 pub(crate) mod workspace;
 pub(crate) mod workspace_ui;
 use pane::TerminalPane;
@@ -41,6 +42,11 @@ pub(crate) struct TerminalView {
     /// Set by the status bar's close button; the app then closes this window.
     close_requested: bool,
     pane_drag: Option<pane_resize::Drag>,
+    /// The `key_tables` entry whose keys are active, if any.
+    key_table: Option<String>,
+    /// The resize or move key pressed this frame was held with the key
+    /// table's `nudge` modifier, for a small step.
+    nudge_step: bool,
 }
 
 struct FloatingTerminal {
@@ -245,6 +251,8 @@ impl TerminalView {
             reload_source,
             close_requested: false,
             pane_drag: None,
+            key_table: None,
+            nudge_step: false,
             picker_bindings,
             floating_padding,
             floating: Default::default(),
@@ -462,6 +470,8 @@ impl TerminalView {
     ) {
         match action {
             AppAction::Workspace(action) => self.workspace_action(action, ctx, gl),
+            AppAction::EnterKeyTable(name) => self.key_table = Some(name),
+            AppAction::ExitKeyTable => self.key_table = None,
             AppAction::SelectWorkspaceId(id) => {
                 if let Err(error) = self.select_workspace(id) {
                     self.show_error("Workspace action failed", error);
@@ -507,6 +517,8 @@ impl TerminalView {
                         }
                     }
                     self.floating_padding = config.padding;
+                    // The reloaded tables may not include the active one.
+                    self.key_table = None;
                     crate::colors::COLORS.reload(ctx, config.colors);
                     self.show_notice("", "Configuration reloaded".into());
                 }
@@ -703,6 +715,7 @@ impl TerminalView {
         content: egui::Rect,
         rect: egui::Rect,
         style: &workspace::Appearance,
+        overlay: &resize_keys::KeyOverlay,
     ) {
         let Some(floating) = self.visible_float() else {
             return;
@@ -717,12 +730,15 @@ impl TerminalView {
                 floating_ui.set_min_size(content.size());
                 let painter = floating_ui.painter();
                 let palette = crate::colors::palette();
-                painter.rect_filled(
-                    content,
-                    0.0,
-                    palette.background.gamma_multiply(90.0 / 255.0),
-                );
-                style.paint_frame(painter, rect, true);
+                // Resize and move modes darken what is behind the float further.
+                let dim = if overlay.is_none() {
+                    90.0 / 255.0
+                } else {
+                    resize_keys::DIM
+                };
+                painter.rect_filled(content, 0.0, palette.background.gamma_multiply(dim));
+                // The overlay replaces the focus highlight while shown.
+                style.paint_frame(painter, rect, overlay.is_none());
                 painter.rect_filled(rect, style.corner_radius, palette.background);
                 painter.add(egui::PaintCallback {
                     rect: style.content_rect(rect),
@@ -733,6 +749,8 @@ impl TerminalView {
                     let position = ids.iter().position(|id| *id == floating.id).unwrap_or(0) + 1;
                     Self::paint_pane_dots(painter, rect, position, ids.len());
                 }
+                // The overlay, drawn last, over the terminal.
+                overlay.paint(painter, rect, style.corner_radius, style.border_width);
             });
         ui.ctx().move_to_top(layer_id);
     }
@@ -759,7 +777,14 @@ impl TerminalView {
         }
     }
 
-    fn show_mode_status(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+    /// The status bar. While a key table is active its name fills the mode
+    /// chip, `hints` follow it, and the focused terminal's size is shown.
+    fn show_mode_status(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        hints: &[resize_keys::KeyHint],
+    ) {
         // Paint the background before the clickable status indicator.
         ui.painter()
             .rect_filled(rect, 0.0, crate::colors::palette().panel_background);
@@ -800,7 +825,11 @@ impl TerminalView {
         // The label is a chip: filled with the accent while a mode such as
         // COPY or SEARCH is active, otherwise a subtle tint.
         let mode_active = status.accent != palette.muted_text;
-        let (chip_fill, chip_text) = if mode_active {
+        // An active key table swallows other keys, so it takes the chip.
+        let table = self.key_table.as_ref().map(|name| name.to_uppercase());
+        let (chip_fill, chip_text) = if table.is_some() {
+            (palette.warning, palette.background)
+        } else if mode_active {
             (status.accent, palette.background)
         } else {
             (egui::Color32::from_white_alpha(14), palette.text)
@@ -840,7 +869,11 @@ impl TerminalView {
                 ui.close();
             }
         });
-        let label = painter.layout_no_wrap(status.label.to_owned(), font.clone(), chip_text);
+        let label = painter.layout_no_wrap(
+            table.clone().unwrap_or_else(|| status.label.to_owned()),
+            font.clone(),
+            chip_text,
+        );
         let label_rect = egui::Rect::from_min_size(
             egui::pos2(menu.right() + 6.0, chip_top),
             egui::vec2(label.size().x + 16.0, chip_height),
@@ -953,8 +986,17 @@ impl TerminalView {
         );
         right_edge = workspace_rect.left() - 12.0;
         // While searching, the query field takes the detail text's place.
-        let searching = self.active_pane_ref().search_active();
-        if let Some(detail) = status.detail.filter(|_| !searching) {
+        // A key table shows the focused terminal's size instead, and its
+        // hints fill the space up to it.
+        let searching = self.active_pane_ref().search_active() && table.is_none();
+        let detail = if table.is_some() {
+            let (columns, rows) = self.active_pane_ref().grid_size();
+            Some(format!("{columns}×{rows}"))
+        } else {
+            status.detail.filter(|_| !searching)
+        };
+        let mut hints_right = right_edge;
+        if let Some(detail) = detail {
             let text = painter.layout_no_wrap(detail, font.clone(), foreground);
             let left = right_edge - text.size().x;
             if left > label_rect.right() + 8.0 {
@@ -963,7 +1005,11 @@ impl TerminalView {
                     text,
                     foreground,
                 );
+                hints_right = left - 16.0;
             }
+        }
+        if table.is_some() {
+            resize_keys::paint_hints(&painter, hints, label_rect, hints_right);
         }
         if searching {
             let search_rect = egui::Rect::from_min_max(

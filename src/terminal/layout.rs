@@ -36,7 +36,7 @@ pub(super) enum Motion {
     Down,
 }
 impl Motion {
-    fn backwards(self) -> bool {
+    pub(super) fn backwards(self) -> bool {
         matches!(self, Self::Left | Self::Up)
     }
     fn direction(self) -> egui::Vec2 {
@@ -328,16 +328,18 @@ pub(super) trait Arrange {
     /// Reorders panes so the focused one is on screen, after focus, layout,
     /// or pane order changes. The default does nothing.
     fn reveal(&self, _w: &mut Workspace) {}
-    /// Moves the divider nearest the focused pane along `axis`: the outer
-    /// split, or one within the focused pane's side of `splits`.
-    fn resize(&self, w: &mut Workspace, index: usize, axis: Axis, forward: bool) {
+    /// Moves a divider on the focused pane's edge along `axis`: the outer
+    /// split, or within its side of `splits` the one before it, or with
+    /// `far` the one after it, by `step` of the space they share: positive
+    /// moves it right or down.
+    fn resize(&self, w: &mut Workspace, index: usize, axis: Axis, far: bool, step: f32) {
         let Some(splits) = self.splits(w) else {
             return;
         };
         if axis == splits.axis {
-            resize_main(w, forward, splits.main == Side::Second);
+            resize_main(w, step, splits.main == Side::Second);
         } else if let Some(group) = splits.groups.into_iter().find(|g| g.contains(&index)) {
-            resize_within(w, index, group, forward);
+            resize_within(w, index, group, far, step);
         }
     }
     /// The pane a motion from the focused pane reaches. The default is the
@@ -595,19 +597,19 @@ fn spatial_target(
 }
 /// Moves the outer split. With the main pane on the second side, growing the
 /// first part shrinks the main pane.
-fn resize_main(w: &mut Workspace, forward: bool, reversed: bool) {
-    let delta = if forward { 0.05 } else { -0.05 };
+fn resize_main(w: &mut Workspace, delta: f32, reversed: bool) {
     let sign = if reversed { -1.0 } else { 1.0 };
     w.main_ratio = (w.main_ratio + sign * delta).clamp(0.1, 0.9);
 }
-/// Moves the divider between the focused pane and a neighbor in `group`,
-/// keeping each at least 5% of their combined weight.
-fn resize_within(w: &mut Workspace, index: usize, group: Range<usize>, forward: bool) {
+/// Moves the divider between the focused pane and a neighbor in `group`: the
+/// one before it, or with `far` the one after it, or whichever it has. Keeps
+/// each pane at least 5% of the pair's combined weight.
+fn resize_within(w: &mut Workspace, index: usize, group: Range<usize>, far: bool, delta: f32) {
     if !group.contains(&index) || group.len() < 2 {
         return;
     }
     let i = index - group.start;
-    let boundary = if forward {
+    let boundary = if far {
         i.min(group.len() - 2)
     } else {
         i.saturating_sub(1)
@@ -616,7 +618,6 @@ fn resize_within(w: &mut Workspace, index: usize, group: Range<usize>, forward: 
         w.panes[group.start + boundary],
         w.panes[group.start + boundary + 1],
     );
-    let delta = if forward { 0.05 } else { -0.05 };
     let before = weight(w.weights(), a);
     let after = weight(w.weights(), b);
     let total = before + after;

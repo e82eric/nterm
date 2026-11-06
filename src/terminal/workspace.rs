@@ -3,6 +3,11 @@ use super::layout::{Area, Axis, DividerAt, DividerId, Motion, Splits};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// How far a resize key moves a divider, as a fraction of the space it
+/// splits, and how far it moves when nudged.
+pub(super) const RESIZE_STEP: f32 = 0.05;
+pub(super) const NUDGE_RESIZE_STEP: f32 = 0.01;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Layout {
@@ -260,13 +265,23 @@ impl Workspace {
         }
         self.layout.arrange().splits(self)
     }
-    /// Move the focused pane's nearest shared divider in the requested direction.
-    pub fn resize(&mut self, horizontal: bool, forward: bool) {
+    /// Moves a divider on the focused pane's edge one step, `forward` meaning
+    /// right or down: its left or top one, or with `far` its right or bottom
+    /// one. A pane with a divider on only one side moves that one either way.
+    /// The step is `RESIZE_STEP`, or with `nudge` the much smaller
+    /// `NUDGE_RESIZE_STEP`.
+    pub fn resize_by(&mut self, horizontal: bool, far: bool, forward: bool, nudge: bool) {
         let Some(index) = self.focused_index().filter(|_| self.panes.len() >= 2) else {
             return;
         };
         let axis = if horizontal { Axis::X } else { Axis::Y };
-        self.layout.arrange().resize(self, index, axis, forward);
+        let step = if nudge {
+            NUDGE_RESIZE_STEP
+        } else {
+            RESIZE_STEP
+        };
+        let step = if forward { step } else { -step };
+        self.layout.arrange().resize(self, index, axis, far, step);
     }
     /// Moves focus, or with `moving` moves the focused pane. `rects` are this
     /// workspace's current rectangles. Returns whether anything changed.
@@ -285,6 +300,53 @@ impl Workspace {
         }
         let moved = arrange.move_pane(self, index, motion, rects);
         self.reveal();
+        moved
+    }
+    /// Which ways the move keys can move the focused pane, given this
+    /// workspace's current `rects`: left, right, up and down.
+    pub(super) fn move_sides(&self, rects: &[(u64, egui::Rect)]) -> [bool; 4] {
+        [Motion::Left, Motion::Right, Motion::Up, Motion::Down]
+            .map(|motion| self.clone().navigate(motion, true, rects))
+    }
+    /// Moves the focused pane as far as it goes toward `motion`, laid out in
+    /// `bounds` with `style`: in Monocle to the start or end of the stack, in
+    /// Deck one step as `navigate` does, and otherwise swap after swap until
+    /// nothing lies further that way. Returns whether anything changed.
+    pub(super) fn move_far(
+        &mut self,
+        motion: Motion,
+        bounds: egui::Rect,
+        style: &Appearance,
+    ) -> bool {
+        let Some(index) = self.focused_index().filter(|_| self.panes.len() >= 2) else {
+            return false;
+        };
+        match self.layout {
+            Layout::Monocle => {
+                let id = self.panes.remove(index);
+                let to = if motion.backwards() {
+                    0
+                } else {
+                    self.panes.len()
+                };
+                self.panes.insert(to, id);
+                return to != index;
+            }
+            Layout::Deck => {
+                let rects = self.rectangles(bounds, style);
+                return self.navigate(motion, true, &rects);
+            }
+            _ => {}
+        }
+        let mut moved = false;
+        // Each swap goes strictly further, so there are at most n - 1.
+        for _ in 1..self.panes.len() {
+            let rects = self.rectangles(bounds, style);
+            if !self.navigate(motion, true, &rects) {
+                break;
+            }
+            moved = true;
+        }
         moved
     }
     /// The focused pane's number for the status bar, or 0 without focus.
@@ -411,6 +473,50 @@ pub(crate) enum Request {
 mod tests {
     use super::*;
     use crate::terminal::layout::Deck;
+    fn panes(layout: Layout, focused: u64) -> Workspace {
+        let mut w = Workspace::new(1, 1);
+        w.layout = layout;
+        w.panes = vec![1, 2, 3, 4];
+        w.focus(focused);
+        w
+    }
+    fn screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0))
+    }
+    #[test]
+    fn moving_far_goes_as_far_as_the_layout_allows() {
+        let style = Appearance::default();
+        // Tile: down the stack to its bottom, keeping focus on the pane.
+        let mut w = panes(Layout::Tile, 2);
+        assert!(w.move_far(Motion::Down, screen(), &style));
+        assert_eq!(w.panes, [1, 3, 4, 2]);
+        assert_eq!(w.focused, Some(2));
+        assert!(!w.move_far(Motion::Down, screen(), &style));
+        // Into the main pane's place, and nothing lies further left.
+        assert!(w.move_far(Motion::Left, screen(), &style));
+        assert_eq!(w.panes[0], 2);
+        assert!(!w.move_far(Motion::Left, screen(), &style));
+        // Monocle: to the start or the end of the stack, without wrapping.
+        let mut w = panes(Layout::Monocle, 3);
+        assert!(w.move_far(Motion::Right, screen(), &style));
+        assert_eq!(w.panes, [1, 2, 4, 3]);
+        assert!(!w.move_far(Motion::Down, screen(), &style));
+        assert!(w.move_far(Motion::Up, screen(), &style));
+        assert_eq!(w.panes, [3, 1, 2, 4]);
+    }
+    #[test]
+    fn move_sides_are_the_ways_a_move_would_change_something() {
+        let style = Appearance::default();
+        let sides = |w: &Workspace| w.move_sides(&w.rectangles(screen(), &style));
+        // The main pane in Tile only has the stack to its right.
+        assert_eq!(sides(&panes(Layout::Tile, 1)), [false, true, false, false]);
+        // A middle stack pane can go left, up and down.
+        assert_eq!(sides(&panes(Layout::Tile, 3)), [true, false, true, true]);
+        // Checking does not move anything.
+        let w = panes(Layout::Tile, 3);
+        sides(&w);
+        assert_eq!(w.panes, [1, 2, 3, 4]);
+    }
     #[test]
     fn resizing_moves_the_main_divider_in_each_layout() {
         let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
@@ -438,12 +544,12 @@ mod tests {
                     rows[0].1.bottom()
                 }
             };
-            w.resize(horizontal, true);
+            w.resize_by(horizontal, false, true, false);
             assert!(
                 edge(&w.rectangles(bounds, &style)) > edge(&before),
                 "{layout:?}"
             );
-            w.resize(horizontal, false);
+            w.resize_by(horizontal, false, false, false);
             assert!((edge(&w.rectangles(bounds, &style)) - edge(&before)).abs() < 0.01);
             assert_eq!(w.focused, Some(2));
         }
@@ -465,11 +571,18 @@ mod tests {
             w.focus(5);
             let before = w.rectangles(bounds, &style);
             let horizontal = layout == Layout::HorizontalGrid;
-            w.resize(horizontal, true);
+            w.resize_by(horizontal, false, true, false);
             let after = w.rectangles(bounds, &style);
-            assert_eq!(before[0], after[0], "unrelated pane changed: {layout:?}");
+            let pane =
+                |rects: &[(u64, egui::Rect)], id| rects.iter().find(|(i, _)| *i == id).unwrap().1;
+            assert_eq!(
+                pane(&before, 1),
+                pane(&after, 1),
+                "unrelated pane changed: {layout:?}"
+            );
             assert_ne!(
-                before[4].1, after[4].1,
+                pane(&before, 5),
+                pane(&after, 5),
                 "focused pane unchanged: {layout:?}"
             );
             let saved = w.pane_weights.clone();
@@ -477,10 +590,10 @@ mod tests {
             w.focus(5);
             assert_eq!(saved, w.pane_weights);
             for _ in 0..100 {
-                w.resize(horizontal, true);
+                w.resize_by(horizontal, false, true, false);
             }
             for _ in 0..100 {
-                w.resize(!horizontal, false);
+                w.resize_by(!horizontal, false, false, false);
             }
             let rects = w.rectangles(bounds, &style);
             for (i, (_, r)) in rects.iter().enumerate() {
@@ -499,18 +612,53 @@ mod tests {
     }
 
     #[test]
+    fn plain_keys_move_the_top_divider_and_far_keys_the_bottom_one() {
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let style = Appearance::default();
+        let mut w = Workspace::new(1, 1);
+        w.panes = vec![1, 2, 3, 4];
+        w.focus(3);
+        let middle = |w: &Workspace| w.rectangles(bounds, &style)[2].1;
+        let before = middle(&w);
+        // Plain keys move the top edge either way; the bottom one stays.
+        w.resize_by(false, false, false, false);
+        let up = middle(&w);
+        assert!(up.top() < before.top());
+        assert!((up.bottom() - before.bottom()).abs() < 0.01);
+        w.resize_by(false, false, true, false);
+        w.resize_by(false, false, true, false);
+        let down = middle(&w);
+        assert!(down.top() > before.top());
+        assert!((down.bottom() - before.bottom()).abs() < 0.01);
+        // Far keys move the bottom edge; the top one stays.
+        w.resize_by(false, true, true, false);
+        let far = middle(&w);
+        assert!(far.bottom() > before.bottom());
+        assert!((far.top() - down.top()).abs() < 0.01);
+        w.resize_by(false, true, false, false);
+        w.resize_by(false, true, false, false);
+        assert!(middle(&w).bottom() < before.bottom());
+        // The last pane has only a divider above, which both move.
+        w.focus(4);
+        let last = |w: &Workspace| w.rectangles(bounds, &style)[3].1.top();
+        let top = last(&w);
+        w.resize_by(false, true, false, false);
+        assert!(last(&w) < top);
+    }
+
+    #[test]
     fn pane_sizes_are_kept_per_layout() {
         let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
         let style = Appearance::default();
         let mut w = Workspace::new(1, 1);
         w.panes = vec![1, 2, 3, 4];
         w.focus(2);
-        w.resize(false, true);
+        w.resize_by(false, false, true, false);
         let tile = w.rectangles(bounds, &style);
         // Grid starts at equal sizes, and its own resizing leaves tile alone.
         w.set_layout(Layout::Grid);
         assert!(w.weights().is_empty());
-        w.resize(false, false);
+        w.resize_by(false, false, false, false);
         w.set_layout(Layout::Monocle);
         w.set_layout(Layout::Tile);
         assert_eq!(w.rectangles(bounds, &style), tile);
@@ -524,12 +672,12 @@ mod tests {
         let mut w = Workspace::new(1, 1);
         w.panes = vec![1];
         w.focus(1);
-        w.resize(true, true);
-        w.resize(false, true);
+        w.resize_by(true, false, true, false);
+        w.resize_by(false, false, true, false);
         w.layout = Layout::Monocle;
         w.panes.push(2);
-        w.resize(true, true);
-        w.resize(false, true);
+        w.resize_by(true, false, true, false);
+        w.resize_by(false, false, true, false);
         assert_eq!(w.main_ratio, 0.5);
         assert!(w.pane_weights.is_empty());
     }
