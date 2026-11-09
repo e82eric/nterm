@@ -1,4 +1,4 @@
-#include <ghostty.h>
+#include <ghostty_host.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>

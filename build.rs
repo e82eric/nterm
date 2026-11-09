@@ -27,8 +27,7 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=/STACK:8388608");
     }
     println!("cargo:rerun-if-changed=src/host_shim.c");
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("include/ghostty.h").display()
-    );
+    for header in ["include/ghostty.h", "include/ghostty_host.h"] {
+        println!("cargo:rerun-if-changed={}", root.join(header).display());
+    }
 }
