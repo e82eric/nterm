@@ -315,7 +315,9 @@ version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
+ "iana-time-zone",
  "num-traits",
+ "windows-link",
 ]
 
 [[package]]
@@ -708,7 +710,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1006,6 +1008,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
+]
+
+[[package]]
+name = "iana-time-zone"
+version = "0.1.65"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
+dependencies = [
+ "android_system_properties",
+ "core-foundation-sys",
+ "iana-time-zone-haiku",
+ "js-sys",
+ "log",
+ "wasm-bindgen",
+ "windows-core",
+]
+
+[[package]]
+name = "iana-time-zone-haiku"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -1391,7 +1417,7 @@ dependencies = [
 [[package]]
 name = "nfm-egui"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
+source = "git+https://github.com/e82eric/npicker?rev=8c15bfdccab7147e221378075bef24a23c61d768#8c15bfdccab7147e221378075bef24a23c61d768"
 dependencies = [
  "crossbeam-channel",
  "egui",
@@ -1407,7 +1433,7 @@ dependencies = [
 [[package]]
 name = "nfm-picker-sources"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
+source = "git+https://github.com/e82eric/npicker?rev=8c15bfdccab7147e221378075bef24a23c61d768#8c15bfdccab7147e221378075bef24a23c61d768"
 dependencies = [
  "chrono",
  "csv",
@@ -1415,17 +1441,18 @@ dependencies = [
  "nfm_search_core",
  "regex",
  "serde",
+ "tracing",
 ]
 
 [[package]]
 name = "nfm-preview-command"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
+source = "git+https://github.com/e82eric/npicker?rev=8c15bfdccab7147e221378075bef24a23c61d768#8c15bfdccab7147e221378075bef24a23c61d768"
 
 [[package]]
 name = "nfm-preview-file"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
+source = "git+https://github.com/e82eric/npicker?rev=8c15bfdccab7147e221378075bef24a23c61d768#8c15bfdccab7147e221378075bef24a23c61d768"
 dependencies = [
  "image",
  "nfm-egui",
@@ -1436,7 +1463,7 @@ dependencies = [
 [[package]]
 name = "nfm-preview-text"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
+source = "git+https://github.com/e82eric/npicker?rev=8c15bfdccab7147e221378075bef24a23c61d768#8c15bfdccab7147e221378075bef24a23c61d768"
 dependencies = [
  "nfm-egui",
  "two-face",
@@ -1447,7 +1474,7 @@ dependencies = [
 [[package]]
 name = "nfm_file_system"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
+source = "git+https://github.com/e82eric/npicker?rev=8c15bfdccab7147e221378075bef24a23c61d768#8c15bfdccab7147e221378075bef24a23c61d768"
 dependencies = [
  "crossbeam-channel",
  "hashbrown 0.17.1",
@@ -1458,7 +1485,7 @@ dependencies = [
 [[package]]
 name = "nfm_search_core"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=d6c90085ee159c27ab93a786a64e515d295fa69d#d6c90085ee159c27ab93a786a64e515d295fa69d"
+source = "git+https://github.com/e82eric/npicker?rev=8c15bfdccab7147e221378075bef24a23c61d768#8c15bfdccab7147e221378075bef24a23c61d768"
 dependencies = [
  "crossbeam-channel",
  "memchr",
@@ -2278,7 +2305,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2674,7 +2701,19 @@ checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "log",
  "pin-project-lite",
+ "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2682,6 +2721,9 @@ name = "tracing-core"
 version = "0.1.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+dependencies = [
+ "once_cell",
+]
 
 [[package]]
 name = "two-face"
@@ -3177,7 +3219,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -284,7 +284,6 @@ impl Picker {
                 shared.set_presentation(result_rows, preview_rows, options.preview_visible);
                 shared.set_preview_line_numbers(line_numbers);
                 shared.set_external_preview(false);
-                shared.set_keybinding_help(Vec::new());
                 shared.set_preview_provider(
                     &ctx,
                     Arc::new(|_: nfm_egui::PreviewRequest<source::Candidate>, _| {
@@ -359,11 +358,6 @@ impl Picker {
                 && !nfm_preview
                 && !matches!(options.preview, Some(config::Preview::Text { .. })),
         );
-        let mut help = Vec::new();
-        if source.is_scrollback() {
-            help.push(("Ctrl+B".into(), "Split selected line".into()));
-        }
-        shared.set_keybinding_help(help);
         let resolved_preview = match &options.preview {
             Some(source @ config::Preview::Dynamic { .. }) => {
                 Some(preview::ResolvedPreview::new(source.clone()))
@@ -602,7 +596,6 @@ impl Picker {
                     self.shared.set_preview_line_numbers(line_numbers);
                 }
                 self.refresh_scrollback_preview(ctx);
-                self.set_keybinding_help(vec![("Ctrl+B".into(), "Split selected line".into())]);
             } else if !self.line_split
                 && self.pipe_session.is_none()
                 && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::B))
@@ -819,13 +812,6 @@ impl Picker {
         self.line_split = true;
         self.apply_line_break_presentation();
         self.refresh_scrollback_preview(ctx);
-        self.set_keybinding_help(vec![(
-            "Alt+Left".into(),
-            "Return to scrollback results".into(),
-        )]);
-    }
-    fn set_keybinding_help(&mut self, help: Vec<(String, String)>) {
-        self.shared.set_keybinding_help(help);
     }
     fn apply_line_break_presentation(&mut self) {
         let settings = self.builtin_pickers.line_break;
