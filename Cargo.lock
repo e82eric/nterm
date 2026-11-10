@@ -1417,7 +1417,7 @@ dependencies = [
 [[package]]
 name = "nfm-egui"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=1ac6dd08009671393a93b4641555856849aa26af#1ac6dd08009671393a93b4641555856849aa26af"
+source = "git+https://github.com/e82eric/npicker?rev=a12945739da73d290937b27adddf9ba5ab9a920a#a12945739da73d290937b27adddf9ba5ab9a920a"
 dependencies = [
  "crossbeam-channel",
  "egui",
@@ -1433,7 +1433,7 @@ dependencies = [
 [[package]]
 name = "nfm-picker-sources"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=1ac6dd08009671393a93b4641555856849aa26af#1ac6dd08009671393a93b4641555856849aa26af"
+source = "git+https://github.com/e82eric/npicker?rev=a12945739da73d290937b27adddf9ba5ab9a920a#a12945739da73d290937b27adddf9ba5ab9a920a"
 dependencies = [
  "chrono",
  "csv",
@@ -1447,12 +1447,12 @@ dependencies = [
 [[package]]
 name = "nfm-preview-command"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=1ac6dd08009671393a93b4641555856849aa26af#1ac6dd08009671393a93b4641555856849aa26af"
+source = "git+https://github.com/e82eric/npicker?rev=a12945739da73d290937b27adddf9ba5ab9a920a#a12945739da73d290937b27adddf9ba5ab9a920a"
 
 [[package]]
 name = "nfm-preview-file"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=1ac6dd08009671393a93b4641555856849aa26af#1ac6dd08009671393a93b4641555856849aa26af"
+source = "git+https://github.com/e82eric/npicker?rev=a12945739da73d290937b27adddf9ba5ab9a920a#a12945739da73d290937b27adddf9ba5ab9a920a"
 dependencies = [
  "image",
  "nfm-egui",
@@ -1463,7 +1463,7 @@ dependencies = [
 [[package]]
 name = "nfm-preview-text"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=1ac6dd08009671393a93b4641555856849aa26af#1ac6dd08009671393a93b4641555856849aa26af"
+source = "git+https://github.com/e82eric/npicker?rev=a12945739da73d290937b27adddf9ba5ab9a920a#a12945739da73d290937b27adddf9ba5ab9a920a"
 dependencies = [
  "nfm-egui",
  "two-face",
@@ -1474,7 +1474,7 @@ dependencies = [
 [[package]]
 name = "nfm_file_system"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=1ac6dd08009671393a93b4641555856849aa26af#1ac6dd08009671393a93b4641555856849aa26af"
+source = "git+https://github.com/e82eric/npicker?rev=a12945739da73d290937b27adddf9ba5ab9a920a#a12945739da73d290937b27adddf9ba5ab9a920a"
 dependencies = [
  "crossbeam-channel",
  "hashbrown 0.17.1",
@@ -1485,7 +1485,7 @@ dependencies = [
 [[package]]
 name = "nfm_search_core"
 version = "0.1.0"
-source = "git+https://github.com/e82eric/npicker?rev=1ac6dd08009671393a93b4641555856849aa26af#1ac6dd08009671393a93b4641555856849aa26af"
+source = "git+https://github.com/e82eric/npicker?rev=a12945739da73d290937b27adddf9ba5ab9a920a#a12945739da73d290937b27adddf9ba5ab9a920a"
 dependencies = [
  "crossbeam-channel",
  "memchr",

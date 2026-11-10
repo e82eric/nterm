@@ -398,10 +398,11 @@ the standard `io` and `os` libraries and a `nterm.json_parse(string)` helper.
 It has no filesystem scan or terminal snapshot. Without an action callback,
 Enter pastes the chosen value. Item lists are limited to 2,000 entries.
 
-`Argument` has nothing to pick from: the query box takes text as typed, and
-Enter runs the required `action` callback with that text as `item.value` and
+`Argument` has nothing to pick from: it opens a one-row prompt that takes text
+as typed, and Enter runs the required `action` callback with that text as `item.value` and
 `item.text`. `prompt` replaces the `>` before the text and `placeholder` is
-shown muted while nothing is typed. The picker stays open after Enter, so the
+shown muted while nothing is typed. Of the options every picker takes, it uses
+`position`, `scope` and `initial_query`. The prompt stays open after Enter, so the
 action either shows a page on top with `app:push_picker` or closes it with
 `app:close_picker()`. The sample `Grep` picker asks for text and pushes
 `Ripgrep` with it as `pattern`.

@@ -114,7 +114,7 @@ impl TerminalPane {
             .copy_mode
             .generation
             .or(self.search.snapshot_generation)
-            .or_else(|| self.pages.top().and_then(|picker| picker.generation));
+            .or_else(|| self.pages.top().and_then(|page| page.generation()));
         let Some(generation) = generation else {
             return Ok(());
         };
@@ -130,10 +130,11 @@ impl TerminalPane {
         if self
             .pages
             .top_mut()
+            .and_then(crate::picker::Page::picker_mut)
             .is_some_and(|picker| picker.prepare_snapshot_resize())
         {
             let picker = self.take_pages().unwrap();
-            let from_copy = picker.from_copy;
+            let from_copy = picker.from_copy();
             drop(picker);
             self.handle_picker_action(crate::picker::Action::Cancel, Some(generation), from_copy);
             if !from_copy {

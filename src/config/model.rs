@@ -47,6 +47,7 @@ impl Model {
     pub(crate) fn picker(&self, name: &str) -> Option<PickerEntry> {
         self.pickers.get(name).map(|entry| match entry {
             PickerEntry::Static(options) => PickerEntry::Static(options.clone()),
+            PickerEntry::Prompt(options) => PickerEntry::Prompt(options.clone()),
             PickerEntry::Factory(factory, _) => {
                 PickerEntry::Factory(factory.clone(), self.defaults)
             }

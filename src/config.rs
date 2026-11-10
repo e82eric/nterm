@@ -33,7 +33,7 @@ impl PickerFactory {
         &self,
         context: &PickerContext,
         defaults: crate::picker::config::PickerDefaults,
-    ) -> Result<crate::picker::config::Options, String> {
+    ) -> Result<crate::picker::config::PageOptions, String> {
         let function: mlua::Function = self
             .lua
             .registry_value(&self.key)
@@ -81,7 +81,12 @@ impl PickerFactory {
             ));
         }
         match definition.resolve(&self.name, defaults)? {
-            crate::picker::config::PickerEntry::Static(options) => Ok(options),
+            crate::picker::config::PickerEntry::Static(options) => {
+                Ok(crate::picker::config::PageOptions::Picker(options))
+            }
+            crate::picker::config::PickerEntry::Prompt(options) => {
+                Ok(crate::picker::config::PageOptions::Prompt(options))
+            }
             crate::picker::config::PickerEntry::Factory(..) => Err(format!(
                 "pickers.{}: factory must return a picker table",
                 self.name
@@ -1669,19 +1674,19 @@ mod tests {
             config.actions,
         )
         .unwrap();
-        let options = bindings
+        // It opens a prompt, not a picker.
+        let Ok(crate::picker::config::PageOptions::Prompt(options)) = bindings
             .named("Grep")
             .unwrap()
-            .resolve(&PickerContext::default())
-            .unwrap();
+            .open(&PickerContext::default())
+        else {
+            panic!("an Argument opens a prompt");
+        };
+        assert_eq!(options.prompt.as_deref(), Some("Grep:"));
         assert_eq!(
-            options.argument,
-            Some(crate::picker::config::ArgumentOptions {
-                prompt: Some("Grep:".into()),
-                placeholder: Some("<text>  Search the working directory".into()),
-            })
+            options.placeholder.as_deref(),
+            Some("<text>  Search the working directory")
         );
-        assert!(!options.preview_visible);
     }
 
     #[test]

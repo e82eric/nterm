@@ -344,32 +344,41 @@ impl TerminalView {
         let Some(pane) = self.pane_mut(origin) else {
             return;
         };
-        let Some((action, generation, from_copy, ends_picker)) = pane.pending_callback.take()
+        let Some(pane::PendingCallback {
+            action,
+            generation,
+            from_copy,
+        }) = pane.pending_callback.take()
         else {
             return;
         };
         let selection = pane.selected_text();
-        if let crate::picker::Action::Custom(callback, text, filesystem, range, value, params) =
+        let result =
             action
-        {
-            let result = callback.with_host(&mut |request| self.host_request(request, gl), || {
-                callback.call_with_selection(
-                    &text, &value, filesystem, generation, range, &params, selection,
-                )
-            });
-            let bindings = self.picker_bindings.clone();
-            let palette = self.palette_context();
-            if let Some(pane) = self.pane_mut(origin) {
-                pane.finish_picker_callback(
-                    result,
-                    generation,
-                    from_copy,
-                    ends_picker,
-                    ctx,
-                    &bindings,
-                    &palette,
-                );
-            }
+                .callback
+                .with_host(&mut |request| self.host_request(request, gl), || {
+                    action.callback.call_with_selection(
+                        &action.text,
+                        &action.value,
+                        action.filesystem,
+                        generation,
+                        action.range,
+                        &action.params,
+                        selection,
+                    )
+                });
+        let bindings = self.picker_bindings.clone();
+        let palette = self.palette_context();
+        if let Some(pane) = self.pane_mut(origin) {
+            pane.finish_picker_callback(
+                result,
+                generation,
+                from_copy,
+                action.accepted,
+                ctx,
+                &bindings,
+                &palette,
+            );
         }
     }
     fn floating_request(
