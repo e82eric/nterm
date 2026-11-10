@@ -344,7 +344,8 @@ impl TerminalView {
         let Some(pane) = self.pane_mut(origin) else {
             return;
         };
-        let Some((action, generation, from_copy)) = pane.pending_callback.take() else {
+        let Some((action, generation, from_copy, ends_picker)) = pane.pending_callback.take()
+        else {
             return;
         };
         let selection = pane.selected_text();
@@ -360,7 +361,13 @@ impl TerminalView {
             let palette = self.palette_context();
             if let Some(pane) = self.pane_mut(origin) {
                 pane.finish_picker_callback(
-                    result, generation, from_copy, ctx, &bindings, &palette,
+                    result,
+                    generation,
+                    from_copy,
+                    ends_picker,
+                    ctx,
+                    &bindings,
+                    &palette,
                 );
             }
         }

@@ -20,6 +20,7 @@ use nfm_egui::copy_mode::{
 };
 use nfm_egui::copy_mode::{CopyMode, CopySelection, Motion, TextRow, VisualMode};
 use nfm_egui::quick_select::{self, Purpose as QuickSelectPurpose, QuickSelect};
+use nfm_egui::{Outcome, PageStack};
 use std::ffi::{c_char, c_void};
 use std::sync::{
     Arc,
@@ -246,6 +247,9 @@ enum PickerOpen {
     /// active says nothing here: a quick select holds its snapshot in copy mode
     /// even when opened from the live terminal.
     FromCallback { from_copy: bool },
+    /// A callback, as a page on top of the picker that ran it, which stays
+    /// beneath. Closing returns where that one was opened.
+    Page { from_copy: bool },
 }
 
 /// An open quick select and the definition its hints came from. Paging and
@@ -271,11 +275,10 @@ pub(super) struct TerminalPane {
     search_worker: SnapshotSearchAdapter,
     copy_mode: CopyMode,
     quick_select: Option<ActiveQuickSelect>,
-    picker: Option<crate::picker::Picker>,
-    /// The pages beneath `picker`, which is the one showing: pickers whose
-    /// action showed another on top with `app:push_picker`. Escape comes back
-    /// to the last, and closing the picker any other way drops them all.
-    picker_pages: Vec<crate::picker::Picker>,
+    /// The open picker and the pages beneath it: pickers whose action showed
+    /// another on top with `app:push_picker`. The top one shows; Escape comes
+    /// back to the one beneath, and closing any other way drops them all.
+    pages: PageStack<crate::picker::Picker>,
     picker_font: crate::picker::font::PickerFont,
     toasts: crate::toast::Toasts,
     copy_search_cursor: usize,
@@ -289,7 +292,13 @@ pub(super) struct TerminalPane {
     /// be reapplied once it scrolls.
     decorated_viewport: std::cell::Cell<Option<(u64, u64, u32)>>,
     prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
-    pub(super) pending_callback: Option<(crate::picker::Action, Option<u64>, bool)>,
+    /// A picker or quick select action for the window to run, which the pane
+    /// cannot: the action may ask for things only the window has. With it go
+    /// the snapshot generation, whether it was opened from copy mode, and
+    /// whether running it ends the picker: an accepted result does, unless
+    /// the action shows a page or another picker, and a key's action or an
+    /// argument's text does not.
+    pub(super) pending_callback: Option<(crate::picker::Action, Option<u64>, bool, bool)>,
 }
 
 #[unsafe(no_mangle)]
@@ -373,7 +382,7 @@ impl TerminalPane {
     /// Whether Escape is free to dismiss toasts: an open picker or search
     /// closes on Escape first.
     pub(super) fn escape_dismisses_toasts(&self) -> bool {
-        self.picker.is_none() && !self.search.active
+        self.pages.is_empty() && !self.search.active
     }
 
     pub(super) fn dismiss_toasts(&mut self) {
@@ -382,7 +391,7 @@ impl TerminalPane {
 
     pub(super) fn open_messages(&mut self, ctx: &egui::Context, config_issues: &[String]) {
         let options = crate::error_log::picker_options(config_issues);
-        self.picker = Some(crate::picker::Picker::start(
+        self.pages.open(crate::picker::Picker::start(
             self.host,
             None,
             false,
@@ -480,8 +489,7 @@ impl TerminalPane {
             search_worker,
             copy_mode: command_blocks::copy_mode(),
             quick_select: None,
-            picker: None,
-            picker_pages: Vec::new(),
+            pages: PageStack::new(),
             picker_font,
             toasts: crate::toast::Toasts::default(),
             copy_search_cursor: 0,
@@ -510,7 +518,7 @@ impl TerminalPane {
     }
 
     pub(super) fn destroy(&mut self) {
-        self.picker = None;
+        self.pages.apply(Outcome::Close);
         #[cfg(any(windows, unix))]
         {
             self.wake.pipe.take();
@@ -528,7 +536,7 @@ impl TerminalPane {
             if !active {
                 self.cancel_workspace_picker();
             }
-            if !active && (self.search.active || self.picker.is_some()) {
+            if !active && (self.search.active || !self.pages.is_empty()) {
                 ctx.memory_mut(|memory| {
                     if let Some(id) = memory.focused() {
                         memory.surrender_focus(id);
@@ -569,7 +577,7 @@ impl TerminalPane {
         self.scale = scale;
         unsafe { ghostty_ffi::nterm_host_resize(self.host, size[0], size[1], scale as f64) };
         if let Err(error) = self.resize_snapshot() {
-            self.picker = None;
+            self.pages.apply(Outcome::Close);
             self.quick_select = None;
             self.close_search();
             self.close_copy_mode();
@@ -581,7 +589,7 @@ impl TerminalPane {
     pub(super) fn update_modes(&mut self, ctx: &egui::Context) {
         // Font/scale changes can alter the native grid without changing pane pixels.
         if let Err(error) = self.resize_snapshot() {
-            self.picker = None;
+            self.pages.apply(Outcome::Close);
             self.quick_select = None;
             self.close_search();
             self.close_copy_mode();
@@ -595,7 +603,7 @@ impl TerminalPane {
         // including a reflow that leaves the viewport at the same row.
         self.refresh_decorations();
         if self.quick_select.is_none()
-            && self.picker.is_none()
+            && self.pages.is_empty()
             && let Some(generation) = self.copy_mode.generation
         {
             let now = Instant::now();
@@ -788,7 +796,7 @@ impl TerminalPane {
         if let Some(pipe) = &self.wake.pipe {
             pipe.bind_window(self.wake.proxy.clone(), window_id);
         }
-        if let Some(picker) = &self.picker {
+        if let Some(picker) = self.pages.top() {
             picker.bind_pipe_search_wake(self.wake.proxy.clone(), window_id);
         }
         // A notification already sent went to the old window.
@@ -895,7 +903,7 @@ impl TerminalPane {
         let copying = self.copy_mode.generation.is_some();
         let visual =
             copying && self.quick_select.is_none() && self.copy_mode.visual_anchor.is_some();
-        let label = if let Some(picker) = &self.picker {
+        let label = if let Some(picker) = self.pages.top() {
             picker.label()
         } else if let Some(quick) = &self.quick_select {
             if matches!(quick.state.purpose(), QuickSelectPurpose::YankLines { .. }) {
@@ -1054,16 +1062,37 @@ impl TerminalPane {
 }
 
 impl TerminalPane {
+    /// Close the picker and the pages beneath it, and hand back the one that
+    /// was on top, for where closing it returns to.
+    fn take_pages(&mut self) -> Option<crate::picker::Picker> {
+        self.pages.apply(Outcome::Close).into_iter().next()
+    }
+    /// Show `picker`: alone when the user opened it, and otherwise on top of
+    /// the pages there are.
+    fn place_page(&mut self, alone: bool, picker: crate::picker::Picker) {
+        if alone {
+            self.pages.open(picker);
+        } else {
+            self.pages.apply(Outcome::Push(picker));
+        }
+    }
+    /// An accepted result's action showed nothing in the picker's place: the
+    /// picker and the pages beneath it are done.
+    fn end_pages(&mut self) {
+        if let Some(picker) = self.take_pages() {
+            picker.surrender_focus();
+        }
+    }
     pub(super) fn workspace_picker_active(&self) -> bool {
-        self.picker
-            .as_ref()
+        self.pages
+            .top()
             .is_some_and(|p| p.scope == crate::picker::config::Scope::Workspace)
     }
     pub(super) fn cancel_workspace_picker(&mut self) {
         if !self.workspace_picker_active() {
             return;
         }
-        let picker = self.picker.take().unwrap();
+        let picker = self.take_pages().unwrap();
         let (generation, from_copy) = (picker.generation, picker.from_copy);
         drop(picker);
         self.pending_callback = None;
@@ -1076,7 +1105,7 @@ impl TerminalPane {
         self.wake.context.request_repaint();
     }
     pub(super) fn show_background_overlays(&mut self, ctx: &egui::Context, bounds: egui::Rect) {
-        if let Some(picker) = &mut self.picker {
+        if let Some(picker) = self.pages.top_mut() {
             picker.typography = self.picker_font.typography(ctx, self.host);
             picker.show_scoped(ctx, bounds, self.workspace_bounds, false);
         }
@@ -1145,7 +1174,7 @@ impl TerminalPane {
         bindings: &crate::picker::config::Bindings,
         palette: &super::PaletteContext,
         open: PickerOpen,
-    ) {
+    ) -> bool {
         let host = self.host;
         let context = if entry.needs_context() {
             let mut row = ghostty_ffi::LiveCursor::default();
@@ -1154,7 +1183,7 @@ impl TerminalPane {
                     "Could not open picker",
                     "Unable to read live cursor line".into(),
                 );
-                return;
+                return false;
             }
             let bytes = if row.len == 0 {
                 &[][..]
@@ -1185,7 +1214,7 @@ impl TerminalPane {
             Ok(options) => options,
             Err(error) => {
                 self.show_error("Could not open picker", error);
-                return;
+                return false;
             }
         };
         options.default_cwd(self.pwd());
@@ -1203,11 +1232,11 @@ impl TerminalPane {
                         "No themes found",
                         "Check your Ghostty resources/themes directory".into(),
                     );
-                    return;
+                    return false;
                 }
                 Err(error) => {
                     self.show_error("Could not load themes", error);
-                    return;
+                    return false;
                 }
             };
             options.source = crate::themes::picker_options(names).source;
@@ -1223,9 +1252,10 @@ impl TerminalPane {
         let copy_generation = self.copy_mode.generation;
         let from_copy = match open {
             PickerOpen::Direct => copy_generation.is_some(),
-            PickerOpen::FromCallback { from_copy } => from_copy,
+            PickerOpen::FromCallback { from_copy } | PickerOpen::Page { from_copy } => from_copy,
         };
         let replace = matches!(open, PickerOpen::FromCallback { .. });
+        let direct = matches!(open, PickerOpen::Direct);
         let cursor_row = if options.position == crate::picker::config::Position::Cursor {
             self.picker_cursor_row()
         } else {
@@ -1240,25 +1270,32 @@ impl TerminalPane {
                 | crate::picker::config::Source::Command(_)
                 | crate::picker::config::Source::TextFile(_)
         ) {
-            let previous = if replace { self.picker.take() } else { None };
-            self.picker = Some(crate::picker::Picker::start_replacing(
-                host,
-                if matches!(
-                    options.source,
-                    crate::picker::config::Source::CommandPalette(_)
-                        | crate::picker::config::Source::Workspaces(_)
-                ) {
-                    None
-                } else {
-                    copy_generation
-                },
-                from_copy,
-                0,
-                ctx.clone(),
-                options,
-                &bindings.prompt_patterns,
-                previous,
-            ));
+            let previous = if replace {
+                self.pages.apply(Outcome::Back).pop()
+            } else {
+                None
+            };
+            self.place_page(
+                direct,
+                crate::picker::Picker::start_replacing(
+                    host,
+                    if matches!(
+                        options.source,
+                        crate::picker::config::Source::CommandPalette(_)
+                            | crate::picker::config::Source::Workspaces(_)
+                    ) {
+                        None
+                    } else {
+                        copy_generation
+                    },
+                    from_copy,
+                    0,
+                    ctx.clone(),
+                    options,
+                    &bindings.prompt_patterns,
+                    previous,
+                ),
+            );
         } else {
             let generation = if let Some(generation) = copy_generation {
                 generation
@@ -1269,7 +1306,7 @@ impl TerminalPane {
                         "Picker unavailable",
                         "Unable to create the scrollback snapshot".into(),
                     );
-                    return;
+                    return false;
                 }
                 generation
             };
@@ -1285,36 +1322,44 @@ impl TerminalPane {
                     "Picker unavailable",
                     "Unable to read the scrollback snapshot".into(),
                 );
-                return;
+                return false;
             }
             if !from_copy {
                 self.copy_mode.start(generation, view);
             }
-            let previous = if replace { self.picker.take() } else { None };
-            self.picker = Some(crate::picker::Picker::start_replacing(
-                host,
-                Some(generation),
-                from_copy,
-                view.total_rows,
-                ctx.clone(),
-                options,
-                &bindings.prompt_patterns,
-                previous,
-            ));
+            let previous = if replace {
+                self.pages.apply(Outcome::Back).pop()
+            } else {
+                None
+            };
+            self.place_page(
+                direct,
+                crate::picker::Picker::start_replacing(
+                    host,
+                    Some(generation),
+                    from_copy,
+                    view.total_rows,
+                    ctx.clone(),
+                    options,
+                    &bindings.prompt_patterns,
+                    previous,
+                ),
+            );
         }
-        if let Some(picker) = self.picker.as_mut() {
+        if let Some(picker) = self.pages.top_mut() {
             picker.cursor_row = cursor_row;
         }
+        true
     }
     pub(super) fn action_context(&self) -> crate::actions::ActionContext {
         crate::actions::ActionContext {
             copying: self.copying(),
-            picker: self.picker.is_some(),
+            picker: !self.pages.is_empty(),
             search: self.search.active,
             quick_select: self.quick_select.is_some(),
             palette: self
-                .picker
-                .as_ref()
+                .pages
+                .top()
                 .is_some_and(crate::picker::Picker::is_command_palette),
         }
     }
@@ -1332,7 +1377,7 @@ impl TerminalPane {
         );
         for (operation, cause) in issues {
             if matches!(cause.as_str(), "SnapshotExpired" | "SnapshotUnavailable") {
-                self.picker = None;
+                self.pages.apply(Outcome::Close);
                 self.cancel_quick_select();
                 self.close_search();
                 self.close_copy_mode();
@@ -1470,7 +1515,7 @@ impl TerminalPane {
                             );
                         }
                         crate::lua_callbacks::Command::ClosePicker => {
-                            if let Some(picker) = self.picker.take() {
+                            if let Some(picker) = self.take_pages() {
                                 picker.surrender_focus();
                                 let (generation, from_copy) = (picker.generation, picker.from_copy);
                                 drop(picker);
@@ -1554,8 +1599,8 @@ impl TerminalPane {
                 unsafe { ghostty_ffi::nterm_host_shell_creation_time(self.host) },
             );
         }
-        if self.picker.as_ref().is_some_and(|p| p.pipe_cancelled()) {
-            let picker = self.picker.take().unwrap();
+        if self.pages.top().is_some_and(|p| p.pipe_cancelled()) {
+            let picker = self.take_pages().unwrap();
             let (generation, from_copy) = (picker.generation, picker.from_copy);
             drop(picker);
             self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
@@ -1584,7 +1629,7 @@ impl TerminalPane {
                         continue;
                     }
                     if !interactive
-                        || self.picker.is_some()
+                        || !self.pages.is_empty()
                         || self.search.active
                         || self.quick_select.is_some()
                     {
@@ -1601,7 +1646,7 @@ impl TerminalPane {
                     self.open_pipe_picker(ctx, bindings, request, session);
                 }
                 other => {
-                    if let Some(picker) = &mut self.picker {
+                    if let Some(picker) = self.pages.top_mut() {
                         picker.pipe_event(ctx, other);
                     }
                 }
@@ -1645,13 +1690,13 @@ impl TerminalPane {
         // over the pipe lists only built-in actions, without floats or workspaces.
         let palette = super::PaletteContext::default();
         self.open_picker(ctx, entry, Some(params), bindings, &palette);
-        if let Some(picker) = &mut self.picker {
+        if let Some(picker) = self.pages.top_mut() {
             if let Err(message) = picker.attach_pipe(ctx, session.clone(), &request) {
                 session.finish(
                     "error",
                     serde_json::json!({"code":"invalid_definition","message":message}),
                 );
-                let picker = self.picker.take().unwrap();
+                let picker = self.take_pages().unwrap();
                 let (generation, from_copy) = (picker.generation, picker.from_copy);
                 drop(picker);
                 self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
@@ -1673,50 +1718,50 @@ impl TerminalPane {
         bounds: egui::Rect,
         bindings: &crate::picker::config::Bindings,
     ) -> (bool, Option<crate::actions::AppAction>) {
-        if self.picker.is_none() {
-            // Closed other than by Escape: the pages beneath go with it.
-            self.picker_pages.clear();
-        }
-        let was_active = self.picker.as_ref().is_some();
+        let was_active = !self.pages.is_empty();
         let consumed = false;
-        let active = self.picker.as_ref().is_some();
+        let active = !self.pages.is_empty();
         let host = self.host;
         let typography = self.picker_font.typography(ui.ctx(), host);
-        if let Some(picker) = self.picker.as_mut() {
+        if let Some(picker) = self.pages.top_mut() {
             picker.typography = typography;
             picker.builtin_pickers = bindings.builtin_pickers;
             picker.set_cursor_scroll_padding(bindings.cursor_scroll_padding);
         }
         let action = self
-            .picker
-            .as_mut()
+            .pages
+            .top_mut()
             .and_then(|picker| picker.show_scoped(ui.ctx(), bounds, self.workspace_bounds, true));
         let mut application_action = None;
         if let Some(action) = action {
+            let picker = self
+                .pages
+                .top()
+                .expect("picker action requires active picker");
+            let (generation, from_copy) = (picker.generation, picker.from_copy);
+            let took_result = picker.took_result();
             if matches!(&action, crate::picker::Action::Custom(..)) {
-                let picker = self
-                    .picker
-                    .as_ref()
-                    .expect("picker key action requires active picker");
-                self.pending_callback = Some((action, picker.generation, picker.from_copy));
+                self.pending_callback = Some((action, generation, from_copy, took_result));
                 ui.ctx().request_repaint();
                 return (true, None);
             }
-            let picker = self
-                .picker
-                .take()
-                .expect("picker action requires active picker");
-            let (generation, from_copy) = (picker.generation, picker.from_copy);
-            let escaped = matches!(action, crate::picker::Action::Cancel) && !picker.accepted();
-            drop(picker);
-            // Escape goes back a page.
-            if escaped && let Some(under) = self.picker_pages.pop() {
+            // Escape goes back a page; anything else ends them all.
+            let escaped = matches!(action, crate::picker::Action::Cancel) && !took_result;
+            drop(self.pages.apply(if escaped {
+                Outcome::Back
+            } else {
+                Outcome::Close
+            }));
+            if let Some(under) = self.pages.top() {
                 // A snapshot the page beneath reads stays; one only the page
-                // on top read goes, as when that page closes alone.
+                // on top read goes, as when that page closes alone. Leaving
+                // that snapshot's view closes the picker with it, which the
+                // pages beneath are no part of, so they stand aside for it.
                 if under.generation.is_none() {
+                    let beneath = std::mem::take(&mut self.pages);
                     self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
+                    self.pages = beneath;
                 }
-                self.picker = Some(under);
                 ui.ctx().request_repaint();
                 return (true, None);
             }
@@ -1762,7 +1807,7 @@ impl TerminalPane {
                 };
             }
             action @ crate::picker::Action::Custom(..) => {
-                self.pending_callback = Some((action, generation, from_copy));
+                self.pending_callback = Some((action, generation, from_copy, false));
             }
         }
         None
@@ -1773,6 +1818,7 @@ impl TerminalPane {
         result: Result<Vec<crate::lua_callbacks::Command>, String>,
         generation: Option<u64>,
         from_copy: bool,
+        ends_picker: bool,
         ctx: &egui::Context,
         bindings: &crate::picker::config::Bindings,
         palette: &super::PaletteContext,
@@ -1788,22 +1834,19 @@ impl TerminalPane {
         };
         match result {
             Ok(commands) => {
-                // Accept callbacks normally close before executing commands.
-                // Keep the old control only when it is needed for replacement.
-                if !commands.iter().any(|command| {
+                // An accepted result ends the picker before its commands run,
+                // unless one of them needs it: to replace, or to go on top of.
+                let needs_picker = commands.iter().any(|command| {
                     matches!(
                         command,
                         crate::lua_callbacks::Command::ReplacePicker { .. }
                             | crate::lua_callbacks::Command::PushPicker { .. }
                     )
-                }) && self
-                    .picker
-                    .as_ref()
-                    .is_some_and(|picker| picker.is_closed())
-                {
-                    if let Some(picker) = self.picker.take() {
-                        picker.surrender_focus();
-                    }
+                });
+                let mut ends_picker = ends_picker;
+                if ends_picker && !needs_picker {
+                    self.end_pages();
+                    ends_picker = false;
                 }
                 let mut navigated = false;
                 let mut sent = false;
@@ -1811,14 +1854,18 @@ impl TerminalPane {
                     match command {
                         crate::lua_callbacks::Command::ReplacePicker { name, params } => {
                             if let Some(entry) = bindings.named(&name) {
-                                self.open_picker_impl(
+                                // The picker it opened is the one showing now;
+                                // had none opened, the accepted one still ends.
+                                if self.open_picker_impl(
                                     ctx,
                                     entry,
                                     Some(params),
                                     bindings,
                                     palette,
                                     PickerOpen::FromCallback { from_copy },
-                                );
+                                ) {
+                                    ends_picker = false;
+                                }
                             } else {
                                 self.show_error(
                                     "Picker replacement failed",
@@ -1834,35 +1881,31 @@ impl TerminalPane {
                                 );
                                 continue;
                             };
-                            let Some(mut under) = self.picker.take() else {
+                            if self.pages.is_empty() {
                                 self.show_error(
                                     "Picker page failed",
                                     "push_picker requires an open picker".into(),
                                 );
                                 continue;
-                            };
-                            // The picker the callback ran in stays as it was,
-                            // beneath the new page.
-                            under.reopen();
+                            }
+                            // The picker the callback ran in stays as it was:
+                            // beneath the new page, or showing still when no
+                            // page opened.
+                            ends_picker = false;
                             self.open_picker_impl(
                                 ctx,
                                 entry,
                                 Some(params),
                                 bindings,
                                 palette,
-                                PickerOpen::FromCallback { from_copy },
+                                PickerOpen::Page { from_copy },
                             );
-                            if self.picker.is_some() {
-                                self.picker_pages.push(under);
-                            } else {
-                                self.picker = Some(under);
-                            }
                         }
                         crate::lua_callbacks::Command::ClosePicker => {
-                            if let Some(picker) = &self.picker {
+                            if let Some(picker) = self.pages.top() {
                                 picker.surrender_focus();
                             }
-                            self.picker = None;
+                            self.pages.apply(Outcome::Close);
                             if sent {
                                 self.close_copy_mode();
                             } else if !navigated {
@@ -1889,7 +1932,7 @@ impl TerminalPane {
                             }
                         }
                         crate::lua_callbacks::Command::Paste(text) => {
-                            if self.picker.is_none() {
+                            if self.pages.is_empty() {
                                 self.close_copy_mode();
                             }
                             sent = true;
@@ -1902,7 +1945,7 @@ impl TerminalPane {
                             }
                         }
                         crate::lua_callbacks::Command::SendText(text) => {
-                            if self.picker.is_none() {
+                            if self.pages.is_empty() {
                                 self.close_copy_mode();
                             }
                             sent = true;
@@ -1913,7 +1956,7 @@ impl TerminalPane {
                             before,
                             after,
                         } => {
-                            if self.picker.is_none() {
+                            if self.pages.is_empty() {
                                 self.close_copy_mode();
                             }
                             sent = true;
@@ -1921,31 +1964,19 @@ impl TerminalPane {
                         }
                     }
                 }
-                if self
-                    .picker
-                    .as_ref()
-                    .is_some_and(|picker| picker.is_closed())
-                {
-                    if let Some(picker) = self.picker.take() {
-                        picker.surrender_focus();
-                    }
+                if ends_picker {
+                    self.end_pages();
                 }
-                if !sent && !navigated && self.picker.is_none() {
+                if !sent && !navigated && self.pages.is_empty() {
                     restore_copy(self);
                 }
             }
             Err(error) => {
                 self.show_error("Picker action failed", error);
-                if self
-                    .picker
-                    .as_ref()
-                    .is_some_and(|picker| picker.is_closed())
-                {
-                    if let Some(picker) = self.picker.take() {
-                        picker.surrender_focus();
-                    }
+                if ends_picker {
+                    self.end_pages();
                 }
-                if self.picker.is_none() {
+                if self.pages.is_empty() {
                     restore_copy(self);
                 }
             }
@@ -2285,7 +2316,7 @@ impl TerminalPane {
             text,
             Default::default(),
         );
-        self.pending_callback = Some((action, Some(quick.generation), quick.from_copy));
+        self.pending_callback = Some((action, Some(quick.generation), quick.from_copy, false));
     }
 
     fn quick_host(&self) -> *mut Host {
@@ -2514,7 +2545,7 @@ impl TerminalPane {
     }
 
     fn close_copy_mode(&mut self) {
-        self.picker = None;
+        self.pages.apply(Outcome::Close);
         self.quick_select = None;
         if let Some(generation) = self.copy_mode.generation {
             if self.copy_search_cursor != 0 {
@@ -2728,7 +2759,7 @@ impl TerminalPane {
                         Err("Unable to read the copy-mode snapshot".into())
                     };
                     match picker {
-                        Ok(picker) => self.picker = Some(picker),
+                        Ok(picker) => self.pages.open(picker),
                         Err(error) => self.show_error("Could not split this line", error),
                     }
                     ctx.request_repaint();
@@ -2888,7 +2919,7 @@ impl TerminalPane {
     }
 
     fn apply_search_result(&mut self) {
-        if self.quick_select.is_some() || self.picker.is_some() {
+        if self.quick_select.is_some() || !self.pages.is_empty() {
             return;
         }
         let result = match self.search_worker.take_latest_result() {

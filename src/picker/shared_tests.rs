@@ -1053,11 +1053,15 @@ fn an_argument_picker_runs_its_action_with_the_text_typed_and_stays_open() {
         panic!("the action did not run");
     };
     assert!(std::rc::Rc::ptr_eq(&actual, &callback));
-    assert_eq!((text.as_str(), value.as_str()), ("fn \"main\" ", "fn \"main\" "));
+    assert_eq!(
+        (text.as_str(), value.as_str()),
+        ("fn \"main\" ", "fn \"main\" ")
+    );
     assert!(!filesystem && range.is_none());
     assert_eq!(params["cwd"], "C:\\src");
-    // It stays as it was, for a page on top to come back to.
-    assert!(!picker.is_closed());
+    // Text is not an accepted result: the picker stays on screen while its
+    // action runs, as it was, for a page on top to come back to.
+    assert!(!picker.took_result());
     assert_eq!(picker.shared.query(), "fn \"main\" ");
 
     let (action, _) = frame(
@@ -1066,11 +1070,11 @@ fn an_argument_picker_runs_its_action_with_the_text_typed_and_stays_open() {
         vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
     );
     assert!(matches!(action, Some(Action::Cancel)));
-    assert!(picker.is_closed() && !picker.accepted());
+    assert!(!picker.took_result());
 }
 
 #[test]
-fn an_accepted_picker_is_hidden_until_a_page_reopens_it() {
+fn an_accepted_result_is_told_apart_and_leaves_the_picker_as_it_was() {
     let ctx = egui::Context::default();
     let mut picker = items(&ctx);
     wait_selection(&ctx, &mut picker);
@@ -1080,17 +1084,11 @@ fn an_accepted_picker_is_hidden_until_a_page_reopens_it() {
         vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
     );
     assert!(matches!(action, Some(Action::SendInput(_))));
-    assert!(picker.is_closed() && picker.accepted());
-    // Accepting again does nothing while it is hidden.
-    let (action, _) = frame(
-        &ctx,
-        &mut picker,
-        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
-    );
-    assert!(action.is_none());
-
-    picker.reopen();
-    assert!(!picker.is_closed());
+    // The pane ends the picker for this, or waits on its action; a page
+    // shown on top comes back to it with nothing changed.
+    assert!(picker.took_result());
+    let (action, _) = frame(&ctx, &mut picker, vec![]);
+    assert!(action.is_none() && !picker.took_result());
     assert_eq!(wait_selection(&ctx, &mut picker).text, "café shown");
     assert_eq!(picker.shared.query(), "café");
 }
@@ -1555,7 +1553,7 @@ fn lua_callback_retains_display_value_and_request_parameters() {
         panic!("callback was not retained");
     };
     assert!(std::rc::Rc::ptr_eq(&actual, &callback));
-    assert!(picker.is_closed());
+    assert!(picker.took_result());
     assert_eq!(text, "café shown");
     assert_eq!(value, "inserted value");
     assert!(!filesystem && range.is_none());
@@ -1728,7 +1726,7 @@ fn replace_picker_from_accept_and_local_key_resets_source_and_callbacks() {
         let Some(Action::Custom(callback, text, filesystem, range, value, params)) = action else {
             panic!("expected callback")
         };
-        assert_eq!(previous.is_closed(), !local_key);
+        assert_eq!(previous.took_result(), !local_key);
         let commands = callback
             .call(&text, &value, filesystem, None, range, &params)
             .unwrap();
@@ -1765,7 +1763,7 @@ fn replace_picker_from_accept_and_local_key_resets_source_and_callbacks() {
             &Default::default(),
             Some(previous),
         );
-        assert!(!replacement.is_closed());
+        assert!(!replacement.shared.is_closed());
         assert!(replacement.callback.is_none());
         assert!(replacement.keys.is_empty());
         assert_eq!(replacement.shared.query(), "target");
@@ -2342,7 +2340,7 @@ fn picker_double_click_override_receives_item_and_stays_open() {
             assert!(
                 matches!(accepted, Some(Action::SendInput(value)) if value == "inserted value")
             );
-            assert!(picker.is_closed());
+            assert!(picker.took_result());
         }
     }
 }

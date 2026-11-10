@@ -64,8 +64,8 @@ pub(crate) struct Picker {
     pipe_items: Vec<pipe::Item>,
     pipe_publisher:
         Option<nfm_search_core::store::PublishingStreamingItemStoreWithPayload<SnapshotCellRange>>,
-    /// A result was accepted; see `is_closed`.
-    accepted: bool,
+    /// What was last reported was an accepted result; see `took_result`.
+    took_result: bool,
     /// An `Argument` picker: Enter runs the callback with the text typed.
     argument: bool,
 }
@@ -85,20 +85,12 @@ pub(crate) enum Action {
     SendInput(String),
 }
 impl Picker {
-    /// Closed by Escape, or by accepting a result. A page is shown on top of
-    /// an accepted picker by reopening it, so the shared control stays open
-    /// when it accepts and this picker records that it did.
-    pub(crate) fn is_closed(&self) -> bool {
-        self.shared.is_closed() || self.accepted
-    }
-    /// Whether a result was accepted, as opposed to Escape closing the picker.
-    pub(crate) fn accepted(&self) -> bool {
-        self.accepted
-    }
-    /// Show an accepted picker again, for a page going on top of it to come
-    /// back to.
-    pub(crate) fn reopen(&mut self) {
-        self.accepted = false;
+    /// Whether the action the picker last reported came of accepting a
+    /// result, as opposed to Escape, a key's action or an argument's text.
+    /// The pane reads it with the action, to say what comes next: an accepted
+    /// result ends the picker unless its action shows a page.
+    pub(crate) fn took_result(&self) -> bool {
+        self.took_result
     }
     pub(crate) fn surrender_focus(&self) {
         self.context.memory_mut(|memory| {
@@ -303,8 +295,6 @@ impl Picker {
                     .as_ref()
                     .and_then(|argument| argument.placeholder.clone())
                     .unwrap_or_default(),
-                // See `is_closed`.
-                close_on_accept: false,
                 ..Default::default()
             },
         );
@@ -415,7 +405,7 @@ impl Picker {
             pipe_session: None,
             pipe_items: Vec::new(),
             pipe_publisher: None,
-            accepted: false,
+            took_result: false,
             argument,
             shared,
             cursor_row: None,
@@ -599,10 +589,7 @@ impl Picker {
                 return Some(Action::Cancel);
             }
         }
-        if self.accepted {
-            // Hidden while its action runs, as a closed picker is.
-            return None;
-        }
+        self.took_result = false;
         let appearance = self.appearance(ctx);
         self.shared.set_bindings(if self.pipe_session.is_none() {
             self.keys
@@ -749,9 +736,8 @@ impl Picker {
                 None
             }
             Some(nfm_egui::PickerEvent::Accepted(selection)) => {
-                let action = self.accept(selection);
-                self.accepted = action.is_some();
-                action
+                self.took_result = true;
+                self.accept(selection)
             }
             // The text typed is the item. The picker stays open, for its
             // action to show a page on top or close it.
