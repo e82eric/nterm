@@ -1752,15 +1752,11 @@ impl TerminalPane {
             } else {
                 Outcome::Close
             }));
-            if let Some(under) = self.pages.top() {
+            if let Some(beneath) = self.pages.top() {
                 // A snapshot the page beneath reads stays; one only the page
-                // on top read goes, as when that page closes alone. Leaving
-                // that snapshot's view closes the picker with it, which the
-                // pages beneath are no part of, so they stand aside for it.
-                if under.generation.is_none() {
-                    let beneath = std::mem::take(&mut self.pages);
-                    self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
-                    self.pages = beneath;
+                // that left read is let go.
+                if beneath.generation.is_none() {
+                    self.leave_picker_view(generation, from_copy);
                 }
                 ui.ctx().request_repaint();
                 return (true, None);
@@ -1832,21 +1828,11 @@ impl TerminalPane {
                 pane.close_copy_mode();
             }
         };
+        let mut ending = Ending::new(ends_picker);
         match result {
             Ok(commands) => {
-                // An accepted result ends the picker before its commands run,
-                // unless one of them needs it: to replace, or to go on top of.
-                let needs_picker = commands.iter().any(|command| {
-                    matches!(
-                        command,
-                        crate::lua_callbacks::Command::ReplacePicker { .. }
-                            | crate::lua_callbacks::Command::PushPicker { .. }
-                    )
-                });
-                let mut ends_picker = ends_picker;
-                if ends_picker && !needs_picker {
+                if ending.before(&commands) {
                     self.end_pages();
-                    ends_picker = false;
                 }
                 let mut navigated = false;
                 let mut sent = false;
@@ -1854,18 +1840,15 @@ impl TerminalPane {
                     match command {
                         crate::lua_callbacks::Command::ReplacePicker { name, params } => {
                             if let Some(entry) = bindings.named(&name) {
-                                // The picker it opened is the one showing now;
-                                // had none opened, the accepted one still ends.
-                                if self.open_picker_impl(
+                                let opened = self.open_picker_impl(
                                     ctx,
                                     entry,
                                     Some(params),
                                     bindings,
                                     palette,
                                     PickerOpen::FromCallback { from_copy },
-                                ) {
-                                    ends_picker = false;
-                                }
+                                );
+                                ending.replaced(opened);
                             } else {
                                 self.show_error(
                                     "Picker replacement failed",
@@ -1888,10 +1871,7 @@ impl TerminalPane {
                                 );
                                 continue;
                             }
-                            // The picker the callback ran in stays as it was:
-                            // beneath the new page, or showing still when no
-                            // page opened.
-                            ends_picker = false;
+                            ending.pushed();
                             self.open_picker_impl(
                                 ctx,
                                 entry,
@@ -1964,7 +1944,7 @@ impl TerminalPane {
                         }
                     }
                 }
-                if ends_picker {
+                if ending.after() {
                     self.end_pages();
                 }
                 if !sent && !navigated && self.pages.is_empty() {
@@ -1973,7 +1953,7 @@ impl TerminalPane {
             }
             Err(error) => {
                 self.show_error("Picker action failed", error);
-                if ends_picker {
+                if ending.after() {
                     self.end_pages();
                 }
                 if self.pages.is_empty() {
@@ -2544,8 +2524,26 @@ impl TerminalPane {
         self.wake.context.request_repaint();
     }
 
+    /// Leave copy mode, and close the pickers shown over it.
     fn close_copy_mode(&mut self) {
         self.pages.apply(Outcome::Close);
+        self.end_copy_view();
+    }
+
+    /// A picker left the view it was shown over, and others stay: copy mode
+    /// it was opened from shows its cursor again, and a snapshot it read
+    /// alone is let go. The pickers are not touched.
+    fn leave_picker_view(&mut self, generation: Option<u64>, from_copy: bool) {
+        if !from_copy {
+            self.end_copy_view();
+        } else if let Some(generation) = generation {
+            self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+        }
+    }
+
+    /// Let go of copy mode's snapshot and what reads it, back to live output.
+    /// The pickers are not touched: `close_copy_mode` closes those too.
+    fn end_copy_view(&mut self) {
         self.quick_select = None;
         if let Some(generation) = self.copy_mode.generation {
             if self.copy_search_cursor != 0 {
@@ -3328,6 +3326,116 @@ fn snapshot_decoration_refresh(
         | SnapshotDecorationOwner::Copy(generation) => generation,
     };
     needs_refresh(generation).then_some(owner)
+}
+
+/// When the picker an action ran in ends. An accepted result ends it, and
+/// the pages beneath it, unless the action shows something in its place; a
+/// key's action or an argument's text ends nothing.
+struct Ending {
+    /// The picker is still to end.
+    owed: bool,
+}
+impl Ending {
+    fn new(took_result: bool) -> Self {
+        Self { owed: took_result }
+    }
+    /// Whether the picker ends now, before the commands run. It waits when
+    /// one of them needs it there: to replace, or to go on top of.
+    fn before(&mut self, commands: &[crate::lua_callbacks::Command]) -> bool {
+        let needed = commands.iter().any(|command| {
+            matches!(
+                command,
+                crate::lua_callbacks::Command::ReplacePicker { .. }
+                    | crate::lua_callbacks::Command::PushPicker { .. }
+            )
+        });
+        if needed {
+            return false;
+        }
+        std::mem::take(&mut self.owed)
+    }
+    /// A command replaced the picker. The one it opened is the one showing
+    /// now; had none opened, the accepted one still ends.
+    fn replaced(&mut self, opened: bool) {
+        if opened {
+            self.owed = false;
+        }
+    }
+    /// A command went to push a page. The picker stays as it was: beneath
+    /// the new page, or showing still when no page opened.
+    fn pushed(&mut self) {
+        self.owed = false;
+    }
+    /// Whether the picker ends now, after the commands or the action's error.
+    fn after(&mut self) -> bool {
+        std::mem::take(&mut self.owed)
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use crate::lua_callbacks::Command;
+
+    fn replace() -> Command {
+        Command::ReplacePicker {
+            name: "Files".into(),
+            params: Default::default(),
+        }
+    }
+    fn push() -> Command {
+        Command::PushPicker {
+            name: "Ripgrep".into(),
+            params: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_accepted_result_ends_the_picker_unless_its_action_shows_another() {
+        // Sending text: the picker is gone before the text is sent.
+        let mut ending = Ending::new(true);
+        assert!(ending.before(&[Command::SendText("nvim".into())]));
+        assert!(!ending.after(), "it ends once");
+        // No commands at all ends it too.
+        assert!(Ending::new(true).before(&[]));
+
+        // A page on top: the picker stays beneath it, and stays showing when
+        // the page could not open.
+        let mut ending = Ending::new(true);
+        assert!(!ending.before(&[Command::ClosePicker, push()]));
+        ending.pushed();
+        assert!(!ending.after());
+
+        // A replacement: the picker ends only when none opened.
+        let mut ending = Ending::new(true);
+        assert!(!ending.before(&[replace()]));
+        ending.replaced(true);
+        assert!(!ending.after());
+        let mut ending = Ending::new(true);
+        assert!(!ending.before(&[replace()]));
+        ending.replaced(false);
+        assert!(ending.after());
+
+        // A picker that was never found, to replace or to push, shows nothing.
+        let mut ending = Ending::new(true);
+        assert!(!ending.before(&[push()]));
+        assert!(ending.after());
+
+        // The action failed.
+        assert!(Ending::new(true).after());
+    }
+
+    #[test]
+    fn a_keys_action_or_an_arguments_text_ends_nothing() {
+        let mut ending = Ending::new(false);
+        assert!(!ending.before(&[Command::SendText("ls".into())]));
+        assert!(!ending.after());
+        let mut ending = Ending::new(false);
+        assert!(!ending.before(&[replace()]));
+        ending.replaced(false);
+        assert!(!ending.after());
+        assert!(!Ending::new(false).after());
+    }
 }
 
 #[cfg(test)]
