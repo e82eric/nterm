@@ -1820,10 +1820,11 @@ impl TerminalPane {
             } else {
                 Outcome::Close
             }));
-            if let Some(beneath) = self.pages.top() {
-                // A snapshot the page beneath reads stays; one only the page
-                // that left read is let go.
-                if beneath.generation().is_none() {
+            if !self.pages.is_empty() {
+                // A snapshot a page still here reads stays, however far
+                // beneath; one only the page that left read is let go.
+                let read = self.pages.iter().map(crate::picker::Page::generation);
+                if !reads_snapshot(read) {
                     self.leave_picker_view(generation, from_copy);
                 }
                 ui.ctx().request_repaint();
@@ -1847,18 +1848,11 @@ impl TerminalPane {
         generation: Option<u64>,
         from_copy: bool,
     ) -> Option<crate::actions::AppAction> {
-        let restore_copy = |pane: &mut Self| {
-            if from_copy {
-                if let Some(generation) = generation {
-                    pane.publish_copy_decoration(generation, pane.copy_mode.cursor, false);
-                }
-            } else {
-                pane.close_copy_mode();
-            }
-        };
         match action {
             crate::picker::Action::Execute(action) => return Some(action),
-            crate::picker::Action::Cancel | crate::picker::Action::Close => restore_copy(self),
+            crate::picker::Action::Cancel | crate::picker::Action::Close => {
+                self.restore_copy(generation, from_copy)
+            }
             crate::picker::Action::Navigate(target) => {
                 if let Some(generation) = generation {
                     self.accept_picker_cell(generation, target);
@@ -1895,15 +1889,6 @@ impl TerminalPane {
         bindings: &crate::picker::config::Bindings,
         palette: &super::PaletteContext,
     ) {
-        let restore_copy = |pane: &mut Self| {
-            if from_copy {
-                if let Some(generation) = generation {
-                    pane.publish_copy_decoration(generation, pane.copy_mode.cursor, false);
-                }
-            } else {
-                pane.close_copy_mode();
-            }
-        };
         let mut ending = Ending::new(ends_picker);
         match result {
             Ok(commands) => {
@@ -1965,7 +1950,7 @@ impl TerminalPane {
                             if sent {
                                 self.close_copy_mode();
                             } else if !navigated {
-                                restore_copy(self);
+                                self.restore_copy(generation, from_copy);
                             }
                         }
                         crate::lua_callbacks::Command::ShowToast {
@@ -2024,7 +2009,7 @@ impl TerminalPane {
                     self.end_pages();
                 }
                 if !sent && !navigated && self.pages.is_empty() {
-                    restore_copy(self);
+                    self.restore_copy(generation, from_copy);
                 }
             }
             Err(error) => {
@@ -2033,7 +2018,7 @@ impl TerminalPane {
                     self.end_pages();
                 }
                 if self.pages.is_empty() {
-                    restore_copy(self);
+                    self.restore_copy(generation, from_copy);
                 }
             }
         }
@@ -2608,6 +2593,18 @@ impl TerminalPane {
     fn close_copy_mode(&mut self) {
         self.pages.apply(Outcome::Close);
         self.end_copy_view();
+    }
+
+    /// The pages are gone: back to copy mode with its cursor showing if they
+    /// were opened from it, and to live output if not.
+    fn restore_copy(&mut self, generation: Option<u64>, from_copy: bool) {
+        if from_copy {
+            if let Some(generation) = generation {
+                self.publish_copy_decoration(generation, self.copy_mode.cursor, false);
+            }
+        } else {
+            self.close_copy_mode();
+        }
     }
 
     /// A picker left the view it was shown over, and others stay: copy mode
@@ -3452,6 +3449,12 @@ impl Ending {
     }
 }
 
+/// Whether any of the pages reads the terminal snapshot, given the snapshot
+/// each reads. A pane has one snapshot, so a page that reads any reads it.
+fn reads_snapshot(pages: impl IntoIterator<Item = Option<u64>>) -> bool {
+    pages.into_iter().any(|generation| generation.is_some())
+}
+
 #[cfg(test)]
 mod page_tests {
     use super::*;
@@ -3468,6 +3471,17 @@ mod page_tests {
             name: "Ripgrep".into(),
             params: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_snapshot_stays_while_any_page_left_reads_it() {
+        // Lines, with a list on top, with lines on top of that: when the top
+        // page leaves, the first still reads the snapshot.
+        assert!(reads_snapshot([Some(7), None]));
+        assert!(reads_snapshot([Some(7), Some(7)]));
+        // Only the page that left read it.
+        assert!(!reads_snapshot([None]));
+        assert!(!reads_snapshot([None, None]));
     }
 
     #[test]
