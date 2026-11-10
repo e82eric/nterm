@@ -1644,6 +1644,69 @@ mod tests {
             matches!(&commands[1], crate::lua_callbacks::Command::SendText(text) if text == "nvim +42 'C:\\it''s here.txt'\r")
         );
     }
+    #[test]
+    fn sample_grep_asks_for_text_and_pushes_ripgrep_with_it() {
+        let config = parse(include_str!("../nterm.lua")).unwrap();
+        let callback = config.pickers.as_ref().unwrap()["Grep"]
+            .callback()
+            .unwrap()
+            .clone();
+        let run = |text: &str| {
+            callback
+                .call(text, text, false, None, None, &Default::default())
+                .unwrap()
+        };
+        let commands = run("fn main");
+        assert!(
+            matches!(&commands[0], crate::lua_callbacks::Command::PushPicker { name, params } if name == "Ripgrep" && params["pattern"] == "fn main")
+        );
+        assert!(run("").is_empty());
+
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+        let options = bindings
+            .named("Grep")
+            .unwrap()
+            .resolve(&PickerContext::default())
+            .unwrap();
+        assert_eq!(
+            options.argument,
+            Some(crate::picker::config::ArgumentOptions {
+                prompt: Some("Grep:".into()),
+                placeholder: Some("<text>  Search the working directory".into()),
+            })
+        );
+        assert!(!options.preview_visible);
+    }
+
+    #[test]
+    fn an_argument_picker_requires_an_action() {
+        let compile = |source: &str| {
+            let config = parse(source).unwrap();
+            crate::picker::config::Bindings::compile_with_actions(
+                config.pickers,
+                config.keys,
+                config.picker_defaults,
+                config.actions,
+            )
+            .map(|_| ())
+        };
+        assert!(
+            compile("return {pickers={x={type='Argument', action=function() end}}}").is_ok()
+        );
+        let error = compile("return {pickers={x={type='Argument'}}}").unwrap_err();
+        assert!(error.contains("Argument requires an action"), "{error}");
+        assert!(
+            compile("return {pickers={x={type='Argument', prompt='a\\nb', action=function() end}}}")
+                .is_err()
+        );
+    }
+
     use super::*;
 
     fn parse(source: &str) -> Result<AppConfig, String> {

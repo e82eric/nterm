@@ -398,6 +398,14 @@ the standard `io` and `os` libraries and a `nterm.json_parse(string)` helper.
 It has no filesystem scan or terminal snapshot. Without an action callback,
 Enter pastes the chosen value. Item lists are limited to 2,000 entries.
 
+`Argument` has nothing to pick from: the query box takes text as typed, and
+Enter runs the required `action` callback with that text as `item.value` and
+`item.text`. `prompt` replaces the `>` before the text and `placeholder` is
+shown muted while nothing is typed. The picker stays open after Enter, so the
+action either shows a page on top with `app:push_picker` or closes it with
+`app:close_picker()`. The sample `Grep` picker asks for text and pushes
+`Ripgrep` with it as `pattern`.
+
 `Command` runs the configured `args` array without a shell and streams stdout
 lines into the fuzzy picker. An argument consisting of `{pattern}` is replaced
 with the named pipe request's `params.pattern`; other `{name}` arguments can use other
@@ -793,6 +801,19 @@ For example, an acceptance callback or local key action can use:
 ```lua
 action = function(app, item)
   app:replace_picker("Details", { selected = item.value, query = item.text })
+end
+```
+
+`app:push_picker(name, params)` takes the same arguments and shows the named
+picker as a page on top of the current one instead. Escape on that page comes
+back to the picker beneath, as it was left: its query, results and selection.
+Accepting a result, `app:close_picker()`, or anything else that closes the
+page on top closes the pickers beneath it too. Pages can be pushed on pages.
+A picker opened by a named pipe request has no callbacks, so it cannot push.
+
+```lua
+action = function(app, item)
+  app:push_picker("Ripgrep", { pattern = item.value })
 end
 ```
 

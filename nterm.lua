@@ -157,6 +157,17 @@ return {
         app:send_text("nvim +" .. line .. " " .. quoted .. "\r")
       end,
     },
+    -- Asks for text, then shows the Ripgrep matches for it as a page on top.
+    -- Escape there comes back here, to change the text and search again.
+    Grep = {
+      type = "Argument",
+      prompt = "Grep:",
+      placeholder = "<text>  Search the working directory",
+      action = function(app, item)
+        if item.value == "" then return end
+        app:push_picker("Ripgrep", { pattern = item.value })
+      end,
+    },
   },
   keys = {
     { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
@@ -178,5 +189,6 @@ return {
     { key = "p", mods = "CTRL|SHIFT", builtin_picker = "words" },
     { key = "o", mods = "CTRL|SHIFT", picker = "files" },
     { key = "k", mods = "CTRL|SHIFT", picker = "CodexSuggestions" },
+    { key = "j", mods = "CTRL|SHIFT", picker = "Grep" },
   },
 }

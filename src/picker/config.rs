@@ -333,7 +333,7 @@ impl<'de> Deserialize<'de> for Definition {
         if !common.contains_key("preview_visible")
             && matches!(
                 source.get("type").and_then(serde_json::Value::as_str),
-                Some("Themes" | "ErrorLog" | "CommandPalette")
+                Some("Themes" | "ErrorLog" | "CommandPalette" | "Argument")
             )
         {
             common.insert("preview_visible".into(), false.into());
@@ -415,6 +415,20 @@ pub(crate) enum DefinitionSource {
         #[serde(default)]
         unique: Option<bool>,
         #[serde(default)]
+        enter_action: Option<EnterAction>,
+        #[serde(skip)]
+        callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
+    },
+    /// Nothing to pick from: the query box takes text as typed, and Enter
+    /// runs `action` with it as the item.
+    Argument {
+        /// Shown before the text in place of `>`.
+        #[serde(default)]
+        prompt: Option<String>,
+        /// Shown muted while nothing is typed.
+        #[serde(default)]
+        placeholder: Option<String>,
+        #[serde(skip)]
         enter_action: Option<EnterAction>,
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
@@ -520,7 +534,41 @@ impl Definition {
             .keys_mut()
             .map(|keys| std::mem::take(keys))
             .unwrap_or_default();
+        let mut argument = None;
         let (source, enter_action) = match definition.source {
+            DefinitionSource::Argument {
+                prompt,
+                placeholder,
+                ..
+            } => {
+                if callback.is_none() {
+                    return Err(format!(
+                        "pickers.{name}: Argument requires an action, which receives the text as the item"
+                    ));
+                }
+                for (field, value) in [("prompt", &prompt), ("placeholder", &placeholder)] {
+                    if value
+                        .as_ref()
+                        .is_some_and(|text| text.len() > 256 || text.chars().any(char::is_control))
+                    {
+                        return Err(format!(
+                            "pickers.{name}.{field} must be at most 256 bytes without control characters"
+                        ));
+                    }
+                }
+                argument = Some(ArgumentOptions {
+                    prompt,
+                    placeholder,
+                });
+                // An argument has nothing to pick from.
+                (
+                    Source::Items(ItemsOptions {
+                        values: Vec::new(),
+                        provider: None,
+                    }),
+                    EnterAction::SendInput,
+                )
+            }
             DefinitionSource::Themes { .. } => (Source::Themes, EnterAction::Navigate),
             DefinitionSource::ErrorLog { .. } => (Source::ErrorLog, EnterAction::Navigate),
             DefinitionSource::CommandPalette { .. } => {
@@ -726,7 +774,11 @@ impl Definition {
             }
         };
         // A file streams through the command picker's source.
-        let label = matches!(source, Source::TextFile(_)).then_some("FILE PICKER");
+        let label = if argument.is_some() {
+            Some("ARGUMENT")
+        } else {
+            matches!(source, Source::TextFile(_)).then_some("FILE PICKER")
+        };
         let mut options = Options {
             scope,
             position,
@@ -740,6 +792,7 @@ impl Definition {
             preview: None,
             preview_visible,
             label,
+            argument,
         };
         if let Some(query) = initial_query {
             options.params.insert("query".into(), query);
@@ -786,6 +839,7 @@ impl Definition {
             | DefinitionSource::FileSystem { callback, .. }
             | DefinitionSource::Command { callback, .. }
             | DefinitionSource::File { callback, .. }
+            | DefinitionSource::Argument { callback, .. }
             | DefinitionSource::Items { callback, .. } => *callback = Some(value),
             DefinitionSource::Factory { .. }
             | DefinitionSource::ErrorLog { .. }
@@ -821,6 +875,11 @@ impl Definition {
                 enter_action,
                 ..
             }
+            | DefinitionSource::Argument {
+                callback,
+                enter_action,
+                ..
+            }
             | DefinitionSource::FileSystem {
                 callback,
                 enter_action,
@@ -840,6 +899,7 @@ impl Definition {
             | DefinitionSource::FileSystem { callback, .. }
             | DefinitionSource::Command { callback, .. }
             | DefinitionSource::File { callback, .. }
+            | DefinitionSource::Argument { callback, .. }
             | DefinitionSource::Items { callback, .. } => callback.as_ref(),
             DefinitionSource::Factory { .. }
             | DefinitionSource::ErrorLog { .. }
@@ -1058,6 +1118,14 @@ pub(crate) struct Options {
     pub(crate) preview_visible: bool,
     /// The header label, in place of the one named for the source.
     pub(crate) label: Option<&'static str>,
+    /// Set for an `Argument` picker: the query box takes text as typed.
+    pub(crate) argument: Option<ArgumentOptions>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ArgumentOptions {
+    pub(crate) prompt: Option<String>,
+    pub(crate) placeholder: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1187,6 +1255,7 @@ impl Default for Options {
             preview: None,
             preview_visible: true,
             label: None,
+            argument: None,
         }
     }
 }

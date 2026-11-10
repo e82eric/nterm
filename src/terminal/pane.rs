@@ -272,6 +272,10 @@ pub(super) struct TerminalPane {
     copy_mode: CopyMode,
     quick_select: Option<ActiveQuickSelect>,
     picker: Option<crate::picker::Picker>,
+    /// The pages beneath `picker`, which is the one showing: pickers whose
+    /// action showed another on top with `app:push_picker`. Escape comes back
+    /// to the last, and closing the picker any other way drops them all.
+    picker_pages: Vec<crate::picker::Picker>,
     picker_font: crate::picker::font::PickerFont,
     toasts: crate::toast::Toasts,
     copy_search_cursor: usize,
@@ -477,6 +481,7 @@ impl TerminalPane {
             copy_mode: command_blocks::copy_mode(),
             quick_select: None,
             picker: None,
+            picker_pages: Vec::new(),
             picker_font,
             toasts: crate::toast::Toasts::default(),
             copy_search_cursor: 0,
@@ -1458,6 +1463,12 @@ impl TerminalPane {
                                 "replace_picker requires a picker callback".into(),
                             );
                         }
+                        crate::lua_callbacks::Command::PushPicker { .. } => {
+                            self.show_error(
+                                "Picker page failed",
+                                "push_picker requires a picker callback".into(),
+                            );
+                        }
                         crate::lua_callbacks::Command::ClosePicker => {
                             if let Some(picker) = self.picker.take() {
                                 picker.surrender_focus();
@@ -1662,6 +1673,10 @@ impl TerminalPane {
         bounds: egui::Rect,
         bindings: &crate::picker::config::Bindings,
     ) -> (bool, Option<crate::actions::AppAction>) {
+        if self.picker.is_none() {
+            // Closed other than by Escape: the pages beneath go with it.
+            self.picker_pages.clear();
+        }
         let was_active = self.picker.as_ref().is_some();
         let consumed = false;
         let active = self.picker.as_ref().is_some();
@@ -1692,7 +1707,19 @@ impl TerminalPane {
                 .take()
                 .expect("picker action requires active picker");
             let (generation, from_copy) = (picker.generation, picker.from_copy);
+            let escaped = matches!(action, crate::picker::Action::Cancel) && !picker.accepted();
             drop(picker);
+            // Escape goes back a page.
+            if escaped && let Some(under) = self.picker_pages.pop() {
+                // A snapshot the page beneath reads stays; one only the page
+                // on top read goes, as when that page closes alone.
+                if under.generation.is_none() {
+                    self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
+                }
+                self.picker = Some(under);
+                ui.ctx().request_repaint();
+                return (true, None);
+            }
             // Surrender query focus before returning terminal/copy input.
             ui.ctx().memory_mut(|m| {
                 if let Some(id) = m.focused() {
@@ -1764,7 +1791,11 @@ impl TerminalPane {
                 // Accept callbacks normally close before executing commands.
                 // Keep the old control only when it is needed for replacement.
                 if !commands.iter().any(|command| {
-                    matches!(command, crate::lua_callbacks::Command::ReplacePicker { .. })
+                    matches!(
+                        command,
+                        crate::lua_callbacks::Command::ReplacePicker { .. }
+                            | crate::lua_callbacks::Command::PushPicker { .. }
+                    )
                 }) && self
                     .picker
                     .as_ref()
@@ -1793,6 +1824,38 @@ impl TerminalPane {
                                     "Picker replacement failed",
                                     format!("Unknown picker {name}"),
                                 );
+                            }
+                        }
+                        crate::lua_callbacks::Command::PushPicker { name, params } => {
+                            let Some(entry) = bindings.named(&name) else {
+                                self.show_error(
+                                    "Picker page failed",
+                                    format!("Unknown picker {name}"),
+                                );
+                                continue;
+                            };
+                            let Some(mut under) = self.picker.take() else {
+                                self.show_error(
+                                    "Picker page failed",
+                                    "push_picker requires an open picker".into(),
+                                );
+                                continue;
+                            };
+                            // The picker the callback ran in stays as it was,
+                            // beneath the new page.
+                            under.reopen();
+                            self.open_picker_impl(
+                                ctx,
+                                entry,
+                                Some(params),
+                                bindings,
+                                palette,
+                                PickerOpen::FromCallback { from_copy },
+                            );
+                            if self.picker.is_some() {
+                                self.picker_pages.push(under);
+                            } else {
+                                self.picker = Some(under);
                             }
                         }
                         crate::lua_callbacks::Command::ClosePicker => {

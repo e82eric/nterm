@@ -64,6 +64,10 @@ pub(crate) struct Picker {
     pipe_items: Vec<pipe::Item>,
     pipe_publisher:
         Option<nfm_search_core::store::PublishingStreamingItemStoreWithPayload<SnapshotCellRange>>,
+    /// A result was accepted; see `is_closed`.
+    accepted: bool,
+    /// An `Argument` picker: Enter runs the callback with the text typed.
+    argument: bool,
 }
 
 pub(crate) enum Action {
@@ -81,8 +85,20 @@ pub(crate) enum Action {
     SendInput(String),
 }
 impl Picker {
+    /// Closed by Escape, or by accepting a result. A page is shown on top of
+    /// an accepted picker by reopening it, so the shared control stays open
+    /// when it accepts and this picker records that it did.
     pub(crate) fn is_closed(&self) -> bool {
-        self.shared.is_closed()
+        self.shared.is_closed() || self.accepted
+    }
+    /// Whether a result was accepted, as opposed to Escape closing the picker.
+    pub(crate) fn accepted(&self) -> bool {
+        self.accepted
+    }
+    /// Show an accepted picker again, for a page going on top of it to come
+    /// back to.
+    pub(crate) fn reopen(&mut self) {
+        self.accepted = false;
     }
     pub(crate) fn surrender_focus(&self) {
         self.context.memory_mut(|memory| {
@@ -272,13 +288,36 @@ impl Picker {
                 preview_visible: options.preview_visible,
                 preview_line_numbers: line_numbers,
                 sort: options.sort.mode(),
+                query_role: if options.argument.is_some() {
+                    nfm_egui::QueryRole::Argument
+                } else {
+                    nfm_egui::QueryRole::Filter
+                },
+                prompt: options
+                    .argument
+                    .as_ref()
+                    .and_then(|argument| argument.prompt.clone())
+                    .unwrap_or_else(|| nfm_egui::PickerConfig::default().prompt),
+                placeholder: options
+                    .argument
+                    .as_ref()
+                    .and_then(|argument| argument.placeholder.clone())
+                    .unwrap_or_default(),
+                // See `is_closed`.
+                close_on_accept: false,
                 ..Default::default()
             },
         );
+        let argument = options.argument.is_some();
         if let Some(mut previous) = previous {
             // NFM's source replacement retains presented rows and rejects stale
             // selections. Recreate the control if its immutable settings differ.
-            if previous.sort == sort && previous.accept_on_click == accept_on_click {
+            // An argument's query box differs too.
+            if previous.sort == sort
+                && previous.accept_on_click == accept_on_click
+                && !previous.argument
+                && !argument
+            {
                 std::mem::swap(&mut shared, &mut previous.shared);
                 shared.replace_source(&ctx, source.provider(), initial_query);
                 shared.set_presentation(result_rows, preview_rows, options.preview_visible);
@@ -376,6 +415,8 @@ impl Picker {
             pipe_session: None,
             pipe_items: Vec::new(),
             pipe_publisher: None,
+            accepted: false,
+            argument,
             shared,
             cursor_row: None,
             position: options.position,
@@ -558,6 +599,10 @@ impl Picker {
                 return Some(Action::Cancel);
             }
         }
+        if self.accepted {
+            // Hidden while its action runs, as a closed picker is.
+            return None;
+        }
         let appearance = self.appearance(ctx);
         self.shared.set_bindings(if self.pipe_session.is_none() {
             self.keys
@@ -703,7 +748,25 @@ impl Picker {
                 self.shared.notify_copied(ctx);
                 None
             }
-            Some(nfm_egui::PickerEvent::Accepted(selection)) => self.accept(selection),
+            Some(nfm_egui::PickerEvent::Accepted(selection)) => {
+                let action = self.accept(selection);
+                self.accepted = action.is_some();
+                action
+            }
+            // The text typed is the item. The picker stays open, for its
+            // action to show a page on top or close it.
+            Some(nfm_egui::PickerEvent::Submitted(text)) => {
+                self.callback.as_ref().map(|callback| {
+                    Action::Custom(
+                        callback.clone(),
+                        text.clone(),
+                        false,
+                        None,
+                        text,
+                        self.request_params.clone(),
+                    )
+                })
+            }
             Some(nfm_egui::PickerEvent::CustomAction { action, selection }) => self
                 .keys
                 .get(action)

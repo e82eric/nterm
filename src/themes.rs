@@ -80,6 +80,7 @@ pub(crate) fn picker_options(names: Vec<String>) -> crate::picker::config::Optio
         preview: None,
         preview_visible: false,
         label: None,
+        argument: None,
     }
 }
 
