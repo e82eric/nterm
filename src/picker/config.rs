@@ -13,6 +13,33 @@ pub(crate) enum EnterAction {
     Close,
 }
 
+/// How a FileSystem picker draws each path. Search and the selected value
+/// always use the full path.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub(crate) enum FileLayout {
+    /// The path on one line.
+    #[default]
+    Path,
+    /// The name, then its parent directory in muted text, on one line.
+    NameDir,
+    /// The name above its parent directory.
+    NameOverDir,
+}
+
+impl std::str::FromStr for FileLayout {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "Path" => Ok(Self::Path),
+            "NameDir" => Ok(Self::NameDir),
+            "NameOverDir" => Ok(Self::NameOverDir),
+            _ => Err(format!(
+                "invalid picker layout: {value} (expected Path, NameDir or NameOverDir)"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub(crate) enum Position {
     Top,
@@ -431,6 +458,8 @@ pub(crate) enum DefinitionSource {
         #[serde(default)]
         relative: bool,
         #[serde(default)]
+        layout: FileLayout,
+        #[serde(default)]
         enter_action: Option<EnterAction>,
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
@@ -692,6 +721,7 @@ impl Definition {
                 files_only,
                 directories_only,
                 relative,
+                layout,
                 ..
             } => {
                 if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
@@ -720,6 +750,7 @@ impl Definition {
                         files_only,
                         directories_only,
                         relative,
+                        layout,
                     }),
                     EnterAction::SendInput,
                 )
@@ -1121,6 +1152,7 @@ pub(crate) struct FileOptions {
     /// Show paths relative to their root. With several roots the same
     /// relative path can come from more than one of them.
     pub(crate) relative: bool,
+    pub(crate) layout: FileLayout,
 }
 
 impl Options {
@@ -1162,6 +1194,9 @@ impl Options {
                 files.relative = relative
                     .parse()
                     .map_err(|_| format!("invalid picker relative: {relative}"))?;
+            }
+            if let Some(layout) = params.get("layout") {
+                files.layout = layout.parse()?;
             }
         }
         self.params.extend(params);

@@ -390,6 +390,23 @@ filters cannot both be true. Filesystem pickers only support `SendInput`, pastin
 the raw path without shell quoting or Enter. Regex extraction is scrollback-only.
 An optional preview can show the selected path's contents.
 
+`layout` chooses how each path is drawn:
+
+| Value | Result row |
+| --- | --- |
+| `"Path"` (default) | The path on one line |
+| `"NameDir"` | A file-type icon, the file or directory name, then its parent directory in muted text, on one line |
+| `"NameOverDir"` | A file-type icon and the name in larger text, above its parent directory |
+
+Icons come from the file name, and directories get a folder icon.
+
+Search and the inserted value always use the full path, and `result_rows`
+still counts results, so `"NameOverDir"` makes the picker about twice as tall.
+A pipe request can override the layout with `params.layout`. With the card
+layouts, match highlighting runs over the name and then the directory, so a
+query typed in path order, such as `srcmain`, ranks the same but may highlight
+only part of the match.
+
 `Items` takes its candidates from a named pipe request's `params.items`, a JSON-encoded
 array of `{ "text": "display label", "value": "text to insert" }`, or from an
 `items = function() ... end` Lua provider. The provider runs each time the picker

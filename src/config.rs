@@ -2454,6 +2454,49 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_layout_is_configurable_and_overridable_per_request() {
+        use crate::picker::config::FileLayout;
+        let config = parse(
+            r#"return { pickers = {
+                files = { type = 'FileSystem', roots = { '.' } },
+                cards = { type = 'FileSystem', roots = { '.' }, layout = 'NameOverDir' },
+            } }"#,
+        )
+        .unwrap();
+        let bindings = crate::picker::config::Bindings::compile_with_actions(
+            config.pickers,
+            config.keys,
+            config.picker_defaults,
+            config.actions,
+        )
+        .unwrap();
+        let layout = |name: &str, params: &[(&str, &str)]| {
+            let params = params
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            bindings
+                .named(name)
+                .unwrap()
+                .resolve(&PickerContext::default())
+                .unwrap()
+                .with_request(params)
+                .map(|options| match options.source {
+                    crate::picker::config::Source::FileSystem(files) => files.layout,
+                    _ => panic!("expected filesystem picker"),
+                })
+        };
+        assert_eq!(layout("files", &[]), Ok(FileLayout::Path));
+        assert_eq!(layout("cards", &[]), Ok(FileLayout::NameOverDir));
+        assert_eq!(
+            layout("files", &[("layout", "NameDir")]),
+            Ok(FileLayout::NameDir)
+        );
+        assert!(layout("files", &[("layout", "Cards")]).is_err());
+        assert!(parse("return {pickers={x={type='FileSystem', layout='Cards'}}}").is_err());
+    }
+
+    #[test]
     fn lua_items_provider_rereads_file_each_time() {
         let path =
             std::env::temp_dir().join(format!("nterm-picker-items-{}.json", std::process::id()));

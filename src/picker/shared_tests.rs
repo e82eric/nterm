@@ -2175,6 +2175,7 @@ fn filesystem_picker_accepts_path_without_terminal_snapshot() {
                 files_only: true,
                 directories_only: false,
                 relative: false,
+                layout: config::FileLayout::Path,
             }),
             params: [("query".into(), "file with spaces".into())].into(),
             enter_action: config::EnterAction::SendInput,

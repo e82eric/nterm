@@ -38,6 +38,7 @@ enum Session {
     FileSystem {
         store: Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>,
         scan: nfm_file_system::walker::FileWalkerScan,
+        layout: config::FileLayout,
     },
 }
 impl Session {
@@ -256,6 +257,7 @@ impl PickerSource {
                 Session::FileSystem {
                     store: shared,
                     scan,
+                    layout: files.layout,
                 }
             }
             crate::picker::config::Source::Themes | crate::picker::config::Source::ErrorLog => {
@@ -588,7 +590,9 @@ impl PickerSource {
             Session::Document { store } => Provider::Document(store.clone()),
             Session::Structured { snapshot } => Provider::Structured(snapshot.clone()),
             Session::StructuredCommand { store } => Provider::StructuredStream(store.clone()),
-            Session::FileSystem { store, .. } => Provider::FileSystem(store.clone()),
+            Session::FileSystem { store, layout, .. } => {
+                Provider::FileSystem(store.clone(), *layout)
+            }
         })
     }
     pub(super) fn accepted_value(&self, result: &SearchResult) -> String {
@@ -864,7 +868,10 @@ pub(super) enum Snapshot {
     Streaming(Arc<Items>),
     Document(Arc<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>),
     Structured(Arc<StructuredStreamingSnapshot>),
-    FileSystem(Arc<nfm_file_system::walker::PublishedSnapshot>),
+    FileSystem(
+        Arc<nfm_file_system::walker::PublishedSnapshot>,
+        config::FileLayout,
+    ),
 }
 #[derive(Clone, Debug)]
 pub(super) struct Candidate {
@@ -877,7 +884,7 @@ macro_rules! delegate_snapshot {
             Snapshot::Streaming(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
             Snapshot::Document(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
             Snapshot::Structured(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
-            Snapshot::FileSystem(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
+            Snapshot::FileSystem(s, _) => ItemsSource::$method(s.as_ref(), $($arg),*),
         }
     };
 }
@@ -935,13 +942,78 @@ impl ItemsSource for Snapshot {
     fn effective_query(&self, input: &str) -> String {
         delegate_snapshot!(self, effective_query, input)
     }
+    fn row_template(&self) -> Option<&nfm_search_core::row::RowTemplate> {
+        match self {
+            Self::FileSystem(_, layout) => file_row_template(*layout),
+            _ => delegate_snapshot!(self, row_template),
+        }
+    }
+    fn row_fields(&self, index: usize) -> Option<nfm_search_core::row::RowFields> {
+        match self {
+            Self::FileSystem(s, layout) => {
+                file_row_template(*layout)?;
+                let (name, dir) = s.name_and_directory(index)?;
+                let icon =
+                    nfm_picker_sources::devicon::lookup_entry(&name, s.is_dir(index)).reference();
+                Some(nfm_search_core::row::RowFields {
+                    values: vec![name, dir, icon],
+                })
+            }
+            _ => delegate_snapshot!(self, row_fields, index),
+        }
+    }
+}
+
+/// The card template for a FileSystem layout: field 0 is the name, field 1
+/// its parent directory and field 2 its file-type icon. `Path` draws plain
+/// one-line results.
+fn file_row_template(
+    layout: config::FileLayout,
+) -> Option<&'static nfm_search_core::row::RowTemplate> {
+    use std::sync::OnceLock;
+    static NAME_DIR: OnceLock<nfm_search_core::row::RowTemplate> = OnceLock::new();
+    static NAME_OVER_DIR: OnceLock<nfm_search_core::row::RowTemplate> = OnceLock::new();
+    let (cell, spec) = match layout {
+        config::FileLayout::Path => return None,
+        config::FileLayout::NameDir => (&NAME_DIR, "name|dir:muted"),
+        config::FileLayout::NameOverDir => (&NAME_OVER_DIR, "name:title;dir:muted"),
+    };
+    Some(cell.get_or_init(|| {
+        nfm_search_core::row::RowTemplate::parse(spec, Some("icon"), |field| match field {
+            "name" => Some(0),
+            "dir" => Some(1),
+            "icon" => Some(2),
+            _ => None,
+        })
+        .expect("built-in file row template")
+    }))
+}
+
+#[cfg(test)]
+mod file_layout_tests {
+    use super::*;
+    #[test]
+    fn file_layouts_choose_card_templates() {
+        assert!(file_row_template(config::FileLayout::Path).is_none());
+        let one = file_row_template(config::FileLayout::NameDir).unwrap();
+        assert_eq!(one.lines.len(), 1);
+        assert_eq!(one.max_field(), Some(2));
+        let two = file_row_template(config::FileLayout::NameOverDir).unwrap();
+        assert_eq!(two.lines.len(), 2);
+        for template in [one, two] {
+            assert_eq!(template.leading.as_ref().map(|slot| slot.field), Some(2));
+        }
+    }
 }
 pub(super) enum Provider {
     Streaming(Arc<SnapshotStore<Items>>),
     Document(Arc<SnapshotStore<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>>),
     Structured(Arc<StructuredStreamingSnapshot>),
     StructuredStream(Arc<SnapshotStore<StructuredStreamingSnapshot>>),
-    FileSystem(Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>),
+    FileSystem(
+        Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>,
+        config::FileLayout,
+    ),
 }
 
 #[cfg(test)]
@@ -1072,7 +1144,9 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Document(s) => s.snapshot().map(|s| Arc::new(Snapshot::Document(s))),
             Self::Structured(s) => Some(Arc::new(Snapshot::Structured(s.clone()))),
             Self::StructuredStream(s) => s.snapshot().map(|s| Arc::new(Snapshot::Structured(s))),
-            Self::FileSystem(s) => s.snapshot().map(|s| Arc::new(Snapshot::FileSystem(s))),
+            Self::FileSystem(s, layout) => s
+                .snapshot()
+                .map(|s| Arc::new(Snapshot::FileSystem(s, *layout))),
         }
     }
     fn snapshot_version(&self) -> u64 {
@@ -1081,7 +1155,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Document(s) => s.snapshot_version(),
             Self::Structured(s) => s.version(),
             Self::StructuredStream(s) => s.snapshot_version(),
-            Self::FileSystem(s) => s.snapshot_version(),
+            Self::FileSystem(s, _) => s.snapshot_version(),
         }
     }
     fn is_done(&self) -> bool {
@@ -1090,7 +1164,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Document(s) => s.is_done(),
             Self::Structured(_) => true,
             Self::StructuredStream(s) => s.is_done(),
-            Self::FileSystem(s) => s.is_done(),
+            Self::FileSystem(s, _) => s.is_done(),
         }
     }
     fn is_append_only(&self) -> bool {
@@ -1103,7 +1177,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Document(s) => s.subscribe_updates(wake),
             Self::Structured(_) => true,
             Self::StructuredStream(s) => s.subscribe_updates(wake),
-            Self::FileSystem(s) => s.subscribe_updates(wake),
+            Self::FileSystem(s, _) => s.subscribe_updates(wake),
         }
     }
 }
