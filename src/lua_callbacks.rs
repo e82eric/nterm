@@ -228,6 +228,33 @@ pub(crate) struct PreviewCommandSpec {
     pub(crate) center_line: Option<usize>,
 }
 
+/// An `Output` definition's `line` function: what to show for a line the
+/// program printed.
+pub(crate) struct LineFilter {
+    pub(crate) lua: Rc<Lua>,
+    pub(crate) key: RegistryKey,
+}
+impl LineFilter {
+    /// The text to add for `line`, or none to show nothing for it.
+    pub(crate) fn text(&self, line: &str) -> Result<Option<String>, String> {
+        let function: mlua::Function = self
+            .lua
+            .registry_value(&self.key)
+            .map_err(|error| error.to_string())?;
+        match function
+            .call::<_, mlua::Value>(line)
+            .map_err(|error| error.to_string())?
+        {
+            mlua::Value::Nil => Ok(None),
+            mlua::Value::String(text) => Ok(Some(text.to_string_lossy().into_owned())),
+            other => Err(format!(
+                "line must return a string or nil, not {}",
+                other.type_name()
+            )),
+        }
+    }
+}
+
 impl ItemsProvider {
     pub(crate) fn read(&self) -> Result<Vec<crate::picker::wire::Item>, String> {
         let function: mlua::Function = self
@@ -632,6 +659,27 @@ mod tests {
     }
 
     #[test]
+    fn push_picker_queues_name_and_optional_parameters() {
+        let callback = callback(
+            "return function(app, item) app:push_picker('Ripgrep', {pattern=item.value}); app:push_picker('Other') end",
+        );
+        let commands = callback
+            .call("shown", "typed", false, None, None, &Default::default())
+            .unwrap();
+        assert!(
+            matches!(&commands[0], Command::PushPicker { name, params } if name == "Ripgrep" && params["pattern"] == "typed")
+        );
+        assert!(
+            matches!(&commands[1], Command::PushPicker { name, params } if name == "Other" && params.is_empty())
+        );
+        for args in ["''", "'Ripgrep', {pattern=false}"] {
+            let invalid =
+                self::callback(&format!("return function(app) app:push_picker({args}) end"));
+            assert!(invalid.call_action(String::new()).is_err(), "{args}");
+        }
+    }
+
+    #[test]
     fn replace_picker_queues_name_and_optional_parameters() {
         let callback = callback(
             "return function(app, item) app:replace_picker('Details', {selected=item.value, query='target'}); app:replace_picker('Other') end",
@@ -661,6 +709,12 @@ mod tests {
 pub(crate) enum Command {
     ClosePicker,
     ReplacePicker {
+        name: String,
+        params: std::collections::BTreeMap<String, String>,
+    },
+    /// Show a named picker as a page on top of the one whose callback this
+    /// is; Escape there comes back.
+    PushPicker {
         name: String,
         params: std::collections::BTreeMap<String, String>,
     },
@@ -853,6 +907,13 @@ impl UserData for App {
                 return Err(mlua::Error::external("invalid picker replacement"));
             }
             app.push(Command::ReplacePicker { name, params })
+        });
+        methods.add_method("push_picker", |_, app, (name, params): (String, Option<std::collections::BTreeMap<String, String>>)| {
+            let params = params.unwrap_or_default();
+            if name.is_empty() || name.contains(' ') || params.iter().any(|(key, value)| key.contains(' ') || value.contains(' ')) {
+                return Err(mlua::Error::external("invalid picker page"));
+            }
+            app.push(Command::PushPicker { name, params })
         });
         methods.add_method("send_text", |_, app, text: String| {
             app.push(Command::SendText(text))

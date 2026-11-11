@@ -2,8 +2,11 @@ pub(crate) mod command;
 pub(crate) mod config;
 pub(crate) mod files;
 pub(crate) mod font;
+mod output;
+mod page;
 pub(crate) mod pipe;
 pub(crate) mod preview;
+mod prompt;
 #[cfg(test)]
 mod shared_tests;
 mod source;
@@ -11,6 +14,9 @@ pub(crate) mod wire;
 
 use crate::ghostty_ffi::{self, Host, SnapshotCell, SnapshotCellRange};
 use nfm_search_core::search::SearchResult;
+pub(crate) use output::Output;
+pub(crate) use page::Page;
+pub(crate) use prompt::Prompt;
 use source::PickerSource;
 use std::sync::{
     Arc,
@@ -66,24 +72,36 @@ pub(crate) struct Picker {
         Option<nfm_search_core::store::PublishingStreamingItemStoreWithPayload<SnapshotCellRange>>,
 }
 
+/// What a page reports the user did, for the pane to act on.
 pub(crate) enum Action {
     Execute(crate::actions::AppAction),
-    Custom(
-        std::rc::Rc<crate::lua_callbacks::Callback>,
-        String,
-        bool,
-        Option<SnapshotCellRange>,
-        String,
-        std::collections::BTreeMap<String, String>,
-    ),
+    /// Run a Lua action.
+    Custom(CustomAction),
+    /// Escape: leave this page for the one beneath.
     Cancel,
+    /// A result was accepted and nothing more comes of it: end the pickers.
+    Close,
     Navigate(SnapshotCell),
     SendInput(String),
 }
+/// A Lua action and the item it runs with.
+pub(crate) struct CustomAction {
+    pub(crate) callback: std::rc::Rc<crate::lua_callbacks::Callback>,
+    /// The item as shown.
+    pub(crate) text: String,
+    /// The item is a path from a file source.
+    pub(crate) filesystem: bool,
+    /// Where the item is in the terminal snapshot, if it came from there.
+    pub(crate) range: Option<SnapshotCellRange>,
+    /// The item's value, which is not always what is shown.
+    pub(crate) value: String,
+    pub(crate) params: std::collections::BTreeMap<String, String>,
+    /// The action came of accepting a result, as opposed to a key's action
+    /// or text entered at a prompt. That ends the pickers unless the action
+    /// shows a page.
+    pub(crate) accepted: bool,
+}
 impl Picker {
-    pub(crate) fn is_closed(&self) -> bool {
-        self.shared.is_closed()
-    }
     pub(crate) fn surrender_focus(&self) {
         self.context.memory_mut(|memory| {
             if let Some(id) = memory.focused() {
@@ -432,58 +450,16 @@ impl Picker {
     }
 
     fn appearance(&self, ctx: &egui::Context) -> nfm_egui::Appearance {
-        let p = crate::colors::palette();
-        nfm_egui::Appearance {
-            palette: nfm_egui::Palette {
-                background: p.panel_background,
-                text: p.text,
-                muted: p.muted_text,
-                selection_background: p.selection_background,
-                selection_text: p.selection_text,
-                preview_selection_background: nfm_egui::Palette::default()
-                    .preview_selection_background,
-                match_highlight: p.picker_match_highlight.unwrap_or(p.match_highlight),
-                divider: p.border,
-                error: p.error,
-                accent: p.accent,
-                copy_cursor_background: p.copy_cursor_background,
-                success: p.success,
-                search_match_background: Some(p.search_match_background),
-                search_match_text: Some(p.search_match_text),
-                search_active_background: Some(p.match_highlight),
-                search_active_text: Some(p.background),
-                yank_background: p.yank_background,
-                cursor_line_background: Some(p.cursor_line_background),
-                cursor_line_text: Some(p.cursor_line_text),
-            },
-            typography: nfm_egui::Typography {
-                normal: self.typography.font.clone(),
-                bold: self.typography.matched_font.clone(),
-                row_height: self.typography.row_height,
-                cell_width: ctx
-                    .fonts_mut(|fonts| fonts.glyph_width(&self.typography.font, 'M'))
-                    .max(1.0),
-            },
-        }
+        appearance(&self.typography, ctx)
     }
     fn placement(&self, bounds: egui::Rect) -> nfm_egui::Placement {
-        let mut placement = nfm_egui::Placement::new(bounds);
-        placement.position = match self.position {
-            config::Position::Top => nfm_egui::Position::Top,
-            config::Position::Center => nfm_egui::Position::Center,
-            config::Position::Bottom => nfm_egui::Position::Bottom,
-            config::Position::FullPane => nfm_egui::Position::FullPane,
-            config::Position::Cursor if self.cursor_row.is_some() => nfm_egui::Position::Cursor,
-            config::Position::Cursor => nfm_egui::Position::Bottom,
-        };
-        placement.anchor = self.cursor_row.map(|row| {
-            let anchor_bounds = self.anchor_bounds.unwrap_or(bounds);
-            egui::pos2(
-                anchor_bounds.center().x,
-                anchor_bounds.top() + (row as f32 + 1.0) * self.typography.row_height,
-            )
-        });
-        placement
+        placement(
+            self.position,
+            self.cursor_row,
+            self.anchor_bounds,
+            self.typography.row_height,
+            bounds,
+        )
     }
     #[cfg(test)]
     pub(crate) fn show(&mut self, ctx: &egui::Context, bottom_margin: f32) -> Option<Action> {
@@ -725,14 +701,16 @@ impl Picker {
             score: 0,
             path: selection.text.clone(),
         };
-        Some(Action::Custom(
+        Some(Action::Custom(CustomAction {
             callback,
-            selection.text,
-            self.source.is_filesystem(),
+            text: selection.text,
+            filesystem: self.source.is_filesystem(),
             range,
-            self.source.accepted_value(&result),
-            self.request_params.clone(),
-        ))
+            value: self.source.accepted_value(&result),
+            params: self.request_params.clone(),
+            // A key's action leaves the picker as it is.
+            accepted: false,
+        }))
     }
     fn accept(&self, selection: nfm_egui::Selection<source::Candidate>) -> Option<Action> {
         if let Some(session) = &self.pipe_session {
@@ -754,7 +732,7 @@ impl Picker {
                 .map(|item| item.id.clone())
                 .unwrap_or_else(|| index.to_string());
             session.finish("accepted",serde_json::json!({"selected":[{"id":id,"text":selection.text,"value":value}],"query":self.shared.query()}));
-            return Some(Action::Cancel);
+            return Some(Action::Close);
         }
         let result = SearchResult {
             node_index: selection.item.node_index,
@@ -778,14 +756,15 @@ impl Picker {
         if let Some(callback) = &self.callback
             && !self.line_split
         {
-            return Some(Action::Custom(
-                callback.clone(),
-                result.path,
-                self.source.is_filesystem(),
+            return Some(Action::Custom(CustomAction {
+                callback: callback.clone(),
+                text: result.path,
+                filesystem: self.source.is_filesystem(),
                 range,
                 value,
-                self.request_params.clone(),
-            ));
+                params: self.request_params.clone(),
+                accepted: true,
+            }));
         }
         match if self.line_split {
             config::EnterAction::SendInput
@@ -794,7 +773,7 @@ impl Picker {
         } {
             config::EnterAction::Navigate => range.map(|r| Action::Navigate(r.start)),
             config::EnterAction::SendInput => Some(Action::SendInput(value)),
-            config::EnterAction::Close => Some(Action::Cancel),
+            config::EnterAction::Close => Some(Action::Close),
         }
     }
     fn enter_line_split(&mut self, ctx: &egui::Context, source: PickerSource) {
@@ -882,6 +861,70 @@ impl Picker {
         picker.apply_line_break_presentation();
         Ok(picker)
     }
+}
+
+/// The terminal's colors and a page's font, as a page's look.
+fn appearance(typography: &font::Typography, ctx: &egui::Context) -> nfm_egui::Appearance {
+    let p = crate::colors::palette();
+    nfm_egui::Appearance {
+        palette: nfm_egui::Palette {
+            background: p.panel_background,
+            text: p.text,
+            muted: p.muted_text,
+            selection_background: p.selection_background,
+            selection_text: p.selection_text,
+            preview_selection_background: nfm_egui::Palette::default().preview_selection_background,
+            match_highlight: p.picker_match_highlight.unwrap_or(p.match_highlight),
+            divider: p.border,
+            error: p.error,
+            accent: p.accent,
+            copy_cursor_background: p.copy_cursor_background,
+            success: p.success,
+            search_match_background: Some(p.search_match_background),
+            search_match_text: Some(p.search_match_text),
+            search_active_background: Some(p.match_highlight),
+            search_active_text: Some(p.background),
+            yank_background: p.yank_background,
+            cursor_line_background: Some(p.cursor_line_background),
+            cursor_line_text: Some(p.cursor_line_text),
+        },
+        typography: nfm_egui::Typography {
+            normal: typography.font.clone(),
+            bold: typography.matched_font.clone(),
+            row_height: typography.row_height,
+            cell_width: ctx
+                .fonts_mut(|fonts| fonts.glyph_width(&typography.font, 'M'))
+                .max(1.0),
+        },
+    }
+}
+/// Where a page goes in `bounds`. A `Cursor` position is beneath the
+/// terminal row `cursor_row` of `anchor_bounds`, and at the bottom without
+/// one.
+fn placement(
+    position: config::Position,
+    cursor_row: Option<u32>,
+    anchor_bounds: Option<egui::Rect>,
+    row_height: f32,
+    bounds: egui::Rect,
+) -> nfm_egui::Placement {
+    let mut placement = nfm_egui::Placement::new(bounds);
+    placement.position = match position {
+        config::Position::Top => nfm_egui::Position::Top,
+        config::Position::Center => nfm_egui::Position::Center,
+        config::Position::Bottom => nfm_egui::Position::Bottom,
+        config::Position::FullPane => nfm_egui::Position::FullPane,
+        config::Position::Cursor if cursor_row.is_some() => nfm_egui::Position::Cursor,
+        config::Position::Cursor => nfm_egui::Position::Bottom,
+    };
+    placement.anchor = cursor_row.map(|row| {
+        let anchor_bounds = anchor_bounds.unwrap_or(bounds);
+        egui::pos2(
+            anchor_bounds.center().x,
+            anchor_bounds.top() + (row as f32 + 1.0) * row_height,
+        )
+    });
+    placement
 }
 
 impl Drop for Picker {

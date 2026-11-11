@@ -218,7 +218,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        assert!(matches!(selected, Some(crate::picker::Action::Cancel)));
+        assert!(matches!(selected, Some(crate::picker::Action::Close)));
     }
     #[test]
     fn history_is_bounded_and_duplicates_move_to_front() {

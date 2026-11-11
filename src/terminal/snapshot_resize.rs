@@ -114,7 +114,7 @@ impl TerminalPane {
             .copy_mode
             .generation
             .or(self.search.snapshot_generation)
-            .or_else(|| self.picker.as_ref().and_then(|picker| picker.generation));
+            .or_else(|| self.pages.iter().find_map(crate::picker::Page::generation));
         let Some(generation) = generation else {
             return Ok(());
         };
@@ -127,13 +127,19 @@ impl TerminalPane {
         {
             return Ok(());
         }
-        if self
-            .picker
-            .as_mut()
-            .is_some_and(|picker| picker.prepare_snapshot_resize())
+        // Every page that reads the snapshot gets ready, not only the one
+        // showing; one still capturing it closes them all.
+        let mut capturing = false;
+        for picker in self
+            .pages
+            .iter_mut()
+            .filter_map(crate::picker::Page::picker_mut)
         {
-            let picker = self.picker.take().unwrap();
-            let from_copy = picker.from_copy;
+            capturing |= picker.prepare_snapshot_resize();
+        }
+        if capturing {
+            let picker = self.take_pages().unwrap();
+            let from_copy = picker.from_copy();
             drop(picker);
             self.handle_picker_action(crate::picker::Action::Cancel, Some(generation), from_copy);
             if !from_copy {

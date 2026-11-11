@@ -624,7 +624,7 @@ fn pipe_stream_publishes_before_end_and_returns_value_without_pasting() {
         &mut picker,
         vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
     );
-    assert!(matches!(action, Some(Action::Cancel)));
+    assert!(matches!(action, Some(Action::Close)));
     assert!(output.is_empty());
     let result = rx.try_recv().unwrap();
     assert_eq!(result["status"], "accepted");
@@ -697,7 +697,7 @@ fn named_stream_feeds_configured_preview_and_returns_item() {
         &mut picker,
         vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
     );
-    assert!(matches!(action, Some(Action::Cancel)));
+    assert!(matches!(action, Some(Action::Close)));
     let result = rx.try_recv().unwrap();
     assert_eq!(result["status"], "accepted");
     assert_eq!(result["selected"][0]["id"], "7");
@@ -1005,6 +1005,25 @@ fn items(ctx: &egui::Context) -> Picker {
         },
     )
 }
+#[test]
+fn an_accepted_result_is_told_apart_and_leaves_the_picker_as_it_was() {
+    let ctx = egui::Context::default();
+    let mut picker = items(&ctx);
+    wait_selection(&ctx, &mut picker);
+    let (action, _) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert!(matches!(action, Some(Action::SendInput(_))));
+    // The pane ends the picker for this, or waits on its action; a page
+    // shown on top comes back to it with nothing changed.
+    let (action, _) = frame(&ctx, &mut picker, vec![]);
+    assert!(action.is_none());
+    assert_eq!(wait_selection(&ctx, &mut picker).text, "café shown");
+    assert_eq!(picker.shared.query(), "café");
+}
+
 #[test]
 fn unicode_display_copy_and_insert_value_survive_migration() {
     let ctx = egui::Context::default();
@@ -1461,11 +1480,20 @@ fn lua_callback_retains_display_value_and_request_parameters() {
         &mut picker,
         vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
     );
-    let Some(Action::Custom(actual, text, filesystem, range, value, params)) = selected else {
+    let Some(Action::Custom(CustomAction {
+        callback: actual,
+        text,
+        filesystem,
+        range,
+        value,
+        params,
+        accepted,
+    })) = selected
+    else {
         panic!("callback was not retained");
     };
     assert!(std::rc::Rc::ptr_eq(&actual, &callback));
-    assert!(picker.shared.is_closed());
+    assert!(accepted);
     assert_eq!(text, "café shown");
     assert_eq!(value, "inserted value");
     assert!(!filesystem && range.is_none());
@@ -1504,9 +1532,19 @@ fn picker_local_lua_key_receives_selection_without_closing() {
             egui::Event::Text("x".into()),
         ],
     );
-    let Some(Action::Custom(callback, text, filesystem, range, value, params)) = action else {
+    let Some(Action::Custom(CustomAction {
+        callback,
+        text,
+        filesystem,
+        range,
+        value,
+        params,
+        accepted,
+    })) = action
+    else {
         panic!("missing callback");
     };
+    assert!(!accepted);
     assert_eq!(picker.shared.query(), query);
     assert!(!picker.shared.is_closed());
     let commands = callback
@@ -1635,10 +1673,19 @@ fn replace_picker_from_accept_and_local_key_resets_source_and_callbacks() {
                 egui::Modifiers::NONE,
             )],
         );
-        let Some(Action::Custom(callback, text, filesystem, range, value, params)) = action else {
+        let Some(Action::Custom(CustomAction {
+            callback,
+            text,
+            filesystem,
+            range,
+            value,
+            params,
+            accepted,
+        })) = action
+        else {
             panic!("expected callback")
         };
-        assert_eq!(previous.is_closed(), !local_key);
+        assert_eq!(accepted, !local_key);
         let commands = callback
             .call(&text, &value, filesystem, None, range, &params)
             .unwrap();
@@ -1675,7 +1722,7 @@ fn replace_picker_from_accept_and_local_key_resets_source_and_callbacks() {
             &Default::default(),
             Some(previous),
         );
-        assert!(!replacement.is_closed());
+        assert!(!replacement.shared.is_closed());
         assert!(replacement.callback.is_none());
         assert!(replacement.keys.is_empty());
         assert_eq!(replacement.shared.query(), "target");
@@ -2243,7 +2290,7 @@ fn picker_double_click_override_receives_item_and_stays_open() {
             }
         }
         if overridden {
-            let Some(Action::Custom(_, text, _, _, value, _)) = accepted else {
+            let Some(Action::Custom(CustomAction { text, value, .. })) = accepted else {
                 panic!("missing clicked item");
             };
             assert_eq!(text, "café shown");
@@ -2253,7 +2300,6 @@ fn picker_double_click_override_receives_item_and_stays_open() {
             assert!(
                 matches!(accepted, Some(Action::SendInput(value)) if value == "inserted value")
             );
-            assert!(picker.shared.is_closed());
         }
     }
 }

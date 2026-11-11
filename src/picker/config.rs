@@ -360,7 +360,7 @@ impl<'de> Deserialize<'de> for Definition {
         if !common.contains_key("preview_visible")
             && matches!(
                 source.get("type").and_then(serde_json::Value::as_str),
-                Some("Themes" | "ErrorLog" | "CommandPalette")
+                Some("Themes" | "ErrorLog" | "CommandPalette" | "Argument")
             )
         {
             common.insert("preview_visible".into(), false.into());
@@ -445,6 +445,39 @@ pub(crate) enum DefinitionSource {
         enter_action: Option<EnterAction>,
         #[serde(skip)]
         callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
+    },
+    /// Nothing to pick from: the query box takes text as typed, and Enter
+    /// runs `action` with it as the item.
+    Argument {
+        /// Shown before the text in place of `>`.
+        #[serde(default)]
+        prompt: Option<String>,
+        /// Shown muted while nothing is typed.
+        #[serde(default)]
+        placeholder: Option<String>,
+        #[serde(skip)]
+        enter_action: Option<EnterAction>,
+        #[serde(skip)]
+        callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
+    },
+    /// Nothing to pick from: a program runs, and what it prints is shown as
+    /// it prints it, to read. An argument that is `{name}` is the parameter
+    /// of that name the page was opened with.
+    Output {
+        args: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        /// The page's height in rows.
+        #[serde(default)]
+        rows: Option<usize>,
+        /// How the text is shown: `Text` as a terminal shows it, or
+        /// `Markdown`.
+        #[serde(default)]
+        format: Option<String>,
+        /// Says what to show for each line the program prints, in place of
+        /// the line.
+        #[serde(skip)]
+        line: Option<std::rc::Rc<crate::lua_callbacks::LineFilter>>,
     },
     FileSystem {
         #[serde(default)]
@@ -550,6 +583,83 @@ impl Definition {
             .map(|keys| std::mem::take(keys))
             .unwrap_or_default();
         let (source, enter_action) = match definition.source {
+            DefinitionSource::Argument {
+                prompt,
+                placeholder,
+                ..
+            } => {
+                let Some(callback) = callback else {
+                    return Err(format!(
+                        "pickers.{name}: Argument requires an action, which receives the text as the item"
+                    ));
+                };
+                for (field, value) in [("prompt", &prompt), ("placeholder", &placeholder)] {
+                    if value
+                        .as_ref()
+                        .is_some_and(|text| text.len() > 256 || text.chars().any(char::is_control))
+                    {
+                        return Err(format!(
+                            "pickers.{name}.{field} must be at most 256 bytes without control characters"
+                        ));
+                    }
+                }
+                // Nothing to pick from: it opens a prompt, not a picker.
+                let mut params = BTreeMap::new();
+                if let Some(query) = initial_query {
+                    params.insert("query".into(), query);
+                }
+                return Ok(PickerEntry::Prompt(PromptOptions {
+                    scope,
+                    position,
+                    callback,
+                    params,
+                    prompt,
+                    placeholder,
+                }));
+            }
+            DefinitionSource::Output {
+                args,
+                cwd,
+                rows,
+                format,
+                line,
+            } => {
+                if args.is_empty()
+                    || args[0].trim().is_empty()
+                    || (args[0].starts_with('{') && args[0].ends_with('}'))
+                {
+                    return Err(format!("pickers.{name}.args requires an executable"));
+                }
+                if let Some(index) = args.iter().position(|arg| arg.contains('\0')) {
+                    return Err(format!("pickers.{name}.args[{index}] contains NUL"));
+                }
+                if cwd.as_ref().is_some_and(|value| value.contains('\0')) {
+                    return Err(format!("pickers.{name}.cwd contains NUL"));
+                }
+                if rows.is_some_and(|rows| !(1..=256).contains(&rows)) {
+                    return Err(format!("pickers.{name}.rows must be between 1 and 256"));
+                }
+                let format = match format.as_deref() {
+                    None | Some("Text") => nfm_output::Format::Text,
+                    Some("Markdown") => nfm_output::Format::Markdown,
+                    Some(other) => {
+                        return Err(format!(
+                            "pickers.{name}.format must be Text or Markdown, not {other}"
+                        ));
+                    }
+                };
+                // Nothing to pick from: it opens an output page, not a picker.
+                return Ok(PickerEntry::Output(OutputOptions {
+                    scope,
+                    position,
+                    args,
+                    cwd,
+                    rows: rows.unwrap_or(DEFAULT_OUTPUT_ROWS),
+                    format,
+                    line,
+                    params: BTreeMap::new(),
+                }));
+            }
             DefinitionSource::Themes { .. } => (Source::Themes, EnterAction::Navigate),
             DefinitionSource::ErrorLog { .. } => (Source::ErrorLog, EnterAction::Navigate),
             DefinitionSource::CommandPalette { .. } => {
@@ -811,14 +921,21 @@ impl Definition {
             *provider = Some(value);
         }
     }
+    pub(crate) fn set_line_filter(&mut self, value: std::rc::Rc<crate::lua_callbacks::LineFilter>) {
+        if let DefinitionSource::Output { line, .. } = &mut self.source {
+            *line = Some(value);
+        }
+    }
     pub(crate) fn set_callback(&mut self, value: std::rc::Rc<crate::lua_callbacks::Callback>) {
         match &mut self.source {
             DefinitionSource::Scrollback { callback, .. }
             | DefinitionSource::FileSystem { callback, .. }
             | DefinitionSource::Command { callback, .. }
             | DefinitionSource::File { callback, .. }
+            | DefinitionSource::Argument { callback, .. }
             | DefinitionSource::Items { callback, .. } => *callback = Some(value),
             DefinitionSource::Factory { .. }
+            | DefinitionSource::Output { .. }
             | DefinitionSource::ErrorLog { .. }
             | DefinitionSource::Themes { .. }
             | DefinitionSource::CommandPalette { .. } => {}
@@ -852,12 +969,18 @@ impl Definition {
                 enter_action,
                 ..
             }
+            | DefinitionSource::Argument {
+                callback,
+                enter_action,
+                ..
+            }
             | DefinitionSource::FileSystem {
                 callback,
                 enter_action,
                 ..
             } => (callback.clone(), *enter_action),
             DefinitionSource::Factory { .. }
+            | DefinitionSource::Output { .. }
             | DefinitionSource::ErrorLog { .. }
             | DefinitionSource::Themes { .. }
             | DefinitionSource::CommandPalette { .. } => (None, None),
@@ -871,8 +994,10 @@ impl Definition {
             | DefinitionSource::FileSystem { callback, .. }
             | DefinitionSource::Command { callback, .. }
             | DefinitionSource::File { callback, .. }
+            | DefinitionSource::Argument { callback, .. }
             | DefinitionSource::Items { callback, .. } => callback.as_ref(),
             DefinitionSource::Factory { .. }
+            | DefinitionSource::Output { .. }
             | DefinitionSource::ErrorLog { .. }
             | DefinitionSource::Themes { .. }
             | DefinitionSource::CommandPalette { .. } => None,
@@ -1091,6 +1216,67 @@ pub(crate) struct Options {
     pub(crate) label: Option<&'static str>,
 }
 
+/// What an `Argument` definition opens: a prompt for a line of text.
+#[derive(Clone)]
+pub(crate) struct PromptOptions {
+    pub(crate) scope: Scope,
+    pub(crate) position: Position,
+    /// Runs with the text typed as its item.
+    pub(crate) callback: std::rc::Rc<crate::lua_callbacks::Callback>,
+    /// Handed to the action. `query` is the text the prompt opens with.
+    pub(crate) params: BTreeMap<String, String>,
+    /// Shown before the text in place of `>`.
+    pub(crate) prompt: Option<String>,
+    /// Shown muted while nothing is typed.
+    pub(crate) placeholder: Option<String>,
+}
+
+/// The rows an output page takes when its definition does not say.
+const DEFAULT_OUTPUT_ROWS: usize = 24;
+
+/// What an `Output` definition opens: a page showing what a program prints.
+#[derive(Clone)]
+pub(crate) struct OutputOptions {
+    pub(crate) scope: Scope,
+    pub(crate) position: Position,
+    /// The program and its arguments. One that is `{name}` is the parameter
+    /// of that name.
+    pub(crate) args: Vec<String>,
+    /// Where it runs, unless a `cwd` parameter says.
+    pub(crate) cwd: Option<String>,
+    pub(crate) rows: usize,
+    /// How the text is shown.
+    pub(crate) format: nfm_output::Format,
+    /// What to show for each line the program prints; the line itself
+    /// without one.
+    pub(crate) line: Option<std::rc::Rc<crate::lua_callbacks::LineFilter>>,
+    pub(crate) params: BTreeMap<String, String>,
+}
+
+/// What a definition opens.
+#[derive(Clone)]
+pub(crate) enum PageOptions {
+    Picker(Options),
+    Prompt(PromptOptions),
+    Output(OutputOptions),
+}
+impl PageOptions {
+    /// Add the parameters a request opened it with.
+    pub(crate) fn with_request(self, params: BTreeMap<String, String>) -> Result<Self, String> {
+        match self {
+            Self::Picker(options) => options.with_request(params).map(Self::Picker),
+            Self::Prompt(mut options) => {
+                options.params.extend(params);
+                Ok(Self::Prompt(options))
+            }
+            Self::Output(mut options) => {
+                options.params.extend(params);
+                Ok(Self::Output(options))
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum Source {
     Themes,
@@ -1231,17 +1417,36 @@ type Binding = KeyBinding<crate::actions::AppAction>;
 #[derive(Clone)]
 pub(crate) enum PickerEntry {
     Static(Options),
+    /// An `Argument` definition, which opens a prompt.
+    Prompt(PromptOptions),
+    /// An `Output` definition, which opens an output page.
+    Output(OutputOptions),
     Factory(std::rc::Rc<crate::config::PickerFactory>, PickerDefaults),
 }
 
 impl PickerEntry {
+    /// What the entry opens; a factory is asked, with `context`.
+    pub(crate) fn open(
+        &self,
+        context: &crate::config::PickerContext,
+    ) -> Result<PageOptions, String> {
+        match self {
+            Self::Static(options) => Ok(PageOptions::Picker(options.clone())),
+            Self::Prompt(options) => Ok(PageOptions::Prompt(options.clone())),
+            Self::Output(options) => Ok(PageOptions::Output(options.clone())),
+            Self::Factory(factory, defaults) => factory.resolve(context, *defaults),
+        }
+    }
+    /// The options of an entry that opens a picker, for tests of those.
+    #[cfg(test)]
     pub(crate) fn resolve(
         &self,
         context: &crate::config::PickerContext,
     ) -> Result<Options, String> {
-        match self {
-            Self::Static(options) => Ok(options.clone()),
-            Self::Factory(factory, defaults) => factory.resolve(context, *defaults),
+        match self.open(context)? {
+            PageOptions::Picker(options) => Ok(options),
+            PageOptions::Prompt(_) => Err("the entry opens a prompt".into()),
+            PageOptions::Output(_) => Err("the entry opens an output page".into()),
         }
     }
 
@@ -1589,7 +1794,9 @@ impl Bindings {
             .pickers
             .iter()
             .filter(|(_, entry)| match entry {
-                PickerEntry::Factory(..) => true,
+                PickerEntry::Factory(..) | PickerEntry::Prompt(_) => true,
+                // It is opened with what to run it on, by another page.
+                PickerEntry::Output(_) => false,
                 PickerEntry::Static(options) => match &options.source {
                     Source::CommandPalette(_) => false,
                     Source::Themes | Source::ErrorLog => true,
