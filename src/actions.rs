@@ -140,7 +140,6 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
         ("/", "CTRL|SHIFT", "OpenSearch"),
         ("m", "CTRL|SHIFT", "EnterCopyMode"),
         ("r", "CTRL|SHIFT", "EnterKeyTable:resize"),
-        ("g", "CTRL|SHIFT", "EnterKeyTable:move"),
         ("Space", "ALT", "OpenQuickSelect"),
         ("ArrowUp", "CTRL|SHIFT", "PreviousCommand"),
         ("ArrowDown", "CTRL|SHIFT", "NextCommand"),

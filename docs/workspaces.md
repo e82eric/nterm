@@ -143,7 +143,8 @@ nterm has two built-in tables. `resize`, entered with **Ctrl+Shift+R**:
 | `m` | switch to the `move` table |
 | `Enter` or `Escape` | leave the table |
 
-And `move`, entered with **Ctrl+Shift+G**:
+And `move`, entered with `m` from `resize`. It has no shortcut of its own;
+bind one with `action = "EnterKeyTable:move"`:
 
 | Keys | Action |
 |---|---|
@@ -166,8 +167,7 @@ Tables in `key_tables` use the same fields as `keys`, and merge with the
 built-in tables the same way: a table named `resize` adds its keys to the
 built-in one, replaces any built-in key it also binds, and removes one with
 `action = "None"`. Other names make new tables. `disable_default_keys = true`
-leaves out the built-in tables and their Ctrl+Shift+R and Ctrl+Shift+G bindings
-too.
+leaves out the built-in tables and the Ctrl+Shift+R binding too.
 
 ```lua
 key_tables = {

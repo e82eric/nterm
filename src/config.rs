@@ -1875,11 +1875,9 @@ mod tests {
             defaults.shortcut_for(&enter("resize")).as_deref(),
             Some("Ctrl+Shift+R")
         );
-        // Ctrl+Shift+G enters the built-in move table.
-        assert_eq!(
-            defaults.shortcut_for(&enter("move")).as_deref(),
-            Some("Ctrl+Shift+G")
-        );
+        // The move table has no key of its own: `m` in resize switches to
+        // it, and a config can bind one.
+        assert_eq!(defaults.shortcut_for(&enter("move")), None);
         let alt = Modifiers::ALT;
         for (key, mods, expected) in [
             (Key::H, none, "ResizeLeft"),

@@ -386,7 +386,7 @@ pub(crate) fn default_bindings() -> Vec<crate::picker::config::KeyBinding> {
 /// and bottom edges. `=` resets sizes like `ResetLayout`, and `m` switches
 /// to `move`.
 ///
-/// `move`, entered with Ctrl+Shift+G: the same keys move like `Move*`,
+/// `move`, entered with `m` from `resize`: the same keys move like `Move*`,
 /// swapping the focused pane with its neighbour or moving the shown float;
 /// with Shift, `MoveFar*` moves it as far as it goes. `c` centres a float
 /// like `CenterFloat`, and `r` switches to `resize`.
