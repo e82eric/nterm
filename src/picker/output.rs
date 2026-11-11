@@ -225,13 +225,22 @@ impl Lines {
     }
 }
 
+/// The name in an argument that is `{name}`: letters, digits and `_` between
+/// the braces. Anything else in braces is an argument as written, such as a
+/// JSON object.
+fn parameter_name(arg: &str) -> Option<&str> {
+    let name = arg.strip_prefix('{')?.strip_suffix('}')?;
+    let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    named.then_some(name)
+}
+
 /// The program to run: `args` with each argument that is `{name}` replaced by
 /// the parameter of that name, in `cwd`, or the `cwd` parameter if there is
 /// one.
 fn command(options: &config::OutputOptions) -> Result<nfm_output::CommandSpec, String> {
     let mut args = Vec::with_capacity(options.args.len());
     for arg in &options.args {
-        let resolved = match arg.strip_prefix('{').and_then(|arg| arg.strip_suffix('}')) {
+        let resolved = match parameter_name(arg) {
             Some(name) => options
                 .params
                 .get(name)
@@ -462,5 +471,17 @@ mod tests {
 
         let error = command(&options(&["ping", "{host}"], &[])).unwrap_err();
         assert!(error.contains("host"), "{error}");
+
+        // Braces around something that is not a name are an argument as
+        // written: a JSON object, or nothing at all.
+        let spec = command(&options(
+            &["claude", "--settings", r#"{"disableAllHooks":true}"#, "{}"],
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(
+            spec.arguments,
+            ["--settings", r#"{"disableAllHooks":true}"#, "{}"]
+        );
     }
 }

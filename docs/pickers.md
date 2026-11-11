@@ -428,7 +428,9 @@ action either shows a page on top with `app:push_picker` or closes it with
 shell and shows what the program prints, standard output and standard error
 together with their colors, while it runs. An argument consisting of `{name}`
 is replaced with the parameter of that name, so another page opens it with
-what to run on: `app:push_picker("Answer", { question = item.value })`. It runs
+what to run on: `app:push_picker("Answer", { question = item.value })`. A name
+is letters, digits and `_`; anything else in braces, such as a JSON object, is
+passed as written. It runs
 in the request's `params.cwd`, else the configured `cwd`, else the shell's
 working directory when known. The page stays at the end as more arrives until
 you move up, and follows again from the last row. `j`/`k` and the arrows move,
