@@ -1199,12 +1199,19 @@ impl TerminalPane {
             let line = String::from_utf8_lossy(bytes).into_owned();
             let before =
                 String::from_utf8_lossy(&bytes[..row.cursor_byte.min(bytes.len())]).into_owned();
+            let (copy_line, copy_line_before_cursor) = if self.opened_from_copy(&open) {
+                self.copy_cursor_line().unwrap_or_default()
+            } else {
+                Default::default()
+            };
             let context = crate::config::PickerContext {
                 line,
                 line_before_cursor: before,
                 cursor_column: row.column,
                 recent_lines: self.recent_picker_lines(),
                 cwd: self.pwd(),
+                copy_line,
+                copy_line_before_cursor,
             };
             unsafe { ghostty_ffi::nterm_host_live_cursor_free(&mut row) };
             context
@@ -2947,6 +2954,19 @@ impl TerminalPane {
             unsafe { ghostty_ffi::nterm_host_snapshot_end(self.host, generation) };
         }
         lines
+    }
+
+    /// The line the copy-mode cursor is on, and the part of it before the
+    /// cursor. A line that wraps is given whole.
+    fn copy_cursor_line(&self) -> Option<(String, String)> {
+        let generation = self.copy_mode.generation?;
+        let (mut line, byte) = self
+            .copy_mode
+            .line_under_cursor(|row| self.read_snapshot_row(generation, row))?;
+        // A terminal row is blank cells out to the window's width.
+        line.truncate(line.trim_end().len());
+        let before = line[..byte.min(line.len())].to_owned();
+        Some((line, before))
     }
 
     fn read_snapshot_row(&self, generation: u64, row: u64) -> Option<TextRow> {

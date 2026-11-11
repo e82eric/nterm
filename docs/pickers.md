@@ -234,6 +234,18 @@ pickers = {
 text before the cursor, and `cursor_column` is the zero-based terminal cell column.
 `context.cwd` is the shell's working directory if it reports one with OSC 7
 (see [Shell working directory](#shell-working-directory)), otherwise `nil`.
+In copy mode, `copy_line` is the line the copy-mode cursor is on and
+`copy_line_before_cursor` is its text before the cursor; the character under
+the cursor comes after that. A line that wraps over several rows is given
+whole, so a word that runs over the end of a row is not cut. Both are empty
+outside copy mode. The word under the cursor is then, for example:
+
+```lua
+local before = context.copy_line_before_cursor
+local after = context.copy_line:sub(#before + 1)
+local word = (before:match("(%S*)$") or "") .. (after:match("^(%S*)") or "")
+```
+
 This is terminal output, not PSReadLine's private edit buffer. `initial_query`
 works for both static and function pickers. The function may choose `type`,
 `position`, `enter_action`, `action`, and other type-specific fields on every invocation.

@@ -15,6 +15,12 @@ pub(crate) struct PickerContext {
     pub(crate) recent_lines: Vec<String>,
     /// The shell's working directory from OSC 7, if it reported one.
     pub(crate) cwd: Option<String>,
+    /// The line the copy-mode cursor is on, whole: the rows a long line
+    /// wraps over, joined. Empty outside copy mode.
+    pub(crate) copy_line: String,
+    /// The part of `copy_line` before the cursor. The character the cursor
+    /// is on comes after it.
+    pub(crate) copy_line_before_cursor: String,
 }
 
 pub(crate) struct PickerFactory {
@@ -54,6 +60,15 @@ impl PickerFactory {
         argument
             .set("cwd", context.cwd.as_deref())
             .map_err(|e| e.to_string())?;
+        argument
+            .set("copy_line", context.copy_line.as_str())
+            .map_err(|e| e.to_string())?;
+        argument
+            .set(
+                "copy_line_before_cursor",
+                context.copy_line_before_cursor.as_str(),
+            )
+            .map_err(|e| e.to_string())?;
         let table: mlua::Table = function
             .call(argument)
             .map_err(|e| format!("pickers.{}: {e}", self.name))?;
@@ -62,6 +77,8 @@ impl PickerFactory {
                 "line": context.line, "line_before_cursor": context.line_before_cursor,
                 "cursor_column": context.cursor_column, "recent_lines": context.recent_lines,
                 "cwd": context.cwd,
+                "copy_line": context.copy_line,
+                "copy_line_before_cursor": context.copy_line_before_cursor,
             })));
         let definition = if let Some(name) = &self.builtin {
             parse_builtin_table(&self.lua, name, &table)
@@ -1717,6 +1734,41 @@ mod tests {
             options.placeholder.as_deref(),
             Some("<text>  Search the working directory")
         );
+    }
+
+    #[test]
+    fn a_factory_is_given_the_line_under_the_copy_cursor() {
+        let config = parse(
+            "return { pickers = { Grep = function(context)
+                local before = context.copy_line_before_cursor
+                local after = context.copy_line:sub(#before + 1)
+                local word = (before:match('(%S*)$') or '') .. (after:match('^(%S*)') or '')
+                return { type = 'Argument', prompt = 'Grep:', initial_query = word,
+                         action = function() end }
+            end } }",
+        )
+        .unwrap();
+        let bindings = try_compile(config).unwrap();
+        let open = |line: &str, before: &str| {
+            let context = PickerContext {
+                copy_line: line.into(),
+                copy_line_before_cursor: before.into(),
+                ..Default::default()
+            };
+            match bindings.named("Grep").unwrap().open(&context) {
+                Ok(crate::picker::config::PageOptions::Prompt(options)) => {
+                    options.params.get("query").cloned()
+                }
+                _ => panic!("an Argument opens a prompt"),
+            }
+        };
+        // The cursor is on the `é` of the second word.
+        assert_eq!(
+            open("see src/café.rs:12 here", "see src/caf").as_deref(),
+            Some("src/café.rs:12")
+        );
+        // Outside copy mode both are empty, and so is the word.
+        assert_eq!(open("", "").as_deref(), Some(""));
     }
 
     #[test]
