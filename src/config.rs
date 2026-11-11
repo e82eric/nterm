@@ -87,6 +87,9 @@ impl PickerFactory {
             crate::picker::config::PickerEntry::Prompt(options) => {
                 Ok(crate::picker::config::PageOptions::Prompt(options))
             }
+            crate::picker::config::PickerEntry::Output(options) => {
+                Ok(crate::picker::config::PageOptions::Output(options))
+            }
             crate::picker::config::PickerEntry::Factory(..) => Err(format!(
                 "pickers.{}: factory must return a picker table",
                 self.name
@@ -180,6 +183,30 @@ fn parse_picker_table(
             key,
         }));
     }
+    let mut line_filter = None;
+    let line: mlua::Value = definition.raw_get("line").map_err(|e| e.to_string())?;
+    if !matches!(line, mlua::Value::Nil) {
+        let mlua::Value::Function(function) = line else {
+            return Err(format!("pickers.{name}.line must be a function"));
+        };
+        if definition
+            .raw_get::<_, String>("type")
+            .map_err(|e| e.to_string())?
+            != "Output"
+        {
+            return Err(format!("pickers.{name}.line requires type Output"));
+        }
+        let key = lua
+            .create_registry_value(function)
+            .map_err(|e| e.to_string())?;
+        definition
+            .raw_set("line", mlua::Value::Nil)
+            .map_err(|e| e.to_string())?;
+        line_filter = Some(std::rc::Rc::new(crate::lua_callbacks::LineFilter {
+            lua: lua.clone(),
+            key,
+        }));
+    }
     let mut preview_resolver = None;
     if let Some(preview) = definition
         .raw_get::<_, Option<mlua::Table>>("preview")
@@ -255,6 +282,9 @@ fn parse_picker_table(
     }
     if let Some(provider) = provider {
         parsed.set_items_provider(provider);
+    }
+    if let Some(line) = line_filter {
+        parsed.set_line_filter(line);
     }
     if let Some(resolve) = preview_resolver {
         parsed.set_preview_resolver(resolve);
@@ -1687,6 +1717,87 @@ mod tests {
             options.placeholder.as_deref(),
             Some("<text>  Search the working directory")
         );
+    }
+
+    #[test]
+    fn an_output_definition_opens_an_output_page_with_the_request_as_parameters() {
+        let compile = |source: &str| {
+            let config = parse(source).unwrap();
+            crate::picker::config::Bindings::compile_with_actions(
+                config.pickers,
+                config.keys,
+                config.picker_defaults,
+                config.actions,
+            )
+        };
+        let bindings = compile(
+            "return { pickers = { Ping = { type = 'Output', args = { 'ping', '{host}' }, rows = 12, position = 'Center' } } }",
+        )
+        .unwrap();
+        let options = bindings
+            .named("Ping")
+            .unwrap()
+            .open(&PickerContext::default())
+            .and_then(|options| options.with_request([("host".into(), "example".into())].into()));
+        let Ok(crate::picker::config::PageOptions::Output(options)) = options else {
+            panic!("an Output opens an output page");
+        };
+        assert_eq!(options.args, ["ping", "{host}"]);
+        assert_eq!(options.rows, 12);
+        assert_eq!(options.position, crate::picker::config::Position::Center);
+        assert_eq!(options.params["host"], "example");
+        assert!(options.line.is_none());
+        assert_eq!(options.format, nfm_output::Format::Text);
+        let bindings = compile(
+            "return { pickers = { Notes = { type = 'Output', args = { 'cat', 'notes.md' }, format = 'Markdown' } } }",
+        )
+        .unwrap();
+        let Ok(crate::picker::config::PageOptions::Output(notes)) =
+            bindings.named("Notes").unwrap().open(&PickerContext::default())
+        else {
+            panic!("an Output opens an output page");
+        };
+        assert_eq!(notes.format, nfm_output::Format::Markdown);
+        // A `line` function is the definition's, and only an Output has one.
+        let bindings = compile(
+            "return { pickers = { Ping = { type = 'Output', args = { 'ping' }, line = function(line) return line .. '!' end } } }",
+        )
+        .unwrap();
+        let Ok(crate::picker::config::PageOptions::Output(with_line)) =
+            bindings.named("Ping").unwrap().open(&PickerContext::default())
+        else {
+            panic!("an Output opens an output page");
+        };
+        assert_eq!(
+            with_line.line.unwrap().text("pong").unwrap().as_deref(),
+            Some("pong!")
+        );
+        assert!(
+            parse("return { pickers = { X = { type = 'Items', items = {}, line = function() end } } }")
+                .is_err_and(|error| error.contains("line requires type Output"))
+        );
+        assert!(
+            parse("return { pickers = { X = { type = 'Output', args = { 'ping' }, line = 'x' } } }")
+                .is_err_and(|error| error.contains("line must be a function"))
+        );
+        // It is opened by another page with what to run on, not from the palette.
+        assert!(bindings.palette_entries().all(|(name, _)| name != "Ping"));
+
+        for (source, error) in [
+            ("{ type = 'Output', args = { '{program}' } }", "requires an executable"),
+            ("{ type = 'Output', args = { 'ping' }, rows = 0 }", "rows must be"),
+            (
+                "{ type = 'Output', args = { 'ping' }, format = 'Html' }",
+                "format must be Text or Markdown",
+            ),
+        ] {
+            let result = compile(&format!("return {{ pickers = {{ Ping = {source} }} }}"));
+            assert!(
+                result.as_ref().is_err_and(|message| message.contains(error)),
+                "{source}: {:?}",
+                result.err()
+            );
+        }
     }
 
     #[test]

@@ -168,6 +168,35 @@ return {
         app:push_picker("Ripgrep", { pattern = item.value })
       end,
     },
+    -- Asks for a question, then shows Claude's answer as a page on top, as it
+    -- is written. Escape there stops Claude and comes back here.
+    Ask = {
+      type = "Argument",
+      prompt = "Ask:",
+      placeholder = "<question>  Ask Claude",
+      action = function(app, item)
+        if item.value == "" then return end
+        app:push_picker("Answer", { question = item.value })
+      end,
+    },
+    -- Claude prints one JSON object per line; `line` takes the answer's text
+    -- out of each, and the page lays it out as markdown.
+    Answer = {
+      type = "Output",
+      format = "Markdown",
+      args = { "claude", "-p", "--output-format", "stream-json",
+               "--include-partial-messages", "--verbose", "{question}" },
+      line = function(line)
+        local ok, event = pcall(nterm.json_parse, line)
+        if not ok or type(event) ~= "table" then return line .. "\n" end
+        if event.type == "stream_event" then
+          local delta = event.event and event.event.delta
+          return delta and delta.text
+        elseif event.type == "result" and event.is_error then
+          return "\n\nError: " .. tostring(event.result) .. "\n"
+        end
+      end,
+    },
   },
   keys = {
     { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
@@ -190,5 +219,6 @@ return {
     { key = "o", mods = "CTRL|SHIFT", picker = "files" },
     { key = "k", mods = "CTRL|SHIFT", picker = "CodexSuggestions" },
     { key = "j", mods = "CTRL|SHIFT", picker = "Grep" },
+    { key = "a", mods = "CTRL|SHIFT", picker = "Ask" },
   },
 }

@@ -1222,6 +1222,9 @@ impl TerminalPane {
                 self.open_prompt(ctx, options, open);
                 return true;
             }
+            Ok(crate::picker::config::PageOptions::Output(options)) => {
+                return self.open_output(ctx, options, open);
+            }
             Err(error) => {
                 self.show_error("Could not open picker", error);
                 return false;
@@ -1395,6 +1398,42 @@ impl TerminalPane {
         let mut prompt = crate::picker::Prompt::start(ctx.clone(), from_copy, options);
         prompt.cursor_row = cursor_row;
         self.place_page(matches!(open, PickerOpen::Direct), prompt);
+    }
+    /// Run a program and show what it prints, which an `Output` definition
+    /// opens. False if the program could not be started.
+    fn open_output(
+        &mut self,
+        ctx: &egui::Context,
+        mut options: crate::picker::config::OutputOptions,
+        open: PickerOpen,
+    ) -> bool {
+        // It runs in the shell's directory unless the request or the
+        // definition named one.
+        if options.cwd.is_none() {
+            if let Some(pwd) = self.pwd() {
+                options.params.entry("cwd".into()).or_insert(pwd);
+            }
+        }
+        let from_copy = self.opened_from_copy(&open);
+        let cursor_row = if options.position == crate::picker::config::Position::Cursor {
+            self.picker_cursor_row()
+        } else {
+            None
+        };
+        let mut output = match crate::picker::Output::start(ctx.clone(), from_copy, options) {
+            Ok(output) => output,
+            Err(error) => {
+                self.show_error("Could not show output", error);
+                return false;
+            }
+        };
+        // It has nothing to carry over from a page it replaces.
+        if matches!(open, PickerOpen::FromCallback { .. }) {
+            drop(self.pages.apply(Outcome::Back));
+        }
+        output.cursor_row = cursor_row;
+        self.place_page(matches!(open, PickerOpen::Direct), output);
+        true
     }
     pub(super) fn action_context(&self) -> crate::actions::ActionContext {
         crate::actions::ActionContext {

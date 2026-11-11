@@ -2,6 +2,7 @@ pub(crate) mod command;
 pub(crate) mod config;
 pub(crate) mod files;
 pub(crate) mod font;
+mod output;
 mod page;
 pub(crate) mod pipe;
 pub(crate) mod preview;
@@ -13,6 +14,7 @@ pub(crate) mod wire;
 
 use crate::ghostty_ffi::{self, Host, SnapshotCell, SnapshotCellRange};
 use nfm_search_core::search::SearchResult;
+pub(crate) use output::Output;
 pub(crate) use page::Page;
 pub(crate) use prompt::Prompt;
 use source::PickerSource;

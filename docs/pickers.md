@@ -407,6 +407,57 @@ action either shows a page on top with `app:push_picker` or closes it with
 `app:close_picker()`. The sample `Grep` picker asks for text and pushes
 `Ripgrep` with it as `pattern`.
 
+`Output` has nothing to pick from either: it runs the `args` array without a
+shell and shows what the program prints, standard output and standard error
+together with their colors, while it runs. An argument consisting of `{name}`
+is replaced with the parameter of that name, so another page opens it with
+what to run on: `app:push_picker("Answer", { question = item.value })`. It runs
+in the request's `params.cwd`, else the configured `cwd`, else the shell's
+working directory when known. The page stays at the end as more arrives until
+you move up, and follows again from the last row. `j`/`k` and the arrows move,
+`/` searches, `v` and `y` select and copy. Escape ends a search or a selection
+first, then goes back to the page beneath; the program is stopped when the
+page goes. `rows` is its height (24 unless set), and of the options every
+picker takes it uses `position` and `scope`. It is not listed in the command
+palette, since it needs its parameters.
+
+`format = "Markdown"` lays the text out as markdown instead of as a terminal
+shows it: headings, lists, quotes, tables, links and emphasis are drawn, and
+fenced code is highlighted for its language. It is laid out again as more
+arrives, so a fence or a list that is still being printed fills in as it comes.
+ANSI colors are not read in markdown.
+
+An `Output` can say what to show for each line the program prints, with
+`line = function(line) ... end`. It gets a line of standard output without its
+line ending and returns the text to add, or `nil` to show nothing for it. The
+text is added as returned, so a line that should end one returns its own
+`"\n"`. Standard error, and how the program ended if it failed, are shown as
+they are. This is for programs that print something other than what you want
+to read, such as one JSON object per line:
+
+```lua
+Answer = {
+  type = "Output",
+  format = "Markdown",
+  args = { "claude", "-p", "--output-format", "stream-json",
+           "--include-partial-messages", "--verbose", "{question}" },
+  line = function(line)
+    local ok, event = pcall(nterm.json_parse, line)
+    if not ok or type(event) ~= "table" then return line .. "\n" end
+    if event.type == "stream_event" then
+      local delta = event.event and event.event.delta
+      return delta and delta.text
+    elseif event.type == "result" and event.is_error then
+      return "\n\nError: " .. tostring(event.result) .. "\n"
+    end
+  end,
+},
+```
+
+The function runs in the terminal's own thread as the page is drawn, so it
+should only work on the line it is given. If it fails, the page says so and
+shows no more.
+
 `Command` runs the configured `args` array without a shell and streams stdout
 lines into the fuzzy picker. An argument consisting of `{pattern}` is replaced
 with the named pipe request's `params.pattern`; other `{name}` arguments can use other

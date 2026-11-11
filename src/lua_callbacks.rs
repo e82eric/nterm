@@ -228,6 +228,33 @@ pub(crate) struct PreviewCommandSpec {
     pub(crate) center_line: Option<usize>,
 }
 
+/// An `Output` definition's `line` function: what to show for a line the
+/// program printed.
+pub(crate) struct LineFilter {
+    pub(crate) lua: Rc<Lua>,
+    pub(crate) key: RegistryKey,
+}
+impl LineFilter {
+    /// The text to add for `line`, or none to show nothing for it.
+    pub(crate) fn text(&self, line: &str) -> Result<Option<String>, String> {
+        let function: mlua::Function = self
+            .lua
+            .registry_value(&self.key)
+            .map_err(|error| error.to_string())?;
+        match function
+            .call::<_, mlua::Value>(line)
+            .map_err(|error| error.to_string())?
+        {
+            mlua::Value::Nil => Ok(None),
+            mlua::Value::String(text) => Ok(Some(text.to_string_lossy().into_owned())),
+            other => Err(format!(
+                "line must return a string or nil, not {}",
+                other.type_name()
+            )),
+        }
+    }
+}
+
 impl ItemsProvider {
     pub(crate) fn read(&self) -> Result<Vec<crate::picker::wire::Item>, String> {
         let function: mlua::Function = self
