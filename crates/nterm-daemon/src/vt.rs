@@ -71,6 +71,8 @@ const OPT_RESIZE_PULL_SCROLLBACK: i32 = 41;
 
 const DATA_COLS: i32 = 1;
 const DATA_ROWS: i32 = 2;
+const DATA_TITLE: i32 = 12;
+const DATA_PWD: i32 = 13;
 const DATA_TOTAL_ROWS: i32 = 14;
 
 const DECODER_OPT_MAX_CONTINUATION_BYTES: i32 = 1;
@@ -474,6 +476,27 @@ impl Terminal {
         (cols, rows)
     }
 
+    /// The title the shell last set, if it has set one.
+    pub fn title(&mut self) -> Option<String> {
+        self.string(DATA_TITLE)
+    }
+
+    /// The directory the shell last reported, as it reported it.
+    pub fn pwd(&mut self) -> Option<String> {
+        self.string(DATA_PWD)
+    }
+
+    fn string(&mut self, data: i32) -> Option<String> {
+        let mut text = Text { ptr: std::ptr::null(), len: 0 };
+        let ok = unsafe { ghostty_terminal_get(self.raw, data, (&raw mut text).cast()) } == 0;
+        if !ok || text.ptr.is_null() || text.len == 0 {
+            return None;
+        }
+        // Borrowed until the terminal next changes: copied before it can.
+        let bytes = unsafe { std::slice::from_raw_parts(text.ptr, text.len) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
     /// Rows held, history included.
     pub fn total_rows(&mut self) -> usize {
         let mut rows = 0usize;
@@ -560,6 +583,16 @@ mod tests {
         // A snapshot's mirror is a separate terminal and keeps none of it.
         let mut mirror = Terminal::decode(&terminal.screen()).unwrap();
         assert_eq!(mirror.feed(b"\x1b[>q"), b"\x1bP>|libghostty\x1b\\");
+    }
+
+    #[test]
+    fn the_title_and_directory_the_shell_set_are_remembered() {
+        let mut terminal = terminal();
+        assert_eq!(terminal.title(), None);
+        assert_eq!(terminal.pwd(), None);
+        terminal.feed(b"\x1b]2;build log\x07\x1b]7;file://host/C:/src\x07");
+        assert_eq!(terminal.title().as_deref(), Some("build log"));
+        assert_eq!(terminal.pwd().as_deref(), Some("file://host/C:/src"));
     }
 
     #[test]

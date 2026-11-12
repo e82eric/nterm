@@ -9,6 +9,7 @@ mod pane;
 pub(crate) use pane::close_from_session as close_pane_from_session;
 mod pane_resize;
 mod resize_keys;
+mod restore;
 pub(crate) mod workspace;
 pub(crate) mod workspace_ui;
 use pane::TerminalPane;
@@ -48,6 +49,13 @@ pub(crate) struct TerminalView {
     /// The resize or move key pressed this frame was held with the key
     /// table's `nudge` modifier, for a small step.
     nudge_step: bool,
+    /// The session each workspace is, by workspace id, once it has one.
+    sessions: std::collections::HashMap<u64, String>,
+    /// What the session daemon was last told of each session, by session.
+    sessions_sent: std::collections::HashMap<String, String>,
+    /// At a launch that offers the waiting sessions: the pane whose shell
+    /// waits for the choice.
+    launch_pane: Option<u64>,
 }
 
 struct FloatingTerminal {
@@ -157,11 +165,17 @@ impl TerminalView {
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
         let window_id = window.id;
-        let pane = TerminalPane::create(egui_ctx, gl, proxy.clone(), window, argc, argv)?;
+        // With sessions waiting in the daemon, the first pane holds its
+        // shell back until one of them, or a new one, has been chosen.
+        let offer = restore::any_detached();
+        crate::session::hold_next(offer);
+        let pane = TerminalPane::create(egui_ctx, gl, proxy.clone(), window, argc, argv);
+        crate::session::hold_next(false);
+        let pane = pane?;
         issues.extend(pane.take_config_issues());
         #[cfg(any(windows, unix))]
         pane.set_pipe_policy(&picker_bindings.pipe_policy);
-        Ok(Self::with_pane(
+        let mut view = Self::with_pane(
             pane,
             egui_ctx,
             proxy,
@@ -171,7 +185,11 @@ impl TerminalView {
             reload_source,
             std::rc::Rc::new(picker_bindings),
             floating_padding,
-        ))
+        );
+        if offer {
+            view.offer_sessions(egui_ctx);
+        }
+        Ok(view)
     }
 
     pub(crate) fn new_window(
@@ -254,6 +272,9 @@ impl TerminalView {
             pane_drag: None,
             key_table: None,
             nudge_step: false,
+            sessions: Default::default(),
+            sessions_sent: Default::default(),
+            launch_pane: None,
             picker_bindings,
             floating_padding,
             floating: Default::default(),
@@ -494,6 +515,13 @@ impl TerminalView {
                     self.show_error("Workspace action failed", error);
                 }
             }
+            AppAction::AttachSession(id) => {
+                if let Err(error) = self.attach_session(&id, gl) {
+                    self.show_error("Session could not be shown", error);
+                }
+            }
+            // Its picker closing is what starts the shell that waited.
+            AppAction::NewSession => {}
             AppAction::MovePaneToWorkspaceId { pane, workspace } => {
                 if let Err(error) = self.move_pane_to_workspace(pane, workspace, gl) {
                     self.show_error("Workspace action failed", error);
@@ -1042,8 +1070,13 @@ impl TerminalView {
         self.close_requested |= close;
     }
 
+    /// The window is closing. Panes that were closed lose their shells as
+    /// usual; the ones still open keep theirs when the session daemon runs
+    /// them.
     pub(crate) fn destroy(&mut self) {
+        self.save_sessions();
         for mut floating in self.floating.entries.drain(..) {
+            floating.pane.keep_shell();
             floating.destroy();
         }
         for mut pane in self.closed_panes.drain(..) {
@@ -1051,10 +1084,12 @@ impl TerminalView {
         }
         for request in self.requests.drain(..) {
             if let WindowRequest::MovePaneToNewWindow(mut pane) = request {
+                pane.0.keep_shell();
                 pane.0.destroy();
             }
         }
         for (_, mut pane) in self.tiled.drain(..) {
+            pane.keep_shell();
             pane.destroy();
         }
     }

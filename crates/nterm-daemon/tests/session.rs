@@ -347,6 +347,24 @@ fn two_uis_share_a_pane_and_blobs() {
         Control::Blob { request: 5, key: "layout".into(), value: Some("{\"tabs\":2}".into()) }
     );
 
+    // Blobs are listed by prefix, and gone once removed.
+    first.send(Control::BlobSet { key: "session/b".into(), value: "2".into() });
+    first.send(Control::BlobSet { key: "session/a".into(), value: "1".into() });
+    first.send(Control::BlobList { request: 6, prefix: "session/".into() });
+    assert_eq!(
+        first.control(|c| matches!(c, Control::Blobs { .. })),
+        Control::Blobs {
+            request: 6,
+            blobs: vec![("session/a".into(), "1".into()), ("session/b".into(), "2".into())],
+        }
+    );
+    first.send(Control::BlobRemove { key: "session/a".into() });
+    first.send(Control::BlobList { request: 7, prefix: "session/".into() });
+    assert_eq!(
+        first.control(|c| matches!(c, Control::Blobs { .. })),
+        Control::Blobs { request: 7, blobs: vec![("session/b".into(), "2".into())] }
+    );
+
     // Closing a running pane ends its shell.
     first.send(Control::Close { pane: pane.pane });
     first.control(|c| matches!(c, Control::Exited { .. }));

@@ -72,8 +72,10 @@ struct State {
 
 impl Pane {
     fn info(&self) -> PaneInfo {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         PaneInfo {
+            title: state.terminal.title(),
+            pwd: state.terminal.pwd(),
             pane: self.id,
             pid: self.process.pid,
             creation_time: self.process.creation_time,
@@ -218,7 +220,9 @@ impl Session {
                     state.closing
                 };
                 log(format_args!("pane {}: exited with {code}", pane.id));
-                if closing {
+                // With no UI connected there is nobody to close it, and it
+                // would keep the daemon from ever being idle.
+                if closing || session.clients.lock().unwrap().is_empty() {
                     session.panes.lock().unwrap().remove(&pane.id);
                 }
                 session.broadcast(Control::Exited { pane: pane.id, code });
@@ -315,10 +319,21 @@ fn serve(session: &Arc<Session>, connection: Connection) {
         result.err().map_or("closed".to_owned(), |error| error.to_string())
     ));
 
-    session.clients.lock().unwrap().remove(&id);
+    let last = {
+        let mut clients = session.clients.lock().unwrap();
+        clients.remove(&id);
+        clients.is_empty()
+    };
     let panes: Vec<_> = session.panes.lock().unwrap().values().cloned().collect();
     for pane in panes {
-        pane.state.lock().unwrap().subscribers.retain(|(client, _)| *client != id);
+        let mut state = pane.state.lock().unwrap();
+        state.subscribers.retain(|(client, _)| *client != id);
+        // The last UI has gone: an ended shell it left has nobody to close
+        // it. Running ones wait for the next UI.
+        if last && state.exited.is_some() {
+            drop(state);
+            session.panes.lock().unwrap().remove(&pane.id);
+        }
     }
     // With every sender gone the writer sends what is queued and ends.
     drop(outbox);
@@ -470,6 +485,21 @@ fn converse(
             Control::BlobGet { request, key } => {
                 let value = session.blobs.lock().unwrap().get(&key).cloned();
                 send(Control::Blob { request, key, value });
+            }
+            Control::BlobList { request, prefix } => {
+                let mut blobs: Vec<(String, String)> = session
+                    .blobs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                blobs.sort();
+                send(Control::Blobs { request, blobs });
+            }
+            Control::BlobRemove { key } => {
+                session.blobs.lock().unwrap().remove(&key);
             }
             Control::Shutdown => session.shutdown(),
             // A second hello, the daemon's own messages, or something newer.

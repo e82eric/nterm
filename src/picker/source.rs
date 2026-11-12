@@ -564,6 +564,17 @@ impl PickerSource {
                 if entries.first().is_some_and(|entry| {
                     matches!(
                         entry.action,
+                        crate::actions::AppAction::AttachSession(_)
+                            | crate::actions::AppAction::NewSession
+                    )
+                }) =>
+            {
+                "SESSIONS"
+            }
+            Self::CommandPalette { entries, .. }
+                if entries.first().is_some_and(|entry| {
+                    matches!(
+                        entry.action,
                         crate::actions::AppAction::MovePaneToWorkspaceId { .. }
                     )
                 }) =>

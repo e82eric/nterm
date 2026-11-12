@@ -6,6 +6,11 @@ pub(crate) enum AppAction {
     Workspace(WorkspaceAction),
     /// Picker results that refer to window-local IDs, not config indexes.
     SelectWorkspaceId(u64),
+    /// Show a session waiting in the session daemon as a workspace. The
+    /// name is the daemon's; empty for the shells no session describes.
+    AttachSession(String),
+    /// The launch picker's choice of a new session over the waiting ones.
+    NewSession,
     MovePaneToWorkspaceId {
         pane: crate::terminal::PaneRef,
         workspace: u64,
@@ -79,6 +84,8 @@ impl AppAction {
             self,
             Self::Workspace(_)
                 | Self::SelectWorkspaceId(_)
+                | Self::AttachSession(_)
+                | Self::NewSession
                 | Self::MovePaneToWorkspaceId { .. }
                 | Self::NewWindow
                 | Self::ReloadConfig

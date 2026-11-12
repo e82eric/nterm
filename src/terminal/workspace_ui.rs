@@ -45,12 +45,28 @@ pub(crate) fn workspace_picker_options(
         ..Options::default()
     }
 }
+/// A picker over rows that each run an action, placed like the workspace
+/// picker.
+pub(super) fn entry_picker(entries: Vec<crate::actions::Entry>) -> crate::picker::config::Options {
+    use crate::picker::config::*;
+    Options {
+        scope: Scope::Workspace,
+        position: Position::Bottom,
+        sort: Sort::SourceOrder,
+        source: Source::Workspaces(entries),
+        ..Options::default()
+    }
+}
 /// A workspace action. Config, Lua and the command palette name actions as
 /// strings; `parse` converts them once and they stay typed from then on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceAction {
     CreateWorkspace,
     RemoveWorkspace,
+    /// Take the workspace out of the window; its shells stay in the daemon.
+    DetachWorkspace,
+    /// End every shell in the workspace.
+    EndWorkspace,
     WorkspacePicker,
     MovePaneToWorkspacePicker,
     /// Moves the focused pane, or the visible float, into a new workspace.
@@ -109,6 +125,8 @@ impl WorkspaceAction {
     pub(crate) const ALL: &[Self] = &[
         Self::CreateWorkspace,
         Self::RemoveWorkspace,
+        Self::DetachWorkspace,
+        Self::EndWorkspace,
         Self::WorkspacePicker,
         Self::MovePaneToWorkspacePicker,
         Self::MovePaneToNewWorkspace,
@@ -177,6 +195,8 @@ impl WorkspaceAction {
             MoveToWorkspace(index) => format!("MoveToWorkspace:{index}").into(),
             CreateWorkspace => "CreateWorkspace".into(),
             RemoveWorkspace => "RemoveWorkspace".into(),
+            DetachWorkspace => "DetachWorkspace".into(),
+            EndWorkspace => "EndWorkspace".into(),
             WorkspacePicker => "WorkspacePicker".into(),
             MovePaneToWorkspacePicker => "MovePaneToWorkspacePicker".into(),
             MovePaneToNewWorkspace => "MovePaneToNewWorkspace".into(),
@@ -292,6 +312,8 @@ impl WorkspaceAction {
             | ResizeFarUp | ResizeFarDown => true,
             CreateWorkspace
             | RemoveWorkspace
+            | DetachWorkspace
+            | EndWorkspace
             | WorkspacePicker
             | MovePaneToWorkspacePicker
             | MovePaneToNewWorkspace
@@ -480,7 +502,11 @@ impl TerminalView {
         if moving && pane.is_none() {
             return;
         }
-        let options = workspace_picker_options(&self.workspaces, self.current, pane);
+        let mut options = workspace_picker_options(&self.workspaces, self.current, pane);
+        // The sessions no window shows can be taken from here too.
+        if !moving && let crate::picker::config::Source::Workspaces(entries) = &mut options.source {
+            entries.extend(self.detached_entries());
+        }
         let bindings = self.picker_bindings.clone();
         let palette = self.palette_context();
         if let Some(pane) = self.active_pane().and_then(|p| self.pane_mut(p)) {
@@ -658,14 +684,18 @@ impl TerminalView {
         Ok(pane_id)
     }
     /// The lowest workspace index not in use.
-    fn free_index(&self) -> usize {
+    pub(super) fn free_index(&self) -> usize {
         (1..)
             .find(|i| !self.workspaces.iter().any(|w| w.index == *i))
             .unwrap()
     }
     /// Adds a workspace without panes. The caller gives it a tiled pane
     /// before the next prune removes it.
-    fn push_workspace(&mut self, index: usize, layout: Option<Layout>) -> &mut Workspace {
+    pub(super) fn push_workspace(
+        &mut self,
+        index: usize,
+        layout: Option<Layout>,
+    ) -> &mut Workspace {
         let id = self.next_workspace;
         self.next_workspace += 1;
         let mut w = Workspace::new(id, index);
@@ -762,7 +792,7 @@ impl TerminalView {
         w.panes.insert(at, id);
         w.focus(id);
     }
-    fn close_tiled(&mut self, id: u64) -> Result<(), String> {
+    pub(super) fn close_tiled(&mut self, id: u64) -> Result<(), String> {
         if !self.workspaces.iter().any(|w| w.panes.contains(&id)) {
             return Err("pane does not exist".into());
         }
@@ -1039,6 +1069,8 @@ impl TerminalView {
                 RemoveWorkspace => {
                     self.workspace_request(Request::Remove(self.current), gl)?;
                 }
+                DetachWorkspace => self.detach_workspace()?,
+                EndWorkspace => self.end_workspace(),
                 NextWorkspace | PreviousWorkspace => {
                     let i = self
                         .workspaces
@@ -1359,6 +1391,8 @@ impl TerminalView {
         for mut p in self.closed_panes.drain(..) {
             p.destroy();
         }
+        self.settle_launch();
+        self.save_sessions();
         let exited: Vec<_> = self
             .workspaces
             .iter()

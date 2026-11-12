@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -91,6 +91,12 @@ pub struct PaneInfo {
     /// How many UIs are attached to it.
     #[serde(default)]
     pub attached: u32,
+    /// The title the shell last set, for a UI that was not there to hear it.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The directory the shell last reported, as it reported it.
+    #[serde(default)]
+    pub pwd: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -123,6 +129,9 @@ pub enum Control {
     /// Opaque state the UI keeps in the daemon, such as its layout.
     BlobSet { key: String, value: String },
     BlobGet { request: u32, key: String },
+    /// Every blob whose key starts with `prefix`.
+    BlobList { request: u32, prefix: String },
+    BlobRemove { key: String },
     /// End every shell and the daemon.
     Shutdown,
 
@@ -141,6 +150,8 @@ pub enum Control {
         key: String,
         value: Option<String>,
     },
+    /// Keys and values, in key order.
+    Blobs { request: u32, blobs: Vec<(String, String)> },
     Error {
         #[serde(default)]
         request: Option<u32>,

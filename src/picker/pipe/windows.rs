@@ -305,6 +305,8 @@ fn authorize(pipe: HANDLE, client: HANDLE, shared: &Shared) -> Result<(), String
     ancestry(client, &shell)
 }
 
+const ENDPOINT_PREFIX: &str = "nterm-picker-";
+
 pub(crate) struct Service {
     pub endpoint: String,
     pub token: String,
@@ -315,10 +317,26 @@ pub(crate) struct Service {
 impl Service {
     pub fn new(context: egui::Context) -> Result<Self, String> {
         let endpoint = format!(
-            "nterm-picker-{}",
+            "{ENDPOINT_PREFIX}{}",
             super::super::wire::new_token().map_err(|e| e.to_string())?
         );
         let token = super::super::wire::new_token().map_err(|e| e.to_string())?;
+        Self::with(context, endpoint, token)
+    }
+    /// The service an earlier nterm ran for a shell that is still running
+    /// in the session daemon: the shell's environment names this endpoint
+    /// and token. Fails if the endpoint is not one of ours, or is in use.
+    pub fn restored(context: egui::Context, endpoint: String, token: String) -> Result<Self, String> {
+        let name = endpoint.strip_prefix(ENDPOINT_PREFIX).unwrap_or("");
+        if name.is_empty()
+            || token.is_empty()
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err("not a picker endpoint".into());
+        }
+        Self::with(context, endpoint, token)
+    }
+    fn with(context: egui::Context, endpoint: String, token: String) -> Result<Self, String> {
         let own = process_token(unsafe { GetCurrentProcess() })?;
         let id = identity(own.0)?;
         let logon = logon_sid(own.0)?;

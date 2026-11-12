@@ -450,6 +450,7 @@ unsafe extern "C" {
     ) -> bool;
     pub(crate) fn nterm_host_snapshot_begin(host: *mut Host, snapshot_generation: *mut u64)
     -> bool;
+    pub(crate) fn nterm_host_wheel_wants_history(host: *mut Host) -> bool;
     pub(crate) fn nterm_host_snapshot_begin_from(
         host: *mut Host,
         snapshot: *const u8,

@@ -8,9 +8,9 @@
 //! One connection serves every pane. A thread reads it and hands each frame
 //! to the pane it names.
 //!
-//! Until layouts are restored, leaving nterm closes its panes as it always
-//! has. A UI that is killed leaves them running, and the next one's first
-//! pane attaches to the oldest of them.
+//! Closing a pane ends its shell. Closing a window, or leaving nterm, does
+//! not: the shells stay in the daemon, and the next nterm opens a pane on
+//! each of them.
 
 use crate::ghostty_ffi::{self, Host, HostSettings, HostSpawn, SurfaceSize};
 use nterm_session::{
@@ -41,6 +41,121 @@ const QUEUED_INPUT_MAX: usize = 1 << 16;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+// Defined by the pane, which is what the surface tells of a title or a
+// directory. `userdata` is the pane's `WakeState`.
+unsafe extern "C" {
+    fn nterm_title(userdata: *mut c_void, title: *const std::ffi::c_char);
+    fn nterm_pwd(userdata: *mut c_void, pwd: *const std::ffi::c_char);
+}
+
+/// Set while panes are being restored: the daemon pane the next pane made
+/// takes instead of starting a shell. Zero for none; the daemon numbers its
+/// panes from one.
+static ADOPT_NEXT: AtomicU32 = AtomicU32::new(0);
+
+/// Set while the window's first pane is made at a launch that offers the
+/// sessions left running: its shell waits for the choice.
+static HOLD_NEXT: AtomicBool = AtomicBool::new(false);
+
+/// The next pane made does not start its shell until `Link::start`.
+pub(crate) fn hold_next(hold: bool) {
+    HOLD_NEXT.store(hold, Ordering::Release);
+}
+
+/// Every pane the daemon has, asked for now. The ones nothing shows become
+/// the shells a pane can take. Connects to the daemon if that has not
+/// happened yet; empty without one.
+pub(crate) fn panes() -> Vec<PaneInfo> {
+    let Some(client) = client().filter(|client| !client.lost.load(Ordering::Acquire)) else {
+        return Vec::new();
+    };
+    let request = client.next_request.fetch_add(1, Ordering::Relaxed);
+    let (sender, receiver) = mpsc::channel();
+    client.pane_lists.lock().unwrap().insert(request, sender);
+    client.control(Control::List { request });
+    let Ok(panes) = receiver.recv_timeout(SNAPSHOT_WAIT) else {
+        client.pane_lists.lock().unwrap().remove(&request);
+        return Vec::new();
+    };
+    *client.adoptable.lock().unwrap() =
+        panes.iter().filter(|pane| waiting(pane)).cloned().collect();
+    panes
+}
+
+/// Whether a pane's shell is running with nothing showing it.
+pub(crate) fn waiting(pane: &PaneInfo) -> bool {
+    pane.exited.is_none() && pane.attached == 0
+}
+/// The next pane made takes this waiting shell instead of starting one.
+/// `None` withdraws it.
+pub(crate) fn adopt_next(pane: Option<PaneId>) {
+    ADOPT_NEXT.store(pane.unwrap_or(0), Ordering::Release);
+}
+
+/// The waiting shell the next pane made will take, if one was named.
+pub(crate) fn adopting() -> Option<PaneId> {
+    Some(ADOPT_NEXT.load(Ordering::Acquire)).filter(|pane| *pane != 0)
+}
+
+fn picker_key(pane: PaneId) -> String {
+    format!("picker/{pane}")
+}
+
+/// The picker endpoint and token in the environment of a shell an earlier
+/// UI started, so that `npick` run from it reaches the pane showing it now.
+pub(crate) fn picker_identity(pane: PaneId) -> Option<(String, String)> {
+    serde_json::from_str(&blob(&picker_key(pane))?).ok()
+}
+
+/// Keep a pane's picker endpoint and token for the next UI.
+pub(crate) fn save_picker_identity(pane: PaneId, endpoint: &str, token: &str) {
+    if let Ok(value) = serde_json::to_string(&(endpoint, token)) {
+        set_blob(picker_key(pane), value);
+    }
+}
+
+/// Something an earlier UI left in the daemon.
+fn blob(key: &str) -> Option<String> {
+    let client = client()?;
+    if client.lost.load(Ordering::Acquire) {
+        return None;
+    }
+    let request = client.next_request.fetch_add(1, Ordering::Relaxed);
+    let (sender, receiver) = mpsc::channel();
+    client.blobs.lock().unwrap().insert(request, sender);
+    client.control(Control::BlobGet { request, key: key.into() });
+    let value = receiver.recv_timeout(SNAPSHOT_WAIT).ok().flatten();
+    client.blobs.lock().unwrap().remove(&request);
+    value
+}
+
+/// The blobs whose keys start with `prefix`, in key order.
+pub(crate) fn blobs(prefix: &str) -> Vec<(String, String)> {
+    let Some(client) = client().filter(|client| !client.lost.load(Ordering::Acquire)) else {
+        return Vec::new();
+    };
+    let request = client.next_request.fetch_add(1, Ordering::Relaxed);
+    let (sender, receiver) = mpsc::channel();
+    client.blob_lists.lock().unwrap().insert(request, sender);
+    client.control(Control::BlobList { request, prefix: prefix.into() });
+    let blobs = receiver.recv_timeout(SNAPSHOT_WAIT).unwrap_or_default();
+    client.blob_lists.lock().unwrap().remove(&request);
+    blobs
+}
+
+/// Keep something in the daemon for the next UI. Does nothing before a
+/// pane has connected to it.
+pub(crate) fn set_blob(key: String, value: String) {
+    if let Some(Some(client)) = CLIENT.get() {
+        client.control(Control::BlobSet { key, value });
+    }
+}
+
+pub(crate) fn remove_blob(key: String) {
+    if let Some(Some(client)) = CLIENT.get() {
+        client.control(Control::BlobRemove { key });
+    }
+}
 /// Called with the configuration before the first pane is made.
 pub(crate) fn configure(enabled: bool) {
     ENABLED.store(enabled, Ordering::Release);
@@ -67,6 +182,11 @@ struct Client {
     spawning: Mutex<HashMap<u32, Arc<Link>>>,
     /// Who waits for each snapshot asked for, by request.
     snapshots: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
+    /// Who waits for each blob asked for, by request.
+    blobs: Mutex<HashMap<u32, mpsc::Sender<Option<String>>>>,
+    /// Who waits for each list of blobs or of panes asked for, by request.
+    blob_lists: Mutex<HashMap<u32, mpsc::Sender<Vec<(String, String)>>>>,
+    pane_lists: Mutex<HashMap<u32, mpsc::Sender<Vec<PaneInfo>>>>,
     next_request: AtomicU32,
     /// Running panes nothing was attached to when this UI connected.
     adoptable: Mutex<Vec<PaneInfo>>,
@@ -94,8 +214,9 @@ impl Client {
 
 /// The connection, made on first use. `None` when the daemon is off or could
 /// not be reached; panes then run their own shells.
+static CLIENT: OnceLock<Option<Arc<Client>>> = OnceLock::new();
+
 fn client() -> Option<&'static Arc<Client>> {
-    static CLIENT: OnceLock<Option<Arc<Client>>> = OnceLock::new();
     if !enabled() {
         return None;
     }
@@ -170,6 +291,9 @@ fn connect() -> io::Result<Arc<Client>> {
             panes: Mutex::default(),
             spawning: Mutex::default(),
             snapshots: Mutex::default(),
+            blobs: Mutex::default(),
+            blob_lists: Mutex::default(),
+            pane_lists: Mutex::default(),
             next_request: AtomicU32::new(1),
             adoptable: Mutex::new(adoptable),
             settings: Mutex::default(),
@@ -210,6 +334,21 @@ fn read(client: &Arc<Client>, mut reader: impl io::Read) {
                     let _ = waiting.send(bytes);
                 }
             }
+            Frame::Control(Control::Blob { request, value, .. }) => {
+                if let Some(waiting) = client.blobs.lock().unwrap().remove(&request) {
+                    let _ = waiting.send(value);
+                }
+            }
+            Frame::Control(Control::Blobs { request, blobs }) => {
+                if let Some(waiting) = client.blob_lists.lock().unwrap().remove(&request) {
+                    let _ = waiting.send(blobs);
+                }
+            }
+            Frame::Control(Control::Panes { request, panes }) => {
+                if let Some(waiting) = client.pane_lists.lock().unwrap().remove(&request) {
+                    let _ = waiting.send(panes);
+                }
+            }
             Frame::Control(Control::Spawned { request, info }) => {
                 let link = client.spawning.lock().unwrap().remove(&request);
                 if let Some(link) = link {
@@ -241,6 +380,9 @@ fn read(client: &Arc<Client>, mut reader: impl io::Read) {
     // The daemon is gone and its shells with it.
     client.lost.store(true, Ordering::Release);
     client.snapshots.lock().unwrap().clear();
+    client.blobs.lock().unwrap().clear();
+    client.blob_lists.lock().unwrap().clear();
+    client.pane_lists.lock().unwrap().clear();
     let mut links: Vec<Arc<Link>> = client.panes.lock().unwrap().drain().map(|(_, l)| l).collect();
     links.extend(client.spawning.lock().unwrap().drain().map(|(_, link)| link));
     if !links.is_empty() {
@@ -276,6 +418,10 @@ struct State {
     /// The shell's pid and creation time.
     shell: (u32, u64),
     closed: bool,
+    /// The surface is going but the shell is to stay.
+    keep: bool,
+    /// The shell is not to be started until `start`.
+    hold: bool,
 }
 
 /// One pane's tie to the daemon. The surface's callbacks arrive here from
@@ -307,12 +453,27 @@ impl Link {
         if client.lost.load(Ordering::Acquire) {
             return None;
         }
-        let adopt = if adopt { client.adoptable.lock().unwrap().pop() } else { None };
+        let wanted = ADOPT_NEXT.swap(0, Ordering::AcqRel);
+        let adopt = {
+            let mut waiting = client.adoptable.lock().unwrap();
+            if wanted != 0 {
+                let at = waiting.iter().position(|pane| pane.pane == wanted);
+                at.map(|at| waiting.remove(at))
+            } else if adopt {
+                waiting.pop()
+            } else {
+                None
+            }
+        };
         let link = Arc::new(Link {
             client: client.clone(),
             wake: wake as usize,
             host: Mutex::new(0),
-            state: Mutex::new(State { adopt, ..State::default() }),
+            state: Mutex::new(State {
+                adopt,
+                hold: HOLD_NEXT.swap(false, Ordering::AcqRel),
+                ..State::default()
+            }),
         });
         // The surface's callbacks hold this reference until `release`.
         let userdata = Arc::into_raw(link.clone()).cast_mut().cast::<c_void>();
@@ -346,6 +507,9 @@ impl Link {
         let mut state = self.state.lock().unwrap();
         if state.started || state.closed {
             return false;
+        }
+        if state.hold {
+            return true;
         }
         let grid = (surface.columns, surface.rows);
         if grid.0 == 0 || grid.1 == 0 || state.laid_out != Some(grid) {
@@ -394,6 +558,16 @@ impl Link {
         }
         state.pane = Some(info.pane);
         state.shell = (info.pid, info.creation_time);
+        // What the shell told the terminal before this UI was there.
+        let wake = self.wake as *mut c_void;
+        for (text, tell) in [
+            (&info.title, nterm_title as unsafe extern "C" fn(*mut c_void, *const std::ffi::c_char)),
+            (&info.pwd, nterm_pwd),
+        ] {
+            if let Some(text) = text.as_deref().and_then(|text| std::ffi::CString::new(text).ok()) {
+                unsafe { tell(wake, text.as_ptr()) };
+            }
+        }
         let size = state.size.unwrap_or(info.size);
         state.sent_size = Some(size);
         let queued = std::mem::take(&mut state.queued_input);
@@ -405,6 +579,18 @@ impl Link {
         }
     }
 
+    /// Let a held pane start its shell.
+    pub(crate) fn start(&self) {
+        self.state.lock().unwrap().hold = false;
+    }
+
+    /// The daemon's pane: known at once for a shell taken over, and once the
+    /// daemon has answered for one this pane started.
+    pub(crate) fn pane_id(&self) -> Option<PaneId> {
+        let state = self.state.lock().unwrap();
+        state.pane.or(state.adopt.as_ref().map(|pane| pane.pane))
+    }
+
     /// The shell's pid and creation time, or zeros while unknown.
     pub(crate) fn shell(&self) -> (u32, u64) {
         self.state.lock().unwrap().shell
@@ -412,11 +598,15 @@ impl Link {
 
     /// The pane's whole terminal as the daemon holds it, history included.
     /// The surface keeps only its screen, so anything that reads history
-    /// asks here. Waits for the answer; `None` when there is none to be had.
-    pub(crate) fn snapshot(&self) -> Option<Vec<u8>> {
-        let pane = self.state.lock().unwrap().pane?;
+    /// asks here. Waits for the answer. `Ok(None)` before the shell has
+    /// started, when there is no history; `Err` when the daemon did not
+    /// answer.
+    pub(crate) fn snapshot(&self) -> Result<Option<Vec<u8>>, ()> {
+        let Some(pane) = self.state.lock().unwrap().pane else {
+            return Ok(None);
+        };
         if self.client.lost.load(Ordering::Acquire) {
-            return None;
+            return Err(());
         }
         let request = self.client.next_request.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
@@ -426,7 +616,7 @@ impl Link {
         if bytes.is_none() {
             self.client.snapshots.lock().unwrap().remove(&request);
         }
-        bytes
+        bytes.map(Some).ok_or(())
     }
 
     /// Tell the UI this pane's shell is gone.
@@ -445,16 +635,29 @@ impl Link {
         self.state.lock().unwrap().closed
     }
 
-    /// The surface is about to be destroyed: stop feeding it and end the
-    /// shell.
+    /// The pane's window is closing, not the pane: its shell stays in the
+    /// daemon when the surface is destroyed.
+    pub(crate) fn keep_shell(&self) {
+        self.state.lock().unwrap().keep = true;
+    }
+
+    /// The surface is about to be destroyed: stop feeding it, and end the
+    /// shell unless it is to be kept.
     pub(crate) fn detach(&self) {
         *self.host.lock().unwrap() = 0;
         let mut state = self.state.lock().unwrap();
         state.closed = true;
+        let keep = state.keep;
         if let Some(pane) = state.pane.take() {
             drop(state);
             self.client.panes.lock().unwrap().remove(&pane);
-            self.client.control(Control::Close { pane });
+            self.client.control(if keep {
+                Control::Detach { pane }
+            } else {
+                // Nothing will run `npick` from it again.
+                remove_blob(picker_key(pane));
+                Control::Close { pane }
+            });
         }
     }
 

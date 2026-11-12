@@ -282,6 +282,9 @@ pub(super) struct TerminalPane {
     /// Set when the shell runs in the session daemon and this surface
     /// mirrors it.
     session: Option<Arc<crate::session::Link>>,
+    /// Copy mode was opened by the wheel, and scrolling back down to the end
+    /// leaves it.
+    wheel_copy: bool,
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
     paint_callback: crate::painter::PaintCallback,
     size: [u32; 2],
@@ -498,6 +501,7 @@ impl TerminalPane {
             host,
             wake,
             session,
+            wheel_copy: false,
             painter,
             paint_callback,
             size: [0, 0],
@@ -536,6 +540,28 @@ impl TerminalPane {
         }
         self.painter.lock().replace_frame(frame);
         true
+    }
+
+    /// The session daemon's pane this one shows, once known.
+    pub(super) fn session_pane(&self) -> Option<u32> {
+        self.session.as_ref().and_then(|session| session.pane_id())
+    }
+
+    /// Start the shell of a pane that was made holding it back.
+    pub(super) fn start_shell(&self) {
+        if let Some(session) = &self.session {
+            session.start();
+        }
+        self.wake.context.request_repaint();
+    }
+
+    /// The window is closing around this pane: leave its shell running in
+    /// the session daemon, for the next nterm to show. A pane with its own
+    /// shell has nowhere to leave it.
+    pub(super) fn keep_shell(&self) {
+        if let Some(session) = &self.session {
+            session.keep_shell();
+        }
     }
 
     pub(super) fn destroy(&mut self) {
@@ -699,6 +725,14 @@ impl TerminalPane {
             .then_some((generation, view.viewport_top, view.viewport_rows))
     }
 
+    /// Whether the frozen view is scrolled all the way down.
+    fn snapshot_at_end(&self, generation: u64) -> bool {
+        let mut view = SnapshotView::default();
+        let known =
+            unsafe { ghostty_ffi::nterm_host_snapshot_view(self.host, generation, &mut view) };
+        known && view.viewport_top + u64::from(view.viewport_rows) >= view.total_rows
+    }
+
     /// Record the viewport that successfully applied decorations cover.
     fn decorations_applied(&self, generation: u64, applied: bool) -> bool {
         if applied {
@@ -718,9 +752,32 @@ impl TerminalPane {
         if suppress_scroll {
             return;
         }
+        if !self.copying() {
+            self.wheel_copy = false;
+        }
+        // A daemon pane's surface keeps no history, so the wheel has none to
+        // scroll. Wheel-up opens copy mode on the daemon's instead, and the
+        // scroll below moves that.
+        let wheel = self.session.as_ref().map_or(0.0, |_| wheel_over(ui, rect));
+        if wheel > 0.0
+            && !self.copying()
+            && unsafe { ghostty_ffi::nterm_host_wheel_wants_history(self.host) }
+        {
+            self.open_copy_mode();
+            self.wheel_copy = self.copying();
+        }
         let scrolled = input::forward(self.host, self.size, ui, rect, self.scale, keyboard_blocked);
         if scrolled {
             self.refresh_decorations();
+            // Scrolled back down to the end: leave, as the wheel alone
+            // would have.
+            if self.wheel_copy
+                && wheel < 0.0
+                && let Some(generation) = self.copy_mode.generation
+                && self.snapshot_at_end(generation)
+            {
+                self.close_copy_mode();
+            }
         }
     }
 
@@ -745,6 +802,22 @@ pub(super) struct PaneStatus<'a> {
     pub(super) pipe_status: Option<bool>,
 }
 
+/// The service `npick` reaches a new pane through. A pane about to take a
+/// shell left in the session daemon gets the one that shell was started
+/// with, so that `npick` run from it still arrives.
+#[cfg(any(windows, unix))]
+fn picker_service(ctx: &egui::Context) -> Result<crate::picker::pipe::Service, String> {
+    #[cfg(windows)]
+    if let Some((endpoint, token)) =
+        crate::session::adopting().and_then(crate::session::picker_identity)
+        && let Ok(service) =
+            crate::picker::pipe::Service::restored(ctx.clone(), endpoint, token)
+    {
+        return Ok(service);
+    }
+    crate::picker::pipe::Service::new(ctx.clone())
+}
+
 impl TerminalPane {
     pub(super) fn create(
         egui_ctx: &egui::Context,
@@ -756,11 +829,9 @@ impl TerminalPane {
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
             #[cfg(any(windows, unix))]
-            pipe: Some(
-                crate::picker::pipe::Service::new(egui_ctx.clone()).map_err(|e| {
-                    crate::native_error::FatalError::new("create secure picker pipe", e)
-                })?,
-            ),
+            pipe: Some(picker_service(egui_ctx).map_err(|e| {
+                crate::native_error::FatalError::new("create secure picker pipe", e)
+            })?),
             context: egui_ctx.clone(),
             proxy,
             window_id: AtomicU64::new(window.id.into()),
@@ -780,7 +851,7 @@ impl TerminalPane {
         let mut error_buffer = [0 as c_char; 2048];
         // The first pane takes over a shell an earlier UI left running.
         let session =
-            crate::session::Link::prepare((&mut *wake as *mut WakeState).cast(), true);
+            crate::session::Link::prepare((&mut *wake as *mut WakeState).cast(), false);
         let host = unsafe {
             ghostty_ffi::nterm_host_create(
                 argc,
@@ -871,7 +942,7 @@ impl TerminalPane {
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
             #[cfg(any(windows, unix))]
-            pipe: Some(crate::picker::pipe::Service::new(ctx.clone()).map_err(|e| {
+            pipe: Some(picker_service(ctx).map_err(|e| {
                 crate::native_error::FatalError::new("create secure picker pipe", e)
             })?),
             context: ctx.clone(),
@@ -1745,7 +1816,17 @@ impl TerminalPane {
             // A shell in the session daemon is known to the daemon, not to
             // the surface.
             let (pid, created) = match &self.session {
-                Some(session) => session.shell(),
+                Some(session) => {
+                    let shell = session.shell();
+                    // The daemon has the shell: leave what `npick` needs to
+                    // reach it with the daemon, for the UI after this one.
+                    if shell.0 != 0
+                        && let Some(pane) = session.pane_id()
+                    {
+                        crate::session::save_picker_identity(pane, &pipe.endpoint, &pipe.token);
+                    }
+                    shell
+                }
                 None => (
                     unsafe { ghostty_ffi::nterm_host_shell_pid(self.host) } as u32,
                     unsafe { ghostty_ffi::nterm_host_shell_creation_time(self.host) },
@@ -4059,26 +4140,46 @@ mod copy_shortcut_tests {
     }
 }
 
+/// The vertical wheel movement over `rect` this frame: positive is up.
+fn wheel_over(ui: &egui::Ui, rect: egui::Rect) -> f32 {
+    ui.input(|input| {
+        if !input.pointer.hover_pos().is_some_and(|pos| rect.contains(pos)) {
+            return 0.0;
+        }
+        input
+            .events
+            .iter()
+            .map(|event| match event {
+                egui::Event::MouseWheel { delta, .. } => delta.y,
+                _ => 0.0,
+            })
+            .sum()
+    })
+}
+
 /// Freeze the pane's terminal for copy mode, search, quick select or a
 /// picker. A pane whose shell runs in the session daemon keeps only its
 /// screen, so the daemon's terminal, which holds the history, is the one
-/// frozen. If it cannot be had, the surface's own is.
+/// frozen. If the daemon does not give it, nothing is frozen: the surface's
+/// own terminal would pass a bare screen off as the whole history.
 fn begin_snapshot(
     host: *mut Host,
     session: Option<&crate::session::Link>,
     generation: &mut u64,
 ) -> bool {
-    if let Some(bytes) = session.and_then(crate::session::Link::snapshot)
-        && unsafe {
+    match session.map(crate::session::Link::snapshot) {
+        Some(Ok(Some(bytes))) => unsafe {
             ghostty_ffi::nterm_host_snapshot_begin_from(
                 host,
                 bytes.as_ptr(),
                 bytes.len(),
                 generation,
             )
-        }
-    {
-        return true;
+        },
+        Some(Err(())) => false,
+        // Its own shell, or a daemon shell that has not started yet.
+        Some(Ok(None)) | None => unsafe {
+            ghostty_ffi::nterm_host_snapshot_begin(host, generation)
+        },
     }
-    unsafe { ghostty_ffi::nterm_host_snapshot_begin(host, generation) }
 }
