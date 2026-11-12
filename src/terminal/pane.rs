@@ -533,6 +533,7 @@ impl TerminalPane {
         self.close_search();
         self.close_copy_mode();
         self.painter.lock().destroy();
+        crate::spike_attach::detach(self.host);
         unsafe { ghostty_ffi::nterm_host_destroy(self.host) };
         self.host = std::ptr::null_mut();
     }
@@ -740,6 +741,7 @@ impl TerminalPane {
         }
         let (picker_endpoint, picker_token) = wake.picker_environment();
         let mut error_buffer = [0 as c_char; 2048];
+        let spike = crate::spike_attach::prepare();
         let host = unsafe {
             ghostty_ffi::nterm_host_create(
                 argc,
@@ -761,6 +763,9 @@ impl TerminalPane {
                 "initialize the main terminal",
                 detail,
             ));
+        }
+        if let Some(spike) = spike {
+            crate::spike_attach::attach(spike, host);
         }
 
         Ok(Self::new(host, wake, gl))

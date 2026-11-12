@@ -580,5 +580,21 @@ void nterm_host_mouse_scroll(NtermHost *host, double x, double y, int mods) {
     ghostty_surface_mouse_scroll(host->surface, x, y, mods);
  runtime_error(host, "nterm_host_mouse_scroll"); }
 
+bool nterm_host_backend_next(
+    void *userdata,
+    void (*write)(void *, const uint8_t *, size_t),
+    void (*resize)(void *, uint16_t, uint16_t, uint32_t, uint32_t),
+    const uint8_t *snapshot, size_t snapshot_len
+) {
+    ghostty_host_backend_s backend = { .userdata = userdata, .write = write, .resize = resize };
+    return ghostty_host_backend_next(&backend, snapshot, snapshot_len);
+}
+void nterm_host_output(NtermHost *host, const uint8_t *bytes, size_t len) {
+    if (host && host->surface) ghostty_surface_host_output(host->surface, bytes, len);
+}
+
+void nterm_host_resync(NtermHost *host, const uint8_t *snapshot, size_t len) {
+    if (host && host->surface) ghostty_surface_host_resync(host->surface, snapshot, len);
+}
 uint64_t nterm_host_shell_pid(NtermHost *host) { return ghostty_surface_shell_pid(host->surface); }
 uint64_t nterm_host_shell_creation_time(NtermHost *host) { return ghostty_surface_shell_creation_time(host->surface); }

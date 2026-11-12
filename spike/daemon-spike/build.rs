@@ -1,0 +1,16 @@
+use std::{env, path::PathBuf};
+
+fn main() {
+    // Link the static libghostty-vt that `zig build host-lib` installs.
+    let lib_dir = env::var_os("GHOSTTY_LIB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../out/lib"));
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rerun-if-env-changed=GHOSTTY_LIB_DIR");
+    if cfg!(windows) {
+        println!("cargo:rustc-link-lib=static=ghostty-vt-static");
+        println!("cargo:rustc-link-lib=ntdll");
+    } else {
+        println!("cargo:rustc-link-lib=static=ghostty-vt");
+    }
+}

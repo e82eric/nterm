@@ -369,6 +369,15 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> *mut Host;
     pub(crate) fn nterm_host_destroy(host: *mut Host);
+    pub(crate) fn nterm_host_backend_next(
+        userdata: *mut c_void,
+        write: extern "C" fn(*mut c_void, *const u8, usize),
+        resize: extern "C" fn(*mut c_void, u16, u16, u32, u32),
+        snapshot: *const u8,
+        snapshot_len: usize,
+    ) -> bool;
+    pub(crate) fn nterm_host_output(host: *mut Host, bytes: *const u8, len: usize);
+    pub(crate) fn nterm_host_resync(host: *mut Host, snapshot: *const u8, len: usize);
     pub(crate) fn nterm_window_attach(window: *mut c_void);
     pub(crate) fn nterm_window_detach(window: *mut c_void);
     pub(crate) fn nterm_host_create_child(
