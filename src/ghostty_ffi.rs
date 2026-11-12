@@ -85,6 +85,12 @@ pub(crate) struct HostSettings {
     pub(crate) grapheme_cluster: bool,
     pub(crate) scrollback_bytes: u64,
     pub(crate) scrollback_lines: u64,
+    pub(crate) xtversion: [u8; 96],
+    pub(crate) enquiry: [u8; 128],
+    pub(crate) da_conformance: u16,
+    pub(crate) da_features: [u16; 4],
+    pub(crate) da_features_len: u16,
+    pub(crate) da_secondary: [u16; 3],
 }
 
 #[repr(C)]
@@ -444,6 +450,12 @@ unsafe extern "C" {
     ) -> bool;
     pub(crate) fn nterm_host_snapshot_begin(host: *mut Host, snapshot_generation: *mut u64)
     -> bool;
+    pub(crate) fn nterm_host_snapshot_begin_from(
+        host: *mut Host,
+        snapshot: *const u8,
+        len: usize,
+        snapshot_generation: *mut u64,
+    ) -> bool;
     pub(crate) fn nterm_host_selection_text(
         host: *mut Host,
         result: *mut SnapshotSelectionText,

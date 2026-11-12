@@ -17,7 +17,8 @@ use nterm_session::{
     DEFAULT_SESSION, GHOSTTY_REVISION,
     pipe::{self, Connection, Writer},
     protocol::{
-        Control, CursorStyle, Frame, PROTOCOL_VERSION, PaneId, PaneInfo, Size, TerminalSettings,
+        Control, CursorStyle, Frame, Identity, PROTOCOL_VERSION, PaneId, PaneInfo, Size,
+        TerminalSettings,
     },
 };
 use std::{
@@ -27,8 +28,13 @@ use std::{
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc,
     },
+    time::Duration,
 };
+
+/// How long copy mode, search and the pickers wait for a pane's history.
+const SNAPSHOT_WAIT: Duration = Duration::from_secs(5);
 
 /// Input typed before the shell exists is kept, up to this much.
 const QUEUED_INPUT_MAX: usize = 1 << 16;
@@ -59,6 +65,8 @@ struct Client {
     panes: Mutex<HashMap<PaneId, Arc<Link>>>,
     /// Panes whose `Spawn` has not been answered, by request.
     spawning: Mutex<HashMap<u32, Arc<Link>>>,
+    /// Who waits for each snapshot asked for, by request.
+    snapshots: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
     next_request: AtomicU32,
     /// Running panes nothing was attached to when this UI connected.
     adoptable: Mutex<Vec<PaneInfo>>,
@@ -161,6 +169,7 @@ fn connect() -> io::Result<Arc<Client>> {
             writer: Mutex::new(writer),
             panes: Mutex::default(),
             spawning: Mutex::default(),
+            snapshots: Mutex::default(),
             next_request: AtomicU32::new(1),
             adoptable: Mutex::new(adoptable),
             settings: Mutex::default(),
@@ -196,6 +205,11 @@ fn read(client: &Arc<Client>, mut reader: impl io::Read) {
                     });
                 }
             }
+            Frame::Snapshot { request, bytes } => {
+                if let Some(waiting) = client.snapshots.lock().unwrap().remove(&request) {
+                    let _ = waiting.send(bytes);
+                }
+            }
             Frame::Control(Control::Spawned { request, info }) => {
                 let link = client.spawning.lock().unwrap().remove(&request);
                 if let Some(link) = link {
@@ -208,6 +222,10 @@ fn read(client: &Arc<Client>, mut reader: impl io::Read) {
                 }
             }
             Frame::Control(Control::Error { request, message }) => {
+                // Dropping the sender tells whoever waits for a snapshot.
+                if let Some(id) = request {
+                    client.snapshots.lock().unwrap().remove(&id);
+                }
                 let failed = request.and_then(|id| client.spawning.lock().unwrap().remove(&id));
                 match failed {
                     Some(link) => {
@@ -222,6 +240,7 @@ fn read(client: &Arc<Client>, mut reader: impl io::Read) {
     };
     // The daemon is gone and its shells with it.
     client.lost.store(true, Ordering::Release);
+    client.snapshots.lock().unwrap().clear();
     let mut links: Vec<Arc<Link>> = client.panes.lock().unwrap().drain().map(|(_, l)| l).collect();
     links.extend(client.spawning.lock().unwrap().drain().map(|(_, link)| link));
     if !links.is_empty() {
@@ -391,6 +410,25 @@ impl Link {
         self.state.lock().unwrap().shell
     }
 
+    /// The pane's whole terminal as the daemon holds it, history included.
+    /// The surface keeps only its screen, so anything that reads history
+    /// asks here. Waits for the answer; `None` when there is none to be had.
+    pub(crate) fn snapshot(&self) -> Option<Vec<u8>> {
+        let pane = self.state.lock().unwrap().pane?;
+        if self.client.lost.load(Ordering::Acquire) {
+            return None;
+        }
+        let request = self.client.next_request.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel();
+        self.client.snapshots.lock().unwrap().insert(request, sender);
+        self.client.control(Control::Snapshot { request, pane });
+        let bytes = receiver.recv_timeout(SNAPSHOT_WAIT).ok();
+        if bytes.is_none() {
+            self.client.snapshots.lock().unwrap().remove(&request);
+        }
+        bytes
+    }
+
     /// Tell the UI this pane's shell is gone.
     fn close_pane(&self) {
         let host = self.host.lock().unwrap();
@@ -503,6 +541,10 @@ extern "C" fn on_settings(userdata: *mut c_void, settings: *const HostSettings) 
     crate::native_error::ffi_boundary("send terminal settings to the session daemon", || {
         let link = link(userdata);
         let from = unsafe { &*settings };
+        let text = |bytes: &[u8]| {
+            let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        };
         let mut last = link.client.settings.lock().unwrap();
         let mut settings = TerminalSettings {
             foreground: Some(from.foreground),
@@ -518,6 +560,13 @@ extern "C" fn on_settings(userdata: *mut c_void, settings: *const HostSettings) 
             cursor_blink: (from.cursor_blink >= 0).then_some(from.cursor_blink > 0),
             image_storage_limit: Some(from.image_storage_limit),
             dark: Some(from.dark),
+            identity: Some(Identity {
+                xtversion: text(&from.xtversion),
+                enquiry: text(&from.enquiry),
+                conformance: from.da_conformance,
+                features: from.da_features[..(from.da_features_len as usize).min(4)].to_vec(),
+                secondary: from.da_secondary,
+            }),
             // Known only when a surface is created; kept across changes.
             scrollback_bytes: last.scrollback_bytes,
             scrollback_lines: last.scrollback_lines,

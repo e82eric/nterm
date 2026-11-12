@@ -4,7 +4,7 @@
 //! writes, holds the history, and is the terminal the program talks to: every
 //! reply to a query comes from here, whether or not a UI is attached.
 
-use nterm_session::protocol::{CursorStyle, Size, TerminalSettings};
+use nterm_session::protocol::{CursorStyle, Identity, Size, TerminalSettings};
 use std::ffi::c_void;
 
 #[repr(C)]
@@ -33,10 +33,29 @@ struct ModeConfig {
     value: bool,
 }
 
+/// Borrowed bytes the library reads before the callback's caller returns.
+#[repr(C)]
+struct Text {
+    ptr: *const u8,
+    len: usize,
+}
+
+#[repr(C)]
+struct DeviceAttributes {
+    conformance: u16,
+    features: [u16; 64],
+    features_len: usize,
+    secondary: [u16; 3],
+    unit_id: u32,
+}
+
 const OPT_USERDATA: i32 = 1;
 const OPT_WRITE_PTY: i32 = 2;
+const OPT_ENQUIRY: i32 = 4;
+const OPT_XTVERSION: i32 = 5;
 const OPT_SIZE: i32 = 7;
 const OPT_COLOR_SCHEME: i32 = 8;
+const OPT_DEVICE_ATTRIBUTES: i32 = 9;
 const OPT_COLOR_FOREGROUND: i32 = 12;
 const OPT_COLOR_BACKGROUND: i32 = 13;
 const OPT_COLOR_CURSOR: i32 = 14;
@@ -114,6 +133,42 @@ struct Hooks {
     replies: Vec<u8>,
     size: SizeReport,
     dark: Option<bool>,
+    /// Unset, the library answers as itself.
+    identity: Option<Identity>,
+}
+
+extern "C" fn report_xtversion(_: Raw, userdata: *mut c_void) -> Text {
+    let hooks = unsafe { &*userdata.cast::<Hooks>() };
+    // An empty answer makes the library use its own name.
+    borrow(hooks.identity.as_ref().map_or("", |identity| &identity.xtversion))
+}
+
+extern "C" fn report_enquiry(_: Raw, userdata: *mut c_void) -> Text {
+    let hooks = unsafe { &*userdata.cast::<Hooks>() };
+    borrow(hooks.identity.as_ref().map_or("", |identity| &identity.enquiry))
+}
+
+fn borrow(text: &str) -> Text {
+    Text { ptr: text.as_ptr(), len: text.len() }
+}
+
+extern "C" fn report_device_attributes(
+    _: Raw,
+    userdata: *mut c_void,
+    out: *mut DeviceAttributes,
+) -> bool {
+    let hooks = unsafe { &*userdata.cast::<Hooks>() };
+    let Some(identity) = &hooks.identity else {
+        return false;
+    };
+    let out = unsafe { &mut *out };
+    out.conformance = identity.conformance;
+    let count = identity.features.len().min(out.features.len());
+    out.features[..count].copy_from_slice(&identity.features[..count]);
+    out.features_len = count;
+    out.secondary = identity.secondary;
+    out.unit_id = 0;
+    true
 }
 
 extern "C" fn write_pty(_: Raw, userdata: *mut c_void, data: *const u8, len: usize) {
@@ -230,6 +285,13 @@ impl Terminal {
             ghostty_terminal_set(raw, OPT_WRITE_PTY, write_pty as *const c_void);
             ghostty_terminal_set(raw, OPT_SIZE, report_size as *const c_void);
             ghostty_terminal_set(raw, OPT_COLOR_SCHEME, report_color_scheme as *const c_void);
+            ghostty_terminal_set(raw, OPT_XTVERSION, report_xtversion as *const c_void);
+            ghostty_terminal_set(raw, OPT_ENQUIRY, report_enquiry as *const c_void);
+            ghostty_terminal_set(
+                raw,
+                OPT_DEVICE_ATTRIBUTES,
+                report_device_attributes as *const c_void,
+            );
         }
         let mut terminal = Self { raw, hooks };
         let (cols, rows) = terminal.grid();
@@ -295,6 +357,9 @@ impl Terminal {
         }
         if settings.dark.is_some() {
             self.hooks.dark = settings.dark;
+        }
+        if settings.identity.is_some() {
+            self.hooks.identity.clone_from(&settings.identity);
         }
         refused
     }
@@ -467,6 +532,36 @@ mod tests {
         assert!(attributes.starts_with(b"\x1b[?"), "{attributes:?}");
     }
 
+    fn identity() -> Identity {
+        Identity {
+            xtversion: "ghostty 1.2.3".into(),
+            enquiry: "here".into(),
+            conformance: 62,
+            features: vec![22, 52],
+            secondary: [1, 10, 0],
+        }
+    }
+
+    #[test]
+    fn the_terminal_names_itself_as_the_ui_does() {
+        let mut terminal = terminal();
+        // Left alone, the library answers as itself.
+        assert_eq!(terminal.feed(b"\x1b[c"), b"\x1b[?62;22c");
+        assert_eq!(terminal.feed(b"\x1b[>q"), b"\x1bP>|libghostty\x1b\\");
+        assert_eq!(terminal.feed(b"\x05"), b"");
+
+        let settings = TerminalSettings { identity: Some(identity()), ..Default::default() };
+        assert!(terminal.apply(&settings).is_empty());
+        assert_eq!(terminal.feed(b"\x1b[c"), b"\x1b[?62;22;52c");
+        assert_eq!(terminal.feed(b"\x1b[>c"), b"\x1b[>1;10;0c");
+        assert_eq!(terminal.feed(b"\x1b[>q"), b"\x1bP>|ghostty 1.2.3\x1b\\");
+        assert_eq!(terminal.feed(b"\x05"), b"here");
+
+        // A snapshot's mirror is a separate terminal and keeps none of it.
+        let mut mirror = Terminal::decode(&terminal.screen()).unwrap();
+        assert_eq!(mirror.feed(b"\x1b[>q"), b"\x1bP>|libghostty\x1b\\");
+    }
+
     #[test]
     fn size_queries_use_the_size_the_ui_gave() {
         let mut terminal = terminal();
@@ -512,6 +607,7 @@ mod tests {
             grapheme_cluster: Some(true),
             image_storage_limit: Some(1 << 20),
             dark: Some(false),
+            identity: Some(identity()),
         };
         let mut terminal = Terminal::new(size(80, 24), &settings).unwrap();
         let _ = terminal.feed(b"some output\r\n");

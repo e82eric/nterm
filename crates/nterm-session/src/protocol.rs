@@ -37,6 +37,24 @@ pub struct TerminalSettings {
     pub image_storage_limit: Option<u64>,
     /// Answer to the light or dark query. Unanswered when unknown.
     pub dark: Option<bool>,
+    /// How the terminal names itself to a program that asks. Left out, the
+    /// library answers as itself.
+    pub identity: Option<Identity>,
+}
+
+/// What a terminal answers to "who are you".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Identity {
+    /// The XTVERSION text.
+    pub xtversion: String,
+    /// The answer to ENQ; empty for none.
+    pub enquiry: String,
+    /// Primary device attributes: conformance level, then feature codes.
+    pub conformance: u16,
+    pub features: Vec<u16>,
+    /// Secondary device attributes: type, firmware version, cartridge.
+    pub secondary: [u16; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

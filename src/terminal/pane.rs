@@ -1376,7 +1376,7 @@ impl TerminalPane {
                 generation
             } else {
                 let mut generation = 0;
-                if !unsafe { ghostty_ffi::nterm_host_snapshot_begin(host, &mut generation) } {
+                if !begin_snapshot(host, self.session.as_deref(), &mut generation) {
                     self.show_error(
                         "Picker unavailable",
                         "Unable to create the scrollback snapshot".into(),
@@ -2167,7 +2167,7 @@ impl TerminalPane {
             generation
         } else {
             let mut generation = 0;
-            if !unsafe { ghostty_ffi::nterm_host_snapshot_begin(host, &mut generation) } {
+            if !begin_snapshot(host, self.session.as_deref(), &mut generation) {
                 self.show_error(
                     "Quick select unavailable",
                     "Unable to create the terminal snapshot".into(),
@@ -2555,7 +2555,7 @@ impl TerminalPane {
         self.pending_search_snapshot = None;
         let host = self.search_host();
         let mut snapshot_generation = 0;
-        if !unsafe { ghostty_ffi::nterm_host_snapshot_begin(host, &mut snapshot_generation) } {
+        if !begin_snapshot(host, self.session.as_deref(), &mut snapshot_generation) {
             self.close_search();
             self.show_error(
                 "Search unavailable",
@@ -2603,7 +2603,7 @@ impl TerminalPane {
     fn open_copy_mode(&mut self) {
         self.close_search();
         let mut generation = 0;
-        if !unsafe { ghostty_ffi::nterm_host_snapshot_begin(self.host, &mut generation) } {
+        if !begin_snapshot(self.host, self.session.as_deref(), &mut generation) {
             self.show_error(
                 "Copy mode failed",
                 "Could not capture the terminal contents. Try again.".into(),
@@ -2990,7 +2990,7 @@ impl TerminalPane {
         let mut generation = self.copy_mode.generation.unwrap_or_default();
         let temporary = self.copy_mode.generation.is_none();
         if temporary
-            && !unsafe { ghostty_ffi::nterm_host_snapshot_begin(self.host, &mut generation) }
+            && !begin_snapshot(self.host, self.session.as_deref(), &mut generation)
         {
             return Vec::new();
         }
@@ -4057,4 +4057,28 @@ mod copy_shortcut_tests {
             Some(Motion::PreviousBigWordEnd)
         );
     }
+}
+
+/// Freeze the pane's terminal for copy mode, search, quick select or a
+/// picker. A pane whose shell runs in the session daemon keeps only its
+/// screen, so the daemon's terminal, which holds the history, is the one
+/// frozen. If it cannot be had, the surface's own is.
+fn begin_snapshot(
+    host: *mut Host,
+    session: Option<&crate::session::Link>,
+    generation: &mut u64,
+) -> bool {
+    if let Some(bytes) = session.and_then(crate::session::Link::snapshot)
+        && unsafe {
+            ghostty_ffi::nterm_host_snapshot_begin_from(
+                host,
+                bytes.as_ptr(),
+                bytes.len(),
+                generation,
+            )
+        }
+    {
+        return true;
+    }
+    unsafe { ghostty_ffi::nterm_host_snapshot_begin(host, generation) }
 }

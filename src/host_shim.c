@@ -461,6 +461,12 @@ bool nterm_host_snapshot_begin(NtermHost *host, uint64_t *snapshot_generation) {
     ghostty_clear_error();
     bool succeeded = ghostty_surface_snapshot_begin(host->surface, snapshot_generation); runtime_error(host, "nterm_host_snapshot_begin"); return succeeded;
 }
+/* As nterm_host_snapshot_begin, freezing the terminal in a whole encoded
+   snapshot: the session daemon's, which holds the history. */
+bool nterm_host_snapshot_begin_from(NtermHost *host, const uint8_t *snapshot, size_t len, uint64_t *snapshot_generation) {
+    ghostty_clear_error();
+    bool succeeded = ghostty_surface_snapshot_begin_from(host->surface, snapshot, len, snapshot_generation); runtime_error(host, "nterm_host_snapshot_begin_from"); return succeeded;
+}
 bool nterm_host_selection_text(NtermHost *host, ghostty_snapshot_selection_text_s *result) {
     ghostty_clear_error();
     ghostty_text_s text = {0};
