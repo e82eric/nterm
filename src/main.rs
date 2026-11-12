@@ -17,7 +17,7 @@ mod picker;
 mod presentation;
 mod preview_worker;
 mod search;
-mod spike_attach;
+mod session;
 mod terminal;
 mod themes;
 mod toast;

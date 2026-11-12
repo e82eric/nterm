@@ -1541,6 +1541,7 @@ dependencies = [
  "nfm-preview-file",
  "nfm_file_system",
  "nfm_search_core",
+ "nterm-session",
  "pollster",
  "regex",
  "serde",

@@ -584,9 +584,14 @@ bool nterm_host_backend_next(
     void *userdata,
     void (*write)(void *, const uint8_t *, size_t),
     void (*resize)(void *, uint16_t, uint16_t, uint32_t, uint32_t),
+    void (*spawn)(void *, const ghostty_host_spawn_s *),
+    void (*settings)(void *, const ghostty_host_settings_s *),
     const uint8_t *snapshot, size_t snapshot_len
 ) {
-    ghostty_host_backend_s backend = { .userdata = userdata, .write = write, .resize = resize };
+    ghostty_host_backend_s backend = {
+        .userdata = userdata, .write = write, .resize = resize,
+        .spawn = spawn, .settings = settings,
+    };
     return ghostty_host_backend_next(&backend, snapshot, snapshot_len);
 }
 void nterm_host_output(NtermHost *host, const uint8_t *bytes, size_t len) {

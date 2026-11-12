@@ -46,6 +46,7 @@ nfm-preview-command = { git = "https://github.com/e82eric/npicker", rev = "f1c61
 nfm-output = { git = "https://github.com/e82eric/npicker", rev = "f1c6188ea3b78ae1af6b5df951abdb6acbea20ba" }
 nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "f1c6188ea3b78ae1af6b5df951abdb6acbea20ba" }
 csv = "1.3"
+nterm-session = { path = "crates/nterm-session" }
 
 [build-dependencies]
 cc = "1.2"

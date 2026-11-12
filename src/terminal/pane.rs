@@ -202,6 +202,12 @@ extern "C" fn nterm_close(userdata: *mut c_void) {
     });
 }
 
+/// The session daemon reports that a pane's shell has ended. `wake` is the
+/// pane's `WakeState`.
+pub(crate) fn close_from_session(wake: *mut c_void) {
+    nterm_close(wake);
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn nterm_write_clipboard(userdata: *mut c_void, bytes: *const u8, len: usize) {
     crate::native_error::ffi_boundary("handle native callback nterm_write_clipboard", || {
@@ -273,6 +279,9 @@ pub(super) struct TerminalPane {
     pub(super) workspace_bounds: Option<egui::Rect>,
     host: *mut Host,
     wake: Box<WakeState>,
+    /// Set when the shell runs in the session daemon and this surface
+    /// mirrors it.
+    session: Option<Arc<crate::session::Link>>,
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
     paint_callback: crate::painter::PaintCallback,
     size: [u32; 2],
@@ -472,7 +481,12 @@ impl TerminalPane {
     pub(super) fn take_config_issues(&self) -> Vec<String> {
         std::mem::take(&mut *self.wake.config_issues.lock().unwrap())
     }
-    fn new(host: *mut Host, wake: Box<WakeState>, gl: &glow::Context) -> Self {
+    fn new(
+        host: *mut Host,
+        wake: Box<WakeState>,
+        session: Option<Arc<crate::session::Link>>,
+        gl: &glow::Context,
+    ) -> Self {
         let painter = Arc::new(egui::mutex::Mutex::new(TerminalPainter::new(gl)));
         let callback_painter = Arc::clone(&painter);
 
@@ -483,6 +497,7 @@ impl TerminalPane {
             workspace_bounds: None,
             host,
             wake,
+            session,
             painter,
             paint_callback,
             size: [0, 0],
@@ -533,8 +548,15 @@ impl TerminalPane {
         self.close_search();
         self.close_copy_mode();
         self.painter.lock().destroy();
-        crate::spike_attach::detach(self.host);
+        // Stop the daemon feeding the surface before it goes, and let go of
+        // the callbacks' reference once it can make no more of them.
+        if let Some(session) = &self.session {
+            session.detach();
+        }
         unsafe { ghostty_ffi::nterm_host_destroy(self.host) };
+        if let Some(session) = self.session.take() {
+            session.release();
+        }
         self.host = std::ptr::null_mut();
     }
 
@@ -576,6 +598,7 @@ impl TerminalPane {
             (rect.height() * scale).round().max(1.0) as u32,
         ];
         if self.size == size && self.scale == scale {
+            self.layout_session();
             return false;
         }
         // Resize the live surface, then coordinate frozen-terminal reflow.
@@ -590,7 +613,21 @@ impl TerminalPane {
             self.close_copy_mode();
             self.show_error("Snapshot resize failed", error);
         }
+        self.layout_session();
         true
+    }
+
+    /// A pane in the session daemon starts its shell once its size has
+    /// settled; see `session::Link::layout`.
+    fn layout_session(&self) {
+        let Some(session) = &self.session else { return };
+        if session.closed_early() {
+            self.wake.close.store(true, Ordering::Release);
+            self.wake.context.request_repaint();
+        } else if session.layout(unsafe { ghostty_ffi::nterm_host_surface_size(self.host) }) {
+            // Come back even if nothing else asks for a frame.
+            self.wake.context.request_repaint();
+        }
     }
 
     pub(super) fn update_modes(&mut self, ctx: &egui::Context) {
@@ -741,7 +778,9 @@ impl TerminalPane {
         }
         let (picker_endpoint, picker_token) = wake.picker_environment();
         let mut error_buffer = [0 as c_char; 2048];
-        let spike = crate::spike_attach::prepare();
+        // The first pane takes over a shell an earlier UI left running.
+        let session =
+            crate::session::Link::prepare((&mut *wake as *mut WakeState).cast(), true);
         let host = unsafe {
             ghostty_ffi::nterm_host_create(
                 argc,
@@ -757,6 +796,9 @@ impl TerminalPane {
             )
         };
         if host.is_null() {
+            if let Some(session) = session {
+                session.release();
+            }
             let detail =
                 unsafe { std::ffi::CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
             return Err(crate::native_error::FatalError::new(
@@ -764,11 +806,11 @@ impl TerminalPane {
                 detail,
             ));
         }
-        if let Some(spike) = spike {
-            crate::spike_attach::attach(spike, host);
+        if let Some(session) = &session {
+            session.attach(host);
         }
 
-        Ok(Self::new(host, wake, gl))
+        Ok(Self::new(host, wake, session, gl))
     }
 
     /// Creates another terminal in this window, as a child of this pane's
@@ -861,6 +903,8 @@ impl TerminalPane {
             .map(|s| std::ffi::CString::new(s.as_str()))
             .transpose()
             .map_err(|e| crate::native_error::FatalError::new("pane directory", e))?;
+        let session =
+            crate::session::Link::prepare((&mut *wake as *mut WakeState).cast(), false);
         let host = unsafe {
             ghostty_ffi::nterm_host_create_child(
                 self.host,
@@ -877,6 +921,9 @@ impl TerminalPane {
             )
         };
         if host.is_null() {
+            if let Some(session) = session {
+                session.release();
+            }
             let detail =
                 unsafe { std::ffi::CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
             return Err(crate::native_error::FatalError::new(
@@ -884,7 +931,10 @@ impl TerminalPane {
                 detail,
             ));
         }
-        Ok(Self::new(host, wake, gl))
+        if let Some(session) = &session {
+            session.attach(host);
+        }
+        Ok(Self::new(host, wake, session, gl))
     }
 
     pub(super) fn tick(&self) {
@@ -1692,10 +1742,16 @@ impl TerminalPane {
         use crate::picker::pipe::Event;
         // The shell may start after the pane; identify it once it exists.
         if let Some(pipe) = self.wake.pipe.as_ref().filter(|p| !p.shell_identified()) {
-            pipe.identify_shell(
-                unsafe { ghostty_ffi::nterm_host_shell_pid(self.host) } as u32,
-                unsafe { ghostty_ffi::nterm_host_shell_creation_time(self.host) },
-            );
+            // A shell in the session daemon is known to the daemon, not to
+            // the surface.
+            let (pid, created) = match &self.session {
+                Some(session) => session.shell(),
+                None => (
+                    unsafe { ghostty_ffi::nterm_host_shell_pid(self.host) } as u32,
+                    unsafe { ghostty_ffi::nterm_host_shell_creation_time(self.host) },
+                ),
+            };
+            pipe.identify_shell(pid, created);
         }
         if self
             .pages

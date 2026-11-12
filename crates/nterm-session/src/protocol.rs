@@ -70,6 +70,9 @@ pub struct PaneInfo {
     pub size: Size,
     /// The exit code once the shell has ended.
     pub exited: Option<u32>,
+    /// How many UIs are attached to it.
+    #[serde(default)]
+    pub attached: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

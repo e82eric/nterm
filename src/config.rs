@@ -397,6 +397,9 @@ struct FontConfig {
 struct TerminalConfig {
     scrollback_limit: Option<u64>,
     command: Option<String>,
+    /// Run shells in the session daemon, so they outlive the UI. Read once,
+    /// at startup.
+    session_daemon: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -934,6 +937,7 @@ pub(crate) fn prepare_with_reload(
             reload_path = Some(path.clone());
             let (options, bindings, padding, overrides) = AppConfig::parse(&source, &path)
                 .and_then(|config| {
+                    crate::session::configure(config.terminal.session_daemon);
                     Ok((
                         config.ghostty_args()?,
                         crate::picker::config::Bindings::compile_with_actions(

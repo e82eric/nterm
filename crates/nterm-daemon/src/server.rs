@@ -80,6 +80,7 @@ impl Pane {
             command: self.command.clone(),
             size: state.size,
             exited: state.exited,
+            attached: state.subscribers.len() as u32,
         }
     }
 }

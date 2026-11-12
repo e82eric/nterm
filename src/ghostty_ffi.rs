@@ -55,6 +55,39 @@ pub(crate) struct FontData {
 }
 
 #[repr(C)]
+pub(crate) struct HostEnv {
+    pub(crate) key: *const c_char,
+    pub(crate) value: *const c_char,
+}
+
+/// ghostty_host_spawn_s: the process a surface would have started.
+#[repr(C)]
+pub(crate) struct HostSpawn {
+    pub(crate) command: *const c_char,
+    pub(crate) cwd: *const c_char,
+    pub(crate) env: *const HostEnv,
+    pub(crate) env_len: usize,
+}
+
+/// ghostty_host_settings_s: what a surface's terminal is configured with.
+#[repr(C)]
+pub(crate) struct HostSettings {
+    pub(crate) palette: [[u8; 3]; 256],
+    pub(crate) foreground: [u8; 3],
+    pub(crate) background: [u8; 3],
+    pub(crate) cursor: [u8; 3],
+    pub(crate) has_cursor: bool,
+    pub(crate) cursor_style: u8,
+    pub(crate) cursor_blink: i8,
+    pub(crate) dark: bool,
+    pub(crate) image_storage_limit: u64,
+    pub(crate) has_creation: bool,
+    pub(crate) grapheme_cluster: bool,
+    pub(crate) scrollback_bytes: u64,
+    pub(crate) scrollback_lines: u64,
+}
+
+#[repr(C)]
 pub(crate) struct SurfaceSize {
     pub(crate) columns: u16,
     pub(crate) rows: u16,
@@ -373,6 +406,8 @@ unsafe extern "C" {
         userdata: *mut c_void,
         write: extern "C" fn(*mut c_void, *const u8, usize),
         resize: extern "C" fn(*mut c_void, u16, u16, u32, u32),
+        spawn: extern "C" fn(*mut c_void, *const HostSpawn),
+        settings: extern "C" fn(*mut c_void, *const HostSettings),
         snapshot: *const u8,
         snapshot_len: usize,
     ) -> bool;

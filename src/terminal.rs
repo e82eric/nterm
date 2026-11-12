@@ -6,6 +6,7 @@ use std::ffi::c_char;
 pub(crate) mod floating;
 mod layout;
 mod pane;
+pub(crate) use pane::close_from_session as close_pane_from_session;
 mod pane_resize;
 mod resize_keys;
 pub(crate) mod workspace;
