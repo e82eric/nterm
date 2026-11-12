@@ -34,6 +34,14 @@ if ($LASTEXITCODE -ne 0) {
 
 $target = Join-Path $PSScriptRoot 'target\release'
 Copy-Item -LiteralPath (Join-Path $target 'nterm.exe') -Destination (Join-Path $prefix 'bin') -Force
+# The session daemon, a default member of the workspace. A daemon that is
+# running from the prefix keeps its file locked and keeps the old build.
+try {
+    Copy-Item -LiteralPath (Join-Path $target 'nterm-daemon.exe') -Destination (Join-Path $prefix 'bin') -Force -ErrorAction Stop
+}
+catch {
+    Write-Warning "nterm-daemon.exe was not replaced, probably because it is running: $($_.Exception.Message)"
+}
 # Lua modules a config can require, e.g. require("nterm.git").
 $share = Join-Path $prefix 'share\nterm'
 $lua = Join-Path $share 'lua'

@@ -1,3 +1,10 @@
+# The session daemon is a separate package so it links libghostty-vt alone and
+# does not rebuild or restart with the UI.
+[workspace]
+members = ["crates/nterm-session", "crates/nterm-daemon"]
+default-members = [".", "crates/nterm-daemon"]
+exclude = ["spike/daemon-spike"]
+
 [package]
 name = "nterm"
 version = "0.1.0"

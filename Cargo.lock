@@ -1554,6 +1554,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nterm-daemon"
+version = "0.1.0"
+dependencies = [
+ "nterm-session",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nterm-session"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"

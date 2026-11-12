@@ -1,0 +1,29 @@
+[package]
+name = "nterm-daemon"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Owns nterm's shells and a headless terminal for each, so the UI can come and go"
+
+[lib]
+name = "nterm_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nterm-daemon"
+path = "src/main.rs"
+
+[dependencies]
+nterm-session = { path = "../nterm-session" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
