@@ -8,6 +8,10 @@ use egui_wgpu::wgpu;
 /// Bytes of immediate data the terminal compositor uses (see painter.rs).
 pub(crate) const IMMEDIATE_SIZE: u32 = 48;
 
+/// The size of the blocks small textures and buffers share. See
+/// `memory_hints` below.
+const FRAME_FREE_BLOCK: u64 = 8 << 20;
+
 pub(crate) struct SharedGpu {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -73,7 +77,17 @@ impl SharedGpu {
             },
             // The default reserves 64 MiB upload and 128 MiB device blocks,
             // far beyond a terminal's needs; upload blocks are resident.
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            //
+            // Device blocks are 8 MiB and no larger. A texture that does not
+            // fit one gets memory of its own, which is given back when the
+            // texture is dropped, and every frame of a pane larger than about
+            // 1900x1100 is one of those. `MemoryUsage` grows its blocks to
+            // 64 MiB and puts frames in them, and a block is kept for as long
+            // as anything is in it: after a few resizes a window held as much
+            // video memory in the gaps as in its textures.
+            memory_hints: wgpu::MemoryHints::Manual {
+                suballocated_device_memory_block_size: FRAME_FREE_BLOCK..FRAME_FREE_BLOCK,
+            },
             ..Default::default()
         }))
         .map_err(|error| format!("create the graphics device: {error}"))?;
