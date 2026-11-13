@@ -263,11 +263,11 @@ fn parse_picker_table(
                 lua: lua.clone(),
                 key,
                 name: name.into(),
+                // Every picker of the configuration uses its one pool.
                 worker: lua
-                    .app_data_ref::<crate::preview_worker::ConfigSource>()
-                    .map(|source| {
-                        crate::preview_worker::Worker::new(
-                            source.clone(),
+                    .app_data_ref::<std::sync::Arc<crate::preview_worker::Pool>>()
+                    .map(|pool| {
+                        pool.worker(
                             name.into(),
                             lua.app_data_ref::<crate::preview_worker::FactoryContext>()
                                 .map(|context| context.clone()),
@@ -446,10 +446,14 @@ impl AppConfig {
         crate::preview_worker::install_ui_api(&lua).map_err(|e| e.to_string())?;
         let modules = crate::preview_worker::module_path(path);
         crate::preview_worker::set_module_path(&lua, &modules).map_err(|e| e.to_string())?;
-        lua.set_app_data(crate::preview_worker::ConfigSource(
-            source.into(),
-            format!("@{}", path.display()),
-            modules,
+        // The preview resolvers run in this pool's Lua states, which run the
+        // source again. It starts nothing until a preview is asked for.
+        lua.set_app_data(crate::preview_worker::Pool::new(
+            crate::preview_worker::ConfigSource(
+                source.into(),
+                format!("@{}", path.display()),
+                modules,
+            ),
         ));
         let nterm = lua.create_table().map_err(|error| error.to_string())?;
         crate::terminal::workspace_ui::install_lua_helpers(&lua, &nterm)
