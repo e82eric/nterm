@@ -19,10 +19,18 @@ pub(crate) struct SharedGpu {
 }
 
 impl SharedGpu {
-    /// Vulkan, unless WGPU_BACKEND overrides it. wgpu's DX12 swapchain
-    /// stretches the previous image while a window resizes.
+    /// Direct3D 12 on Windows and Vulkan elsewhere, unless WGPU_BACKEND
+    /// overrides it. On Windows wgpu's DX12 swapchain stretches the previous
+    /// image while a window resizes, which Vulkan's does not. But with
+    /// NVIDIA's driver a Vulkan window held about a third more video memory,
+    /// and the memory the driver keeps for itself grew further as windows
+    /// were opened and resized.
     fn backends() -> wgpu::Backends {
-        wgpu::Backends::from_env().unwrap_or(wgpu::Backends::VULKAN)
+        wgpu::Backends::from_env().unwrap_or(if cfg!(windows) {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::VULKAN
+        })
     }
 
     pub fn new() -> Result<Self, String> {

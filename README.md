@@ -427,8 +427,8 @@ These ship with nterm or its samples and are built from the same parts:
 | C compiler | MSVC Build Tools on Windows; gcc or clang on Linux | The C shim and the bundled Lua, compiled through Cargo |
 | [.NET SDK](https://dotnet.microsoft.com/download) | any current SDK, Windows only | Verifying the signature of the pinned ConPTY package |
 
-Running nterm needs a GPU with Vulkan drivers (or another
-[wgpu backend](#rendering)). The sample configurations also use
+Running nterm needs a GPU with Direct3D 12 drivers on Windows, or Vulkan
+drivers on Linux (or another [wgpu backend](#rendering)). The sample configurations also use
 [PowerShell 7.4+](https://github.com/PowerShell/PowerShell),
 [ripgrep](https://github.com/BurntSushi/ripgrep),
 [bat](https://github.com/sharkdp/bat), [ffmpeg](https://ffmpeg.org), and
@@ -500,9 +500,9 @@ also in the command palette, whether or not it has a key.
 ## Rendering
 
 nterm embeds Ghostty's terminal emulation in a Rust and egui shell and renders
-with wgpu, using Vulkan by default on both Windows and Linux. Ghostty and egui
+with wgpu, using Direct3D 12 by default on Windows and Vulkan on Linux. Ghostty and egui
 share one GPU device, so finished terminal frames are textures that egui draws
-directly, without a copy. Set `WGPU_BACKEND` (for example `dx12`) to choose
+directly, without a copy. Set `WGPU_BACKEND` (for example `vulkan`) to choose
 another backend. Without a hardware adapter, as in a virtual machine, it falls
 back to software rendering if a software adapter is available (such as WARP
 with `dx12`) and reports that as a warning.
