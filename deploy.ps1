@@ -24,10 +24,13 @@ $conptyDll = $conpty.Dll
 $conptyHost = $conpty.Host
 
 # Ghostty loads conpty.dll and its matching OpenConsole.exe beside the app.
-$files = @('ghostty.dll', 'nterm.exe', 'conpty.dll', 'OpenConsole.exe')
+# nterm starts the session daemon from beside itself; without it, shells run
+# in the UI and end with it.
+$files = @('ghostty.dll', 'nterm.exe', 'nterm-daemon.exe', 'conpty.dll', 'OpenConsole.exe')
 $fileSources = @{
     'ghostty.dll' = Join-Path $source 'ghostty.dll'
     'nterm.exe' = Join-Path $source 'nterm.exe'
+    'nterm-daemon.exe' = Join-Path $source 'nterm-daemon.exe'
     'conpty.dll' = $conptyDll
     'OpenConsole.exe' = $conptyHost
 }
@@ -58,8 +61,25 @@ foreach ($relativePath in $compiledTerminfoPaths) {
 if (-not $hasCompiledTerminfo) {
     throw "Missing compiled xterm-ghostty terminfo database. Rebuild with Git for Windows installed or pass -Dterminfo-compiler=<path to tic.exe>."
 }
+$kept = @()
 foreach ($file in $files) {
-    Copy-Item -LiteralPath $fileSources[$file] -Destination (Join-Path $destinationPath $file) -Force
+    try {
+        Copy-Item -LiteralPath $fileSources[$file] -Destination (Join-Path $destinationPath $file) -Force
+    }
+    catch {
+        # A daemon that is running holds its file, and the files it loaded.
+        # Its shells are worth more than the new build: the rest is deployed,
+        # and these are replaced by a deploy after the daemon has ended.
+        $running = Get-Process -Name 'nterm-daemon' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq (Join-Path $destinationPath 'nterm-daemon.exe') }
+        if (-not $running -or $file -in @('nterm.exe', 'ghostty.dll')) {
+            throw
+        }
+        $kept += $file
+    }
+}
+if ($kept) {
+    Write-Warning "Not replaced, because the session daemon is running from $destinationPath`: $($kept -join ', ')"
 }
 
 # Keep the share layout beside the executable so Ghostty's resource discovery
