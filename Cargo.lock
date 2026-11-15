@@ -1559,6 +1559,7 @@ name = "nterm-daemon"
 version = "0.1.0"
 dependencies = [
  "nterm-session",
+ "png",
  "windows-sys 0.61.2",
 ]
 

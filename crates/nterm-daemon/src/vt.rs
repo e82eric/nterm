@@ -125,6 +125,103 @@ unsafe extern "C" {
     ) -> i32;
     fn ghostty_formatter_format(formatter: *mut c_void, writer: Writer) -> i32;
     fn ghostty_formatter_free(formatter: *mut c_void);
+    fn ghostty_sys_set(option: i32, value: *const c_void) -> i32;
+    fn ghostty_alloc(allocator: *const c_void, len: usize) -> *mut u8;
+    fn ghostty_free(allocator: *const c_void, ptr: *mut u8, len: usize);
+}
+
+const SYS_OPT_DECODE_PNG: i32 = 2;
+
+/// GhosttySysImage: 8-bit RGBA, row by row from the top left.
+#[repr(C)]
+struct Image {
+    width: u32,
+    height: u32,
+    data: *mut u8,
+    data_len: usize,
+}
+
+/// Give the library what it leaves to its host, before it is first used:
+/// it decodes no PNG itself, and refuses the pictures a program sends as
+/// one. The UI's terminal takes them, so without this a picture would be on
+/// the UI's screen and not on this one, and would go when the UI is sent
+/// this screen, as it is after a resize.
+fn init() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // Whoever is first sets it while the others wait: the library is not
+    // to be given it while a thread is using it.
+    ONCE.call_once(|| unsafe {
+        ghostty_sys_set(SYS_OPT_DECODE_PNG, decode_png as *const c_void);
+    });
+}
+
+extern "C" fn decode_png(
+    _: *mut c_void,
+    allocator: *const c_void,
+    data: *const u8,
+    len: usize,
+    out: *mut Image,
+) -> bool {
+    let png = unsafe { std::slice::from_raw_parts(data, len) };
+    // A PNG is whatever a program wrote. One that makes the decoder panic
+    // is refused; it does not end the daemon and every shell with it.
+    match std::panic::catch_unwind(|| pixels(png, allocator)) {
+        Ok(Some(image)) => {
+            unsafe { *out = image };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `png` as the pixels the library keeps, in memory of its `allocator`.
+fn pixels(png: &[u8], allocator: *const c_void) -> Option<Image> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
+    // Eight bits a channel, with a palette or a transparent colour made
+    // into channels.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let (width, height) = (reader.info().width, reader.info().height);
+    let count = (width as usize).checked_mul(height as usize)?;
+    let len = count.checked_mul(4)?;
+    // Before anything is decoded: the allocator is what limits how much one
+    // picture may take, and it refuses one that is too large.
+    let data = unsafe { ghostty_alloc(allocator, len) };
+    if data.is_null() {
+        return None;
+    }
+    let filled = (|| {
+        let size = reader.output_buffer_size()?;
+        let mut decoded = Vec::new();
+        decoded.try_reserve_exact(size).ok()?;
+        decoded.resize(size, 0);
+        let frame = reader.next_frame(&mut decoded).ok()?;
+        let channels = match frame.color_type {
+            png::ColorType::Grayscale => 1,
+            png::ColorType::GrayscaleAlpha => 2,
+            png::ColorType::Rgb => 3,
+            png::ColorType::Rgba => 4,
+            png::ColorType::Indexed => return None,
+        };
+        let decoded = decoded.get(..count.checked_mul(channels)?)?;
+        for (index, pixel) in decoded.chunks_exact(channels).enumerate() {
+            let rgba = match *pixel {
+                [grey] => [grey, grey, grey, 255],
+                [grey, alpha] => [grey, grey, grey, alpha],
+                [red, green, blue] => [red, green, blue, 255],
+                [red, green, blue, alpha] => [red, green, blue, alpha],
+                _ => return None,
+            };
+            // The memory is not yet anything, so it is written, not read.
+            unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), data.add(index * 4), 4) };
+        }
+        Some(())
+    })();
+    if filled.is_none() {
+        unsafe { ghostty_free(allocator, data, len) };
+        return None;
+    }
+    Some(Image { width, height, data, data_len: len })
 }
 
 /// What the library's callbacks read and write. Boxed so its address holds
@@ -245,6 +342,7 @@ unsafe impl Send for Terminal {}
 impl Terminal {
     /// A terminal with `settings` applied, ready for a shell's output.
     pub fn new(size: Size, settings: &TerminalSettings) -> Result<Self, String> {
+        init();
         let mut raw: Raw = std::ptr::null_mut();
         let result =
             unsafe { ghostty_terminal_new(std::ptr::null(), &mut raw, size.cols, size.rows) };
@@ -413,6 +511,7 @@ impl Terminal {
 
     /// Rebuild a terminal from `snapshot` or `screen` bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        init();
         let mut decoder = std::ptr::null_mut();
         let mut raw: Raw = std::ptr::null_mut();
         let result = unsafe {
@@ -543,6 +642,73 @@ mod tests {
 
     fn terminal() -> Terminal {
         Terminal::new(size(80, 24), &TerminalSettings::default()).unwrap()
+    }
+
+    /// A PNG of noise, which nothing packs small, and its pixel count.
+    fn noise_png(width: u32, height: u32) -> Vec<u8> {
+        let mut seed = 12345u32;
+        let pixels: Vec<u8> = (0..width * height * 3)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&pixels).unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let bits = chunk.iter().fold(0u32, |bits, byte| bits << 8 | *byte as u32)
+                << (8 * (3 - chunk.len()));
+            for digit in 0..4 {
+                out.push(if digit <= chunk.len() {
+                    DIGITS[(bits >> (18 - 6 * digit) & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+        }
+        out
+    }
+
+    /// The kitty graphics command that shows a PNG as image `id`.
+    fn show(id: u32, png: &[u8]) -> Vec<u8> {
+        format!("\x1b_Ga=T,f=100,i={id};{}\x1b\\", base64(png)).into_bytes()
+    }
+
+    #[test]
+    fn a_png_a_program_shows_is_kept_and_what_is_not_one_is_refused() {
+        let mut terminal = terminal();
+        let plain = terminal.screen().len();
+        let reply = terminal.feed(&show(7, &noise_png(64, 64)));
+        assert_eq!(String::from_utf8_lossy(&reply), "\x1b_Gi=7;OK\x1b\\");
+        // The picture takes rows: what follows it is under it, as it is on
+        // the UI's screen.
+        let cursor = terminal.feed(b"\x1b[6n");
+        assert_ne!(cursor, b"\x1b[1;1R", "{:?}", String::from_utf8_lossy(&cursor));
+        // The screen a UI is sent says there is a picture and where, and
+        // the whole snapshot has its pixels. The screen does not: they come
+        // after its READY record, where a screen ends.
+        let screen = terminal.screen();
+        assert!(screen.len() > plain && screen.len() < plain + 64 * 64 * 3);
+        assert!(terminal.snapshot().len() >= plain + 64 * 64 * 3);
+
+        // What is not a PNG is refused, and the terminal goes on.
+        let mut terminal = self::terminal();
+        let reply = terminal.feed(&show(8, b"not a png at all"));
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("\x1b_Gi=8;E"), "{reply:?}");
+        assert_eq!(terminal.feed(b"\x1b[6n"), b"\x1b[1;1R");
     }
 
     #[test]
