@@ -1384,26 +1384,6 @@ impl TerminalView {
             let _ = self.select_workspace(id);
         }
     }
-    /// Runs the Lua `startup` callback for a newly created window, before its
-    /// first frame.
-    pub(crate) fn run_startup(&mut self, ctx: &egui::Context, gl: &glow::Context) {
-        // It sets up a window that has a terminal. One that waits for the
-        // session daemon runs it when it starts its first shell.
-        if self.empty.is_some() {
-            self.startup_pending = true;
-            return;
-        }
-        if let Some(callback) = self.picker_bindings.startup.clone() {
-            let result = callback.with_host(&mut |r| self.host_request(r, gl), || {
-                callback.call_action(String::new())
-            });
-            // Its output (toasts, text) goes to the pane that has focus after it.
-            if let Some(pane) = self.active_pane().and_then(|p| self.pane_mut(p)) {
-                pane.finish_lua_action(result, ctx);
-            }
-            self.post_requests();
-        }
-    }
     /// Pane lifecycle work before building a frame: releases terminals closed
     /// during the previous frame, whose paint callbacks have run or been
     /// dropped by now, then closes panes whose shell exited. Those are released

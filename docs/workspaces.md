@@ -273,10 +273,9 @@ Custom picker definitions and factory results accept the same `scope` field.
 For example, `scope="Workspace", position="FullPane"` fills the workspace;
 `scope="Pane"` restores pane-local command-palette placement.
 
-`startup = function(app) ... end` runs once after each native window is ready.
-Reload updates settings, keybindings, and actions without rerunning startup or
-recreating terminals. Runtime APIs are available inside startup, named actions,
-and picker callbacks. Retained `app` handles expire when the callback returns.
+Runtime APIs are available inside named actions and picker callbacks. Reload
+updates settings, keybindings, and actions without recreating terminals.
+Retained `app` handles expire when the callback returns.
 
 ```lua
 return {
@@ -285,11 +284,16 @@ return {
     inner_gap=10, outer_gap=10, padding=4, corner_radius=8, border_width=1.5,
     shadow_size=10, shadow_opacity=0.3, shadow_offset={0,2},
   },
-  startup = function(app)
-    local ws = app:ensure_workspace {index=2, layout="tile"}
-    app:create_pane {workspace=ws.id, cwd="C:/src", command="pwsh.exe -NoLogo"}
-    app:select_workspace(ws.id)
-  end,
+  actions = {
+    OpenServers = {
+      label = "Open the servers workspace",
+      action = function(app)
+        local ws = app:ensure_workspace {index=2, layout="tile"}
+        app:create_pane {workspace=ws.id, cwd="C:/src", command="pwsh.exe -NoLogo"}
+        app:select_workspace(ws.id)
+      end,
+    },
+  },
 }
 ```
 
@@ -348,8 +352,8 @@ closes its terminals, and the app exits after the last window closes.
 the visible float, or else the focused tiled pane, into a new window. The shell
 keeps running, and copy mode, search, quick select, and pane-scope pickers
 stay open; a workspace-scope picker is cancelled. A float becomes the new
-window's tiled pane. The new window starts with one workspace and does not run
-`startup`. Any pane can move, including the window's first. Moving a
+window's tiled pane. The new window starts with one workspace. Any pane can
+move, including the window's first. Moving a
 workspace's last tiled pane removes that
 workspace and closes its floats, as with other moves, and moving a window's
 last pane closes that window.

@@ -59,9 +59,6 @@ pub(crate) struct TerminalView {
     sessions_sent: std::collections::HashMap<String, String>,
     /// Why the window has no terminal, while it has none and is to stay.
     empty: Option<empty::Empty>,
-    /// The Lua `startup` callback is to run once the window has its first
-    /// terminal on a new shell.
-    startup_pending: bool,
     /// What the daemon held when the session rows of the open picker were
     /// made: the session chosen from them is taken from it.
     waiting: Option<crate::session::Listing>,
@@ -297,7 +294,6 @@ impl TerminalView {
             sessions: Default::default(),
             sessions_sent: Default::default(),
             empty: None,
-            startup_pending: false,
             waiting: None,
             listing_asked: None,
             picker_bindings,

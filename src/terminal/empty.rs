@@ -98,13 +98,13 @@ impl TerminalView {
                 }
                 Status::Unavailable(reason) => Some(Empty::Unavailable { lost: false, reason }),
                 Status::Lost => Some(Empty::Unavailable { lost: true, reason: String::new() }),
-                Status::Off => self.first_shell(&ctx, gl),
+                Status::Off => self.first_shell(gl),
                 Status::Connected => {
                     let waiting = crate::session::take_first_listing()
                         .and_then(|listing| self.chooser(&ctx, listing));
                     match waiting {
                         Some(picker) => Some(Empty::Choose(picker)),
-                        None => self.first_shell(&ctx, gl),
+                        None => self.first_shell(gl),
                     }
                 }
             },
@@ -119,7 +119,7 @@ impl TerminalView {
                 Some(action) => {
                     picker.surrender_focus();
                     drop(picker);
-                    self.chosen(action, &ctx, gl)
+                    self.chosen(action, gl)
                 }
             },
             // Another window asked again, and it is under way or done.
@@ -187,40 +187,25 @@ impl TerminalView {
 
     /// The choice was made: a session, or, by its row or by Escape, a new
     /// shell.
-    fn chosen(
-        &mut self,
-        action: crate::picker::Action,
-        ctx: &egui::Context,
-        gl: &glow::Context,
-    ) -> Option<Empty> {
+    fn chosen(&mut self, action: crate::picker::Action, gl: &glow::Context) -> Option<Empty> {
         let crate::picker::Action::Execute(AppAction::AttachSession(id)) = action else {
             self.waiting = None;
-            return self.first_shell(ctx, gl);
+            return self.first_shell(gl);
         };
         match self.attach_session(&id, gl) {
-            Ok(()) => {
-                // The startup callback sets up a new window. This one is
-                // a session as it was left.
-                self.startup_pending = false;
-                None
-            }
+            Ok(()) => None,
             Err(error) => {
                 self.show_error("Session could not be shown", error);
-                self.first_shell(ctx, gl)
+                self.first_shell(gl)
             }
         }
     }
 
     /// The window's first terminal, on a new shell. On failure the window
     /// stays empty and says why.
-    fn first_shell(&mut self, ctx: &egui::Context, gl: &glow::Context) -> Option<Empty> {
+    fn first_shell(&mut self, gl: &glow::Context) -> Option<Empty> {
         match self.workspace_request(Request::CreatePane(Default::default()), gl) {
-            Ok(_) => {
-                if std::mem::take(&mut self.startup_pending) {
-                    self.run_startup(ctx, gl);
-                }
-                None
-            }
+            Ok(_) => None,
             Err(reason) => Some(Empty::Unavailable { lost: false, reason }),
         }
     }

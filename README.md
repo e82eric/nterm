@@ -376,9 +376,8 @@ These ship with nterm or its samples and are built from the same parts:
     cycle between them, and hide one to get back to the tiled panes. Hidden
     floats keep running, and the command palette can restore any of them.
   - **[Lua automation](docs/workspaces.md#lua-automation-and-appearance):**
-    a `startup` function runs when each window opens, and actions can run the
-    same code from a key or the command palette. Through `app` they create
-    workspaces and panes with a command and working directory, set layouts and
+    named actions run Lua from a key or the command palette. Through `app` they
+    create workspaces and panes with a command and working directory, set layouts and
     the main pane's share, and move, float, or close panes. This one opens a
     project with an editor as the main pane and a build and a shell beside it:
 
@@ -404,8 +403,6 @@ These ship with nterm or its samples and are built from the same parts:
       keys = {
         { key = "o", mods = "CTRL|ALT|SHIFT", action = "OpenNterm" },
       },
-      -- Runs once when each window opens; reloading does not rerun it.
-      startup = function(app) open_project(app, "C:/src/nterm") end,
     }
     ```
 

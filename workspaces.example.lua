@@ -11,14 +11,19 @@ return {
     corner_radius = 8, border_width = 1.5,
     shadow_size = 10, shadow_opacity = 0.3, shadow_offset = {0, 2},
   },
-  -- Runs once after each native window is ready. Reloading does not rerun it.
-  startup = function(app)
-    local first = app:get_workspace()
-    app:create_pane {workspace=first.id}
-    local servers = app:ensure_workspace {index=2, layout="deck"}
-    -- Newly created workspaces already contain one terminal pane.
-    -- command is a command-line string; cwd is an optional directory.
-    -- app:create_pane {workspace=servers.id, command="pwsh.exe -NoLogo", cwd="C:/src"}
-    app:select_workspace(first.id)
-  end,
+  actions = {
+    -- Run it from the command palette, or bind a key to "SetUpWindow".
+    SetUpWindow = {
+      label = "Set up this window",
+      action = function(app)
+        local first = app:get_workspace()
+        app:create_pane {workspace=first.id}
+        local servers = app:ensure_workspace {index=2, layout="deck"}
+        -- Newly created workspaces already contain one terminal pane.
+        -- command is a command-line string; cwd is an optional directory.
+        -- app:create_pane {workspace=servers.id, command="pwsh.exe -NoLogo", cwd="C:/src"}
+        app:select_workspace(first.id)
+      end,
+    },
+  },
 }

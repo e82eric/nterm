@@ -1459,7 +1459,6 @@ impl PickerEntry {
 pub(crate) struct Bindings {
     pub(crate) workspace_appearance: crate::terminal::workspace::Appearance,
     pub(crate) default_layout: crate::terminal::workspace::Layout,
-    pub(crate) startup: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     pub(crate) pipe_policy: super::pipe::Policy,
     pub(crate) builtin_pickers: BuiltinPickers,
     pub(crate) cursor_scroll_padding: u32,
@@ -1474,12 +1473,10 @@ impl Bindings {
     pub(crate) fn with_workspaces(
         mut self,
         workspaces: crate::terminal::workspace::Config,
-        startup: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     ) -> Result<Self, String> {
         workspaces.appearance.validate()?;
         self.workspace_appearance = workspaces.appearance;
         self.default_layout = workspaces.default_layout;
-        self.startup = startup;
         Ok(self)
     }
 
@@ -1726,7 +1723,6 @@ impl Bindings {
             key_tables,
             workspace_appearance: Default::default(),
             default_layout: Default::default(),
-            startup: None,
             pipe_policy: super::pipe::Policy::default(),
             model,
             builtin_pickers: BuiltinPickers::default(),

@@ -235,10 +235,8 @@ impl NativeWindow {
         })
     }
 
-    /// Runs the Lua startup callback, then shows the window for its first frame.
+    /// Shows the window for its first frame.
     fn start(&mut self) -> Result<(), FatalError> {
-        let shell = self.shell.as_mut().expect("terminal shell");
-        shell.terminal.run_startup(&self.egui.egui_ctx, &self.gl);
         self.show();
         Ok(())
     }

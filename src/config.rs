@@ -361,8 +361,6 @@ struct AppConfig {
     theme_colors: std::collections::BTreeMap<String, crate::colors::UiOverrides>,
     floating: FloatingConfig,
     workspaces: crate::terminal::workspace::Config,
-    #[serde(skip)]
-    startup: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     picker_defaults: crate::picker::config::PickerDefaults,
     builtin_pickers: crate::picker::config::BuiltinPickers,
     cursor_scroll_padding: Option<u32>,
@@ -490,26 +488,6 @@ impl AppConfig {
         if !matches!(value, mlua::Value::Table(_)) {
             return Err("config must return a table".into());
         }
-        let startup = if let mlua::Value::Table(root) = &value {
-            let function: Option<mlua::Function> =
-                root.get("startup").map_err(|e| e.to_string())?;
-            root.raw_set("startup", mlua::Value::Nil)
-                .map_err(|e| e.to_string())?;
-            function
-                .map(|f| {
-                    lua.create_registry_value(f).map(|key| {
-                        std::rc::Rc::new(crate::lua_callbacks::Callback {
-                            lua: lua.clone(),
-                            key,
-                            name: "startup".into(),
-                        })
-                    })
-                })
-                .transpose()
-                .map_err(|e| e.to_string())?
-        } else {
-            None
-        };
         let mut parsed_keys = None;
         let mut parsed_tables = std::collections::BTreeMap::new();
         let mut parsed_pickers = None;
@@ -716,7 +694,6 @@ impl AppConfig {
         };
         config.pickers = parsed_pickers;
         config.actions = actions;
-        config.startup = startup;
         Ok(config)
     }
 
@@ -841,7 +818,7 @@ impl ReloadSource {
                     config.picker_defaults,
                     config.actions,
                 )?
-                .with_workspaces(config.workspaces, config.startup)?
+                .with_workspaces(config.workspaces)?
                 .with_builtin_pickers(config.builtin_pickers)
                 .with_pipe_policy(config.picker_pipe)
                 .with_prompt_patterns(config.compiled_prompts)
@@ -946,7 +923,7 @@ pub(crate) fn prepare_with_reload(
                             config.picker_defaults,
                             config.actions,
                         )?
-                        .with_workspaces(config.workspaces, config.startup)?
+                        .with_workspaces(config.workspaces)?
                         .with_builtin_pickers(config.builtin_pickers)
                         .with_pipe_policy(config.picker_pipe)
                         .with_prompt_patterns(config.compiled_prompts)
@@ -1058,9 +1035,8 @@ mod tests {
     }
 
     #[test]
-    fn workspace_configuration_compiles_helpers_startup_and_appearance() {
+    fn workspace_configuration_compiles_helpers_and_appearance() {
         let config = parse(include_str!("../workspaces.example.lua")).unwrap();
-        assert!(config.startup.is_some());
         assert_eq!(config.workspaces.appearance.inner_gap, 10.0);
         let bindings = crate::picker::config::Bindings::compile_with_actions(
             config.pickers,
@@ -1086,7 +1062,8 @@ mod tests {
             crate::terminal::workspace::Layout::HorizontalGrid
         );
         assert_eq!(config.workspaces.appearance.inner_gap, 3.0);
-        assert!(parse("return {startup=123}").is_err());
+        // There was once a `startup` function; it is refused like any unknown key.
+        assert!(parse("return {startup=function() end}").is_err());
     }
     #[test]
     fn picker_local_keys_parse_validate_and_keep_lua_functions() {
@@ -2370,7 +2347,7 @@ mod tests {
             config.actions,
         )
         .unwrap()
-        .with_workspaces(config.workspaces, config.startup)
+        .with_workspaces(config.workspaces)
         .unwrap()
         .with_builtin_pickers(config.builtin_pickers)
         .with_pipe_policy(config.picker_pipe)
