@@ -13,7 +13,7 @@ use egui_winit::winit;
 use shared_ui::{SharedUi, WindowUi};
 
 use std::ffi::c_void;
-use std::ffi::{CString, c_char};
+use std::ffi::CString;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,14 +49,6 @@ pub(crate) fn run(
 
 struct ShellApp {
     terminal: TerminalView,
-    // Ghostty borrows argc/argv as process-global state, so retain both the
-    // strings and pointer array until after the embedded app is destroyed.
-    _startup: std::rc::Rc<StartupArgs>,
-}
-
-struct StartupArgs {
-    _args: Vec<CString>,
-    _argv: Vec<*mut c_char>,
 }
 
 impl ShellApp {
@@ -72,25 +64,22 @@ impl ShellApp {
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, FatalError> {
         let command_label = command_label(&args);
-        let mut argv: Vec<*mut c_char> = args.iter().map(|arg| arg.as_ptr().cast_mut()).collect();
+        // The ghostty application is made before any terminal. Every window
+        // holds it, so it lasts until the last window has gone.
+        let app = std::rc::Rc::new(crate::terminal::ghostty_app::GhosttyApp::new(egui_ctx, args)?);
         Ok(Self {
             terminal: TerminalView::new(
+                app,
                 egui_ctx,
                 gl,
                 proxy,
                 window,
-                argv.len(),
-                argv.as_mut_ptr(),
                 command_label,
                 pickers,
                 floating_padding,
                 issues,
                 reload_source,
             )?,
-            _startup: std::rc::Rc::new(StartupArgs {
-                _args: args,
-                _argv: argv,
-            }),
         })
     }
 
@@ -351,7 +340,6 @@ impl NativeApp {
         )?;
         window.shell = Some(ShellApp {
             terminal,
-            _startup: parent_shell._startup.clone(),
         });
         window.start()?;
         self.windows.insert(window.surface.window().id(), window);
@@ -384,7 +372,6 @@ impl NativeApp {
             .adopt_window(pane, window.surface.pane_window());
         window.shell = Some(ShellApp {
             terminal,
-            _startup: origin._startup.clone(),
         });
         window.show();
         self.windows.insert(window.surface.window().id(), window);
@@ -576,17 +563,14 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             }
             UserEvent::GhosttyWake => {
                 APP_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
-                // All windows/panes share one app; a single tick drains its mailbox.
-                for window in self.windows.values_mut() {
-                    if window
+                // All windows share one app; a single tick drains its mailbox.
+                if let Some(window) = self.windows.values_mut().next() {
+                    window
                         .shell
                         .as_mut()
                         .expect("terminal shell")
                         .terminal
-                        .tick()
-                    {
-                        break;
-                    }
+                        .tick();
                 }
             }
             UserEvent::FrameReady(id) => {

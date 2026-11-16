@@ -1,9 +1,10 @@
 use crate::actions::AppAction;
 use crate::app::UserEvent;
 use crate::graphics as glow;
-use std::ffi::c_char;
+use ghostty_app::GhosttyApp;
 
 pub(crate) mod floating;
+pub(crate) mod ghostty_app;
 mod layout;
 mod pane;
 pub(crate) use pane::close_from_session as close_pane_from_session;
@@ -40,7 +41,9 @@ pub(crate) struct TerminalView {
     /// Whether a `UserEvent::WindowRequests` is on its way to the app.
     requests_posted: bool,
     proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
-    window_id: egui_winit::winit::window::WindowId,
+    window: crate::graphics::PaneWindow,
+    /// The ghostty application, which every window shares.
+    app: std::rc::Rc<GhosttyApp>,
     /// Set by the status bar's close button; the app then closes this window.
     close_requested: bool,
     pane_drag: Option<pane_resize::Drag>,
@@ -118,18 +121,9 @@ pub(crate) enum PaneRef {
 
 impl TerminalView {
     pub(crate) fn apply_theme(&mut self, name: &str) -> Result<(), String> {
-        self.app_pane()
-            .ok_or("no terminal is open")?
-            .apply_theme(name)
-    }
-    /// Any terminal in this window. Every terminal shares one native app, so
-    /// app-wide work (ticks, settings, and new terminals) can go through any
-    /// of them. None only once the window's last terminal has closed.
-    fn app_pane(&self) -> Option<&TerminalPane> {
-        self.tiled
-            .first()
-            .map(|(_, p)| p)
-            .or_else(|| self.floating.entries.first().map(|e| &e.value.pane))
+        self.app.apply_theme(name)?;
+        self.context.request_repaint();
+        Ok(())
     }
     /// The visible float, else the focused tiled pane. Only called while the
     /// window has a tiled pane.
@@ -152,31 +146,40 @@ impl TerminalView {
     }
 
     pub(crate) fn new(
+        app: std::rc::Rc<GhosttyApp>,
         egui_ctx: &egui::Context,
         gl: &glow::Context,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
         window: crate::graphics::PaneWindow,
-        argc: usize,
-        argv: *mut *mut c_char,
         command_label: String,
         picker_bindings: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
         mut issues: Vec<String>,
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
-        let window_id = window.id;
+        issues.extend(app.take_config_issues());
         // With sessions waiting in the daemon, the first pane holds its
         // shell back until one of them, or a new one, has been chosen.
         let offer = restore::any_detached();
-        let pane = TerminalPane::create(egui_ctx, gl, proxy.clone(), window, argc, argv, offer)?;
-        issues.extend(pane.take_config_issues());
+        let mut pane = TerminalPane::create(
+            &app,
+            egui_ctx,
+            gl,
+            proxy.clone(),
+            window,
+            &pane::SpawnOptions::default(),
+        )?;
+        if offer {
+            pane.hold();
+        }
         #[cfg(any(windows, unix))]
         pane.set_pipe_policy(&picker_bindings.pipe_policy);
         let mut view = Self::with_pane(
+            app,
             pane,
             egui_ctx,
             proxy,
-            window_id,
+            window,
             issues,
             command_label,
             reload_source,
@@ -195,16 +198,17 @@ impl TerminalView {
         gl: &glow::Context,
         window: crate::graphics::PaneWindow,
     ) -> Result<Self, crate::native_error::FatalError> {
-        let window_id = window.id;
-        let pane = self
-            .app_pane()
-            .ok_or_else(|| {
-                crate::native_error::FatalError::new("open a window", "no terminal is open")
-            })?
-            .create_window(egui_ctx, gl, window)?;
+        let pane = TerminalPane::create(
+            &self.app,
+            egui_ctx,
+            gl,
+            self.proxy.clone(),
+            window,
+            &pane::SpawnOptions::default(),
+        )?;
         #[cfg(any(windows, unix))]
         pane.set_pipe_policy(&self.picker_bindings.pipe_policy);
-        Ok(self.sibling(pane, window_id))
+        Ok(self.sibling(pane, window))
     }
 
     /// A view for a new window whose first pane is one moved out of this
@@ -215,18 +219,18 @@ impl TerminalView {
         window: crate::graphics::PaneWindow,
     ) -> Self {
         pane.0.move_to_window(window.id);
-        self.sibling(pane.0, window.id)
+        self.sibling(pane.0, window)
     }
 
     /// A view for another window around `pane`, sharing this window's settings.
-    fn sibling(&self, pane: TerminalPane, window_id: egui_winit::winit::window::WindowId) -> Self {
-        let issues = pane.take_config_issues();
+    fn sibling(&self, pane: TerminalPane, window: crate::graphics::PaneWindow) -> Self {
         Self::with_pane(
+            self.app.clone(),
             pane,
             &self.context,
             self.proxy.clone(),
-            window_id,
-            issues,
+            window,
+            Vec::new(),
             self.command_label.clone(),
             self.reload_source.clone(),
             self.picker_bindings.clone(),
@@ -236,10 +240,11 @@ impl TerminalView {
 
     /// A one-workspace view whose only pane is `pane`, tiled pane 0.
     fn with_pane(
+        app: std::rc::Rc<GhosttyApp>,
         pane: TerminalPane,
         context: &egui::Context,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
-        window_id: egui_winit::winit::window::WindowId,
+        window: crate::graphics::PaneWindow,
         issues: Vec<String>,
         command_label: String,
         reload_source: crate::config::ReloadSource,
@@ -278,7 +283,8 @@ impl TerminalView {
             requests: Vec::new(),
             requests_posted: false,
             proxy,
-            window_id,
+            window,
+            app,
         }
     }
 
@@ -289,11 +295,15 @@ impl TerminalView {
         gl: &glow::Context,
         options: &pane::SpawnOptions,
     ) -> Result<TerminalPane, String> {
-        let pane = self
-            .app_pane()
-            .ok_or("no terminal is open")?
-            .create_child(gl, options)
-            .map_err(|e| e.to_string())?;
+        let pane = TerminalPane::create(
+            &self.app,
+            &self.context,
+            gl,
+            self.proxy.clone(),
+            self.window,
+            options,
+        )
+        .map_err(|e| e.to_string())?;
         #[cfg(any(windows, unix))]
         pane.set_pipe_policy(&self.picker_bindings.pipe_policy);
         Ok(pane)
@@ -315,7 +325,7 @@ impl TerminalView {
         }
         self.requests_posted = self
             .proxy
-            .send_event(UserEvent::WindowRequests(self.window_id))
+            .send_event(UserEvent::WindowRequests(self.window.id))
             .is_ok();
     }
 
@@ -323,10 +333,17 @@ impl TerminalView {
         self.show_error("Could not open terminal window", error);
     }
 
-    /// Drains the shared native app's mailbox. False if this window has no
-    /// terminal left to do it through.
-    pub(crate) fn tick(&mut self) -> bool {
-        self.app_pane().map(|pane| pane.tick()).is_some()
+    /// Drains the mailbox of the ghostty application, which all windows
+    /// share, and shows what went wrong in it.
+    pub(crate) fn tick(&mut self) {
+        self.app.tick();
+        for (operation, cause) in self.app.take_issues() {
+            self.toasts.push_error(
+                "Terminal operation failed".into(),
+                format!("{operation}: {cause}"),
+                10000,
+            );
+        }
     }
 
     pub(crate) fn acquire_frames(&mut self) -> bool {
@@ -530,11 +547,7 @@ impl TerminalView {
                         || config.font_family.is_some()
                         || config.font_size.is_some()
                     {
-                        let applied = match self.app_pane() {
-                            Some(pane) => pane.apply_settings(&config),
-                            None => Err("no terminal is open".into()),
-                        };
-                        if let Err(error) = applied {
+                        if let Err(error) = self.app.apply_settings(&config) {
                             self.show_error("Could not reload configuration", error);
                             return;
                         }

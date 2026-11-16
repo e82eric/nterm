@@ -1,8 +1,17 @@
 use std::ffi::{c_char, c_void};
 
 unsafe extern "C" {
-    pub(crate) fn nterm_host_apply_settings(
-        host: *mut Host,
+    pub(crate) fn nterm_app_create(
+        argc: usize,
+        argv: *mut *mut c_char,
+        userdata: *mut c_void,
+        error_buffer: *mut c_char,
+        error_capacity: usize,
+    ) -> *mut App;
+    pub(crate) fn nterm_app_destroy(app: *mut App);
+    pub(crate) fn nterm_app_tick(app: *mut App);
+    pub(crate) fn nterm_app_apply_settings(
+        app: *mut App,
         name: *const c_char,
         family: *const c_char,
         size: f32,
@@ -14,12 +23,26 @@ unsafe extern "C" {
         userdata: *mut c_void,
         callback: extern "C" fn(*mut c_void, *const c_char),
     ) -> bool;
-    pub(crate) fn nterm_host_apply_theme(
-        host: *mut Host,
-        name: *const c_char,
-        error: *mut c_char,
-        capacity: usize,
-    ) -> bool;
+}
+
+/// The shim's `NtermApp`: the one ghostty application.
+#[repr(C)]
+pub(crate) struct App(c_void);
+
+/// The shim's `NtermHostOptions`: what a terminal is created with.
+/// `command` and `cwd` may be null, for the configured ones; `backend` is
+/// null for a terminal that runs its own shell.
+#[repr(C)]
+pub(crate) struct HostOptions {
+    pub(crate) userdata: *mut c_void,
+    pub(crate) window: *mut c_void,
+    pub(crate) driver: *const c_void,
+    pub(crate) scale: f64,
+    pub(crate) picker_endpoint: *const c_char,
+    pub(crate) picker_token: *const c_char,
+    pub(crate) command: *const c_char,
+    pub(crate) cwd: *const c_char,
+    pub(crate) backend: *const HostBackend,
 }
 
 pub(crate) fn native_error(operation: &str) -> String {
@@ -406,15 +429,8 @@ unsafe extern "C" {
     pub(crate) fn ghostty_font_data_free(result: *mut FontData);
     pub(crate) fn nterm_host_surface_size(host: *mut Host) -> SurfaceSize;
     pub(crate) fn nterm_host_create(
-        argc: usize,
-        argv: *mut *mut c_char,
-        userdata: *mut c_void,
-        window: *mut c_void,
-        driver: *const c_void,
-        scale: f64,
-        picker_endpoint: *const c_char,
-        picker_token: *const c_char,
-        backend: *const HostBackend,
+        app: *mut App,
+        options: *const HostOptions,
         error_buffer: *mut c_char,
         error_capacity: usize,
     ) -> *mut Host;
@@ -423,21 +439,6 @@ unsafe extern "C" {
     pub(crate) fn nterm_host_resync(host: *mut Host, snapshot: *const u8, len: usize);
     pub(crate) fn nterm_window_attach(window: *mut c_void);
     pub(crate) fn nterm_window_detach(window: *mut c_void);
-    pub(crate) fn nterm_host_create_child(
-        parent: *mut Host,
-        userdata: *mut c_void,
-        window: *mut c_void,
-        driver: *const c_void,
-        scale: f64,
-        picker_endpoint: *const c_char,
-        picker_token: *const c_char,
-        command: *const c_char,
-        cwd: *const c_char,
-        backend: *const HostBackend,
-        error_buffer: *mut c_char,
-        error_capacity: usize,
-    ) -> *mut Host;
-    pub(crate) fn nterm_host_tick(host: *mut Host);
     pub(crate) fn nterm_host_shell_pid(host: *mut Host) -> u64;
     pub(crate) fn nterm_host_shell_creation_time(host: *mut Host) -> u64;
     pub(crate) fn nterm_host_resize(host: *mut Host, width: u32, height: u32, scale: f64);

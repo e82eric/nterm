@@ -115,7 +115,6 @@ struct WakeState {
     /// The shell's working directory from OSC 7, if it reported one.
     pwd: std::sync::Mutex<Option<String>>,
     clipboard_text: std::sync::Mutex<Option<String>>,
-    config_issues: std::sync::Mutex<Vec<String>>,
     runtime_issues: std::sync::Mutex<Vec<(String, String)>>,
 }
 
@@ -331,20 +330,6 @@ pub(super) struct TerminalPane {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn nterm_config_issue(userdata: *mut c_void, message: *const c_char) {
-    crate::native_error::ffi_boundary("handle native callback nterm_config_issue", || {
-        if message.is_null() {
-            return;
-        }
-        let state = unsafe { &*(userdata.cast::<WakeState>()) };
-        let message = unsafe { std::ffi::CStr::from_ptr(message) }
-            .to_string_lossy()
-            .into_owned();
-        state.config_issues.lock().unwrap().push(format!("Ghostty configuration issue. Invalid settings were ignored.\nFix the configuration and restart the app.\n\n{message}"));
-    });
-}
-
-#[unsafe(no_mangle)]
 extern "C" fn nterm_runtime_issue(
     userdata: *mut c_void,
     operation: *const c_char,
@@ -377,27 +362,6 @@ extern "C" fn nterm_runtime_issue(
     });
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn nterm_theme_colors(
-    userdata: *mut c_void,
-    colors: *const crate::colors::ThemeColors,
-    name: *const u8,
-    name_len: usize,
-) {
-    crate::native_error::ffi_boundary("handle native callback nterm_theme_colors", || {
-        if colors.is_null() {
-            return;
-        }
-        let state = unsafe { &*(userdata.cast::<WakeState>()) };
-        let name = if name.is_null() {
-            None
-        } else {
-            std::str::from_utf8(unsafe { std::slice::from_raw_parts(name, name_len) }).ok()
-        };
-        crate::colors::COLORS.apply_theme(&state.context, unsafe { &*colors }, name);
-    });
-}
-
 impl TerminalPane {
     pub(super) fn show_error(&mut self, title: &str, error: String) {
         crate::error_log::error("terminal", title, &error);
@@ -425,71 +389,8 @@ impl TerminalPane {
             crate::picker::Picker::start(self.host, None, false, 0, ctx.clone(), options),
         );
     }
-    pub(super) fn apply_theme(&self, name: &str) -> Result<(), String> {
-        let name = std::ffi::CString::new(name).map_err(|_| "Theme name contains NUL")?;
-        let mut error = [0u8; 4096];
-        if unsafe {
-            ghostty_ffi::nterm_host_apply_theme(
-                self.host,
-                name.as_ptr(),
-                error.as_mut_ptr().cast(),
-                error.len(),
-            )
-        } {
-            self.wake.context.request_repaint();
-            Ok(())
-        } else {
-            Err(
-                String::from_utf8_lossy(error.split(|byte| *byte == 0).next().unwrap_or_default())
-                    .into_owned(),
-            )
-        }
-    }
-    pub(super) fn apply_settings(
-        &self,
-        config: &crate::config::ReloadedConfig,
-    ) -> Result<(), String> {
-        let theme = config
-            .theme
-            .as_deref()
-            .map(std::ffi::CString::new)
-            .transpose()
-            .map_err(|_| "Theme contains NUL")?;
-        let family = config
-            .font_family
-            .as_deref()
-            .map(std::ffi::CString::new)
-            .transpose()
-            .map_err(|_| "Font contains NUL")?;
-        let mut error = [0u8; 4096];
-        if unsafe {
-            ghostty_ffi::nterm_host_apply_settings(
-                self.host,
-                theme
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                family
-                    .as_ref()
-                    .map_or(std::ptr::null(), |value| value.as_ptr()),
-                config.font_size.unwrap_or(0.0),
-                error.as_mut_ptr().cast(),
-                error.len(),
-            )
-        } {
-            Ok(())
-        } else {
-            Err(
-                String::from_utf8_lossy(error.split(|byte| *byte == 0).next().unwrap_or_default())
-                    .into_owned(),
-            )
-        }
-    }
-
     pub(super) fn refresh_picker_font(&mut self, ctx: &egui::Context) {
         self.picker_font = crate::picker::font::PickerFont::new(ctx, self.host);
-    }
-    pub(super) fn take_config_issues(&self) -> Vec<String> {
-        std::mem::take(&mut *self.wake.config_issues.lock().unwrap())
     }
     fn new(
         host: *mut Host,
@@ -555,6 +456,12 @@ impl TerminalPane {
         self.session.as_ref().and_then(|session| session.pane_id())
     }
 
+    /// Do not start this pane's shell until `start_shell`. Called before
+    /// the pane is first laid out.
+    pub(super) fn hold(&mut self) {
+        self.held = true;
+    }
+
     /// Start the shell of a pane that was made holding it back.
     pub(super) fn start_shell(&mut self) {
         self.held = false;
@@ -580,15 +487,14 @@ impl TerminalPane {
         self.close_search();
         self.close_copy_mode();
         self.painter.lock().destroy();
-        // Stop the daemon feeding the surface before it goes, and let go of
-        // the callbacks' reference once it can make no more of them.
+        // Stop the daemon feeding the surface before it goes. The surface's
+        // callbacks borrow this pane's reference to the link, so that is
+        // let go only once the surface can make no more of them.
         if let Some(session) = &self.session {
             session.detach();
         }
         unsafe { ghostty_ffi::nterm_host_destroy(self.host) };
-        if let Some(session) = self.session.take() {
-            session.release();
-        }
+        self.session = None;
         self.host = std::ptr::null_mut();
     }
 
@@ -829,28 +735,34 @@ fn picker_service(
 }
 
 impl TerminalPane {
+    /// Creates a terminal of `app` in `window`. The window decides whether
+    /// it is tiled or floating.
+    ///
+    /// With the session daemon, the link is made first, because the surface
+    /// is created with its callbacks; then the surface; then the link is
+    /// told the surface. A failure in between drops the link.
     pub(super) fn create(
-        egui_ctx: &egui::Context,
+        app: &super::ghostty_app::GhosttyApp,
+        ctx: &egui::Context,
         gl: &glow::Context,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
         window: crate::graphics::PaneWindow,
-        argc: usize,
-        argv: *mut *mut c_char,
-        held: bool,
+        options: &SpawnOptions,
     ) -> Result<Self, crate::native_error::FatalError> {
+        use crate::native_error::FatalError;
         let mut wake = Box::new(WakeState {
             #[cfg(any(windows, unix))]
-            pipe: Some(picker_service(egui_ctx, crate::session::Start::Shell).map_err(|e| {
-                crate::native_error::FatalError::new("create secure picker pipe", e)
-            })?),
-            context: egui_ctx.clone(),
+            pipe: Some(
+                picker_service(ctx, options.start)
+                    .map_err(|e| FatalError::new("create secure picker pipe", e))?,
+            ),
+            context: ctx.clone(),
             proxy,
             window_id: AtomicU64::new(window.id.into()),
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             title: std::sync::Mutex::new(String::new()),
             pwd: std::sync::Mutex::new(None),
-            config_issues: std::sync::Mutex::new(Vec::new()),
             runtime_issues: std::sync::Mutex::new(Vec::new()),
             clipboard_text: std::sync::Mutex::new(None),
         });
@@ -859,71 +771,48 @@ impl TerminalPane {
             pipe.bind_window(wake.proxy.clone(), wake.window_id());
         }
         let (picker_endpoint, picker_token) = wake.picker_environment();
-        let mut error_buffer = [0 as c_char; 2048];
-        let session = crate::session::Link::prepare(
-            (&mut *wake as *mut WakeState).cast(),
-            crate::session::Start::Shell,
-        )
-        .map_err(|e| crate::native_error::FatalError::new("reach the session daemon", e))?;
+        let text = |value: &Option<String>, what: &'static str| {
+            value
+                .as_ref()
+                .map(|s| std::ffi::CString::new(s.as_str()))
+                .transpose()
+                .map_err(|e| FatalError::new(what, e))
+        };
+        let command = text(&options.command, "pane command")?;
+        let cwd = text(&options.cwd, "pane directory")?;
+        let userdata: *mut c_void = (&mut *wake as *mut WakeState).cast();
+        let session = crate::session::Link::prepare(userdata, options.start)
+            .map_err(|e| FatalError::new("show a running shell", e))?;
         let backend = session.as_ref().map(|session| session.backend());
+        let asked = ghostty_ffi::HostOptions {
+            userdata,
+            window: window.native,
+            driver: gl.driver(),
+            scale: ctx.pixels_per_point() as f64,
+            picker_endpoint: picker_endpoint.as_ptr(),
+            picker_token: picker_token.as_ptr(),
+            command: command.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            cwd: cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            backend: backend.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+        };
+        let mut error_buffer = [0 as c_char; 2048];
         let host = unsafe {
             ghostty_ffi::nterm_host_create(
-                argc,
-                argv,
-                (&mut *wake as *mut WakeState).cast(),
-                window.native,
-                gl.driver(),
-                egui_ctx.pixels_per_point() as f64,
-                picker_endpoint.as_ptr(),
-                picker_token.as_ptr(),
-                backend.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+                app.raw(),
+                &asked,
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
             )
         };
         if host.is_null() {
-            if let Some(session) = session {
-                session.release();
-            }
             let detail =
                 unsafe { std::ffi::CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
-            return Err(crate::native_error::FatalError::new(
-                "initialize the main terminal",
-                detail,
-            ));
+            return Err(FatalError::new("create a terminal", detail));
         }
         if let Some(session) = &session {
             session.attach(host);
         }
-
-        let mut pane = Self::new(host, wake, session, gl);
-        pane.held = held;
-        Ok(pane)
-    }
-
-    /// Creates another terminal in this window, as a child of this pane's
-    /// app. The window decides whether it is tiled or floating.
-    pub(super) fn create_child(
-        &self,
-        gl: &glow::Context,
-        options: &SpawnOptions,
-    ) -> Result<Self, crate::native_error::FatalError> {
-        self.spawn(&self.wake.context, gl, self.wake.window_id(), None, options)
-    }
-
-    pub(super) fn create_window(
-        &self,
-        ctx: &egui::Context,
-        gl: &glow::Context,
-        window: crate::graphics::PaneWindow,
-    ) -> Result<Self, crate::native_error::FatalError> {
-        self.spawn(
-            ctx,
-            gl,
-            window.id,
-            Some(window.native),
-            &SpawnOptions::default(),
-        )
+        Ok(Self::new(host, wake, session, gl))
     }
 
     /// Moves this terminal to another window, keeping its process and UI
@@ -945,91 +834,6 @@ impl TerminalPane {
             .frame_ready_pending
             .store(false, Ordering::Release);
         self.workspace_bounds = None;
-    }
-
-    /// `native` is the handle of a new window this terminal is the first in;
-    /// terminals added to an existing window pass `None`.
-    fn spawn(
-        &self,
-        ctx: &egui::Context,
-        gl: &glow::Context,
-        window_id: egui_winit::winit::window::WindowId,
-        native: Option<*mut c_void>,
-        options: &SpawnOptions,
-    ) -> Result<Self, crate::native_error::FatalError> {
-        let mut wake = Box::new(WakeState {
-            #[cfg(any(windows, unix))]
-            pipe: Some(picker_service(ctx, options.start).map_err(|e| {
-                crate::native_error::FatalError::new("create secure picker pipe", e)
-            })?),
-            context: ctx.clone(),
-            proxy: self.wake.proxy.clone(),
-            window_id: AtomicU64::new(window_id.into()),
-            frame_ready_pending: AtomicBool::new(false),
-            close: AtomicBool::new(false),
-            title: std::sync::Mutex::new(String::new()),
-            pwd: std::sync::Mutex::new(None),
-            config_issues: std::sync::Mutex::new(Vec::new()),
-            runtime_issues: std::sync::Mutex::new(Vec::new()),
-            clipboard_text: std::sync::Mutex::new(None),
-        });
-        #[cfg(any(windows, unix))]
-        if let Some(pipe) = &wake.pipe {
-            pipe.bind_window(wake.proxy.clone(), wake.window_id());
-        }
-        let (picker_endpoint, picker_token) = wake.picker_environment();
-        let mut error_buffer = [0 as c_char; 2048];
-        let command = options
-            .command
-            .as_ref()
-            .map(|s| std::ffi::CString::new(s.as_str()))
-            .transpose()
-            .map_err(|e| crate::native_error::FatalError::new("pane command", e))?;
-        let cwd = options
-            .cwd
-            .as_ref()
-            .map(|s| std::ffi::CString::new(s.as_str()))
-            .transpose()
-            .map_err(|e| crate::native_error::FatalError::new("pane directory", e))?;
-        let session =
-            crate::session::Link::prepare((&mut *wake as *mut WakeState).cast(), options.start)
-                .map_err(|e| crate::native_error::FatalError::new("show a running shell", e))?;
-        let backend = session.as_ref().map(|session| session.backend());
-        let host = unsafe {
-            ghostty_ffi::nterm_host_create_child(
-                self.host,
-                (&mut *wake as *mut WakeState).cast(),
-                native.unwrap_or(std::ptr::null_mut()),
-                gl.driver(),
-                ctx.pixels_per_point() as f64,
-                picker_endpoint.as_ptr(),
-                picker_token.as_ptr(),
-                command.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-                cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-                backend.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
-                error_buffer.as_mut_ptr(),
-                error_buffer.len(),
-            )
-        };
-        if host.is_null() {
-            if let Some(session) = session {
-                session.release();
-            }
-            let detail =
-                unsafe { std::ffi::CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
-            return Err(crate::native_error::FatalError::new(
-                "create the additional terminal",
-                detail,
-            ));
-        }
-        if let Some(session) = &session {
-            session.attach(host);
-        }
-        Ok(Self::new(host, wake, session, gl))
-    }
-
-    pub(super) fn tick(&self) {
-        unsafe { ghostty_ffi::nterm_host_tick(self.host) };
     }
 
     pub(super) fn should_close(&self) -> bool {

@@ -11,19 +11,38 @@
 #endif
 
 typedef struct NtermHost NtermHost;
+// The one terminal application of the process. It is made before any
+// terminal and outlives them all: a window with no terminal still has it.
 typedef struct {
+    ghostty_app_t app;
+    // The configuration as loaded, before a theme was folded in.
     ghostty_config_t base_config;
     NtermHost *hosts;
-} NtermShared;
+    void *userdata;
+} NtermApp;
 
+// One terminal: a surface of the application.
 struct NtermHost {
-    ghostty_app_t app;
+    NtermApp *app;
     ghostty_surface_t surface;
-    NtermShared *shared;
     NtermHost *next;
     bool focused;
-    ghostty_platform_wgpu_s platform;
 };
+
+// What a terminal is created with. `command` and `cwd` may be null, for
+// the configured ones. `backend` is null for a terminal that runs its own
+// shell.
+typedef struct {
+    void *userdata;
+    void *window;
+    const void *driver;
+    double scale;
+    const char *picker_endpoint;
+    const char *picker_token;
+    const char *command;
+    const char *cwd;
+    const ghostty_host_backend_s *backend;
+} NtermHostOptions;
 
 #ifdef _WIN32
 // Holds the window procedure that window_proc replaced.
@@ -213,16 +232,15 @@ static void startup_error(char *buffer, size_t capacity, const char *stage, cons
         cause ? cause : "The native API returned failure without additional details.");
 }
 
-NtermHost *nterm_host_create(
+extern void nterm_app_issue(void *userdata, const char *operation, const char *cause);
+
+// Starts the library, loads the configuration and makes the application.
+// `userdata` is given the theme's colours and each configuration issue,
+// here and whenever the settings change.
+NtermApp *nterm_app_create(
     size_t argc,
     char **argv,
     void *userdata,
-    void *window,
-    const void *driver,
-    double scale,
-    const char *picker_endpoint,
-    const char *picker_token,
-    const ghostty_host_backend_s *backend,
     char *error_buffer,
     size_t error_capacity
 ) {
@@ -254,6 +272,11 @@ NtermHost *nterm_host_create(
         nterm_config_issue(userdata, diagnostic.message);
     }
 
+    NtermApp *app = calloc(1, sizeof(*app));
+    if (!app) {
+        startup_error(error_buffer, error_capacity, "allocate the terminal application", strerror(errno));
+        ghostty_config_free(base_config); ghostty_config_free(config); return NULL;
+    }
     ghostty_runtime_config_s runtime = {
         // App wakeups use the process event loop, not a particular surface.
         .userdata = NULL,
@@ -264,112 +287,78 @@ NtermHost *nterm_host_create(
         .write_clipboard_cb = write_clipboard,
         .close_surface_cb = close_surface,
     };
-    ghostty_app_t app = ghostty_app_new(&runtime, config);
-    if (!app) {
-        startup_error(error_buffer, error_capacity, "create the embedded terminal application", NULL);
-        ghostty_config_free(base_config); ghostty_config_free(config); return NULL;
-    }
+    app->app = ghostty_app_new(&runtime, config);
     ghostty_config_free(config);
-
-    ghostty_surface_config_s options = ghostty_surface_config_new();
-    options.platform_tag = GHOSTTY_PLATFORM_WGPU;
-    options.platform.wgpu.window = window;
-    options.platform.wgpu.driver = driver;
-    options.scale_factor = scale;
-    options.userdata = userdata;
-    ghostty_env_var_s token_env[] = {
-        { .key = "NTERM_PICKER_ENDPOINT", .value = picker_endpoint },
-        { .key = "NTERM_PICKER_TOKEN", .value = picker_token },
-    };
-    options.env_vars = token_env;
-    options.env_var_count = 2;
-    options.host_backend = backend;
-    ghostty_clear_error();
-    ghostty_surface_t surface = ghostty_surface_new(app, &options);
-    if (!surface) {
-        startup_error(error_buffer, error_capacity, "create the main terminal surface", NULL);
-        ghostty_config_free(base_config);
-        ghostty_app_free(app);
-        return NULL;
+    if (!app->app) {
+        startup_error(error_buffer, error_capacity, "create the embedded terminal application", NULL);
+        ghostty_config_free(base_config); free(app); return NULL;
     }
-
-    NtermHost *host = calloc(1, sizeof(*host));
-    if (!host) {
-        startup_error(error_buffer, error_capacity, "allocate the main terminal host", strerror(errno));
-        ghostty_config_free(base_config);
-        ghostty_surface_free(surface);
-        ghostty_app_free(app);
-        return NULL;
-    }
-    host->app = app;
-    host->surface = surface;
-    host->shared = calloc(1, sizeof(*host->shared));
-    if (!host->shared) {
-        startup_error(error_buffer, error_capacity, "allocate shared terminal application", strerror(errno));
-        ghostty_surface_free(surface);
-        ghostty_app_free(app);
-        ghostty_config_free(base_config);
-        free(host);
-        return NULL;
-    }
-    host->shared->base_config = base_config;
-    host->shared->hosts = host;
-    host->platform = options.platform.wgpu;
-    return host;
+    app->base_config = base_config;
+    app->userdata = userdata;
+    return app;
 }
 
-NtermHost *nterm_host_create_child(
-    NtermHost *parent, void *userdata, void *window, const void *driver,
-    double scale,
-    const char *picker_endpoint, const char *picker_token,
-    const char *command, const char *cwd,
-    const ghostty_host_backend_s *backend,
-    char *error_buffer, size_t error_capacity
+// Every terminal must have been destroyed first.
+void nterm_app_destroy(NtermApp *app) {
+    if (!app) return;
+    ghostty_app_free(app->app);
+    ghostty_config_free(app->base_config);
+    free(app);
+}
+
+void nterm_app_tick(NtermApp *app) {
+    ghostty_clear_error();
+    ghostty_app_tick(app->app);
+    const char *cause = ghostty_last_error();
+    if (cause) nterm_app_issue(app->userdata, "nterm_app_tick", cause);
+}
+
+NtermHost *nterm_host_create(
+    NtermApp *app,
+    const NtermHostOptions *asked,
+    char *error_buffer,
+    size_t error_capacity
 ) {
     if (error_buffer && error_capacity) error_buffer[0] = '\0';
-    if (!parent) {
-        startup_error(error_buffer, error_capacity, "create an additional terminal", "No parent terminal is available");
-        return NULL;
-    }
     NtermHost *host = calloc(1, sizeof(*host));
     if (!host) {
-        startup_error(error_buffer, error_capacity, "allocate an additional terminal host", strerror(errno));
+        startup_error(error_buffer, error_capacity, "allocate a terminal host", strerror(errno));
         return NULL;
     }
     ghostty_surface_config_s options = ghostty_surface_config_new();
     options.platform_tag = GHOSTTY_PLATFORM_WGPU;
-    options.platform.wgpu = parent->platform;
-    if (window) options.platform.wgpu.window = window;
-    if (driver) options.platform.wgpu.driver = driver;
-    options.scale_factor = scale;
-    options.userdata = userdata;
-    options.command = command;
-    options.working_directory = cwd;
+    options.platform.wgpu.window = asked->window;
+    options.platform.wgpu.driver = asked->driver;
+    options.scale_factor = asked->scale;
+    options.userdata = asked->userdata;
+    options.command = asked->command;
+    options.working_directory = asked->cwd;
     ghostty_env_var_s token_env[] = {
-        { .key = "NTERM_PICKER_ENDPOINT", .value = picker_endpoint },
-        { .key = "NTERM_PICKER_TOKEN", .value = picker_token },
+        { .key = "NTERM_PICKER_ENDPOINT", .value = asked->picker_endpoint },
+        { .key = "NTERM_PICKER_TOKEN", .value = asked->picker_token },
     };
     options.env_vars = token_env;
     options.env_var_count = 2;
-    options.host_backend = backend;
-    host->app = parent->app;
-    host->platform = options.platform.wgpu;
-    host->surface = ghostty_surface_new(host->app, &options);
+    options.host_backend = asked->backend;
+    ghostty_clear_error();
+    host->app = app;
+    host->surface = ghostty_surface_new(app->app, &options);
     if (!host->surface) {
-        startup_error(error_buffer, error_capacity, "create an additional terminal surface", NULL);
+        startup_error(error_buffer, error_capacity, "create a terminal surface", ghostty_last_error());
         free(host);
         return NULL;
     }
-    host->shared = parent->shared;
-    host->next = host->shared->hosts;
-    host->shared->hosts = host;
+    host->next = app->hosts;
+    app->hosts = host;
     return host;
 }
 
-bool nterm_host_apply_settings(NtermHost *host, const char *name, const char *family, float size, char *error, size_t capacity) {
-    if (!host || !host->shared->base_config) return false;
+// A null `name` keeps the theme; a null `family` and a zero `size` keep the
+// font.
+bool nterm_app_apply_settings(NtermApp *app, const char *name, const char *family, float size, char *error, size_t capacity) {
+    if (!app || !app->base_config) return false;
     ghostty_clear_error();
-    ghostty_config_t candidate = ghostty_config_clone(host->shared->base_config);
+    ghostty_config_t candidate = ghostty_config_clone(app->base_config);
     if (!candidate) {
         snprintf(error, capacity, "Unable to allocate theme configuration");
         return false;
@@ -386,37 +375,26 @@ bool nterm_host_apply_settings(NtermHost *host, const char *name, const char *fa
         if (inputs) ghostty_config_free(inputs);
         return false;
     }
-    // One app owns all window and floating surfaces. The update propagates
-    // to existing surfaces and becomes the configuration for future surfaces.
-    ghostty_app_update_config(host->app, candidate);
-    for (NtermHost *item = host->shared->hosts; item; item = item->next)
-        if (item->surface) report_theme_colors(candidate, ghostty_surface_userdata(item->surface));
-    ghostty_config_free(host->shared->base_config);
-    host->shared->base_config = inputs;
+    // The update reaches every existing surface and becomes the
+    // configuration of later ones.
+    ghostty_app_update_config(app->app, candidate);
+    report_theme_colors(candidate, app->userdata);
+    ghostty_config_free(app->base_config);
+    app->base_config = inputs;
     ghostty_config_free(candidate);
     return true;
-}
-
-bool nterm_host_apply_theme(NtermHost *host, const char *name, char *error, size_t capacity) {
-    return nterm_host_apply_settings(host, name, NULL, 0, error, capacity);
 }
 
 void nterm_host_destroy(NtermHost *host) {
     if (!host) return;
     if (host->surface) ghostty_surface_free(host->surface);
-    NtermHost **link = &host->shared->hosts;
+    NtermHost **link = &host->app->hosts;
     while (*link && *link != host) link = &(*link)->next;
     if (*link) *link = host->next;
-    if (!host->shared->hosts) {
-        ghostty_app_free(host->app);
-        ghostty_config_free(host->shared->base_config);
-        free(host->shared);
-    } else {
-        bool focused = false;
-        for (NtermHost *item = host->shared->hosts; item; item = item->next)
-            focused |= item->focused;
-        ghostty_app_set_focus(host->app, focused);
-    }
+    bool focused = false;
+    for (NtermHost *item = host->app->hosts; item; item = item->next)
+        focused |= item->focused;
+    ghostty_app_set_focus(host->app->app, focused);
     free(host);
 }
 
@@ -427,8 +405,6 @@ bool nterm_host_read_font(NtermHost *host, bool bold, ghostty_font_data_s *resul
 ghostty_surface_size_s nterm_host_surface_size(NtermHost *host) {
     return ghostty_surface_size(host->surface);
 }
-void nterm_host_tick(NtermHost *host) {
-    ghostty_clear_error(); ghostty_app_tick(host->app);  runtime_error(host, "nterm_host_tick"); }
 void nterm_host_resize(NtermHost *host, uint32_t width, uint32_t height, double scale) {
     ghostty_clear_error();
     ghostty_surface_set_content_scale(host->surface, scale, scale);
@@ -439,9 +415,9 @@ void nterm_host_focus(NtermHost *host, bool focused) {
     ghostty_clear_error();
     host->focused = focused;
     bool app_focused = false;
-    for (NtermHost *item = host->shared->hosts; item; item = item->next)
+    for (NtermHost *item = host->app->hosts; item; item = item->next)
         app_focused |= item->focused;
-    ghostty_app_set_focus(host->app, app_focused);
+    ghostty_app_set_focus(host->app->app, app_focused);
     runtime_error(host, "set terminal app focus");
     ghostty_surface_set_focus(host->surface, focused);
  runtime_error(host, "nterm_host_focus"); }

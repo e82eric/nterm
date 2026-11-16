@@ -458,13 +458,13 @@ impl Link {
             host: Mutex::new(0),
             state: Mutex::new(State { adopt, ..State::default() }),
         });
-        // The surface's callbacks hold this reference until `release`.
-        std::mem::forget(link.clone());
         Ok(Some(link))
     }
 
     /// What the surface is created with: the callbacks that make it this
-    /// link's mirror. The surface copies it.
+    /// link's mirror. The surface copies it. The callbacks borrow the
+    /// pane's reference to the link, so the pane keeps that reference until
+    /// the surface is destroyed.
     pub(crate) fn backend(self: &Arc<Self>) -> ghostty_ffi::HostBackend {
         ghostty_ffi::HostBackend {
             userdata: Arc::as_ptr(self).cast_mut().cast(),
@@ -631,11 +631,6 @@ impl Link {
                 Control::Close { pane }
             });
         }
-    }
-
-    /// The surface is destroyed and will make no more callbacks.
-    pub(crate) fn release(self: &Arc<Self>) {
-        unsafe { Arc::decrement_strong_count(Arc::as_ptr(self)) };
     }
 }
 
