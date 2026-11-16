@@ -13,6 +13,7 @@ use egui_winit::winit;
 use shared_ui::{SharedUi, WindowUi};
 
 use std::ffi::c_void;
+use crate::terminal::ghostty_app::GhosttyApp;
 use std::ffi::CString;
 
 use std::sync::Arc;
@@ -53,20 +54,17 @@ struct ShellApp {
 
 impl ShellApp {
     fn new(
+        app: Rc<GhosttyApp>,
         egui_ctx: &egui::Context,
         gl: &glow::Context,
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
         window: crate::graphics::PaneWindow,
-        args: Vec<CString>,
+        command_label: String,
         pickers: crate::picker::config::Bindings,
         floating_padding: Option<crate::config::FloatingPadding>,
         issues: Vec<String>,
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, FatalError> {
-        let command_label = command_label(&args);
-        // The ghostty application is made before any terminal. Every window
-        // holds it, so it lasts until the last window has gone.
-        let app = std::rc::Rc::new(crate::terminal::ghostty_app::GhosttyApp::new(egui_ctx, args)?);
         Ok(Self {
             terminal: TerminalView::new(
                 app,
@@ -192,6 +190,9 @@ struct NativeApp {
     )>,
     windows: std::collections::HashMap<winit::window::WindowId, NativeWindow>,
     shared_ui: Option<Rc<RefCell<SharedUi>>>,
+    /// The ghostty application, which every window's terminals belong to.
+    /// Made with the first window; the windows hold it too.
+    ghostty: Option<Rc<GhosttyApp>>,
 }
 
 struct NativeWindow {
@@ -317,6 +318,7 @@ impl NativeApp {
             startup: Some((args, pickers, floating_padding, issues, reload_source)),
             windows: std::collections::HashMap::new(),
             shared_ui: None,
+            ghostty: None,
         }
     }
 
@@ -461,6 +463,7 @@ impl NativeApp {
         self.windows.remove(&id);
         if self.windows.is_empty() {
             self.shared_ui = None;
+            self.ghostty = None;
             event_loop.exit();
         } else if let Err(error) = self.sync_viewports() {
             self.fail(event_loop, error);
@@ -485,12 +488,18 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
                 event_loop,
                 self.shared_ui.as_ref().expect("shared renderer").clone(),
             )?;
+            // The ghostty application is made before any terminal. The
+            // windows hold it too, so it outlives their terminals.
+            let command_label = command_label(&args);
+            let ghostty = Rc::new(GhosttyApp::new(&window.egui.egui_ctx, args)?);
+            self.ghostty = Some(ghostty.clone());
             window.shell = Some(ShellApp::new(
+                ghostty,
                 &window.egui.egui_ctx,
                 &window.gl,
                 self.proxy.clone(),
                 window.surface.pane_window(),
-                args,
+                command_label,
                 pickers,
                 padding,
                 issues,
@@ -563,14 +572,21 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             }
             UserEvent::GhosttyWake => {
                 APP_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
-                // All windows share one app; a single tick drains its mailbox.
-                if let Some(window) = self.windows.values_mut().next() {
-                    window
-                        .shell
-                        .as_mut()
-                        .expect("terminal shell")
-                        .terminal
-                        .tick();
+                // One tick drains the mailbox of the app all windows share.
+                // What went wrong in it is shown in a window.
+                if let Some(ghostty) = &self.ghostty {
+                    ghostty.tick();
+                    let issues = ghostty.take_issues();
+                    if let (false, Some(window)) =
+                        (issues.is_empty(), self.windows.values_mut().next())
+                    {
+                        window
+                            .shell
+                            .as_mut()
+                            .expect("terminal shell")
+                            .terminal
+                            .show_app_issues(issues);
+                    }
                 }
             }
             UserEvent::FrameReady(id) => {
@@ -613,6 +629,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         self.windows.clear();
         self.shared_ui = None;
+        self.ghostty = None;
     }
 }
 

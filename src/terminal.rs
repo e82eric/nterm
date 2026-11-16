@@ -333,11 +333,10 @@ impl TerminalView {
         self.show_error("Could not open terminal window", error);
     }
 
-    /// Drains the mailbox of the ghostty application, which all windows
-    /// share, and shows what went wrong in it.
-    pub(crate) fn tick(&mut self) {
-        self.app.tick();
-        for (operation, cause) in self.app.take_issues() {
+    /// Shows failures of the ghostty application's own work, which belong
+    /// to no terminal, as (operation, cause).
+    pub(crate) fn show_app_issues(&mut self, issues: Vec<(String, String)>) {
+        for (operation, cause) in issues {
             self.toasts.push_error(
                 "Terminal operation failed".into(),
                 format!("{operation}: {cause}"),
