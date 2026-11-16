@@ -59,6 +59,12 @@ pub(crate) struct TerminalView {
     /// At a launch that offers the waiting sessions: the pane whose shell
     /// waits for the choice.
     launch_pane: Option<u64>,
+    /// What the daemon held when the session rows of the open picker were
+    /// made: the session chosen from them is taken from it.
+    waiting: Option<crate::session::Listing>,
+    /// The listing the workspace picker has asked the daemon for and is
+    /// waiting to open with, and when it asked.
+    listing_asked: Option<(crate::session::Asked, std::time::Instant)>,
 }
 
 struct FloatingTerminal {
@@ -158,9 +164,12 @@ impl TerminalView {
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
         issues.extend(app.take_config_issues());
-        // With sessions waiting in the daemon, the first pane holds its
+        // What the daemon holds, once the connection to it is made or has
+        // failed. With sessions waiting there, the first pane holds its
         // shell back until one of them, or a new one, has been chosen.
-        let offer = restore::any_detached();
+        let listing = crate::session::launch_listing()
+            .filter(|listing| !restore::detached(listing).is_empty());
+        let offer = listing.is_some();
         let mut pane = TerminalPane::create(
             &app,
             egui_ctx,
@@ -186,8 +195,8 @@ impl TerminalView {
             std::rc::Rc::new(picker_bindings),
             floating_padding,
         );
-        if offer {
-            view.offer_sessions(egui_ctx);
+        if let Some(listing) = listing {
+            view.offer_sessions(egui_ctx, listing);
         }
         Ok(view)
     }
@@ -277,6 +286,8 @@ impl TerminalView {
             sessions: Default::default(),
             sessions_sent: Default::default(),
             launch_pane: None,
+            waiting: None,
+            listing_asked: None,
             picker_bindings,
             floating_padding,
             floating: Default::default(),

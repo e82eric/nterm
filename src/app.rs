@@ -493,6 +493,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             let command_label = command_label(&args);
             let ghostty = Rc::new(GhosttyApp::new(&window.egui.egui_ctx, args)?);
             self.ghostty = Some(ghostty.clone());
+            crate::session::set_ui(&window.egui.egui_ctx);
             window.shell = Some(ShellApp::new(
                 ghostty,
                 &window.egui.egui_ctx,
@@ -628,6 +629,8 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         self.windows.clear();
+        // The last panes have just queued what becomes of their shells.
+        crate::session::flush();
         self.shared_ui = None;
         self.ghostty = None;
     }

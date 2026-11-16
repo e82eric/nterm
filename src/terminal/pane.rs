@@ -721,11 +721,11 @@ pub(super) struct PaneStatus<'a> {
 #[cfg(any(windows, unix))]
 fn picker_service(
     ctx: &egui::Context,
-    start: crate::session::Start,
+    start: &crate::session::Start,
 ) -> Result<crate::picker::pipe::Service, String> {
     #[cfg(windows)]
-    if let crate::session::Start::Adopt(pane) = start
-        && let Some((endpoint, token)) = crate::session::picker_identity(pane)
+    if let crate::session::Start::Adopt(adopt) = start
+        && let Some((endpoint, token)) = adopt.picker.clone()
         && let Ok(service) =
             crate::picker::pipe::Service::restored(ctx.clone(), endpoint, token)
     {
@@ -753,7 +753,7 @@ impl TerminalPane {
         let mut wake = Box::new(WakeState {
             #[cfg(any(windows, unix))]
             pipe: Some(
-                picker_service(ctx, options.start)
+                picker_service(ctx, &options.start)
                     .map_err(|e| FatalError::new("create secure picker pipe", e))?,
             ),
             context: ctx.clone(),
@@ -781,7 +781,7 @@ impl TerminalPane {
         let command = text(&options.command, "pane command")?;
         let cwd = text(&options.cwd, "pane directory")?;
         let userdata: *mut c_void = (&mut *wake as *mut WakeState).cast();
-        let session = crate::session::Link::prepare(userdata, options.start)
+        let session = crate::session::Link::prepare(userdata, &options.start)
             .map_err(|e| FatalError::new("show a running shell", e))?;
         let backend = session.as_ref().map(|session| session.backend());
         let asked = ghostty_ffi::HostOptions {

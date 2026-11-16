@@ -497,15 +497,30 @@ pub(crate) fn install_lua_helpers(lua: &mlua::Lua, nterm: &mlua::Table) -> mlua:
     )
 }
 impl TerminalView {
+    /// The sessions no window shows can be taken from the workspace
+    /// picker too. The daemon is asked for them, and the picker opens when
+    /// it has answered: see `poll_waiting`.
     fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
+        if moving || !self.ask_waiting() {
+            self.show_workspace_picker(ctx, moving, None);
+        }
+    }
+
+    pub(super) fn show_workspace_picker(
+        &mut self,
+        ctx: &egui::Context,
+        moving: bool,
+        waiting: Option<crate::session::Listing>,
+    ) {
         let pane = if moving { self.active_pane() } else { None };
         if moving && pane.is_none() {
             return;
         }
         let mut options = workspace_picker_options(&self.workspaces, self.current, pane);
-        // The sessions no window shows can be taken from here too.
-        if !moving && let crate::picker::config::Source::Workspaces(entries) = &mut options.source {
-            entries.extend(self.detached_entries());
+        if let (Some(listing), crate::picker::config::Source::Workspaces(entries)) =
+            (waiting, &mut options.source)
+        {
+            entries.extend(self.offer_waiting(listing));
         }
         let bindings = self.picker_bindings.clone();
         let palette = self.palette_context();
@@ -1392,6 +1407,7 @@ impl TerminalView {
             p.destroy();
         }
         self.settle_launch();
+        self.poll_waiting();
         self.save_sessions();
         let exited: Vec<_> = self
             .workspaces

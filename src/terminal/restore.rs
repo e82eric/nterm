@@ -82,15 +82,16 @@ fn new_id() -> String {
     format!("{time:x}-{:x}-{:x}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// The sessions nothing is showing, asked of the daemon now. Shells that no
-/// session describes come last, as one more.
-pub(super) fn detached() -> Vec<Detached> {
-    let panes = crate::session::panes();
-    if !panes.iter().any(crate::session::waiting) {
+/// The sessions nothing is showing, among what the daemon held when
+/// `listing` was made. Shells that no session describes come last, as one
+/// more. Descriptions whose shells have all gone are removed from the
+/// daemon.
+pub(super) fn detached(listing: &crate::session::Listing) -> Vec<Detached> {
+    if !listing.panes.iter().any(crate::session::waiting) {
         return Vec::new();
     }
-    let blobs = crate::session::blobs(PREFIX);
-    let (sessions, stale) = sort(&panes, blobs);
+    let blobs = listing.blobs.iter().filter(|(key, _)| key.starts_with(PREFIX)).cloned().collect();
+    let (sessions, stale) = sort(&listing.panes, blobs);
     for key in stale {
         crate::session::remove_blob(key);
     }
@@ -188,22 +189,63 @@ fn entries(sessions: &[Detached]) -> Vec<crate::actions::Entry> {
         .collect()
 }
 
-/// Whether a launch has sessions to offer. Asks the daemon.
-pub(super) fn any_detached() -> bool {
-    !detached().is_empty()
-}
+/// How long the workspace picker waits for the daemon's listing before it
+/// opens without the waiting sessions.
+const LISTING_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl TerminalView {
-    /// The workspace picker's rows for the sessions nothing is showing.
-    pub(super) fn detached_entries(&self) -> Vec<crate::actions::Entry> {
-        entries(&detached())
+    /// A picker's rows for the sessions waiting in `listing`. The listing
+    /// is kept, for the session that may be chosen from them.
+    pub(super) fn offer_waiting(
+        &mut self,
+        listing: crate::session::Listing,
+    ) -> Vec<crate::actions::Entry> {
+        let rows = entries(&detached(&listing));
+        self.waiting = Some(listing);
+        rows
+    }
+
+    /// Ask the daemon what is waiting, for the workspace picker, which
+    /// opens when the answer comes. False when there is no daemon to ask.
+    pub(super) fn ask_waiting(&mut self) -> bool {
+        if self.listing_asked.is_none() {
+            let Some(asked) = crate::session::request_listing() else { return false };
+            self.listing_asked = Some((asked, std::time::Instant::now()));
+        }
+        true
+    }
+
+    /// Every frame: open the workspace picker once the listing it asked
+    /// for has come, or will not.
+    pub(super) fn poll_waiting(&mut self) {
+        use crate::session::Answer;
+        let Some((asked, since)) = self.listing_asked else { return };
+        let listing = match crate::session::take_listing(asked) {
+            Answer::Ready(listing) => Some(listing),
+            Answer::Gone => None,
+            Answer::Waiting if since.elapsed() < LISTING_WAIT => {
+                self.context.request_repaint_after(std::time::Duration::from_millis(50));
+                return;
+            }
+            Answer::Waiting => {
+                crate::session::forget_listing(asked);
+                self.show_notice(
+                    "Sessions",
+                    "The session daemon did not answer. Waiting sessions are not listed.".into(),
+                );
+                None
+            }
+        };
+        self.listing_asked = None;
+        let ctx = self.context.clone();
+        self.show_workspace_picker(&ctx, false, listing);
     }
 
     /// At launch, with sessions waiting: ask which to show, or a new one.
     /// The window's first pane has not started its shell; it does once the
     /// picker has gone without a session being taken.
-    pub(super) fn offer_sessions(&mut self, ctx: &egui::Context) {
-        let mut entries = entries(&detached());
+    pub(super) fn offer_sessions(&mut self, ctx: &egui::Context, listing: crate::session::Listing) {
+        let mut entries = self.offer_waiting(listing);
         let Some((first, _)) = self.tiled.first() else { return };
         let first = *first;
         if entries.is_empty() {
@@ -251,7 +293,9 @@ impl TerminalView {
     /// Show a waiting session as a new workspace of this window, and go to
     /// it. At launch it takes the place of the pane that was held.
     pub(super) fn attach_session(&mut self, id: &str, gl: &glow::Context) -> Result<(), String> {
-        let session = detached()
+        // The listing the picker's rows were made from. It is used once.
+        let listing = self.waiting.take().ok_or("That session is no longer waiting.")?;
+        let session = detached(&listing)
             .into_iter()
             .find(|session| session.id == id)
             .ok_or("That session is no longer waiting.")?;
@@ -262,7 +306,7 @@ impl TerminalView {
         let mut tiled: HashMap<u32, u64> = HashMap::new();
         let mut floating: HashMap<u32, u64> = HashMap::new();
         for number in &saved.panes {
-            let Some(pane) = self.adopt(*number, gl) else { continue };
+            let Some(pane) = self.adopt(*number, &listing, gl) else { continue };
             let id = self.next_pane;
             self.next_pane += 1;
             self.tiled.push((id, pane));
@@ -274,7 +318,7 @@ impl TerminalView {
             return Err("None of the session's shells could be shown.".into());
         }
         for float in &saved.floats {
-            let Some(pane) = self.adopt(float.pane, gl) else { continue };
+            let Some(pane) = self.adopt(float.pane, &listing, gl) else { continue };
             let id = self.floating.insert(float.name.clone(), FloatingTerminal { pane });
             floating.insert(float.pane, id);
             self.workspace_by_id(workspace_id).floats.add(id);
@@ -322,9 +366,18 @@ impl TerminalView {
 
     /// A pane on a shell the daemon is running. `None`, with the error
     /// shown, when the terminal could not be made.
-    fn adopt(&mut self, number: u32, gl: &glow::Context) -> Option<super::TerminalPane> {
+    fn adopt(
+        &mut self,
+        number: u32,
+        listing: &crate::session::Listing,
+        gl: &glow::Context,
+    ) -> Option<super::TerminalPane> {
+        let Some(adopt) = listing.adopt(number) else {
+            self.window_error(format!("Shell {number} is no longer waiting."));
+            return None;
+        };
         let options = super::pane::SpawnOptions {
-            start: crate::session::Start::Adopt(number),
+            start: crate::session::Start::Adopt(Box::new(adopt)),
             ..Default::default()
         };
         let pane = self.create_pane(gl, &options);

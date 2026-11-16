@@ -5,8 +5,10 @@
 //! daemon's screen and then the shell's output, and that sends back only what
 //! the user did. The daemon's terminal answers the program's queries.
 //!
-//! One connection serves every pane. A thread reads it and hands each frame
-//! to the pane it names.
+//! One connection serves every pane. It is made by a thread of its own, and
+//! can be made again after it fails or is lost. While it lasts, one thread
+//! reads it and hands each frame to the pane it names, and one writes what
+//! the others queue for it, so that none of them waits on the pipe.
 //!
 //! Closing a pane ends its shell. Closing a window, or leaving nterm, does
 //! not: the shells stay in the daemon, and the next nterm opens a pane on
@@ -15,26 +17,32 @@
 use crate::ghostty_ffi::{self, Host, HostSettings, HostSpawn, SurfaceSize};
 use nterm_session::{
     DEFAULT_SESSION, GHOSTTY_REVISION,
-    pipe::{self, Connection, Writer},
+    pipe::{self, Connection},
     protocol::{
         Control, CursorStyle, Frame, Identity, PROTOCOL_VERSION, PaneId, PaneInfo, Size,
         TerminalSettings,
     },
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CStr, c_void},
     io,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// How long copy mode, search and the pickers wait for a pane's history.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a launch waits for the connection before it goes on without.
+const LAUNCH_WAIT: Duration = Duration::from_secs(10);
+
+/// How long leaving nterm waits for what was queued to be written.
+const FLUSH_WAIT: Duration = Duration::from_secs(2);
 
 /// Input typed before the shell exists is kept, up to this much.
 const QUEUED_INPUT_MAX: usize = 1 << 16;
@@ -49,47 +57,76 @@ unsafe extern "C" {
 }
 
 /// What a pane being made does for a shell.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) enum Start {
     /// Start one.
     #[default]
     Shell,
     /// Take this one, which the daemon is running with nothing showing it.
-    Adopt(PaneId),
+    Adopt(Box<Adopt>),
 }
 
-/// Every pane the daemon has, asked for now. The ones nothing shows become
-/// the shells a pane can take. Connects to the daemon if that has not
-/// happened yet; empty without one.
-pub(crate) fn panes() -> Vec<PaneInfo> {
-    let Some(client) = client().filter(|client| !client.lost.load(Ordering::Acquire)) else {
-        return Vec::new();
-    };
-    let request = client.next_request.fetch_add(1, Ordering::Relaxed);
-    let (sender, receiver) = mpsc::channel();
-    client.pane_lists.lock().unwrap().insert(request, sender);
-    client.control(Control::List { request });
-    let Ok(panes) = receiver.recv_timeout(SNAPSHOT_WAIT) else {
-        client.pane_lists.lock().unwrap().remove(&request);
-        return Vec::new();
-    };
-    *client.adoptable.lock().unwrap() =
-        panes.iter().filter(|pane| waiting(pane)).cloned().collect();
-    panes
+/// A shell to take, as a listing gave it.
+#[derive(Clone, Debug)]
+pub(crate) struct Adopt {
+    pub(crate) info: PaneInfo,
+    /// The picker endpoint and token in the shell's environment, which the
+    /// UI that started it left, so that `npick` run from it reaches the
+    /// pane showing it now.
+    pub(crate) picker: Option<(String, String)>,
+    /// The connection whose listing this came from.
+    daemon: u64,
+}
+
+/// What the daemon holds, as it answered one request: every pane, and
+/// everything UIs have left with it. It is not kept up to date; whoever
+/// asked takes it, and asks again for a newer one.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Listing {
+    pub(crate) panes: Vec<PaneInfo>,
+    pub(crate) blobs: Vec<(String, String)>,
+    /// The connection that answered. Its pane numbers mean nothing to
+    /// another daemon.
+    daemon: u64,
+}
+
+impl Listing {
+    /// What a pane needs to take the shell `pane`, if it is waiting.
+    pub(crate) fn adopt(&self, pane: PaneId) -> Option<Adopt> {
+        let info = self.panes.iter().find(|info| info.pane == pane && waiting(info))?.clone();
+        let key = picker_key(pane);
+        let picker = self
+            .blobs
+            .iter()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| serde_json::from_str(value).ok());
+        Some(Adopt { info, picker, daemon: self.daemon })
+    }
+}
+
+/// A listing asked for and not yet taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Asked {
+    /// The connection it was asked on.
+    daemon: u64,
+    request: u32,
+}
+
+/// Where a listing asked for is.
+pub(crate) enum Answer {
+    Waiting,
+    Ready(Listing),
+    /// The connection it was asked on is gone; it will not come.
+    Gone,
 }
 
 /// Whether a pane's shell is running with nothing showing it.
 pub(crate) fn waiting(pane: &PaneInfo) -> bool {
     pane.exited.is_none() && pane.attached == 0
 }
+
 fn picker_key(pane: PaneId) -> String {
     format!("picker/{pane}")
-}
-
-/// The picker endpoint and token in the environment of a shell an earlier
-/// UI started, so that `npick` run from it reaches the pane showing it now.
-pub(crate) fn picker_identity(pane: PaneId) -> Option<(String, String)> {
-    serde_json::from_str(&blob(&picker_key(pane))?).ok()
 }
 
 /// Keep a pane's picker endpoint and token for the next UI.
@@ -99,48 +136,71 @@ pub(crate) fn save_picker_identity(pane: PaneId, endpoint: &str, token: &str) {
     }
 }
 
-/// Something an earlier UI left in the daemon.
-fn blob(key: &str) -> Option<String> {
-    let client = client()?;
-    if client.lost.load(Ordering::Acquire) {
-        return None;
-    }
-    let request = client.next_request.fetch_add(1, Ordering::Relaxed);
-    let (sender, receiver) = mpsc::channel();
-    client.blobs.lock().unwrap().insert(request, sender);
-    client.control(Control::BlobGet { request, key: key.into() });
-    let value = receiver.recv_timeout(SNAPSHOT_WAIT).ok().flatten();
-    client.blobs.lock().unwrap().remove(&request);
-    value
-}
-
-/// The blobs whose keys start with `prefix`, in key order.
-pub(crate) fn blobs(prefix: &str) -> Vec<(String, String)> {
-    let Some(client) = client().filter(|client| !client.lost.load(Ordering::Acquire)) else {
-        return Vec::new();
-    };
-    let request = client.next_request.fetch_add(1, Ordering::Relaxed);
-    let (sender, receiver) = mpsc::channel();
-    client.blob_lists.lock().unwrap().insert(request, sender);
-    client.control(Control::BlobList { request, prefix: prefix.into() });
-    let blobs = receiver.recv_timeout(SNAPSHOT_WAIT).unwrap_or_default();
-    client.blob_lists.lock().unwrap().remove(&request);
-    blobs
-}
-
-/// Keep something in the daemon for the next UI. Does nothing before a
-/// pane has connected to it.
+/// Keep something in the daemon for the next UI. Does nothing without a
+/// connection.
 pub(crate) fn set_blob(key: String, value: String) {
-    if let Some(Some(client)) = CLIENT.get() {
-        client.control(Control::BlobSet { key, value });
+    if let Some(daemon) = daemon() {
+        daemon.control(Control::BlobSet { key, value });
     }
 }
 
 pub(crate) fn remove_blob(key: String) {
-    if let Some(Some(client)) = CLIENT.get() {
-        client.control(Control::BlobRemove { key });
+    if let Some(daemon) = daemon() {
+        daemon.control(Control::BlobRemove { key });
     }
 }
+
+/// Ask the daemon what it holds. `None` without a connection. The answer
+/// is collected with `take_listing`, or given up with `forget_listing`.
+pub(crate) fn request_listing() -> Option<Asked> {
+    let daemon = daemon()?;
+    let request = daemon.next_request.fetch_add(1, Ordering::Relaxed);
+    daemon.listings.lock().unwrap().insert(request, Parked::default());
+    daemon.control(Control::List { request });
+    daemon.control(Control::BlobList { request, prefix: String::new() });
+    Some(Asked { daemon: daemon.number, request })
+}
+
+/// The answer to `asked`, once. Taking it leaves nothing behind.
+pub(crate) fn take_listing(asked: Asked) -> Answer {
+    let Some(daemon) = daemon().filter(|daemon| daemon.number == asked.daemon) else {
+        return Answer::Gone;
+    };
+    let mut listings = daemon.listings.lock().unwrap();
+    match listings.get(&asked.request) {
+        None => Answer::Gone,
+        Some(parked) if !parked.complete() => Answer::Waiting,
+        Some(_) => {
+            let mut listing = listings.remove(&asked.request).unwrap().listing;
+            listing.daemon = daemon.number;
+            Answer::Ready(listing)
+        }
+    }
+}
+
+/// Nobody wants the answer to `asked` any more.
+pub(crate) fn forget_listing(asked: Asked) {
+    if let Some(daemon) = daemon().filter(|daemon| daemon.number == asked.daemon) {
+        daemon.listings.lock().unwrap().remove(&asked.request);
+    }
+}
+
+/// A listing on its way: the daemon answers for the panes and for the
+/// blobs separately.
+#[derive(Default)]
+struct Parked {
+    listing: Listing,
+    panes: bool,
+    blobs: bool,
+}
+
+impl Parked {
+    fn complete(&self) -> bool {
+        self.panes && self.blobs
+    }
+}
+
+
 /// Called with the configuration before the first pane is made.
 pub(crate) fn configure(enabled: bool) {
     ENABLED.store(enabled, Ordering::Release);
@@ -148,6 +208,10 @@ pub(crate) fn configure(enabled: bool) {
 
 /// `NTERM_SESSION_DAEMON=1` or `0` overrides the configuration.
 fn enabled() -> bool {
+    #[cfg(test)]
+    if tests::TARGET.lock().unwrap().is_some() {
+        return true;
+    }
     match std::env::var("NTERM_SESSION_DAEMON").as_deref() {
         Ok("1") => true,
         Ok("0") => false,
@@ -159,36 +223,180 @@ fn report(summary: &str, details: &str) {
     crate::error_log::error("session", summary, details);
 }
 
+/// Where the connection to the daemon stands.
+enum Conn {
+    Idle,
+    Connecting,
+    Connected(Arc<Daemon>),
+    Unavailable,
+    Lost,
+}
+
+/// The connection, whatever state it is in. There is one for the process.
 struct Client {
+    state: Mutex<Conn>,
+    /// Told of every change of `state`.
+    changed: Condvar,
+    /// Counts the connections made, to tell one from the next.
+    connections: Mutex<u64>,
+    /// The UI, to be woken when something it may be waiting for arrives.
+    ui: Mutex<Option<egui::Context>>,
+}
+
+static CLIENT: Client = Client {
+    state: Mutex::new(Conn::Idle),
+    changed: Condvar::new(),
+    connections: Mutex::new(0),
+    ui: Mutex::new(None),
+};
+
+impl Client {
+    fn set(&self, state: Conn) {
+        *self.state.lock().unwrap() = state;
+        self.changed.notify_all();
+        self.wake_ui();
+    }
+
+    fn wake_ui(&self) {
+        if let Some(ui) = &*self.ui.lock().unwrap() {
+            ui.request_repaint();
+        }
+    }
+}
+
+/// The UI to wake when the connection changes or a listing arrives.
+pub(crate) fn set_ui(ui: &egui::Context) {
+    *CLIENT.ui.lock().unwrap() = Some(ui.clone());
+}
+
+/// Start connecting, unless that is under way or done. Returns at once; the
+/// UI is woken when it has succeeded or failed. After a failure or a loss
+/// this tries again.
+pub(crate) fn connect() {
+    if !enabled() {
+        return;
+    }
+    {
+        let mut state = CLIENT.state.lock().unwrap();
+        if matches!(*state, Conn::Connecting | Conn::Connected(_)) {
+            return;
+        }
+        *state = Conn::Connecting;
+    }
+    CLIENT.changed.notify_all();
+    let started = std::thread::Builder::new().name("session-connect".into()).spawn(|| {
+        let number = {
+            let mut connections = CLIENT.connections.lock().unwrap();
+            *connections += 1;
+            *connections
+        };
+        CLIENT.set(match open(number) {
+            Ok(daemon) => Conn::Connected(daemon),
+            Err(error) => {
+                report(
+                    "Session daemon unavailable",
+                    &format!("{error}\n\nPanes run their own shells."),
+                );
+                Conn::Unavailable
+            }
+        });
+    });
+    if let Err(error) = started {
+        report("Session daemon unavailable", &format!("{error}\n\nPanes run their own shells."));
+        CLIENT.set(Conn::Unavailable);
+    }
+}
+
+/// At launch: connect, wait until that has succeeded or failed, and take
+/// what the daemon held when it did. `None` without a connection.
+///
+/// This is the one place the UI thread waits for the connection. It is
+/// here because a window cannot yet be shown before its first pane, and
+/// the first pane depends on the answer.
+pub(crate) fn launch_listing() -> Option<Listing> {
+    connect();
+    let deadline = Instant::now() + LAUNCH_WAIT;
+    let mut state = CLIENT.state.lock().unwrap();
+    while matches!(*state, Conn::Connecting) {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        state = CLIENT.changed.wait_timeout(state, left).unwrap().0;
+    }
+    match &*state {
+        Conn::Connected(daemon) => daemon.at_connect.lock().unwrap().take(),
+        _ => None,
+    }
+}
+
+/// Leaving nterm: wait, briefly, until what was queued for the daemon has
+/// been written. A shell's fate is in that queue.
+pub(crate) fn flush() {
+    let Some(daemon) = daemon() else { return };
+    let (done, written) = mpsc::channel();
+    if daemon.queue(Out::Flush(done)) {
+        let _ = written.recv_timeout(FLUSH_WAIT);
+    }
+}
+
+/// The connection, while there is one.
+fn daemon() -> Option<Arc<Daemon>> {
+    if !enabled() {
+        return None;
+    }
+    match &*CLIENT.state.lock().unwrap() {
+        Conn::Connected(daemon) => Some(daemon.clone()),
+        _ => None,
+    }
+}
+
+/// Something for the writer thread.
+enum Out {
+    Frame(Frame),
+    /// Answer when everything before this has been written.
+    Flush(mpsc::Sender<()>),
+}
+
+/// One connection to one daemon, and what is known of the daemon over it.
+/// A pane's link belongs to the connection it was made on: pane numbers
+/// mean nothing to another daemon.
+struct Daemon {
+    number: u64,
     connection: Connection,
-    writer: Mutex<Writer>,
+    /// The writer thread's queue; `None` once the connection is gone.
+    outbox: Mutex<Option<mpsc::Sender<Out>>>,
     panes: Mutex<HashMap<PaneId, Arc<Link>>>,
     /// Panes whose `Spawn` has not been answered, by request.
     spawning: Mutex<HashMap<u32, Arc<Link>>>,
     /// Who waits for each snapshot asked for, by request.
     snapshots: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
-    /// Who waits for each blob asked for, by request.
-    blobs: Mutex<HashMap<u32, mpsc::Sender<Option<String>>>>,
-    /// Who waits for each list of blobs or of panes asked for, by request.
-    blob_lists: Mutex<HashMap<u32, mpsc::Sender<Vec<(String, String)>>>>,
-    pane_lists: Mutex<HashMap<u32, mpsc::Sender<Vec<PaneInfo>>>>,
+    /// Listings asked for, by request, until they are taken.
+    listings: Mutex<HashMap<u32, Parked>>,
+    /// What the daemon held when the connection was made, until the launch
+    /// takes it.
+    at_connect: Mutex<Option<Listing>>,
     next_request: AtomicU32,
-    /// Running panes nothing was attached to when this UI connected.
-    adoptable: Mutex<Vec<PaneInfo>>,
+    /// The waiting shells that panes of this process have taken.
+    taken: Mutex<HashSet<PaneId>>,
     /// What the daemon was last told.
     settings: Mutex<TerminalSettings>,
-    lost: AtomicBool,
+    gone: AtomicBool,
 }
 
-impl Client {
-    fn send(&self, frame: &Frame) {
-        if frame.write(&mut *self.writer.lock().unwrap()).is_err() {
-            self.connection.close();
+impl Daemon {
+    /// Queue something for the writer thread. Nothing is written here, so
+    /// no caller waits on the pipe. False once the connection is gone.
+    fn queue(&self, out: Out) -> bool {
+        match &*self.outbox.lock().unwrap() {
+            Some(outbox) => outbox.send(out).is_ok(),
+            None => false,
         }
     }
 
+    fn send(&self, frame: Frame) {
+        self.queue(Out::Frame(frame));
+    }
+
     fn control(&self, control: Control) {
-        self.send(&Frame::Control(control));
+        self.send(Frame::Control(control));
     }
 
     /// The pane's link, without holding the table while it is used.
@@ -197,40 +405,30 @@ impl Client {
     }
 }
 
-/// The connection, made on first use. `None` when the daemon is off or could
-/// not be reached; panes then run their own shells.
-static CLIENT: OnceLock<Option<Arc<Client>>> = OnceLock::new();
-
-fn client() -> Option<&'static Arc<Client>> {
-    if !enabled() {
-        return None;
+/// The session to connect to and the daemon program to start for it.
+fn target() -> io::Result<(String, std::path::PathBuf)> {
+    #[cfg(test)]
+    if let Some(target) = tests::TARGET.lock().unwrap().clone() {
+        return Ok(target);
     }
-    CLIENT
-        .get_or_init(|| match connect() {
-            Ok(client) => Some(client),
-            Err(error) => {
-                report(
-                    "Session daemon unavailable",
-                    &format!("{error}\n\nPanes run their own shells for this run."),
-                );
-                None
-            }
-        })
-        .as_ref()
-}
-
-fn connect() -> io::Result<Arc<Client>> {
-    let daemon = std::env::current_exe()?.with_file_name(if cfg!(windows) {
+    let program = std::env::current_exe()?.with_file_name(if cfg!(windows) {
         "nterm-daemon.exe"
     } else {
         "nterm-daemon"
     });
+    Ok((DEFAULT_SESSION.to_owned(), program))
+}
+
+/// Make connection `number`: find or start the daemon, greet it, and ask
+/// what it holds. Runs on the connecting thread.
+fn open(number: u64) -> io::Result<Arc<Daemon>> {
+    let (session, program) = target()?;
     let other = |message: String| io::Error::other(message);
     // A daemon from another build cannot be trusted to speak the same
     // snapshot format. One with no panes is replaced; one with panes is left
     // alone and not used.
     for attempt in 0..2 {
-        let connection = pipe::connect_or_start(DEFAULT_SESSION, &daemon)?;
+        let connection = pipe::connect_or_start(&session, &program)?;
         let mut reader = io::BufReader::with_capacity(1 << 16, connection.reader()?);
         let mut writer = connection.writer()?;
         Frame::Control(Control::Hello {
@@ -243,57 +441,87 @@ fn connect() -> io::Result<Arc<Client>> {
             return Err(other("the daemon did not answer the greeting".into()));
         };
         Frame::Control(Control::List { request: 0 }).write(&mut writer)?;
-        let panes = loop {
+        Frame::Control(Control::BlobList { request: 0, prefix: String::new() }).write(&mut writer)?;
+        let mut held = Parked::default();
+        held.listing.daemon = number;
+        while !held.complete() {
             match Frame::read(&mut reader)? {
-                Frame::Control(Control::Panes { panes, .. }) => break panes,
+                Frame::Control(Control::Panes { panes, .. }) => {
+                    held.listing.panes = panes;
+                    held.panes = true;
+                }
+                Frame::Control(Control::Blobs { blobs, .. }) => {
+                    held.listing.blobs = blobs;
+                    held.blobs = true;
+                }
                 Frame::Control(Control::Error { message, .. }) => return Err(other(message)),
                 _ => {}
             }
-        };
+        }
         if protocol != PROTOCOL_VERSION || ghostty != GHOSTTY_REVISION {
-            if panes.is_empty() && attempt == 0 {
+            let panes = held.listing.panes.len();
+            if panes == 0 && attempt == 0 {
                 Frame::Control(Control::Shutdown).write(&mut writer)?;
                 // Wait for it to go, so the next connect starts a new one.
                 while Frame::read(&mut reader).is_ok() {}
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
             return Err(other(format!(
-                "a daemon from another build is running with {} panes \
+                "a daemon from another build is running with {panes} panes \
                  (protocol {protocol}, ghostty {ghostty}; this build has \
-                 protocol {PROTOCOL_VERSION}, ghostty {GHOSTTY_REVISION})",
-                panes.len()
+                 protocol {PROTOCOL_VERSION}, ghostty {GHOSTTY_REVISION})"
             )));
         }
-        let mut adoptable: Vec<PaneInfo> = panes
-            .into_iter()
-            .filter(|pane| pane.exited.is_none() && pane.attached == 0)
-            .collect();
-        adoptable.sort_by_key(|pane| std::cmp::Reverse(pane.pane));
-        let client = Arc::new(Client {
+        let (outbox, queued) = mpsc::channel();
+        let daemon = Arc::new(Daemon {
+            number,
             connection,
-            writer: Mutex::new(writer),
+            outbox: Mutex::new(Some(outbox)),
             panes: Mutex::default(),
             spawning: Mutex::default(),
             snapshots: Mutex::default(),
-            blobs: Mutex::default(),
-            blob_lists: Mutex::default(),
-            pane_lists: Mutex::default(),
+            listings: Mutex::default(),
+            at_connect: Mutex::new(Some(held.listing)),
             next_request: AtomicU32::new(1),
-            adoptable: Mutex::new(adoptable),
+            taken: Mutex::default(),
             settings: Mutex::default(),
-            lost: AtomicBool::new(false),
+            gone: AtomicBool::new(false),
         });
-        let reading = client.clone();
+        let writing = daemon.clone();
+        std::thread::Builder::new()
+            .name("session-write".into())
+            .spawn(move || write(&writing, writer, queued))?;
+        let reading = daemon.clone();
         std::thread::Builder::new()
             .name("session".into())
             .spawn(move || read(&reading, reader))?;
-        return Ok(client);
+        return Ok(daemon);
     }
     unreachable!("the second attempt returns")
 }
 
-fn read(client: &Arc<Client>, mut reader: impl io::Read) {
+/// The writer thread: the only one that writes to the pipe. Ends when the
+/// queue is closed, or when a write fails, which closes the connection so
+/// that the reader ends too.
+fn write(daemon: &Daemon, mut writer: impl io::Write, queued: mpsc::Receiver<Out>) {
+    for out in queued {
+        match out {
+            Out::Frame(frame) => {
+                if frame.write(&mut writer).is_err() {
+                    daemon.connection.close();
+                    break;
+                }
+            }
+            Out::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+/// The reader thread.
+fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
     let error = loop {
         let frame = match Frame::read(&mut reader) {
             Ok(frame) => frame,
@@ -301,56 +529,56 @@ fn read(client: &Arc<Client>, mut reader: impl io::Read) {
         };
         match frame {
             Frame::Output { pane, bytes } => {
-                if let Some(link) = client.pane(pane) {
+                if let Some(link) = daemon.pane(pane) {
                     link.with_host(|host| unsafe {
                         ghostty_ffi::nterm_host_output(host, bytes.as_ptr(), bytes.len());
                     });
                 }
             }
             Frame::Screen { pane, bytes } => {
-                if let Some(link) = client.pane(pane) {
+                if let Some(link) = daemon.pane(pane) {
                     link.with_host(|host| unsafe {
                         ghostty_ffi::nterm_host_resync(host, bytes.as_ptr(), bytes.len());
                     });
                 }
             }
             Frame::Snapshot { request, bytes } => {
-                if let Some(waiting) = client.snapshots.lock().unwrap().remove(&request) {
+                if let Some(waiting) = daemon.snapshots.lock().unwrap().remove(&request) {
                     let _ = waiting.send(bytes);
                 }
             }
-            Frame::Control(Control::Blob { request, value, .. }) => {
-                if let Some(waiting) = client.blobs.lock().unwrap().remove(&request) {
-                    let _ = waiting.send(value);
+            Frame::Control(Control::Panes { request, panes }) => {
+                if let Some(parked) = daemon.listings.lock().unwrap().get_mut(&request) {
+                    parked.listing.panes = panes;
+                    parked.panes = true;
                 }
+                CLIENT.wake_ui();
             }
             Frame::Control(Control::Blobs { request, blobs }) => {
-                if let Some(waiting) = client.blob_lists.lock().unwrap().remove(&request) {
-                    let _ = waiting.send(blobs);
+                if let Some(parked) = daemon.listings.lock().unwrap().get_mut(&request) {
+                    parked.listing.blobs = blobs;
+                    parked.blobs = true;
                 }
-            }
-            Frame::Control(Control::Panes { request, panes }) => {
-                if let Some(waiting) = client.pane_lists.lock().unwrap().remove(&request) {
-                    let _ = waiting.send(panes);
-                }
+                CLIENT.wake_ui();
             }
             Frame::Control(Control::Spawned { request, info }) => {
-                let link = client.spawning.lock().unwrap().remove(&request);
+                let link = daemon.spawning.lock().unwrap().remove(&request);
                 if let Some(link) = link {
                     link.spawned(&info);
                 }
             }
             Frame::Control(Control::Exited { pane, .. }) => {
-                if let Some(link) = client.pane(pane) {
+                if let Some(link) = daemon.pane(pane) {
                     link.close_pane();
                 }
             }
             Frame::Control(Control::Error { request, message }) => {
                 // Dropping the sender tells whoever waits for a snapshot.
                 if let Some(id) = request {
-                    client.snapshots.lock().unwrap().remove(&id);
+                    daemon.snapshots.lock().unwrap().remove(&id);
+                    daemon.listings.lock().unwrap().remove(&id);
                 }
-                let failed = request.and_then(|id| client.spawning.lock().unwrap().remove(&id));
+                let failed = request.and_then(|id| daemon.spawning.lock().unwrap().remove(&id));
                 match failed {
                     Some(link) => {
                         report("The shell could not be started", &message);
@@ -362,17 +590,27 @@ fn read(client: &Arc<Client>, mut reader: impl io::Read) {
             _ => {}
         }
     };
-    // The daemon is gone and its shells with it.
-    client.lost.store(true, Ordering::Release);
-    client.snapshots.lock().unwrap().clear();
-    client.blobs.lock().unwrap().clear();
-    client.blob_lists.lock().unwrap().clear();
-    client.pane_lists.lock().unwrap().clear();
-    let mut links: Vec<Arc<Link>> = client.panes.lock().unwrap().drain().map(|(_, l)| l).collect();
-    links.extend(client.spawning.lock().unwrap().drain().map(|(_, link)| link));
+    // The daemon is gone and its shells with it. Closing the queue ends
+    // the writer thread.
+    daemon.gone.store(true, Ordering::Release);
+    *daemon.outbox.lock().unwrap() = None;
+    daemon.connection.close();
+    daemon.snapshots.lock().unwrap().clear();
+    daemon.listings.lock().unwrap().clear();
+    let mut links: Vec<Arc<Link>> = daemon.panes.lock().unwrap().drain().map(|(_, l)| l).collect();
+    links.extend(daemon.spawning.lock().unwrap().drain().map(|(_, link)| link));
     if !links.is_empty() {
         report("The session daemon went away", &format!("{error}\n\nIts panes are closed."));
     }
+    // Only if this is still the connection in use: a later one is not lost.
+    {
+        let mut state = CLIENT.state.lock().unwrap();
+        if matches!(&*state, Conn::Connected(current) if current.number == daemon.number) {
+            *state = Conn::Lost;
+        }
+    }
+    CLIENT.changed.notify_all();
+    CLIENT.wake_ui();
     for link in links {
         link.close_pane();
     }
@@ -410,7 +648,10 @@ struct State {
 /// One pane's tie to the daemon. The surface's callbacks arrive here from
 /// its IO thread; frames arrive from the session thread.
 pub(crate) struct Link {
-    client: Arc<Client>,
+    daemon: Arc<Daemon>,
+    /// The waiting shell this pane took, which no other pane may take while
+    /// this link lasts.
+    adopted: Option<PaneId>,
     /// The pane's `WakeState`, for telling the UI the shell has ended.
     wake: usize,
     /// The surface, or zero before it exists and after it is destroyed. Held
@@ -435,25 +676,29 @@ impl Link {
     /// runs its own shell. `Err` when a shell was to be taken and is not
     /// there to take; starting another in its place would pass a new shell
     /// off as the one asked for.
-    pub(crate) fn prepare(wake: *mut c_void, start: Start) -> Result<Option<Arc<Link>>, String> {
-        let client = client().filter(|client| !client.lost.load(Ordering::Acquire));
-        let adopt = match (start, client) {
+    pub(crate) fn prepare(wake: *mut c_void, start: &Start) -> Result<Option<Arc<Link>>, String> {
+        let daemon = daemon();
+        let adopt = match (start, &daemon) {
             (Start::Shell, _) => None,
             (Start::Adopt(_), None) => {
                 return Err("the session daemon cannot be reached".into());
             }
-            (Start::Adopt(wanted), Some(client)) => {
-                let mut waiting = client.adoptable.lock().unwrap();
-                let at = waiting.iter().position(|pane| pane.pane == wanted);
-                match at {
-                    Some(at) => Some(waiting.remove(at)),
-                    None => return Err(format!("shell {wanted} is no longer waiting")),
+            (Start::Adopt(adopt), Some(daemon)) => {
+                let pane = adopt.info.pane;
+                if adopt.daemon != daemon.number {
+                    return Err(format!("shell {pane} was in a daemon that has gone"));
                 }
+                // A listing can be older than another pane's taking of it.
+                if !daemon.taken.lock().unwrap().insert(pane) {
+                    return Err(format!("shell {pane} is already shown"));
+                }
+                Some(adopt.info.clone())
             }
         };
-        let Some(client) = client else { return Ok(None) };
+        let Some(daemon) = daemon else { return Ok(None) };
         let link = Arc::new(Link {
-            client: client.clone(),
+            daemon,
+            adopted: adopt.as_ref().map(|info| info.pane),
             wake: wake as usize,
             host: Mutex::new(0),
             state: Mutex::new(State { adopt, ..State::default() }),
@@ -513,9 +758,9 @@ impl Link {
             return false;
         };
         drop(state);
-        let request = self.client.next_request.fetch_add(1, Ordering::Relaxed);
-        self.client.spawning.lock().unwrap().insert(request, self.clone());
-        self.client.control(Control::Spawn {
+        let request = self.daemon.next_request.fetch_add(1, Ordering::Relaxed);
+        self.daemon.spawning.lock().unwrap().insert(request, self.clone());
+        self.daemon.control(Control::Spawn {
             request,
             command: spec.command,
             cwd: spec.cwd,
@@ -530,7 +775,7 @@ impl Link {
         let mut state = self.state.lock().unwrap();
         if state.closed {
             drop(state);
-            self.client.control(Control::Close { pane: info.pane });
+            self.daemon.control(Control::Close { pane: info.pane });
             return;
         }
         state.pane = Some(info.pane);
@@ -549,10 +794,10 @@ impl Link {
         state.sent_size = Some(size);
         let queued = std::mem::take(&mut state.queued_input);
         // Registered before the attach is sent, so its screen finds us.
-        self.client.panes.lock().unwrap().insert(info.pane, self.clone());
-        self.client.control(Control::Attach { pane: info.pane, size });
+        self.daemon.panes.lock().unwrap().insert(info.pane, self.clone());
+        self.daemon.control(Control::Attach { pane: info.pane, size });
         if !queued.is_empty() {
-            self.client.send(&Frame::Input { pane: info.pane, bytes: queued });
+            self.daemon.send(Frame::Input { pane: info.pane, bytes: queued });
         }
     }
 
@@ -577,16 +822,16 @@ impl Link {
         let Some(pane) = self.state.lock().unwrap().pane else {
             return Ok(None);
         };
-        if self.client.lost.load(Ordering::Acquire) {
+        if self.daemon.gone.load(Ordering::Acquire) {
             return Err(());
         }
-        let request = self.client.next_request.fetch_add(1, Ordering::Relaxed);
+        let request = self.daemon.next_request.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
-        self.client.snapshots.lock().unwrap().insert(request, sender);
-        self.client.control(Control::Snapshot { request, pane });
+        self.daemon.snapshots.lock().unwrap().insert(request, sender);
+        self.daemon.control(Control::Snapshot { request, pane });
         let bytes = receiver.recv_timeout(SNAPSHOT_WAIT).ok();
         if bytes.is_none() {
-            self.client.snapshots.lock().unwrap().remove(&request);
+            self.daemon.snapshots.lock().unwrap().remove(&request);
         }
         bytes.map(Some).ok_or(())
     }
@@ -622,14 +867,22 @@ impl Link {
         let keep = state.keep;
         if let Some(pane) = state.pane.take() {
             drop(state);
-            self.client.panes.lock().unwrap().remove(&pane);
-            self.client.control(if keep {
+            self.daemon.panes.lock().unwrap().remove(&pane);
+            self.daemon.control(if keep {
                 Control::Detach { pane }
             } else {
                 // Nothing will run `npick` from it again.
                 remove_blob(picker_key(pane));
                 Control::Close { pane }
             });
+        }
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        if let Some(pane) = self.adopted {
+            self.daemon.taken.lock().unwrap().remove(&pane);
         }
     }
 }
@@ -647,7 +900,7 @@ extern "C" fn on_write(userdata: *mut c_void, bytes: *const u8, len: usize) {
         match state.pane {
             Some(pane) => {
                 drop(state);
-                link.client.send(&Frame::Input { pane, bytes: bytes.to_vec() });
+                link.daemon.send(Frame::Input { pane, bytes: bytes.to_vec() });
             }
             None if state.queued_input.len() + bytes.len() <= QUEUED_INPUT_MAX => {
                 state.queued_input.extend_from_slice(bytes);
@@ -683,7 +936,7 @@ extern "C" fn on_resize(userdata: *mut c_void, cols: u16, rows: u16, width: u32,
         }
         state.sent_size = Some(size);
         drop(state);
-        link.client.control(Control::Resize { pane, size });
+        link.daemon.control(Control::Resize { pane, size });
     });
 }
 
@@ -715,7 +968,7 @@ extern "C" fn on_settings(userdata: *mut c_void, settings: *const HostSettings) 
             let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
             String::from_utf8_lossy(&bytes[..end]).into_owned()
         };
-        let mut last = link.client.settings.lock().unwrap();
+        let mut last = link.daemon.settings.lock().unwrap();
         let mut settings = TerminalSettings {
             foreground: Some(from.foreground),
             background: Some(from.background),
@@ -749,7 +1002,96 @@ extern "C" fn on_settings(userdata: *mut c_void, settings: *const HostSettings) 
         }
         if *last != settings {
             *last = settings.clone();
-            link.client.control(Control::Settings { settings });
+            link.daemon.control(Control::Settings { settings });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The session and daemon program a test connects to, in place of the
+    /// user's own. Setting it also turns the session daemon on.
+    pub(super) static TARGET: Mutex<Option<(String, std::path::PathBuf)>> = Mutex::new(None);
+
+    const WAIT: Duration = Duration::from_secs(20);
+
+    fn until<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(value) = ready() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn listing() -> Listing {
+        let asked = request_listing().expect("connected");
+        until("a listing", || match take_listing(asked) {
+            Answer::Ready(listing) => Some(listing),
+            Answer::Waiting => None,
+            Answer::Gone => panic!("the listing was lost"),
+        })
+    }
+
+    /// One test, because there is one connection for the process: it is
+    /// made off the calling thread, a listing is parked until taken and
+    /// taken once, a lost daemon is noticed, and connecting again reaches
+    /// a new one.
+    #[test]
+    #[cfg(windows)]
+    fn connects_parks_listings_and_connects_again() {
+        // The daemon binary is built beside the tests' directory.
+        let program = std::env::current_exe().unwrap();
+        let program = program.parent().unwrap().parent().unwrap().join("nterm-daemon.exe");
+        assert!(program.exists(), "build nterm-daemon first: {}", program.display());
+        let session = format!("test-client-{}", std::process::id());
+        *TARGET.lock().unwrap() = Some((session, program));
+
+        // The launch waits for the connection and takes what the daemon held.
+        let held = launch_listing().expect("the daemon was started");
+        assert!(held.panes.is_empty() && held.blobs.is_empty());
+        assert!(matches!(&*CLIENT.state.lock().unwrap(), Conn::Connected(_)));
+        // It is taken once.
+        assert!(launch_listing().is_none());
+        let first = daemon().unwrap().number;
+
+        // What is queued is written in order: the blob is there to be listed.
+        set_blob("picker/7".into(), r#"["endpoint","token"]"#.into());
+        let asked = request_listing().unwrap();
+        let listed = until("a listing", || match take_listing(asked) {
+            Answer::Ready(listing) => Some(listing),
+            _ => None,
+        });
+        assert_eq!(listed.blobs, vec![("picker/7".to_owned(), r#"["endpoint","token"]"#.to_owned())]);
+        // Taking it left nothing behind.
+        assert!(matches!(take_listing(asked), Answer::Gone));
+        // No shell 7 is waiting, so there is nothing to take.
+        assert!(listed.adopt(7).is_none());
+
+        // The daemon goes away: the connection is lost, and what was asked
+        // of it will not come.
+        let asked = request_listing().unwrap();
+        daemon().unwrap().control(Control::Shutdown);
+        until("the loss", || matches!(&*CLIENT.state.lock().unwrap(), Conn::Lost).then_some(()));
+        assert!(daemon().is_none());
+        assert!(request_listing().is_none());
+        assert!(matches!(take_listing(asked), Answer::Gone));
+
+        // Connecting again starts a new daemon, which holds nothing.
+        connect();
+        until("the new connection", || daemon().map(|_| ()));
+        assert_ne!(daemon().unwrap().number, first);
+        assert!(matches!(take_listing(asked), Answer::Gone));
+        assert!(listing().blobs.is_empty());
+
+        // Leaving waits for the queue to be written.
+        daemon().unwrap().control(Control::Shutdown);
+        flush();
+        until("the end", || daemon().is_none().then_some(()));
+        *TARGET.lock().unwrap() = None;
+    }
 }
