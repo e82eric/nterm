@@ -60,6 +60,16 @@ pub(crate) struct HostEnv {
     pub(crate) value: *const c_char,
 }
 
+/// ghostty_host_backend_s: what makes a surface one its host drives.
+#[repr(C)]
+pub(crate) struct HostBackend {
+    pub(crate) userdata: *mut c_void,
+    pub(crate) write: extern "C" fn(*mut c_void, *const u8, usize),
+    pub(crate) resize: extern "C" fn(*mut c_void, u16, u16, u32, u32),
+    pub(crate) spawn: extern "C" fn(*mut c_void, *const HostSpawn),
+    pub(crate) settings: extern "C" fn(*mut c_void, *const HostSettings),
+}
+
 /// ghostty_host_spawn_s: the process a surface would have started.
 #[repr(C)]
 pub(crate) struct HostSpawn {
@@ -404,19 +414,11 @@ unsafe extern "C" {
         scale: f64,
         picker_endpoint: *const c_char,
         picker_token: *const c_char,
+        backend: *const HostBackend,
         error_buffer: *mut c_char,
         error_capacity: usize,
     ) -> *mut Host;
     pub(crate) fn nterm_host_destroy(host: *mut Host);
-    pub(crate) fn nterm_host_backend_next(
-        userdata: *mut c_void,
-        write: extern "C" fn(*mut c_void, *const u8, usize),
-        resize: extern "C" fn(*mut c_void, u16, u16, u32, u32),
-        spawn: extern "C" fn(*mut c_void, *const HostSpawn),
-        settings: extern "C" fn(*mut c_void, *const HostSettings),
-        snapshot: *const u8,
-        snapshot_len: usize,
-    ) -> bool;
     pub(crate) fn nterm_host_output(host: *mut Host, bytes: *const u8, len: usize);
     pub(crate) fn nterm_host_resync(host: *mut Host, snapshot: *const u8, len: usize);
     pub(crate) fn nterm_window_attach(window: *mut c_void);
@@ -431,6 +433,7 @@ unsafe extern "C" {
         picker_token: *const c_char,
         command: *const c_char,
         cwd: *const c_char,
+        backend: *const HostBackend,
         error_buffer: *mut c_char,
         error_capacity: usize,
     ) -> *mut Host;

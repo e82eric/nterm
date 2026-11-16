@@ -222,6 +222,7 @@ NtermHost *nterm_host_create(
     double scale,
     const char *picker_endpoint,
     const char *picker_token,
+    const ghostty_host_backend_s *backend,
     char *error_buffer,
     size_t error_capacity
 ) {
@@ -282,6 +283,7 @@ NtermHost *nterm_host_create(
     };
     options.env_vars = token_env;
     options.env_var_count = 2;
+    options.host_backend = backend;
     ghostty_clear_error();
     ghostty_surface_t surface = ghostty_surface_new(app, &options);
     if (!surface) {
@@ -321,6 +323,7 @@ NtermHost *nterm_host_create_child(
     double scale,
     const char *picker_endpoint, const char *picker_token,
     const char *command, const char *cwd,
+    const ghostty_host_backend_s *backend,
     char *error_buffer, size_t error_capacity
 ) {
     if (error_buffer && error_capacity) error_buffer[0] = '\0';
@@ -348,6 +351,7 @@ NtermHost *nterm_host_create_child(
     };
     options.env_vars = token_env;
     options.env_var_count = 2;
+    options.host_backend = backend;
     host->app = parent->app;
     host->platform = options.platform.wgpu;
     host->surface = ghostty_surface_new(host->app, &options);
@@ -589,20 +593,6 @@ void nterm_host_mouse_scroll(NtermHost *host, double x, double y, int mods) {
     ghostty_surface_mouse_scroll(host->surface, x, y, mods);
  runtime_error(host, "nterm_host_mouse_scroll"); }
 
-bool nterm_host_backend_next(
-    void *userdata,
-    void (*write)(void *, const uint8_t *, size_t),
-    void (*resize)(void *, uint16_t, uint16_t, uint32_t, uint32_t),
-    void (*spawn)(void *, const ghostty_host_spawn_s *),
-    void (*settings)(void *, const ghostty_host_settings_s *),
-    const uint8_t *snapshot, size_t snapshot_len
-) {
-    ghostty_host_backend_s backend = {
-        .userdata = userdata, .write = write, .resize = resize,
-        .spawn = spawn, .settings = settings,
-    };
-    return ghostty_host_backend_next(&backend, snapshot, snapshot_len);
-}
 void nterm_host_output(NtermHost *host, const uint8_t *bytes, size_t len) {
     if (host && host->surface) ghostty_surface_host_output(host->surface, bytes, len);
 }

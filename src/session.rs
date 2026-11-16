@@ -48,18 +48,14 @@ unsafe extern "C" {
     fn nterm_pwd(userdata: *mut c_void, pwd: *const std::ffi::c_char);
 }
 
-/// Set while panes are being restored: the daemon pane the next pane made
-/// takes instead of starting a shell. Zero for none; the daemon numbers its
-/// panes from one.
-static ADOPT_NEXT: AtomicU32 = AtomicU32::new(0);
-
-/// Set while the window's first pane is made at a launch that offers the
-/// sessions left running: its shell waits for the choice.
-static HOLD_NEXT: AtomicBool = AtomicBool::new(false);
-
-/// The next pane made does not start its shell until `Link::start`.
-pub(crate) fn hold_next(hold: bool) {
-    HOLD_NEXT.store(hold, Ordering::Release);
+/// What a pane being made does for a shell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Start {
+    /// Start one.
+    #[default]
+    Shell,
+    /// Take this one, which the daemon is running with nothing showing it.
+    Adopt(PaneId),
 }
 
 /// Every pane the daemon has, asked for now. The ones nothing shows become
@@ -86,17 +82,6 @@ pub(crate) fn panes() -> Vec<PaneInfo> {
 pub(crate) fn waiting(pane: &PaneInfo) -> bool {
     pane.exited.is_none() && pane.attached == 0
 }
-/// The next pane made takes this waiting shell instead of starting one.
-/// `None` withdraws it.
-pub(crate) fn adopt_next(pane: Option<PaneId>) {
-    ADOPT_NEXT.store(pane.unwrap_or(0), Ordering::Release);
-}
-
-/// The waiting shell the next pane made will take, if one was named.
-pub(crate) fn adopting() -> Option<PaneId> {
-    Some(ADOPT_NEXT.load(Ordering::Acquire)).filter(|pane| *pane != 0)
-}
-
 fn picker_key(pane: PaneId) -> String {
     format!("picker/{pane}")
 }
@@ -420,8 +405,6 @@ struct State {
     closed: bool,
     /// The surface is going but the shell is to stay.
     keep: bool,
-    /// The shell is not to be started until `start`.
-    hold: bool,
 }
 
 /// One pane's tie to the daemon. The surface's callbacks arrive here from
@@ -444,55 +427,52 @@ impl Link {
         }
     }
 
-    /// Make the next surface created on this thread a mirror of a daemon
-    /// pane. `wake` is the pane's `WakeState`. With `adopt`, a pane left
-    /// running by an earlier UI is taken instead of starting a shell.
-    /// `None` leaves the surface to run its own shell.
-    pub(crate) fn prepare(wake: *mut c_void, adopt: bool) -> Option<Arc<Link>> {
-        let client = client()?;
-        if client.lost.load(Ordering::Acquire) {
-            return None;
-        }
-        let wanted = ADOPT_NEXT.swap(0, Ordering::AcqRel);
-        let adopt = {
-            let mut waiting = client.adoptable.lock().unwrap();
-            if wanted != 0 {
+    /// A link for a pane whose shell is to run in the daemon. The pane's
+    /// surface is then created with the link's `backend`, which makes it a
+    /// mirror of the daemon's pane. `wake` is the pane's `WakeState`.
+    ///
+    /// `Ok(None)` when the daemon is off or cannot be reached: the surface
+    /// runs its own shell. `Err` when a shell was to be taken and is not
+    /// there to take; starting another in its place would pass a new shell
+    /// off as the one asked for.
+    pub(crate) fn prepare(wake: *mut c_void, start: Start) -> Result<Option<Arc<Link>>, String> {
+        let client = client().filter(|client| !client.lost.load(Ordering::Acquire));
+        let adopt = match (start, client) {
+            (Start::Shell, _) => None,
+            (Start::Adopt(_), None) => {
+                return Err("the session daemon cannot be reached".into());
+            }
+            (Start::Adopt(wanted), Some(client)) => {
+                let mut waiting = client.adoptable.lock().unwrap();
                 let at = waiting.iter().position(|pane| pane.pane == wanted);
-                at.map(|at| waiting.remove(at))
-            } else if adopt {
-                waiting.pop()
-            } else {
-                None
+                match at {
+                    Some(at) => Some(waiting.remove(at)),
+                    None => return Err(format!("shell {wanted} is no longer waiting")),
+                }
             }
         };
+        let Some(client) = client else { return Ok(None) };
         let link = Arc::new(Link {
             client: client.clone(),
             wake: wake as usize,
             host: Mutex::new(0),
-            state: Mutex::new(State {
-                adopt,
-                hold: HOLD_NEXT.swap(false, Ordering::AcqRel),
-                ..State::default()
-            }),
+            state: Mutex::new(State { adopt, ..State::default() }),
         });
         // The surface's callbacks hold this reference until `release`.
-        let userdata = Arc::into_raw(link.clone()).cast_mut().cast::<c_void>();
-        let ok = unsafe {
-            ghostty_ffi::nterm_host_backend_next(
-                userdata,
-                on_write,
-                on_resize,
-                on_spawn,
-                on_settings,
-                std::ptr::null(),
-                0,
-            )
-        };
-        if !ok {
-            unsafe { drop(Arc::from_raw(userdata.cast::<Link>())) };
-            return None;
+        std::mem::forget(link.clone());
+        Ok(Some(link))
+    }
+
+    /// What the surface is created with: the callbacks that make it this
+    /// link's mirror. The surface copies it.
+    pub(crate) fn backend(self: &Arc<Self>) -> ghostty_ffi::HostBackend {
+        ghostty_ffi::HostBackend {
+            userdata: Arc::as_ptr(self).cast_mut().cast(),
+            write: on_write,
+            resize: on_resize,
+            spawn: on_spawn,
+            settings: on_settings,
         }
-        Some(link)
     }
 
     /// The surface exists.
@@ -507,9 +487,6 @@ impl Link {
         let mut state = self.state.lock().unwrap();
         if state.started || state.closed {
             return false;
-        }
-        if state.hold {
-            return true;
         }
         let grid = (surface.columns, surface.rows);
         if grid.0 == 0 || grid.1 == 0 || state.laid_out != Some(grid) {
@@ -577,11 +554,6 @@ impl Link {
         if !queued.is_empty() {
             self.client.send(&Frame::Input { pane: info.pane, bytes: queued });
         }
-    }
-
-    /// Let a held pane start its shell.
-    pub(crate) fn start(&self) {
-        self.state.lock().unwrap().hold = false;
     }
 
     /// The daemon's pane: known at once for a shell taken over, and once the

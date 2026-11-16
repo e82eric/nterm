@@ -28,6 +28,7 @@ impl CreateOptions {
         super::pane::SpawnOptions {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
+            ..Default::default()
         }
     }
 }

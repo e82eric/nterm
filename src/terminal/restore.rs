@@ -232,7 +232,7 @@ impl TerminalView {
     }
 
     fn start_held(&mut self, pane: u64) {
-        if let Some(pane) = self.tiled_ref(pane) {
+        if let Some(pane) = self.tiled_mut(pane) {
             pane.start_shell();
         }
     }
@@ -323,9 +323,11 @@ impl TerminalView {
     /// A pane on a shell the daemon is running. `None`, with the error
     /// shown, when the terminal could not be made.
     fn adopt(&mut self, number: u32, gl: &glow::Context) -> Option<super::TerminalPane> {
-        crate::session::adopt_next(Some(number));
-        let pane = self.create_pane(gl, &Default::default());
-        crate::session::adopt_next(None);
+        let options = super::pane::SpawnOptions {
+            start: crate::session::Start::Adopt(number),
+            ..Default::default()
+        };
+        let pane = self.create_pane(gl, &options);
         match pane {
             Ok(pane) => Some(pane),
             Err(error) => {

@@ -376,6 +376,7 @@ impl CreatePaneOptions {
         super::pane::SpawnOptions {
             command: self.command.clone(),
             cwd: self.cwd.clone(),
+            ..Default::default()
         }
     }
 }

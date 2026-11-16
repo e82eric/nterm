@@ -168,10 +168,7 @@ impl TerminalView {
         // With sessions waiting in the daemon, the first pane holds its
         // shell back until one of them, or a new one, has been chosen.
         let offer = restore::any_detached();
-        crate::session::hold_next(offer);
-        let pane = TerminalPane::create(egui_ctx, gl, proxy.clone(), window, argc, argv);
-        crate::session::hold_next(false);
-        let pane = pane?;
+        let pane = TerminalPane::create(egui_ctx, gl, proxy.clone(), window, argc, argv, offer)?;
         issues.extend(pane.take_config_issues());
         #[cfg(any(windows, unix))]
         pane.set_pipe_policy(&picker_bindings.pipe_policy);

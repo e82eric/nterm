@@ -227,6 +227,9 @@ extern "C" fn nterm_write_clipboard(userdata: *mut c_void, bytes: *const u8, len
 pub(crate) struct SpawnOptions {
     pub command: Option<String>,
     pub cwd: Option<String>,
+    /// Whether the pane starts a shell or takes one the session daemon is
+    /// running.
+    pub start: crate::session::Start,
 }
 impl SpawnOptions {
     pub fn validate(&self) -> Result<(), String> {
@@ -285,6 +288,10 @@ pub(super) struct TerminalPane {
     /// Copy mode was opened by the wheel, and scrolling back down to the end
     /// leaves it.
     wheel_copy: bool,
+    /// The shell is not to be started yet: at a launch that offers the
+    /// waiting sessions, this pane only stands behind the picker until the
+    /// choice is made. Read and written on the UI thread alone.
+    held: bool,
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
     paint_callback: crate::painter::PaintCallback,
     size: [u32; 2],
@@ -502,6 +509,7 @@ impl TerminalPane {
             wake,
             session,
             wheel_copy: false,
+            held: false,
             painter,
             paint_callback,
             size: [0, 0],
@@ -548,10 +556,8 @@ impl TerminalPane {
     }
 
     /// Start the shell of a pane that was made holding it back.
-    pub(super) fn start_shell(&self) {
-        if let Some(session) = &self.session {
-            session.start();
-        }
+    pub(super) fn start_shell(&mut self) {
+        self.held = false;
         self.wake.context.request_repaint();
     }
 
@@ -650,7 +656,8 @@ impl TerminalPane {
         if session.closed_early() {
             self.wake.close.store(true, Ordering::Release);
             self.wake.context.request_repaint();
-        } else if session.layout(unsafe { ghostty_ffi::nterm_host_surface_size(self.host) }) {
+        } else if !self.held
+            && session.layout(unsafe { ghostty_ffi::nterm_host_surface_size(self.host) }) {
             // Come back even if nothing else asks for a frame.
             self.wake.context.request_repaint();
         }
@@ -806,10 +813,13 @@ pub(super) struct PaneStatus<'a> {
 /// shell left in the session daemon gets the one that shell was started
 /// with, so that `npick` run from it still arrives.
 #[cfg(any(windows, unix))]
-fn picker_service(ctx: &egui::Context) -> Result<crate::picker::pipe::Service, String> {
+fn picker_service(
+    ctx: &egui::Context,
+    start: crate::session::Start,
+) -> Result<crate::picker::pipe::Service, String> {
     #[cfg(windows)]
-    if let Some((endpoint, token)) =
-        crate::session::adopting().and_then(crate::session::picker_identity)
+    if let crate::session::Start::Adopt(pane) = start
+        && let Some((endpoint, token)) = crate::session::picker_identity(pane)
         && let Ok(service) =
             crate::picker::pipe::Service::restored(ctx.clone(), endpoint, token)
     {
@@ -826,10 +836,11 @@ impl TerminalPane {
         window: crate::graphics::PaneWindow,
         argc: usize,
         argv: *mut *mut c_char,
+        held: bool,
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
             #[cfg(any(windows, unix))]
-            pipe: Some(picker_service(egui_ctx).map_err(|e| {
+            pipe: Some(picker_service(egui_ctx, crate::session::Start::Shell).map_err(|e| {
                 crate::native_error::FatalError::new("create secure picker pipe", e)
             })?),
             context: egui_ctx.clone(),
@@ -849,9 +860,12 @@ impl TerminalPane {
         }
         let (picker_endpoint, picker_token) = wake.picker_environment();
         let mut error_buffer = [0 as c_char; 2048];
-        // The first pane takes over a shell an earlier UI left running.
-        let session =
-            crate::session::Link::prepare((&mut *wake as *mut WakeState).cast(), false);
+        let session = crate::session::Link::prepare(
+            (&mut *wake as *mut WakeState).cast(),
+            crate::session::Start::Shell,
+        )
+        .map_err(|e| crate::native_error::FatalError::new("reach the session daemon", e))?;
+        let backend = session.as_ref().map(|session| session.backend());
         let host = unsafe {
             ghostty_ffi::nterm_host_create(
                 argc,
@@ -862,6 +876,7 @@ impl TerminalPane {
                 egui_ctx.pixels_per_point() as f64,
                 picker_endpoint.as_ptr(),
                 picker_token.as_ptr(),
+                backend.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
             )
@@ -881,7 +896,9 @@ impl TerminalPane {
             session.attach(host);
         }
 
-        Ok(Self::new(host, wake, session, gl))
+        let mut pane = Self::new(host, wake, session, gl);
+        pane.held = held;
+        Ok(pane)
     }
 
     /// Creates another terminal in this window, as a child of this pane's
@@ -942,7 +959,7 @@ impl TerminalPane {
     ) -> Result<Self, crate::native_error::FatalError> {
         let mut wake = Box::new(WakeState {
             #[cfg(any(windows, unix))]
-            pipe: Some(picker_service(ctx).map_err(|e| {
+            pipe: Some(picker_service(ctx, options.start).map_err(|e| {
                 crate::native_error::FatalError::new("create secure picker pipe", e)
             })?),
             context: ctx.clone(),
@@ -975,7 +992,9 @@ impl TerminalPane {
             .transpose()
             .map_err(|e| crate::native_error::FatalError::new("pane directory", e))?;
         let session =
-            crate::session::Link::prepare((&mut *wake as *mut WakeState).cast(), false);
+            crate::session::Link::prepare((&mut *wake as *mut WakeState).cast(), options.start)
+                .map_err(|e| crate::native_error::FatalError::new("show a running shell", e))?;
+        let backend = session.as_ref().map(|session| session.backend());
         let host = unsafe {
             ghostty_ffi::nterm_host_create_child(
                 self.host,
@@ -987,6 +1006,7 @@ impl TerminalPane {
                 picker_token.as_ptr(),
                 command.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                backend.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
                 error_buffer.as_mut_ptr(),
                 error_buffer.len(),
             )
