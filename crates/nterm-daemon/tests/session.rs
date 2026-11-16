@@ -228,7 +228,7 @@ fn lifecycle(session: &str) {
     assert_eq!(pane.exited, None);
 
     // Attach, then type.
-    ui.send(Control::Attach { pane: pane.pane, size: size(80, 24) });
+    ui.send(Control::Attach { request: 0, pane: pane.pane, size: size(80, 24), exclusive: false });
     ui.frame(|frame| matches!(frame, Frame::Screen { .. }));
     ui.input(pane.pane, "echo first-marker\r");
     ui.until_text("the echoed line", |text| text.contains("\nfirst-marker"));
@@ -269,7 +269,7 @@ fn lifecycle(session: &str) {
     assert!(text.contains("\nwhile-away-1\n"), "{text}");
 
     // Reattach at another size: screen first, then live output.
-    ui.send(Control::Attach { pane: pane.pane, size: size(90, 20) });
+    ui.send(Control::Attach { request: 0, pane: pane.pane, size: size(90, 20), exclusive: false });
     ui.frame(|frame| matches!(frame, Frame::Screen { .. }));
     assert_eq!(ui.mirror.as_mut().unwrap().grid(), (90, 20));
     ui.until_text("the end of the loop", |text| text.contains("while-away-300"));
@@ -322,7 +322,7 @@ fn two_uis_share_a_pane_and_blobs() {
 
     let pane = first.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
     for ui in [&mut first, &mut second] {
-        ui.send(Control::Attach { pane: pane.pane, size: size(80, 24) });
+        ui.send(Control::Attach { request: 0, pane: pane.pane, size: size(80, 24), exclusive: false });
         ui.frame(|frame| matches!(frame, Frame::Screen { .. }));
     }
     first.input(pane.pane, "echo seen-by-both\r");
@@ -437,4 +437,47 @@ fn an_idle_daemon_exits_and_a_second_one_defers() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let _ = std::io::stdout().flush();
+}
+
+#[test]
+fn an_attach_is_answered_and_an_exclusive_one_is_refused_when_taken() {
+    let session = session("exclusive");
+    let mut first = Ui::connect(&session);
+    let mut second = Ui::connect(&session);
+    let pane = first.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+    let answer = |ui: &mut Ui| {
+        ui.control(|c| matches!(c, Control::Attached { .. } | Control::Error { .. }))
+    };
+    let attach = |ui: &mut Ui, request: u32, pane: PaneId, size: Size| {
+        ui.send(Control::Attach { request, pane, size, exclusive: true });
+    };
+
+    // No such pane: the refusal names the request.
+    attach(&mut first, 11, pane.pane + 100, size(80, 24));
+    assert!(matches!(answer(&mut first), Control::Error { request: Some(11), .. }));
+
+    // The answer comes before the screen, and counts the asker.
+    attach(&mut first, 12, pane.pane, size(80, 24));
+    let Control::Attached { request: 12, info } = answer(&mut first) else {
+        panic!("the attach was not answered");
+    };
+    assert_eq!((info.pane, info.attached), (pane.pane, 1));
+    first.frame(|frame| matches!(frame, Frame::Screen { .. }));
+
+    // A second UI is refused, and the pane is not resized for it.
+    attach(&mut second, 13, pane.pane, size(40, 10));
+    assert!(matches!(answer(&mut second), Control::Error { request: Some(13), .. }));
+    let listed = second.panes();
+    assert_eq!((listed[0].size, listed[0].attached), (size(80, 24), 1));
+
+    // Once the first has let go, the second can have it.
+    first.send(Control::Detach { pane: pane.pane });
+    first.panes();
+    attach(&mut second, 14, pane.pane, size(40, 10));
+    let Control::Attached { request: 14, info } = answer(&mut second) else {
+        panic!("the attach was not answered");
+    };
+    assert_eq!((info.size, info.attached), (size(40, 10), 1));
+    second.frame(|frame| matches!(frame, Frame::Screen { .. }));
+    second.shutdown();
 }

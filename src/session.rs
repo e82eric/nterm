@@ -24,7 +24,7 @@ use nterm_session::{
     },
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     ffi::{CStr, c_void},
     io,
     sync::{
@@ -364,8 +364,9 @@ struct Daemon {
     /// The writer thread's queue; `None` once the connection is gone.
     outbox: Mutex<Option<mpsc::Sender<Out>>>,
     panes: Mutex<HashMap<PaneId, Arc<Link>>>,
-    /// Panes whose `Spawn` has not been answered, by request.
-    spawning: Mutex<HashMap<u32, Arc<Link>>>,
+    /// Links waiting for the daemon to answer a `Spawn` or an `Attach`, by
+    /// request.
+    starting: Mutex<HashMap<u32, Arc<Link>>>,
     /// Who waits for each snapshot asked for, by request.
     snapshots: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
     /// Listings asked for, by request, until they are taken.
@@ -374,8 +375,6 @@ struct Daemon {
     /// takes it.
     at_connect: Mutex<Option<Listing>>,
     next_request: AtomicU32,
-    /// The waiting shells that panes of this process have taken.
-    taken: Mutex<HashSet<PaneId>>,
     /// What the daemon was last told.
     settings: Mutex<TerminalSettings>,
     gone: AtomicBool,
@@ -479,12 +478,11 @@ fn open(number: u64) -> io::Result<Arc<Daemon>> {
             connection,
             outbox: Mutex::new(Some(outbox)),
             panes: Mutex::default(),
-            spawning: Mutex::default(),
+            starting: Mutex::default(),
             snapshots: Mutex::default(),
             listings: Mutex::default(),
             at_connect: Mutex::new(Some(held.listing)),
             next_request: AtomicU32::new(1),
-            taken: Mutex::default(),
             settings: Mutex::default(),
             gone: AtomicBool::new(false),
         });
@@ -562,9 +560,15 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 CLIENT.wake_ui();
             }
             Frame::Control(Control::Spawned { request, info }) => {
-                let link = daemon.spawning.lock().unwrap().remove(&request);
+                let link = daemon.starting.lock().unwrap().remove(&request);
                 if let Some(link) = link {
                     link.spawned(&info);
+                }
+            }
+            Frame::Control(Control::Attached { request, .. }) => {
+                let link = daemon.starting.lock().unwrap().remove(&request);
+                if let Some(link) = link {
+                    link.attached();
                 }
             }
             Frame::Control(Control::Exited { pane, .. }) => {
@@ -578,12 +582,9 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                     daemon.snapshots.lock().unwrap().remove(&id);
                     daemon.listings.lock().unwrap().remove(&id);
                 }
-                let failed = request.and_then(|id| daemon.spawning.lock().unwrap().remove(&id));
+                let failed = request.and_then(|id| daemon.starting.lock().unwrap().remove(&id));
                 match failed {
-                    Some(link) => {
-                        report("The shell could not be started", &message);
-                        link.close_pane();
-                    }
+                    Some(link) => link.refused("The shell could not be shown", &message),
                     None => report("Session daemon error", &message),
                 }
             }
@@ -598,7 +599,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
     daemon.snapshots.lock().unwrap().clear();
     daemon.listings.lock().unwrap().clear();
     let mut links: Vec<Arc<Link>> = daemon.panes.lock().unwrap().drain().map(|(_, l)| l).collect();
-    links.extend(daemon.spawning.lock().unwrap().drain().map(|(_, link)| link));
+    links.extend(daemon.starting.lock().unwrap().drain().map(|(_, link)| link));
     if !links.is_empty() {
         report("The session daemon went away", &format!("{error}\n\nIts panes are closed."));
     }
@@ -623,35 +624,67 @@ struct SpawnSpec {
     env: Vec<(String, String)>,
 }
 
-#[derive(Default)]
+/// What a link does once its surface has a size.
+enum Want {
+    /// Start what the surface would have run, once the fork has described
+    /// it.
+    Spawn(Option<SpawnSpec>),
+    /// Take a shell the daemon is running.
+    Adopt(PaneInfo),
+}
+
+/// Where a link is. It moves down this list, or from anywhere to `Closed`.
+enum Phase {
+    /// The surface is being made and laid out. `grid` is its grid at the
+    /// last layout, to tell when it has settled.
+    Sizing { want: Want, grid: Option<(u16, u16)> },
+    /// The daemon has been asked to start the shell.
+    Spawning,
+    /// The daemon has been asked to attach this link to `pane`, at the size
+    /// `sent`.
+    Attaching { pane: PaneId, sent: Size },
+    /// `pane` is this link's: its output comes here and input goes to it.
+    Attached { pane: PaneId, sent: Size },
+    /// Over: the pane was closed, or the daemon refused or went away.
+    Closed,
+}
+
 struct State {
-    /// The daemon's pane, once known.
-    pane: Option<PaneId>,
-    /// A running pane to attach to instead of starting a shell.
-    adopt: Option<PaneInfo>,
-    spec: Option<SpawnSpec>,
-    /// Whether the daemon has been asked to start or attach the pane.
-    started: bool,
-    /// The grid at the last layout, to tell when it has settled.
-    laid_out: Option<(u16, u16)>,
-    /// The size the daemon should have; sent once the pane is known.
+    phase: Phase,
+    /// The size the surface has now, for the daemon to match.
     size: Option<Size>,
-    sent_size: Option<Size>,
+    /// Input typed before the shell is this link's.
     queued_input: Vec<u8>,
-    /// The shell's pid and creation time.
+    /// The shell's pid and creation time, or zeros while unknown.
     shell: (u32, u64),
-    closed: bool,
-    /// The surface is going but the shell is to stay.
-    keep: bool,
+}
+
+impl State {
+    /// The daemon's pane, once the daemon has been asked for it.
+    fn pane(&self) -> Option<PaneId> {
+        match self.phase {
+            Phase::Attaching { pane, .. } | Phase::Attached { pane, .. } => Some(pane),
+            _ => None,
+        }
+    }
+}
+
+/// What becomes of the shell when its pane goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum End {
+    /// It ends with the pane.
+    Close,
+    /// It stays in the daemon, with nothing showing it.
+    Keep,
 }
 
 /// One pane's tie to the daemon. The surface's callbacks arrive here from
-/// its IO thread; frames arrive from the session thread.
+/// its IO thread; frames arrive from the session thread; the pane calls
+/// from the UI thread.
 pub(crate) struct Link {
     daemon: Arc<Daemon>,
-    /// The waiting shell this pane took, which no other pane may take while
-    /// this link lasts.
-    adopted: Option<PaneId>,
+    /// Whether the shell was taken, not started by this pane.
+    adopted: bool,
     /// The pane's `WakeState`, for telling the UI the shell has ended.
     wake: usize,
     /// The surface, or zero before it exists and after it is destroyed. Held
@@ -673,35 +706,36 @@ impl Link {
     /// mirror of the daemon's pane. `wake` is the pane's `WakeState`.
     ///
     /// `Ok(None)` when the daemon is off or cannot be reached: the surface
-    /// runs its own shell. `Err` when a shell was to be taken and is not
-    /// there to take; starting another in its place would pass a new shell
-    /// off as the one asked for.
+    /// runs its own shell. `Err` when a shell was to be taken and cannot
+    /// be; starting another in its place would pass a new shell off as the
+    /// one asked for.
     pub(crate) fn prepare(wake: *mut c_void, start: &Start) -> Result<Option<Arc<Link>>, String> {
         let daemon = daemon();
-        let adopt = match (start, &daemon) {
-            (Start::Shell, _) => None,
+        let want = match (start, &daemon) {
+            (Start::Shell, _) => Want::Spawn(None),
             (Start::Adopt(_), None) => {
                 return Err("the session daemon cannot be reached".into());
             }
             (Start::Adopt(adopt), Some(daemon)) => {
-                let pane = adopt.info.pane;
                 if adopt.daemon != daemon.number {
+                    let pane = adopt.info.pane;
                     return Err(format!("shell {pane} was in a daemon that has gone"));
                 }
-                // A listing can be older than another pane's taking of it.
-                if !daemon.taken.lock().unwrap().insert(pane) {
-                    return Err(format!("shell {pane} is already shown"));
-                }
-                Some(adopt.info.clone())
+                Want::Adopt(adopt.info.clone())
             }
         };
         let Some(daemon) = daemon else { return Ok(None) };
         let link = Arc::new(Link {
             daemon,
-            adopted: adopt.as_ref().map(|info| info.pane),
+            adopted: matches!(want, Want::Adopt(_)),
             wake: wake as usize,
             host: Mutex::new(0),
-            state: Mutex::new(State { adopt, ..State::default() }),
+            state: Mutex::new(State {
+                phase: Phase::Sizing { want, grid: None },
+                size: None,
+                queued_input: Vec::new(),
+                shell: (0, 0),
+            }),
         });
         Ok(Some(link))
     }
@@ -725,17 +759,18 @@ impl Link {
         *self.host.lock().unwrap() = host as usize;
     }
 
-    /// Called at every layout. The shell is started, or the pane attached,
-    /// once the grid has been the same for two layouts in a row, so that it
-    /// starts at the size it will keep. Returns true while still waiting.
+    /// Called at every layout while `Sizing`. Once the grid has been the
+    /// same for two layouts in a row, the daemon is asked to start the
+    /// shell, or to attach to the one being taken, so that it starts at the
+    /// size it will keep. Returns true while still waiting for that.
     pub(crate) fn layout(self: &Arc<Self>, surface: SurfaceSize) -> bool {
         let mut state = self.state.lock().unwrap();
-        if state.started || state.closed {
+        let Phase::Sizing { want, grid } = &mut state.phase else {
             return false;
-        }
-        let grid = (surface.columns, surface.rows);
-        if grid.0 == 0 || grid.1 == 0 || state.laid_out != Some(grid) {
-            state.laid_out = Some(grid);
+        };
+        let now = (surface.columns, surface.rows);
+        if now.0 == 0 || now.1 == 0 || *grid != Some(now) {
+            *grid = Some(now);
             return true;
         }
         let size = Size {
@@ -744,42 +779,53 @@ impl Link {
             cell_width: surface.cell_width_px,
             cell_height: surface.cell_height_px,
         };
-        state.started = true;
+        let want = std::mem::replace(want, Want::Spawn(None));
         state.size = Some(size);
-        if let Some(pane) = state.adopt.take() {
-            drop(state);
-            self.spawned(&pane);
-            return false;
+        match want {
+            Want::Adopt(info) => self.ask_attach(state, &info),
+            Want::Spawn(Some(spec)) => {
+                state.phase = Phase::Spawning;
+                drop(state);
+                self.ask(|request| Control::Spawn {
+                    request,
+                    command: spec.command,
+                    cwd: spec.cwd,
+                    env: spec.env,
+                    size,
+                });
+            }
+            Want::Spawn(None) => {
+                drop(state);
+                self.refused("The shell could not be started", "The terminal did not describe it.");
+            }
         }
-        let Some(spec) = state.spec.take() else {
-            drop(state);
-            report("The shell could not be started", "The terminal did not describe it.");
-            self.close_pane();
-            return false;
-        };
-        drop(state);
-        let request = self.daemon.next_request.fetch_add(1, Ordering::Relaxed);
-        self.daemon.spawning.lock().unwrap().insert(request, self.clone());
-        self.daemon.control(Control::Spawn {
-            request,
-            command: spec.command,
-            cwd: spec.cwd,
-            env: spec.env,
-            size,
-        });
         false
     }
 
-    /// The daemon's pane is known: attach to it at the size wanted now.
-    fn spawned(self: &Arc<Self>, info: &PaneInfo) {
-        let mut state = self.state.lock().unwrap();
-        if state.closed {
-            drop(state);
-            self.daemon.control(Control::Close { pane: info.pane });
-            return;
+    /// Ask the daemon for something it answers by request number, with
+    /// this link waiting for the answer. If the daemon has gone there will
+    /// be none, and the pane closes.
+    fn ask(self: &Arc<Self>, control: impl FnOnce(u32) -> Control) {
+        let request = self.daemon.next_request.fetch_add(1, Ordering::Relaxed);
+        self.daemon.starting.lock().unwrap().insert(request, self.clone());
+        self.daemon.control(control(request));
+        // Checked after the link is where the reader looks when the daemon
+        // goes, so one of the two sees it.
+        if self.daemon.gone.load(Ordering::Acquire)
+            && self.daemon.starting.lock().unwrap().remove(&request).is_some()
+        {
+            self.refused("The shell could not be started", "The session daemon has gone.");
         }
-        state.pane = Some(info.pane);
+    }
+
+    /// The daemon's pane is known: ask to be attached to it, alone, at the
+    /// size wanted now.
+    fn ask_attach(self: &Arc<Self>, mut state: std::sync::MutexGuard<'_, State>, info: &PaneInfo) {
+        let pane = info.pane;
+        let size = state.size.unwrap_or(info.size);
+        state.phase = Phase::Attaching { pane, sent: size };
         state.shell = (info.pid, info.creation_time);
+        drop(state);
         // What the shell told the terminal before this UI was there.
         let wake = self.wake as *mut c_void;
         for (text, tell) in [
@@ -790,22 +836,61 @@ impl Link {
                 unsafe { tell(wake, text.as_ptr()) };
             }
         }
-        let size = state.size.unwrap_or(info.size);
-        state.sent_size = Some(size);
-        let queued = std::mem::take(&mut state.queued_input);
         // Registered before the attach is sent, so its screen finds us.
-        self.daemon.panes.lock().unwrap().insert(info.pane, self.clone());
-        self.daemon.control(Control::Attach { pane: info.pane, size });
+        self.daemon.panes.lock().unwrap().insert(pane, self.clone());
+        self.ask(|request| Control::Attach { request, pane, size, exclusive: true });
+    }
+
+    /// The daemon has started the shell this link asked for.
+    fn spawned(self: &Arc<Self>, info: &PaneInfo) {
+        let state = self.state.lock().unwrap();
+        if !matches!(state.phase, Phase::Spawning) {
+            // The pane was closed while the shell was being started.
+            drop(state);
+            self.daemon.control(Control::Close { pane: info.pane });
+            return;
+        }
+        self.ask_attach(state, info);
+    }
+
+    /// The daemon has attached this link to its pane: the shell is ours.
+    fn attached(&self) {
+        let mut state = self.state.lock().unwrap();
+        let Phase::Attaching { pane, sent } = state.phase else {
+            // Closed meanwhile; `detach` has dealt with the pane.
+            return;
+        };
+        state.phase = Phase::Attached { pane, sent };
+        let queued = std::mem::take(&mut state.queued_input);
+        drop(state);
         if !queued.is_empty() {
-            self.daemon.send(Frame::Input { pane: info.pane, bytes: queued });
+            self.daemon.send(Frame::Input { pane, bytes: queued });
         }
     }
 
-    /// The daemon's pane: known at once for a shell taken over, and once the
-    /// daemon has answered for one this pane started.
+    /// The daemon would not start or attach the shell, or cannot. The pane
+    /// closes. A shell this pane started ends with it, as nothing shows
+    /// it; one it meant to take is not this link's to end.
+    fn refused(&self, summary: &str, details: &str) {
+        report(summary, details);
+        let phase = std::mem::replace(&mut self.state.lock().unwrap().phase, Phase::Closed);
+        if let Phase::Attaching { pane, .. } = phase {
+            self.daemon.panes.lock().unwrap().remove(&pane);
+            if !self.adopted {
+                self.daemon.control(Control::Close { pane });
+            }
+        }
+        self.close_pane();
+    }
+
+    /// The daemon's pane: known at once for a shell taken over, and once
+    /// the daemon has answered for one this pane started.
     pub(crate) fn pane_id(&self) -> Option<PaneId> {
         let state = self.state.lock().unwrap();
-        state.pane.or(state.adopt.as_ref().map(|pane| pane.pane))
+        match &state.phase {
+            Phase::Sizing { want: Want::Adopt(info), .. } => Some(info.pane),
+            _ => state.pane(),
+        }
     }
 
     /// The shell's pid and creation time, or zeros while unknown.
@@ -819,7 +904,7 @@ impl Link {
     /// started, when there is no history; `Err` when the daemon did not
     /// answer.
     pub(crate) fn snapshot(&self) -> Result<Option<Vec<u8>>, ()> {
-        let Some(pane) = self.state.lock().unwrap().pane else {
+        let Some(pane) = self.state.lock().unwrap().pane() else {
             return Ok(None);
         };
         if self.daemon.gone.load(Ordering::Acquire) {
@@ -836,54 +921,34 @@ impl Link {
         bytes.map(Some).ok_or(())
     }
 
-    /// Tell the UI this pane's shell is gone.
+    /// Tell the UI this pane's shell is gone. The pane then closes, which
+    /// comes back here as `detach`.
     fn close_pane(&self) {
-        let host = self.host.lock().unwrap();
-        if *host != 0 {
+        if *self.host.lock().unwrap() != 0 {
             crate::terminal::close_pane_from_session(self.wake as *mut c_void);
-        } else {
-            // The surface does not exist yet; it is closed once it does.
-            self.state.lock().unwrap().closed = true;
         }
     }
 
-    /// Whether the pane should close as soon as its surface exists.
-    pub(crate) fn closed_early(&self) -> bool {
-        self.state.lock().unwrap().closed
-    }
-
-    /// The pane's window is closing, not the pane: its shell stays in the
-    /// daemon when the surface is destroyed.
-    pub(crate) fn keep_shell(&self) {
-        self.state.lock().unwrap().keep = true;
-    }
-
-    /// The surface is about to be destroyed: stop feeding it, and end the
-    /// shell unless it is to be kept.
-    pub(crate) fn detach(&self) {
+    /// The surface is about to be destroyed: stop feeding it, and settle
+    /// what becomes of the shell.
+    pub(crate) fn detach(&self, end: End) {
         *self.host.lock().unwrap() = 0;
-        let mut state = self.state.lock().unwrap();
-        state.closed = true;
-        let keep = state.keep;
-        if let Some(pane) = state.pane.take() {
-            drop(state);
-            self.daemon.panes.lock().unwrap().remove(&pane);
-            self.daemon.control(if keep {
-                Control::Detach { pane }
-            } else {
-                // Nothing will run `npick` from it again.
-                remove_blob(picker_key(pane));
-                Control::Close { pane }
-            });
-        }
-    }
-}
-
-impl Drop for Link {
-    fn drop(&mut self) {
-        if let Some(pane) = self.adopted {
-            self.daemon.taken.lock().unwrap().remove(&pane);
-        }
+        let phase = std::mem::replace(&mut self.state.lock().unwrap().phase, Phase::Closed);
+        let (pane, ours) = match phase {
+            Phase::Attached { pane, .. } => (pane, true),
+            // The daemon has not said the shell is this link's. One this
+            // pane started is; one it meant to take may be another's.
+            Phase::Attaching { pane, .. } => (pane, !self.adopted),
+            _ => return,
+        };
+        self.daemon.panes.lock().unwrap().remove(&pane);
+        self.daemon.control(if end == End::Close && ours {
+            // Nothing will run `npick` from it again.
+            remove_blob(picker_key(pane));
+            Control::Close { pane }
+        } else {
+            Control::Detach { pane }
+        });
     }
 }
 
@@ -897,15 +962,16 @@ extern "C" fn on_write(userdata: *mut c_void, bytes: *const u8, len: usize) {
         let link = link(userdata);
         let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
         let mut state = link.state.lock().unwrap();
-        match state.pane {
-            Some(pane) => {
+        match state.phase {
+            Phase::Attached { pane, .. } => {
                 drop(state);
                 link.daemon.send(Frame::Input { pane, bytes: bytes.to_vec() });
             }
-            None if state.queued_input.len() + bytes.len() <= QUEUED_INPUT_MAX => {
+            Phase::Closed => {}
+            _ if state.queued_input.len() + bytes.len() <= QUEUED_INPUT_MAX => {
                 state.queued_input.extend_from_slice(bytes);
             }
-            None => {}
+            _ => {}
         }
     });
 }
@@ -924,17 +990,21 @@ extern "C" fn on_resize(userdata: *mut c_void, cols: u16, rows: u16, width: u32,
             cell_height: height / rows as u32,
         };
         let mut state = link.state.lock().unwrap();
-        // Before the pane starts, the layout decides its size.
-        if !state.started {
+        // While sizing, the layout decides the size the shell starts at.
+        if matches!(state.phase, Phase::Sizing { .. } | Phase::Closed) {
             return;
         }
         state.size = Some(size);
-        let Some(pane) = state.pane else { return };
-        let grid = |size: Size| (size.cols, size.rows);
-        if state.sent_size.map(grid) == Some(grid(size)) {
+        let (Phase::Attaching { pane, sent } | Phase::Attached { pane, sent }) = &mut state.phase
+        else {
+            // Spawning: the attach that follows is sent this size.
+            return;
+        };
+        if (sent.cols, sent.rows) == (size.cols, size.rows) {
             return;
         }
-        state.sent_size = Some(size);
+        *sent = size;
+        let pane = *pane;
         drop(state);
         link.daemon.control(Control::Resize { pane, size });
     });
@@ -950,11 +1020,17 @@ extern "C" fn on_spawn(userdata: *mut c_void, spawn: *const HostSpawn) {
         } else {
             unsafe { std::slice::from_raw_parts(spawn.env, spawn.env_len) }
         };
-        link.state.lock().unwrap().spec = Some(SpawnSpec {
+        let spec = SpawnSpec {
             command: text(spawn.command),
             cwd: (!spawn.cwd.is_null()).then(|| text(spawn.cwd)),
             env: env.iter().map(|var| (text(var.key), text(var.value))).collect(),
-        });
+        };
+        // A link that takes a running shell has no use for it.
+        if let Phase::Sizing { want: Want::Spawn(wanted), .. } =
+            &mut link.state.lock().unwrap().phase
+        {
+            *wanted = Some(spec);
+        }
     });
 }
 

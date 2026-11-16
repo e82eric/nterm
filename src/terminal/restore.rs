@@ -505,13 +505,13 @@ impl TerminalView {
         let workspace = self.workspaces.remove(at);
         for pane in &workspace.panes {
             if let Some(at) = self.tiled.iter().position(|(id, _)| id == pane) {
-                let (_, pane) = self.tiled.remove(at);
+                let (_, mut pane) = self.tiled.remove(at);
                 pane.keep_shell();
                 self.closed_panes.push(pane);
             }
         }
         for float in workspace.floats.ids() {
-            if let Some(float) = self.floating.remove(*float) {
+            if let Some(mut float) = self.floating.remove(*float) {
                 float.pane.keep_shell();
                 self.closed_panes.push(float.pane);
             }

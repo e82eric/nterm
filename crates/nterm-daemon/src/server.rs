@@ -72,7 +72,11 @@ struct State {
 
 impl Pane {
     fn info(&self) -> PaneInfo {
-        let mut state = self.state.lock().unwrap();
+        self.info_of(&mut self.state.lock().unwrap())
+    }
+
+    /// The pane's info, for a caller that holds its state.
+    fn info_of(&self, state: &mut State) -> PaneInfo {
         PaneInfo {
             title: state.terminal.title(),
             pwd: state.terminal.pwd(),
@@ -418,16 +422,26 @@ fn converse(
                     Err(message) => fail(Some(request), message),
                 }
             }
-            Control::Attach { pane: pane_id, size } => {
+            Control::Attach { request, pane: pane_id, size, exclusive } => {
                 let Some(pane) = session.pane(pane_id) else {
-                    missing(None, pane_id);
+                    missing(Some(request), pane_id);
                     continue;
                 };
-                // Resize, screen and subscription under one lock, so the
-                // output that follows starts exactly where the screen ends.
+                // The check, the resize, the screen and the subscription
+                // under one lock: of two UIs that ask for a pane to
+                // themselves one is refused, and the output that follows
+                // starts exactly where the screen ends.
                 let mut state = pane.state.lock().unwrap();
+                if exclusive && state.subscribers.iter().any(|(client, _)| *client != id) {
+                    drop(state);
+                    fail(Some(request), format!("pane {pane_id} is already shown"));
+                    continue;
+                }
                 state.resize(&pane, size);
                 state.subscribers.retain(|(client, _)| *client != id);
+                let mut info = pane.info_of(&mut state);
+                info.attached += 1;
+                send(Control::Attached { request, info });
                 if state.send_screen(pane_id, outbox) {
                     state.subscribers.push((id, outbox.clone()));
                 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -117,7 +117,17 @@ pub enum Control {
         size: Size,
     },
     /// Resize the pane to `size`, send its screen, then its output.
-    Attach { pane: PaneId, size: Size },
+    /// Answered with `Attached` before the screen. Answered with `Error`,
+    /// and the pane left as it was, when there is no such pane, or when
+    /// the attach is `exclusive` and a UI is already attached.
+    Attach {
+        request: u32,
+        pane: PaneId,
+        size: Size,
+        /// The pane is to be this UI's alone: refuse if another has it.
+        #[serde(default)]
+        exclusive: bool,
+    },
     Detach { pane: PaneId },
     /// The daemon resizes and sends the pane's screen again.
     Resize { pane: PaneId, size: Size },
@@ -143,6 +153,9 @@ pub enum Control {
         session: String,
     },
     Spawned { request: u32, info: PaneInfo },
+    /// The attach asked for by `request` was done. `info.attached` counts
+    /// the asker.
+    Attached { request: u32, info: PaneInfo },
     Exited { pane: PaneId, code: u32 },
     Panes { request: u32, panes: Vec<PaneInfo> },
     Blob {

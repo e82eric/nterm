@@ -291,6 +291,10 @@ pub(super) struct TerminalPane {
     /// waiting sessions, this pane only stands behind the picker until the
     /// choice is made. Read and written on the UI thread alone.
     held: bool,
+    /// What becomes of the shell when this pane is destroyed: it ends, or,
+    /// once `keep_shell` has been called, it stays in the session daemon.
+    /// Read and written on the UI thread alone.
+    end: crate::session::End,
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
     paint_callback: crate::painter::PaintCallback,
     size: [u32; 2],
@@ -411,6 +415,7 @@ impl TerminalPane {
             session,
             wheel_copy: false,
             held: false,
+            end: crate::session::End::Close,
             painter,
             paint_callback,
             size: [0, 0],
@@ -471,10 +476,8 @@ impl TerminalPane {
     /// The window is closing around this pane: leave its shell running in
     /// the session daemon, for the next nterm to show. A pane with its own
     /// shell has nowhere to leave it.
-    pub(super) fn keep_shell(&self) {
-        if let Some(session) = &self.session {
-            session.keep_shell();
-        }
+    pub(super) fn keep_shell(&mut self) {
+        self.end = crate::session::End::Keep;
     }
 
     pub(super) fn destroy(&mut self) {
@@ -491,7 +494,7 @@ impl TerminalPane {
         // callbacks borrow this pane's reference to the link, so that is
         // let go only once the surface can make no more of them.
         if let Some(session) = &self.session {
-            session.detach();
+            session.detach(self.end);
         }
         unsafe { ghostty_ffi::nterm_host_destroy(self.host) };
         self.session = None;
@@ -559,10 +562,7 @@ impl TerminalPane {
     /// settled; see `session::Link::layout`.
     fn layout_session(&self) {
         let Some(session) = &self.session else { return };
-        if session.closed_early() {
-            self.wake.close.store(true, Ordering::Release);
-            self.wake.context.request_repaint();
-        } else if !self.held
+        if !self.held
             && session.layout(unsafe { ghostty_ffi::nterm_host_surface_size(self.host) }) {
             // Come back even if nothing else asks for a frame.
             self.wake.context.request_repaint();
