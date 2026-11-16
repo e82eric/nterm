@@ -3,6 +3,7 @@ use crate::app::UserEvent;
 use crate::graphics as glow;
 use ghostty_app::GhosttyApp;
 
+mod empty;
 pub(crate) mod floating;
 pub(crate) mod ghostty_app;
 mod layout;
@@ -56,9 +57,11 @@ pub(crate) struct TerminalView {
     sessions: std::collections::HashMap<u64, String>,
     /// What the session daemon was last told of each session, by session.
     sessions_sent: std::collections::HashMap<String, String>,
-    /// At a launch that offers the waiting sessions: the pane whose shell
-    /// waits for the choice.
-    launch_pane: Option<u64>,
+    /// Why the window has no terminal, while it has none and is to stay.
+    empty: Option<empty::Empty>,
+    /// The Lua `startup` callback is to run once the window has its first
+    /// terminal on a new shell.
+    startup_pending: bool,
     /// What the daemon held when the session rows of the open picker were
     /// made: the session chosen from them is taken from it.
     waiting: Option<crate::session::Listing>,
@@ -134,13 +137,17 @@ impl TerminalView {
     /// The visible float, else the focused tiled pane. Only called while the
     /// window has a tiled pane.
     fn active_pane_ref(&self) -> &TerminalPane {
+        self.active_pane_opt().expect("an open window has a tiled pane")
+    }
+    /// The visible float, else the focused tiled pane, if the window has
+    /// a terminal at all.
+    fn active_pane_opt(&self) -> Option<&TerminalPane> {
         if let Some(float) = self.visible_float() {
-            &float.pane
+            Some(&float.pane)
         } else {
             self.focused_id()
                 .and_then(|id| self.tiled_ref(id))
                 .or_else(|| self.tiled.first().map(|(_, p)| p))
-                .expect("an open window has a tiled pane")
         }
     }
     fn show_error(&mut self, title: &str, error: String) {
@@ -164,25 +171,25 @@ impl TerminalView {
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
         issues.extend(app.take_config_issues());
-        // What the daemon holds, once the connection to it is made or has
-        // failed. With sessions waiting there, the first pane holds its
-        // shell back until one of them, or a new one, has been chosen.
-        let listing = crate::session::launch_listing()
-            .filter(|listing| !restore::detached(listing).is_empty());
-        let offer = listing.is_some();
-        let mut pane = TerminalPane::create(
-            &app,
-            egui_ctx,
-            gl,
-            proxy.clone(),
-            window,
-            &pane::SpawnOptions::default(),
-        )?;
-        if offer {
-            pane.hold();
-        }
-        #[cfg(any(windows, unix))]
-        pane.set_pipe_policy(&picker_bindings.pipe_policy);
+        // With shells kept in the session daemon the window starts with no
+        // terminal: what it shows first depends on what the daemon holds,
+        // and the daemon is reached while the window is already up.
+        let pane = if crate::session::status() == crate::session::Status::Off {
+            let pane = TerminalPane::create(
+                &app,
+                egui_ctx,
+                gl,
+                proxy.clone(),
+                window,
+                &pane::SpawnOptions::default(),
+            )?;
+            #[cfg(any(windows, unix))]
+            pane.set_pipe_policy(&picker_bindings.pipe_policy);
+            Some(pane)
+        } else {
+            crate::session::connect();
+            None
+        };
         let mut view = Self::with_pane(
             app,
             pane,
@@ -195,8 +202,8 @@ impl TerminalView {
             std::rc::Rc::new(picker_bindings),
             floating_padding,
         );
-        if let Some(listing) = listing {
-            view.offer_sessions(egui_ctx, listing);
+        if view.tiled.is_empty() {
+            view.empty = Some(empty::Empty::Connecting);
         }
         Ok(view)
     }
@@ -217,7 +224,7 @@ impl TerminalView {
         )?;
         #[cfg(any(windows, unix))]
         pane.set_pipe_policy(&self.picker_bindings.pipe_policy);
-        Ok(self.sibling(pane, window))
+        Ok(self.sibling(Some(pane), window))
     }
 
     /// A view for a new window whose first pane is one moved out of this
@@ -228,11 +235,11 @@ impl TerminalView {
         window: crate::graphics::PaneWindow,
     ) -> Self {
         pane.0.move_to_window(window.id);
-        self.sibling(pane.0, window)
+        self.sibling(Some(pane.0), window)
     }
 
     /// A view for another window around `pane`, sharing this window's settings.
-    fn sibling(&self, pane: TerminalPane, window: crate::graphics::PaneWindow) -> Self {
+    fn sibling(&self, pane: Option<TerminalPane>, window: crate::graphics::PaneWindow) -> Self {
         Self::with_pane(
             self.app.clone(),
             pane,
@@ -247,10 +254,11 @@ impl TerminalView {
         )
     }
 
-    /// A one-workspace view whose only pane is `pane`, tiled pane 0.
+    /// A one-workspace view whose only pane is `pane`, tiled pane 0, or which
+    /// has none yet.
     fn with_pane(
         app: std::rc::Rc<GhosttyApp>,
-        pane: TerminalPane,
+        pane: Option<TerminalPane>,
         context: &egui::Context,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
         window: crate::graphics::PaneWindow,
@@ -260,17 +268,20 @@ impl TerminalView {
         picker_bindings: std::rc::Rc<crate::picker::config::Bindings>,
         floating_padding: Option<crate::config::FloatingPadding>,
     ) -> Self {
+        let first = pane.is_some();
         Self {
             messages: crate::messages::Messages::new(issues),
             toasts: Default::default(),
             context: context.clone(),
-            tiled: vec![(0, pane)],
+            tiled: pane.into_iter().map(|pane| (0, pane)).collect(),
             closed_panes: Vec::new(),
             workspaces: vec![{
                 let mut w = workspace::Workspace::new(1, 1);
                 w.layout = picker_bindings.default_layout;
-                w.panes.push(0);
-                w.focused = Some(0);
+                if first {
+                    w.panes.push(0);
+                    w.focused = Some(0);
+                }
                 w
             }],
             current: 1,
@@ -285,7 +296,8 @@ impl TerminalView {
             nudge_step: false,
             sessions: Default::default(),
             sessions_sent: Default::default(),
-            launch_pane: None,
+            empty: None,
+            startup_pending: false,
             waiting: None,
             listing_asked: None,
             picker_bindings,
@@ -544,7 +556,8 @@ impl TerminalView {
                     self.show_error("Session could not be shown", error);
                 }
             }
-            // Its picker closing is what starts the shell that waited.
+            // The row of the picker a window without a terminal asks with,
+            // which acts on it itself.
             AppAction::NewSession => {}
             AppAction::MovePaneToWorkspaceId { pane, workspace } => {
                 if let Err(error) = self.move_pane_to_workspace(pane, workspace, gl) {
@@ -825,7 +838,7 @@ impl TerminalView {
     }
 
     pub(crate) fn should_close(&self) -> bool {
-        self.close_requested || self.workspaces.iter().all(|w| w.panes.is_empty())
+        self.close_requested || (self.empty.is_none() && !self.has_panes())
     }
 
     /// Opens the messages picker in the visible float, or else the focused pane.
@@ -874,7 +887,10 @@ impl TerminalView {
             self.show_messages(ui.ctx());
         }
         let mut right_edge = messages_left;
-        let status = self.active_pane_ref().status(&self.command_label);
+        let status = match self.active_pane_opt() {
+            Some(pane) => pane.status(&self.command_label),
+            None => self.empty_status(),
+        };
         let foreground = crate::colors::palette().text;
         let painter = ui.painter().with_clip_rect(rect);
         let separator = status.separator;
@@ -1053,9 +1069,10 @@ impl TerminalView {
         // While searching, the query field takes the detail text's place.
         // A key table shows the focused terminal's size instead, and its
         // hints fill the space up to it.
-        let searching = self.active_pane_ref().search_active() && table.is_none();
+        let searching =
+            self.active_pane_opt().is_some_and(|pane| pane.search_active()) && table.is_none();
         let detail = if table.is_some() {
-            let (columns, rows) = self.active_pane_ref().grid_size();
+            let (columns, rows) = self.active_pane_opt().map_or((0, 0), |pane| pane.grid_size());
             Some(format!("{columns}×{rows}"))
         } else {
             status.detail.filter(|_| !searching)

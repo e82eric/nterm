@@ -32,14 +32,13 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// How long copy mode, search and the pickers wait for a pane's history.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(5);
 
 /// How long a launch waits for the connection before it goes on without.
-const LAUNCH_WAIT: Duration = Duration::from_secs(10);
 
 /// How long leaving nterm waits for what was queued to be written.
 const FLUSH_WAIT: Duration = Duration::from_secs(2);
@@ -228,7 +227,7 @@ enum Conn {
     Idle,
     Connecting,
     Connected(Arc<Daemon>),
-    Unavailable,
+    Unavailable(String),
     Lost,
 }
 
@@ -239,8 +238,8 @@ struct Client {
     changed: Condvar,
     /// Counts the connections made, to tell one from the next.
     connections: Mutex<u64>,
-    /// The UI, to be woken when something it may be waiting for arrives.
-    ui: Mutex<Option<egui::Context>>,
+    /// Wakes the UI when something it may be waiting for arrives.
+    ui: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 static CLIENT: Client = Client {
@@ -258,15 +257,19 @@ impl Client {
     }
 
     fn wake_ui(&self) {
-        if let Some(ui) = &*self.ui.lock().unwrap() {
-            ui.request_repaint();
+        if let Some(wake) = &*self.ui.lock().unwrap() {
+            wake();
         }
     }
 }
 
-/// The UI to wake when the connection changes or a listing arrives.
-pub(crate) fn set_ui(ui: &egui::Context) {
-    *CLIENT.ui.lock().unwrap() = Some(ui.clone());
+/// How to wake the UI when the connection changes or a listing arrives.
+/// It is called from the session's threads, so it must draw every window
+/// whichever thread asks. A repaint asked of the egui context does not: off
+/// the UI thread it is asked of the root viewport, which no window is, and
+/// egui passes on only the first such request until the root is next run.
+pub(crate) fn set_ui(wake: impl Fn() + Send + 'static) {
+    *CLIENT.ui.lock().unwrap() = Some(Box::new(wake));
 }
 
 /// Start connecting, unless that is under way or done. Returns at once; the
@@ -293,38 +296,51 @@ pub(crate) fn connect() {
         CLIENT.set(match open(number) {
             Ok(daemon) => Conn::Connected(daemon),
             Err(error) => {
-                report(
-                    "Session daemon unavailable",
-                    &format!("{error}\n\nPanes run their own shells."),
-                );
-                Conn::Unavailable
+                let error = error.to_string();
+                report("Session daemon unavailable", &error);
+                Conn::Unavailable(error)
             }
         });
     });
     if let Err(error) = started {
-        report("Session daemon unavailable", &format!("{error}\n\nPanes run their own shells."));
-        CLIENT.set(Conn::Unavailable);
+        let error = error.to_string();
+        report("Session daemon unavailable", &error);
+        CLIENT.set(Conn::Unavailable(error));
     }
 }
 
-/// At launch: connect, wait until that has succeeded or failed, and take
-/// what the daemon held when it did. `None` without a connection.
-///
-/// This is the one place the UI thread waits for the connection. It is
-/// here because a window cannot yet be shown before its first pane, and
-/// the first pane depends on the answer.
-pub(crate) fn launch_listing() -> Option<Listing> {
-    connect();
-    let deadline = Instant::now() + LAUNCH_WAIT;
-    let mut state = CLIENT.state.lock().unwrap();
-    while matches!(*state, Conn::Connecting) {
-        let left = deadline.checked_duration_since(Instant::now())?;
-        state = CLIENT.changed.wait_timeout(state, left).unwrap().0;
+/// Where the connection to the daemon stands, for a window to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Status {
+    /// Shells are not kept in a daemon: each pane runs its own.
+    Off,
+    /// `connect` has not been called.
+    Idle,
+    Connecting,
+    Connected,
+    /// The daemon could not be reached or started, and why.
+    Unavailable(String),
+    /// The daemon was connected and has gone.
+    Lost,
+}
+
+pub(crate) fn status() -> Status {
+    if !enabled() {
+        return Status::Off;
     }
-    match &*state {
-        Conn::Connected(daemon) => daemon.at_connect.lock().unwrap().take(),
-        _ => None,
+    match &*CLIENT.state.lock().unwrap() {
+        Conn::Idle => Status::Idle,
+        Conn::Connecting => Status::Connecting,
+        Conn::Connected(_) => Status::Connected,
+        Conn::Unavailable(error) => Status::Unavailable(error.clone()),
+        Conn::Lost => Status::Lost,
     }
+}
+
+/// What the daemon held when this connection to it was made. It is there
+/// to be taken once, by the window that decides what to show first.
+pub(crate) fn take_first_listing() -> Option<Listing> {
+    daemon()?.at_connect.lock().unwrap().take()
 }
 
 /// Leaving nterm: wait, briefly, until what was queued for the daemon has
@@ -705,10 +721,10 @@ impl Link {
     /// surface is then created with the link's `backend`, which makes it a
     /// mirror of the daemon's pane. `wake` is the pane's `WakeState`.
     ///
-    /// `Ok(None)` when the daemon is off or cannot be reached: the surface
-    /// runs its own shell. `Err` when a shell was to be taken and cannot
-    /// be; starting another in its place would pass a new shell off as the
-    /// one asked for.
+    /// `Ok(None)` when shells are not kept in a daemon: the surface runs
+    /// its own. `Err` when they are and the daemon cannot be reached, or
+    /// when the shell to be taken cannot be. A shell of the surface's own
+    /// in its place would not outlive the window, and nothing would say so.
     pub(crate) fn prepare(wake: *mut c_void, start: &Start) -> Result<Option<Arc<Link>>, String> {
         let daemon = daemon();
         let want = match (start, &daemon) {
@@ -724,7 +740,12 @@ impl Link {
                 Want::Adopt(adopt.info.clone())
             }
         };
-        let Some(daemon) = daemon else { return Ok(None) };
+        let Some(daemon) = daemon else {
+            return match enabled() {
+                true => Err("the session daemon cannot be reached".into()),
+                false => Ok(None),
+            };
+        };
         let link = Arc::new(Link {
             daemon,
             adopted: matches!(want, Want::Adopt(_)),
@@ -1094,12 +1115,12 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(20);
 
     fn until<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
-        let deadline = Instant::now() + WAIT;
+        let deadline = std::time::Instant::now() + WAIT;
         loop {
             if let Some(value) = ready() {
                 return value;
             }
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -1127,12 +1148,15 @@ mod tests {
         let session = format!("test-client-{}", std::process::id());
         *TARGET.lock().unwrap() = Some((session, program));
 
-        // The launch waits for the connection and takes what the daemon held.
-        let held = launch_listing().expect("the daemon was started");
+        // Once connected, what the daemon held is there to be taken.
+        assert_eq!(status(), Status::Idle);
+        connect();
+        until("the connection", || (status() == Status::Connected).then_some(()));
+        let held = take_first_listing().expect("the daemon was started");
         assert!(held.panes.is_empty() && held.blobs.is_empty());
         assert!(matches!(&*CLIENT.state.lock().unwrap(), Conn::Connected(_)));
         // It is taken once.
-        assert!(launch_listing().is_none());
+        assert!(take_first_listing().is_none());
         let first = daemon().unwrap().number;
 
         // What is queued is written in order: the blob is there to be listed.
@@ -1152,7 +1176,7 @@ mod tests {
         // of it will not come.
         let asked = request_listing().unwrap();
         daemon().unwrap().control(Control::Shutdown);
-        until("the loss", || matches!(&*CLIENT.state.lock().unwrap(), Conn::Lost).then_some(()));
+        until("the loss", || (status() == Status::Lost).then_some(()));
         assert!(daemon().is_none());
         assert!(request_listing().is_none());
         assert!(matches!(take_listing(asked), Answer::Gone));

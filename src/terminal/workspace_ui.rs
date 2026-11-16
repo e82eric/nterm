@@ -633,7 +633,7 @@ impl TerminalView {
             }
         }
     }
-    fn prune_workspaces(&mut self) {
+    pub(super) fn prune_workspaces(&mut self) {
         let orphaned =
             workspace::prune_empty(&mut self.workspaces, &mut self.current, &mut self.previous);
         self.close_floats(orphaned);
@@ -1387,6 +1387,12 @@ impl TerminalView {
     /// Runs the Lua `startup` callback for a newly created window, before its
     /// first frame.
     pub(crate) fn run_startup(&mut self, ctx: &egui::Context, gl: &glow::Context) {
+        // It sets up a window that has a terminal. One that waits for the
+        // session daemon runs it when it starts its first shell.
+        if self.empty.is_some() {
+            self.startup_pending = true;
+            return;
+        }
         if let Some(callback) = self.picker_bindings.startup.clone() {
             let result = callback.with_host(&mut |r| self.host_request(r, gl), || {
                 callback.call_action(String::new())
@@ -1406,7 +1412,6 @@ impl TerminalView {
         for mut p in self.closed_panes.drain(..) {
             p.destroy();
         }
-        self.settle_launch();
         self.poll_waiting();
         self.save_sessions();
         let exited: Vec<_> = self
@@ -1427,10 +1432,15 @@ impl TerminalView {
             .map(|p| p.id)
             .collect();
         self.close_floats(exited);
+        self.note_daemon_loss();
     }
     pub(super) fn update_workspaces(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
         let ctx = ui.ctx().clone();
         if self.should_close() {
+            return;
+        }
+        if self.empty.is_some() {
+            self.update_empty(ui, gl);
             return;
         }
         // Leaving the window leaves a key table, so returning to it does not

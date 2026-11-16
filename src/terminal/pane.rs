@@ -287,10 +287,6 @@ pub(super) struct TerminalPane {
     /// Copy mode was opened by the wheel, and scrolling back down to the end
     /// leaves it.
     wheel_copy: bool,
-    /// The shell is not to be started yet: at a launch that offers the
-    /// waiting sessions, this pane only stands behind the picker until the
-    /// choice is made. Read and written on the UI thread alone.
-    held: bool,
     /// What becomes of the shell when this pane is destroyed: it ends, or,
     /// once `keep_shell` has been called, it stays in the session daemon.
     /// Read and written on the UI thread alone.
@@ -414,7 +410,6 @@ impl TerminalPane {
             wake,
             session,
             wheel_copy: false,
-            held: false,
             end: crate::session::End::Close,
             painter,
             paint_callback,
@@ -459,18 +454,6 @@ impl TerminalPane {
     /// The session daemon's pane this one shows, once known.
     pub(super) fn session_pane(&self) -> Option<u32> {
         self.session.as_ref().and_then(|session| session.pane_id())
-    }
-
-    /// Do not start this pane's shell until `start_shell`. Called before
-    /// the pane is first laid out.
-    pub(super) fn hold(&mut self) {
-        self.held = true;
-    }
-
-    /// Start the shell of a pane that was made holding it back.
-    pub(super) fn start_shell(&mut self) {
-        self.held = false;
-        self.wake.context.request_repaint();
     }
 
     /// The window is closing around this pane: leave its shell running in
@@ -562,8 +545,7 @@ impl TerminalPane {
     /// settled; see `session::Link::layout`.
     fn layout_session(&self) {
         let Some(session) = &self.session else { return };
-        if !self.held
-            && session.layout(unsafe { ghostty_ffi::nterm_host_surface_size(self.host) }) {
+        if session.layout(unsafe { ghostty_ffi::nterm_host_surface_size(self.host) }) {
             // Come back even if nothing else asks for a frame.
             self.wake.context.request_repaint();
         }

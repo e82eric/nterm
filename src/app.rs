@@ -493,7 +493,12 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             let command_label = command_label(&args);
             let ghostty = Rc::new(GhosttyApp::new(&window.egui.egui_ctx, args)?);
             self.ghostty = Some(ghostty.clone());
-            crate::session::set_ui(&window.egui.egui_ctx);
+            crate::session::set_ui({
+                let proxy = self.proxy.clone();
+                move || {
+                    let _ = proxy.send_event(UserEvent::Repaint(Instant::now()));
+                }
+            });
             window.shell = Some(ShellApp::new(
                 ghostty,
                 &window.egui.egui_ctx,

@@ -241,57 +241,8 @@ impl TerminalView {
         self.show_workspace_picker(&ctx, false, listing);
     }
 
-    /// At launch, with sessions waiting: ask which to show, or a new one.
-    /// The window's first pane has not started its shell; it does once the
-    /// picker has gone without a session being taken.
-    pub(super) fn offer_sessions(&mut self, ctx: &egui::Context, listing: crate::session::Listing) {
-        let mut entries = self.offer_waiting(listing);
-        let Some((first, _)) = self.tiled.first() else { return };
-        let first = *first;
-        if entries.is_empty() {
-            self.start_held(first);
-            return;
-        }
-        entries.push(crate::actions::Entry {
-            id: "session.new".into(),
-            label: "New session".into(),
-            shortcut: None,
-            action: AppAction::NewSession,
-        });
-        let options = super::workspace_ui::entry_picker(entries);
-        let bindings = self.picker_bindings.clone();
-        let palette = self.palette_context();
-        if let Some(pane) = self.tiled_mut(first) {
-            pane.open_picker(
-                ctx,
-                crate::picker::config::PickerEntry::Static(options),
-                None,
-                &bindings,
-                &palette,
-            );
-        }
-        self.launch_pane = Some(first);
-    }
-
-    fn start_held(&mut self, pane: u64) {
-        if let Some(pane) = self.tiled_mut(pane) {
-            pane.start_shell();
-        }
-    }
-
-    /// Every frame: once the launch picker has gone, by a choice of a new
-    /// session or by Escape, the first pane starts its shell.
-    pub(super) fn settle_launch(&mut self) {
-        let Some(pane) = self.launch_pane else { return };
-        if self.tiled_ref(pane).is_some_and(|pane| pane.workspace_picker_active()) {
-            return;
-        }
-        self.launch_pane = None;
-        self.start_held(pane);
-    }
-
     /// Show a waiting session as a new workspace of this window, and go to
-    /// it. At launch it takes the place of the pane that was held.
+    /// it. In a window that had no terminal it is the only workspace.
     pub(super) fn attach_session(&mut self, id: &str, gl: &glow::Context) -> Result<(), String> {
         // The listing the picker's rows were made from. It is used once.
         let listing = self.waiting.take().ok_or("That session is no longer waiting.")?;
@@ -355,10 +306,8 @@ impl TerminalView {
             self.sessions.insert(workspace_id, id.to_owned());
         }
         self.select_workspace(workspace_id)?;
-        if let Some(held) = self.launch_pane.take() {
-            // Never started, so no shell ends with it.
-            self.close_tiled(held)?;
-        }
+        // A window that had no terminal had a workspace with nothing in it.
+        self.prune_workspaces();
         workspace::renumber(&mut self.workspaces);
         self.context.request_repaint();
         Ok(())
