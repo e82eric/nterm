@@ -169,6 +169,13 @@ impl Picker {
         if !self.source.set_entries(entries) {
             return false;
         }
+        if self.source.members().is_some() {
+            // Its rows are one member of it. The folders after them are
+            // another, which is left as it is: found no further again, and
+            // with the selection if that is on one of them.
+            self.shared.replace_member(ctx, 0, self.source.provider());
+            return true;
+        }
         let query = self.shared.query().to_owned();
         self.shared.replace_source(ctx, self.source.provider(), query);
         true
@@ -181,9 +188,11 @@ impl Picker {
         roots: &[std::path::PathBuf],
         depth: i32,
     ) {
-        if self.source.list_folders(roots, depth) {
+        if self.source.list_folders(roots, depth)
+            && let Some(members) = self.source.members()
+        {
             let query = self.shared.query().to_owned();
-            self.shared.replace_source(ctx, self.source.provider(), query);
+            self.shared.replace_sources(ctx, members, query);
         }
     }
     pub(crate) fn bind_pipe_search_wake(
@@ -858,7 +867,7 @@ impl Picker {
         }))
     }
     fn accept(&self, selection: nfm_egui::Selection<source::Candidate>) -> Option<Action> {
-        let unmoved = selection.index == 0;
+        let unmoved = selection.index == 0 && selection.member == 0;
         if let Some(session) = &self.pipe_session {
             let index = selection.item.node_index;
             let value = self
