@@ -715,6 +715,14 @@ fn uis_are_told_of_the_sessions_as_they_change() {
         told.len() == 1 && told[0].panes.iter().all(|pane| pane.attached == 0)
     });
 
+    // A shell nothing shows changes its title: nothing was asked of the
+    // daemon, and the UIs are told.
+    ui.input(b, "title later\r");
+    other.sessions("the title", |told| {
+        let titled = |pane: &PaneInfo| pane.title.as_deref().is_some_and(|title| title.contains("later"));
+        told[0].panes.iter().any(titled)
+    });
+
     // A session is told without its shells that have ended, and with none
     // left it is forgotten.
     ui.send(Control::Close { pane: a });

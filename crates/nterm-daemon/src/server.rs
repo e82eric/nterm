@@ -102,6 +102,9 @@ struct State {
     exited: Option<u32>,
     /// Forget the pane as soon as its shell has ended.
     closing: bool,
+    /// The title and directory of the shell when the UIs were last told of
+    /// them because they had changed.
+    named: (Option<String>, Option<String>),
 }
 
 impl Pane {
@@ -264,6 +267,7 @@ impl Session {
                 subscribers: Vec::new(),
                 exited: None,
                 closing: false,
+                named: (None, None),
             }),
         });
         self.panes.lock().unwrap().insert(id, pane.clone());
@@ -287,6 +291,7 @@ impl Session {
 
         let reader = {
             let pane = pane.clone();
+            let session = self.clone();
             thread("output")
                 .spawn(move || {
                     let mut buffer = vec![0u8; 65536];
@@ -307,6 +312,15 @@ impl Session {
                         if !state.subscribers.is_empty() {
                             let frame = Frame::encode_output(pane.id, bytes);
                             state.subscribers.retain(|(_, outbox)| outbox.send(frame.clone()).is_ok());
+                        }
+                        // What a waiting shell calls itself, and where it is,
+                        // are what a UI lists it by.
+                        if state.subscribers.is_empty() {
+                            let named = (state.terminal.title(), state.terminal.pwd());
+                            if state.named != named {
+                                state.named = named;
+                                session.sessions_changed();
+                            }
                         }
                     }
                 })
@@ -403,11 +417,7 @@ pub fn run(options: Options) -> io::Result<()> {
         std::thread::Builder::new().name("sessions".into()).spawn(move || {
             let mut told = Vec::new();
             loop {
-                // A shell changes its title or its directory without anything
-                // being asked of the daemon, so look now and then as well.
-                if let Err(mpsc::RecvTimeoutError::Disconnected) =
-                    changes.recv_timeout(Duration::from_secs(1))
-                {
+                if changes.recv().is_err() {
                     return;
                 }
                 while changes.try_recv().is_ok() {}
@@ -421,6 +431,9 @@ pub fn run(options: Options) -> io::Result<()> {
                         let _ = outbox.send(frame.clone());
                     }
                     told = frame;
+                    // A shell can change its title many times a second.
+                    // What comes meanwhile is one more message.
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             }
         })?;
