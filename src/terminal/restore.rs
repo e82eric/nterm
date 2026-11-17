@@ -197,7 +197,7 @@ impl TerminalView {
         if self.offered.is_none() {
             return;
         }
-        if self.sessions_picker_mut().is_none() {
+        if self.window_picker.is_none() {
             // The picker has closed.
             self.offered = None;
             return;
@@ -207,7 +207,7 @@ impl TerminalView {
         }
         let rows = self.workspace_picker_rows();
         let ctx = self.context.clone();
-        if let Some(picker) = self.sessions_picker_mut() {
+        if let Some(picker) = &mut self.window_picker {
             picker.set_entries(&ctx, rows);
         }
     }

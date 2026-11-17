@@ -490,9 +490,6 @@ impl TerminalPane {
 
     pub(super) fn set_active(&mut self, ctx: &egui::Context, active: bool, window_focused: bool) {
         if self.active != active {
-            if !active {
-                self.cancel_workspace_picker();
-            }
             if !active && (self.search.active || !self.pages.is_empty()) {
                 ctx.memory_mut(|memory| {
                     if let Some(id) = memory.focused() {
@@ -1009,31 +1006,9 @@ impl TerminalPane {
             picker.surrender_focus();
         }
     }
-    pub(super) fn workspace_picker_active(&self) -> bool {
-        self.pages
-            .top()
-            .is_some_and(|p| p.scope() == crate::picker::config::Scope::Workspace)
-    }
-    /// The picker of workspaces and sessions, when it is the one open.
-    /// Other pickers are shown across the workspace too.
-    pub(super) fn workspace_picker_mut(&mut self) -> Option<&mut crate::picker::Picker> {
-        self.pages.top_mut()?.picker_mut().filter(|picker| picker.lists_workspaces())
-    }
-    pub(super) fn cancel_workspace_picker(&mut self) {
-        if !self.workspace_picker_active() {
-            return;
-        }
-        let picker = self.take_pages().unwrap();
-        let (generation, from_copy) = (picker.generation(), picker.from_copy());
-        drop(picker);
-        self.pending_callback = None;
-        self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
-        self.wake.context.memory_mut(|memory| {
-            if let Some(id) = memory.focused() {
-                memory.surrender_focus(id);
-            }
-        });
-        self.wake.context.request_repaint();
+    /// How a picker's text is sized to match this terminal's cells.
+    pub(super) fn picker_typography(&mut self, ctx: &egui::Context) -> crate::picker::font::Typography {
+        self.picker_font.typography(ctx, self.host)
     }
     pub(super) fn show_background_overlays(&mut self, ctx: &egui::Context, bounds: egui::Rect) {
         if let Some(page) = self.pages.top_mut() {

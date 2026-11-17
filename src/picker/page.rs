@@ -2,7 +2,7 @@
 //! or what a program prints. The pane keeps them in a stack and treats them alike for where they
 //! were opened and what they report; what only a picker does is asked of the
 //! picker.
-use super::{Action, Output, Picker, Prompt, config, font};
+use super::{Action, Output, Picker, Prompt, font};
 
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Page {
@@ -55,13 +55,6 @@ impl Page {
             Self::Picker(picker) => picker.from_copy,
             Self::Prompt(prompt) => prompt.from_copy,
             Self::Output(output) => output.from_copy,
-        }
-    }
-    pub(crate) fn scope(&self) -> config::Scope {
-        match self {
-            Self::Picker(picker) => picker.scope,
-            Self::Prompt(prompt) => prompt.scope,
-            Self::Output(output) => output.scope,
         }
     }
     pub(crate) fn label(&self) -> &'static str {

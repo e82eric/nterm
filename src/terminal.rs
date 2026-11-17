@@ -63,6 +63,10 @@ pub(crate) struct TerminalView {
     /// What the open picker that offers the waiting sessions was made from,
     /// while there is one.
     offered: Option<(u64, u64)>,
+    /// The picker of workspaces and sessions, while it is open. It is the
+    /// window's and not a pane's: it is about no pane, and a window with no
+    /// terminal shows it too.
+    window_picker: Option<Box<crate::picker::Picker>>,
 }
 
 struct FloatingTerminal {
@@ -293,6 +297,7 @@ impl TerminalView {
             sessions_sent: Default::default(),
             empty: None,
             offered: None,
+            window_picker: None,
             picker_bindings,
             floating_padding,
             floating: Default::default(),
@@ -880,10 +885,13 @@ impl TerminalView {
             self.show_messages(ui.ctx());
         }
         let mut right_edge = messages_left;
-        let status = match self.active_pane_opt() {
+        let mut status = match self.active_pane_opt() {
             Some(pane) => pane.status(&self.command_label),
             None => self.empty_status(),
         };
+        if let Some(picker) = &self.window_picker {
+            status.label = picker.label();
+        }
         let foreground = crate::colors::palette().text;
         let painter = ui.painter().with_clip_rect(rect);
         let separator = status.separator;

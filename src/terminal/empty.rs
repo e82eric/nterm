@@ -14,7 +14,7 @@ pub(super) enum Empty {
     /// Sessions wait in the daemon: which to show, or a new one. The picker
     /// is the one a pane shows for workspaces; the window holds it, as
     /// there is no pane to.
-    Choose(Box<crate::picker::Picker>),
+    Choose,
     /// The daemon could not be reached, or was and has gone.
     Unavailable { lost: bool, reason: String },
 }
@@ -23,7 +23,7 @@ impl Empty {
     fn label(&self) -> &'static str {
         match self {
             Self::Connecting => "CONNECTING",
-            Self::Choose(_) => "SESSIONS",
+            Self::Choose => "SESSIONS",
             Self::Unavailable { .. } => "NO DAEMON",
         }
     }
@@ -63,7 +63,7 @@ impl TerminalView {
         // Nothing of what the window knew of the daemon holds any more.
         self.sessions.clear();
         self.sessions_sent.clear();
-        self.offered = None;
+        self.close_window_picker();
         self.key_table = None;
         self.empty = Some(Empty::Unavailable { lost, reason });
         self.context.request_repaint();
@@ -98,33 +98,30 @@ impl TerminalView {
                 Status::Lost => Some(Empty::Unavailable { lost: true, reason: String::new() }),
                 Status::Off => self.first_shell(gl),
                 Status::Connected => {
-                    let waiting = self.chooser(&ctx);
-                    match waiting {
-                        Some(picker) => Some(Empty::Choose(picker)),
-                        None => self.first_shell(gl),
+                    // With sessions waiting, ask which to show.
+                    let rows = self.workspace_picker_rows();
+                    if rows.is_empty() {
+                        self.first_shell(gl)
+                    } else {
+                        self.show_in_window(&ctx, super::workspace_ui::entry_picker(rows));
+                        Some(Empty::Choose)
                     }
                 }
             },
             // The daemon went while the choice was open: say so next frame.
-            Empty::Choose(picker) if now != Status::Connected => {
-                picker.surrender_focus();
-                self.offered = None;
+            Empty::Choose if now != Status::Connected => {
+                self.close_window_picker();
                 Some(Empty::Connecting)
             }
             // Other windows took every session that waited, so there is
             // nothing left to ask: see `workspace_picker_rows`.
-            Empty::Choose(picker) if self.offered.is_none() => {
-                picker.surrender_focus();
-                drop(picker);
+            Empty::Choose if self.offered.is_none() || self.window_picker.is_none() => {
+                self.close_window_picker();
                 self.first_shell(gl)
             }
-            Empty::Choose(mut picker) => match picker.show_scoped(&ctx, content, None, true) {
-                None => Some(Empty::Choose(picker)),
-                Some(action) => {
-                    picker.surrender_focus();
-                    drop(picker);
-                    self.chosen(action, &ctx, gl)
-                }
+            Empty::Choose => match self.show_window_picker(&ctx, content) {
+                None => Some(Empty::Choose),
+                Some(action) => self.chosen(action, &ctx, gl),
             },
             // Another window asked again, and it is under way or done.
             Empty::Unavailable { .. } if matches!(now, Status::Connecting | Status::Connected) => {
@@ -158,29 +155,8 @@ impl TerminalView {
         self.toasts.show(&ctx, content, egui::Id::new("window-toasts"), None, 0.0);
     }
 
-    /// The picker of workspaces and sessions, for a window with no pane to
-    /// hold it. `None` when no session waits.
-    fn chooser(&mut self, ctx: &egui::Context) -> Option<Box<crate::picker::Picker>> {
-        let entries = self.workspace_picker_rows();
-        if entries.is_empty() {
-            return None;
-        }
-        let options = super::workspace_ui::entry_picker(entries);
-        // Its rows are given to it, so it reads no terminal.
-        Some(Box::new(crate::picker::Picker::start_replacing(
-            std::ptr::null_mut(),
-            None,
-            false,
-            0,
-            ctx.clone(),
-            options,
-            &self.picker_bindings.prompt_patterns,
-            None,
-        )))
-    }
-
-    /// The picker has gone. What was chosen is done as it is from a pane's
-    /// picker; a window still without a terminal after that, by the row for
+    /// The picker has gone. What was chosen is done as in any window; a
+    /// window still without a terminal after that, by the row for
     /// a new session, by Escape, or because the session could not be shown,
     /// starts a shell.
     fn chosen(

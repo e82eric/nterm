@@ -526,38 +526,79 @@ impl TerminalView {
         entries
     }
 
-    /// The open picker of workspaces and sessions: in the active pane, or
-    /// the window's own while it has no terminal.
-    pub(super) fn sessions_picker_mut(&mut self) -> Option<&mut crate::picker::Picker> {
-        if matches!(self.empty, Some(super::empty::Empty::Choose(_))) {
-            let Some(super::empty::Empty::Choose(picker)) = &mut self.empty else { return None };
-            return Some(picker);
-        }
-        let pane = self.active_pane()?;
-        self.pane_mut(pane)?.workspace_picker_mut()
-    }
-
+    /// Open the picker of workspaces and sessions, or, `moving`, of where
+    /// the active pane can be moved to. The window holds it, with or
+    /// without a terminal: it is about no pane.
     fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
+        self.close_window_picker();
         let pane = if moving { self.active_pane() } else { None };
         if moving && pane.is_none() {
             return;
         }
-        let mut options = workspace_picker_options(&self.workspaces, self.current, pane);
-        self.offered = None;
-        if !moving {
-            options = entry_picker(self.workspace_picker_rows());
+        let options = if moving {
+            workspace_picker_options(&self.workspaces, self.current, pane)
+        } else {
+            entry_picker(self.workspace_picker_rows())
+        };
+        self.show_in_window(ctx, options);
+    }
+
+    /// Open the window's picker. Its rows are given to it, so it reads no
+    /// terminal.
+    pub(super) fn show_in_window(
+        &mut self,
+        ctx: &egui::Context,
+        options: crate::picker::config::Options,
+    ) {
+        self.window_picker = Some(Box::new(crate::picker::Picker::start_replacing(
+            std::ptr::null_mut(),
+            None,
+            false,
+            0,
+            ctx.clone(),
+            options,
+            &self.picker_bindings.prompt_patterns,
+            None,
+        )));
+        ctx.request_repaint();
+    }
+
+    pub(super) fn close_window_picker(&mut self) {
+        if let Some(picker) = self.window_picker.take() {
+            picker.surrender_focus();
+            self.offered = None;
+            self.context.request_repaint();
         }
-        let bindings = self.picker_bindings.clone();
-        let palette = self.palette_context();
-        if let Some(pane) = self.active_pane().and_then(|p| self.pane_mut(p)) {
-            pane.open_picker(
-                ctx,
-                crate::picker::config::PickerEntry::Static(options),
-                None,
-                &bindings,
-                &palette,
-            );
+    }
+
+    /// A frame of the window's picker, across `content`. Returns what was
+    /// chosen, or that it was left, once: the picker has then gone.
+    pub(super) fn show_window_picker(
+        &mut self,
+        ctx: &egui::Context,
+        content: egui::Rect,
+    ) -> Option<crate::picker::Action> {
+        self.window_picker.as_ref()?;
+        // Text is sized to a terminal's cells, when there is a terminal.
+        let typography = self
+            .active_pane()
+            .and_then(|pane| self.pane_mut(pane))
+            .map(|pane| pane.picker_typography(ctx));
+        let builtin = self.picker_bindings.builtin_pickers;
+        let padding = self.picker_bindings.cursor_scroll_padding;
+        let picker = self.window_picker.as_mut()?;
+        if let Some(typography) = typography {
+            picker.typography = typography;
         }
+        picker.builtin_pickers = builtin;
+        picker.set_cursor_scroll_padding(padding);
+        let action = picker.show_scoped(ctx, content, None, true)?;
+        // Its rows run no Lua.
+        if matches!(action, crate::picker::Action::Custom(_)) {
+            return None;
+        }
+        self.close_window_picker();
+        Some(action)
     }
     pub(super) fn workspace(&self) -> &Workspace {
         self.workspaces
@@ -588,15 +629,7 @@ impl TerminalView {
             return Err("workspace does not exist".into());
         }
         if self.current != id {
-            let panes = self.workspace().panes.clone();
-            for pane_id in panes {
-                if let Some(pane) = self.tiled_mut(pane_id) {
-                    pane.cancel_workspace_picker();
-                }
-            }
-            for pane in &mut self.floating.entries {
-                pane.cancel_workspace_picker();
-            }
+            self.close_window_picker();
             self.previous = self.current;
             self.current = id;
         }
@@ -785,7 +818,7 @@ impl TerminalView {
     /// pane pickers carry over; a workspace-scope picker is cancelled. A float
     /// becomes the new window's tiled pane.
     pub(super) fn move_pane_to_new_window(&mut self, pane: PaneRef) -> Result<(), String> {
-        let mut pane = match pane {
+        let pane = match pane {
             PaneRef::Tiled(id) => {
                 let at = self
                     .tiled
@@ -809,7 +842,6 @@ impl TerminalView {
                 float.pane
             }
         };
-        pane.cancel_workspace_picker();
         self.requests
             .push(super::WindowRequest::MovePaneToNewWindow(super::MovedPane(
                 pane,
@@ -1462,7 +1494,9 @@ impl TerminalView {
             (input.action, true)
         } else {
             self.nudge_step = false;
-            let context = self.active_pane_ref().action_context();
+            let mut context = self.active_pane_ref().action_context();
+            // The window's picker takes the keys a pane's would.
+            context.picker |= self.window_picker.is_some();
             ui.input_mut(|i| {
                 self.picker_bindings
                     .consume_when(&mut i.events, |a, m| context.allows(a, m))
@@ -1509,7 +1543,7 @@ impl TerminalView {
         let scale = ctx.pixels_per_point();
         let floating_active = self.floats().visible().is_some();
         let focused_window = ui.input(|i| i.viewport().focused.unwrap_or(false));
-        let picker_active = self.active_pane_ref().workspace_picker_active();
+        let picker_active = self.window_picker.is_some();
         // A shown float covers the tiled panes, so only its edges resize.
         let resizable = if floating_active {
             let rect = self.floating_rect_for(content);
@@ -1694,6 +1728,7 @@ impl TerminalView {
         // Escape dismisses the window's toasts along with the focused pane's.
         let window_toasts = !self.toasts.is_empty();
         let mut toasts_dismissed = false;
+        let windowed = self.window_picker.is_some();
         if let (Some(origin), Some(bounds)) = (origin, bounds) {
             let bindings = self.picker_bindings.clone();
             if let Some(p) = self.pane_mut(origin) {
@@ -1704,7 +1739,18 @@ impl TerminalView {
                 if toasts_dismissed {
                     p.dismiss_toasts();
                 }
-                let input = p.handle_input(ui, bounds, &bindings);
+                let input = if windowed {
+                    // The window's picker has the keys; what the pane shows
+                    // stays beneath it.
+                    p.show_background_overlays(&ctx, bounds);
+                    super::pane::PaneInput {
+                        keyboard_blocked: true,
+                        suppress_forward: true,
+                        action: None,
+                    }
+                } else {
+                    p.handle_input(ui, bounds, &bindings)
+                };
                 p.forward_input(
                     ui,
                     bounds,
@@ -1720,6 +1766,9 @@ impl TerminalView {
             self.toasts.clear();
         }
         if let Some(action) = action {
+            self.execute_action(action, self.floats().visible().is_some(), &ctx, gl);
+        }
+        if let Some(crate::picker::Action::Execute(action)) = self.show_window_picker(&ctx, content) {
             self.execute_action(action, self.floats().visible().is_some(), &ctx, gl);
         }
         self.show_mode_status(ui, status, &key_hints);
