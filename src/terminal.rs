@@ -60,6 +60,9 @@ pub(crate) struct TerminalView {
     /// window's and not a pane's: it is about no pane, and a window with no
     /// terminal shows it too.
     window_picker: Option<Box<crate::picker::Picker>>,
+    /// What the rows `window_picker` was last given are of; see
+    /// `workspace_picker_rows`.
+    window_picker_rows: String,
 }
 
 struct FloatingTerminal {
@@ -288,6 +291,7 @@ impl TerminalView {
             nudge_step: false,
             empty: None,
             window_picker: None,
+            window_picker_rows: String::new(),
             picker_bindings,
             floating_padding,
             floating: Default::default(),

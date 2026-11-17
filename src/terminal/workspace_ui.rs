@@ -493,16 +493,23 @@ pub(crate) fn install_lua_helpers(lua: &mlua::Lua, nterm: &mlua::Table) -> mlua:
 impl TerminalView {
     /// The rows of the picker of workspaces and sessions: this window's
     /// workspaces, the sessions the daemon holds that no window shows, and
-    /// a new one.
-    pub(super) fn workspace_picker_rows(&self) -> Vec<crate::actions::Entry> {
+    /// a new one. With them, what they are rows of: an open picker is given
+    /// its rows again when that changes, and not for a waiting shell's new
+    /// title or directory, which its row shows as they were. Rows given
+    /// again take the selection back to the first.
+    pub(super) fn workspace_picker_rows(&self) -> (Vec<crate::actions::Entry>, String) {
         let window = self.has_panes();
         let options = workspace_picker_options(&self.workspaces, self.current);
         let mut entries = match options.source {
             crate::picker::config::Source::Workspaces(entries) if window => entries,
             _ => Vec::new(),
         };
+        // All a workspace's row says is the user's doing.
+        let mut of: String =
+            entries.iter().map(|row| format!("{:?}{:?}", row.label, row.shortcut)).collect();
         if let Some(listing) = crate::session::sessions() {
             entries.extend(super::restore::session_rows(&listing));
+            of.push_str(&super::restore::session_rows_key(&listing));
         }
         entries.push(if window {
             crate::actions::Entry {
@@ -521,7 +528,8 @@ impl TerminalView {
                 action: AppAction::NewSession,
             }
         });
-        entries
+        of.push_str(if window { "window" } else { "launch" });
+        (entries, of)
     }
 
     /// Open the picker of workspaces and sessions. The window holds it,
@@ -529,13 +537,15 @@ impl TerminalView {
     /// to it, so it reads no terminal.
     pub(super) fn open_workspace_picker(&mut self, ctx: &egui::Context) {
         self.close_window_picker();
+        let (rows, of) = self.workspace_picker_rows();
+        self.window_picker_rows = of;
         self.window_picker = Some(Box::new(crate::picker::Picker::start_replacing(
             std::ptr::null_mut(),
             None,
             false,
             0,
             ctx.clone(),
-            entry_picker(self.workspace_picker_rows()),
+            entry_picker(rows),
             &self.picker_bindings.prompt_patterns,
             None,
         )));
@@ -562,7 +572,7 @@ impl TerminalView {
             .active_pane()
             .and_then(|pane| self.pane_mut(pane))
             .map(|pane| pane.picker_typography(ctx));
-        let rows = self.workspace_picker_rows();
+        let (rows, of) = self.workspace_picker_rows();
         let builtin = self.picker_bindings.builtin_pickers;
         let padding = self.picker_bindings.cursor_scroll_padding;
         let picker = self.window_picker.as_mut()?;
@@ -571,9 +581,12 @@ impl TerminalView {
         }
         picker.builtin_pickers = builtin;
         picker.set_cursor_scroll_padding(padding);
-        // Its rows are what there is now: the daemon says when the
-        // sessions change, and rows that are what it has are left alone.
-        picker.set_entries(ctx, rows);
+        // The daemon says when the sessions change. Rows of what the picker
+        // already has rows of are left alone.
+        if of != self.window_picker_rows {
+            self.window_picker_rows = of;
+            picker.set_entries(ctx, rows);
+        }
         let action = picker.show_scoped(ctx, content, None, true)?;
         // Its rows run no Lua.
         if matches!(action, crate::picker::Action::Custom(_)) {

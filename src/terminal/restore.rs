@@ -103,6 +103,20 @@ fn session_name(session: &SessionInfo) -> Option<String> {
     named.name.as_deref().and_then(workspace::named)
 }
 
+/// What the rows `session_rows` gives are of: which sessions there are to
+/// take, what the user called each, and which shells each has. Rows are
+/// given to an open picker again when this changes. It leaves out what a
+/// shell is called and where it is, which change on their own: those are
+/// shown as they were when the rows were last given, so that a picker's
+/// selection is not taken back to its first row for a new title.
+pub(super) fn session_rows_key(listing: &crate::session::Listing) -> String {
+    let key = |session: &SessionInfo| {
+        let panes: Vec<u32> = takeable(session).iter().map(|pane| pane.pane).collect();
+        (!panes.is_empty()).then(|| format!("{:?}{:?}{panes:?}", session.id, session_name(session)))
+    };
+    listing.sessions.iter().filter_map(key).collect()
+}
+
 /// A picker's rows for the sessions the daemon holds that nothing is
 /// showing: what runs in each, how many panes and where.
 pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::actions::Entry> {
@@ -503,6 +517,26 @@ mod tests {
         // What is typed is trimmed and kept to a line; nothing is no name.
         assert_eq!(workspace::named("  api\tserver\n "), Some("apiserver".into()));
         assert_eq!(workspace::named("   "), None);
+    }
+
+    #[test]
+    fn rows_are_of_the_sessions_and_their_shells_not_of_what_the_shells_say() {
+        let key = |sessions| session_rows_key(&crate::session::Listing::of(sessions));
+        let named = |name: &str| format!(r#"{{"version":{VERSION},"panes":[1],"name":"{name}"}}"#);
+        let was = key(vec![session("a", named("build"), &[pane(1, false, Some("idle"))])]);
+        // A shell's new title, or directory, is not a reason for new rows.
+        let mut moved = pane(1, false, Some("compiling"));
+        moved.pwd = Some("file://host/C:/src".into());
+        assert_eq!(key(vec![session("a", named("build"), &[moved])]), was);
+        // Another name, another shell, or another session is.
+        assert_ne!(key(vec![session("a", named("test"), &[pane(1, false, None)])]), was);
+        let two = [pane(1, false, None), pane(2, false, None)];
+        assert_ne!(key(vec![session("a", named("build"), &two)]), was);
+        let other = session("b", String::new(), &[pane(3, false, None)]);
+        let both = vec![session("a", named("build"), &[pane(1, false, None)]), other];
+        assert_ne!(key(both), was);
+        // One a window has taken is no row, and neither is its key.
+        assert_eq!(key(vec![session("a", named("build"), &[pane(1, true, None)])]), "");
     }
 
     #[test]
