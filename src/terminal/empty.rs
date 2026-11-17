@@ -11,9 +11,8 @@ use crate::{graphics as glow, session::Status};
 pub(super) enum Empty {
     /// The session daemon is being reached.
     Connecting,
-    /// Sessions wait in the daemon: which to show, or a new one. The picker
-    /// is the one a pane shows for workspaces; the window holds it, as
-    /// there is no pane to.
+    /// The window asks what to show, with its picker of workspaces and
+    /// sessions: a session that waits in the daemon, or a new one.
     Choose,
     /// The daemon could not be reached, or was and has gone.
     Unavailable { lost: bool, reason: String },
@@ -98,14 +97,9 @@ impl TerminalView {
                 Status::Lost => Some(Empty::Unavailable { lost: true, reason: String::new() }),
                 Status::Off => self.first_shell(gl),
                 Status::Connected => {
-                    // With sessions waiting, ask which to show.
-                    let rows = self.workspace_picker_rows();
-                    if rows.is_empty() {
-                        self.first_shell(gl)
-                    } else {
-                        self.show_in_window(&ctx, super::workspace_ui::entry_picker(rows));
-                        Some(Empty::Choose)
-                    }
+                    // Ask what to show: a session that waits, or a new one.
+                    self.open_workspace_picker(&ctx, false);
+                    Some(Empty::Choose)
                 }
             },
             // The daemon went while the choice was open: say so next frame.
@@ -113,12 +107,7 @@ impl TerminalView {
                 self.close_window_picker();
                 Some(Empty::Connecting)
             }
-            // Other windows took every session that waited, so there is
-            // nothing left to ask: see `workspace_picker_rows`.
-            Empty::Choose if self.offered.is_none() || self.window_picker.is_none() => {
-                self.close_window_picker();
-                self.first_shell(gl)
-            }
+            Empty::Choose if self.window_picker.is_none() => self.first_shell(gl),
             Empty::Choose => match self.show_window_picker(&ctx, content) {
                 None => Some(Empty::Choose),
                 Some(action) => self.chosen(action, &ctx, gl),
@@ -165,7 +154,6 @@ impl TerminalView {
         ctx: &egui::Context,
         gl: &glow::Context,
     ) -> Option<Empty> {
-        self.offered = None;
         if let crate::picker::Action::Execute(action) = action {
             self.execute_action(action, false, ctx, gl);
         }

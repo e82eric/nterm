@@ -60,9 +60,9 @@ pub(crate) struct TerminalView {
     sessions_sent: std::collections::HashMap<String, String>,
     /// Why the window has no terminal, while it has none and is to stay.
     empty: Option<empty::Empty>,
-    /// What the open picker that offers the waiting sessions was made from,
-    /// while there is one.
-    offered: Option<(u64, u64)>,
+    /// Whether the window's picker lists the workspaces and sessions, and
+    /// so is given them again as they change.
+    picker_follows: bool,
     /// The picker of workspaces and sessions, while it is open. It is the
     /// window's and not a pane's: it is about no pane, and a window with no
     /// terminal shows it too.
@@ -296,7 +296,7 @@ impl TerminalView {
             sessions: Default::default(),
             sessions_sent: Default::default(),
             empty: None,
-            offered: None,
+            picker_follows: false,
             window_picker: None,
             picker_bindings,
             floating_padding,

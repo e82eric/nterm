@@ -14,7 +14,7 @@ use super::{
     workspace::{self, Appearance, Layout},
 };
 use crate::{actions::AppAction, graphics as glow};
-use nterm_session::protocol::PaneInfo;
+use nterm_session::protocol::{PaneInfo, SessionInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -41,15 +41,6 @@ struct Saved {
 struct Float {
     pane: u32,
     name: Option<String>,
-}
-
-/// A session nothing is showing.
-pub(super) struct Detached {
-    /// Empty for the shells no session describes.
-    id: String,
-    saved: Saved,
-    label: String,
-    detail: String,
 }
 
 impl Saved {
@@ -81,51 +72,23 @@ fn new_id() -> String {
     format!("{time:x}-{:x}-{:x}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// The sessions nothing is showing, among those in `listing`. The waiting
-/// shells that none of them lays out come last, as one more: those in no
-/// session, and those whose session this build cannot read.
-pub(super) fn detached(listing: &crate::session::Listing) -> Vec<Detached> {
-    let waiting: HashMap<u32, &PaneInfo> = listing
-        .sessions
-        .iter()
-        .flat_map(|session| &session.panes)
-        .filter(|pane| crate::session::waiting(pane))
-        .map(|pane| (pane.pane, pane))
-        .collect();
-    let mut placed = HashSet::new();
-    let mut sessions = Vec::new();
-    for session in &listing.sessions {
-        // The daemon says which shells are the session's; the layout says
-        // where they go.
-        let members: HashSet<u32> = session.panes.iter().map(|pane| pane.pane).collect();
-        let saved = serde_json::from_str::<Saved>(&session.layout).ok();
-        let Some(mut saved) = saved.filter(|saved| saved.version == VERSION) else { continue };
-        saved.keep_only(|pane| {
-            members.contains(&pane) && waiting.contains_key(&pane) && placed.insert(pane)
-        });
-        if !saved.panes.is_empty() {
-            sessions.push(describe(session.id.clone(), saved, &waiting));
-        }
+/// The shells of a session that can be taken: all of them, when nothing
+/// shows any. A session is taken whole, so one a window shows part of is
+/// not offered. The shells in no session, which the daemon gives under no
+/// name, are not one thing, and those of them that wait are offered.
+fn takeable(session: &SessionInfo) -> Vec<&PaneInfo> {
+    let waiting: Vec<&PaneInfo> =
+        session.panes.iter().filter(|pane| crate::session::waiting(pane)).collect();
+    if session.id.is_empty() || waiting.len() == session.panes.len() {
+        waiting
+    } else {
+        Vec::new()
     }
-    let mut strays: Vec<u32> =
-        waiting.keys().copied().filter(|pane| !placed.contains(pane)).collect();
-    if !strays.is_empty() {
-        strays.sort_unstable();
-        let saved = Saved { version: VERSION, panes: strays, ..Saved::default() };
-        sessions.push(describe(String::new(), saved, &waiting));
-    }
-    sessions
 }
 
-/// What the picker says of a session: what runs in it, how many panes and
-/// where.
-fn describe(id: String, saved: Saved, panes: &HashMap<u32, &PaneInfo>) -> Detached {
-    let all: Vec<&PaneInfo> = saved
-        .panes
-        .iter()
-        .chain(saved.floats.iter().map(|float| &float.pane))
-        .filter_map(|pane| panes.get(pane).copied())
-        .collect();
+/// A picker's rows for the sessions the daemon holds that nothing is
+/// showing: what runs in each, how many panes and where.
+pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::actions::Entry> {
     let name = |pane: &PaneInfo| {
         let title = pane.title.as_deref().filter(|title| !title.trim().is_empty());
         let name = title.unwrap_or(&pane.command);
@@ -133,95 +96,59 @@ fn describe(id: String, saved: Saved, panes: &HashMap<u32, &PaneInfo>) -> Detach
         let short = name.rsplit(['\\', '/']).next().filter(|short| !short.is_empty());
         short.unwrap_or(name).to_owned()
     };
-    let mut names: Vec<String> = all.iter().take(3).map(|pane| name(pane)).collect();
-    if all.len() > names.len() {
-        names.push(format!("+{}", all.len() - names.len()));
-    }
-    let count = match all.len() {
-        1 => "1 pane".to_owned(),
-        count => format!("{count} panes"),
-    };
-    let place = all.iter().find_map(|pane| pane.pwd.clone());
-    Detached {
-        label: format!(
-            "{}{}",
-            if id.is_empty() { "Shells without a layout: " } else { "Session: " },
-            names.join(", ")
-        ),
-        detail: match place {
-            Some(place) => format!("{} / {count} / {place}", saved.layout.tag()),
-            None => format!("{} / {count}", saved.layout.tag()),
-        },
-        id,
-        saved,
-    }
-}
-
-/// The picker rows that take a waiting session.
-fn entries(sessions: &[Detached]) -> Vec<crate::actions::Entry> {
-    sessions
-        .iter()
-        .map(|session| crate::actions::Entry {
+    let row = |session: &SessionInfo| {
+        let panes = takeable(session);
+        if panes.is_empty() {
+            return None;
+        }
+        let mut names: Vec<String> = panes.iter().take(3).map(|pane| name(pane)).collect();
+        if panes.len() > names.len() {
+            names.push(format!("+{}", panes.len() - names.len()));
+        }
+        let count = match panes.len() {
+            1 => "1 pane".to_owned(),
+            count => format!("{count} panes"),
+        };
+        let kind = if session.id.is_empty() { "Shells in no session: " } else { "Session: " };
+        Some(crate::actions::Entry {
             id: format!("session.{}", session.id),
-            label: session.label.clone(),
-            shortcut: Some(session.detail.clone()),
+            label: format!("{kind}{}", names.join(", ")),
+            shortcut: Some(match panes.iter().find_map(|pane| pane.pwd.clone()) {
+                Some(place) => format!("{count} / {place}"),
+                None => count,
+            }),
             action: AppAction::AttachSession(session.id.clone()),
         })
-        .collect()
+    };
+    listing.sessions.iter().filter_map(row).collect()
+}
+
+/// How a session being taken is laid out: as its window left it, cut down
+/// to the shells that are there to take. Shells its layout does not place,
+/// which is all of them when it cannot be read, are tiled after the rest.
+/// `None` when the session cannot be taken.
+fn arrangement(session: &SessionInfo) -> Option<Saved> {
+    let panes: Vec<u32> = takeable(session).iter().map(|pane| pane.pane).collect();
+    if panes.is_empty() {
+        return None;
+    }
+    let read = serde_json::from_str::<Saved>(&session.layout).ok();
+    let mut saved = read.filter(|saved| saved.version == VERSION).unwrap_or_default();
+    saved.version = VERSION;
+    saved.keep_only(|pane| panes.contains(&pane));
+    let placed = saved.members();
+    saved.panes.extend(panes.iter().filter(|pane| !placed.contains(pane)));
+    Some(saved)
 }
 
 impl TerminalView {
-    /// A picker's rows for the sessions that are waiting now. Which list
-    /// they were made from is remembered, for `sessions_changed`.
-    pub(super) fn offer_waiting(&mut self) -> Vec<crate::actions::Entry> {
-        let Some(listing) = crate::session::sessions() else {
-            self.offered = None;
-            return Vec::new();
-        };
-        self.offered = Some(listing.stamp());
-        entries(&detached(&listing))
-    }
-
-    /// Whether the daemon has given another list since `offer_waiting` last
-    /// made rows. Another list need not make other rows.
-    pub(super) fn sessions_changed(&self) -> bool {
-        let now = crate::session::sessions().map(|listing| listing.stamp());
-        self.offered.is_some() && now.is_some() && now != self.offered
-    }
-
-    /// Every frame: the open picker of workspaces and sessions is given its
-    /// rows again when the daemon has given another list. It stays open,
-    /// with what is typed in it, and is left alone if the rows are what it
-    /// has.
-    pub(super) fn follow_sessions(&mut self) {
-        if self.offered.is_none() {
-            return;
-        }
-        if self.window_picker.is_none() {
-            // The picker has closed.
-            self.offered = None;
-            return;
-        }
-        if !self.sessions_changed() {
-            return;
-        }
-        let rows = self.workspace_picker_rows();
-        let ctx = self.context.clone();
-        if let Some(picker) = &mut self.window_picker {
-            picker.set_entries(&ctx, rows);
-        }
-    }
-
     /// Show a waiting session as a new workspace of this window, and go to
     /// it. In a window that had no terminal it is the only workspace.
     pub(super) fn attach_session(&mut self, id: &str, gl: &glow::Context) -> Result<(), String> {
         // The sessions as they are now, which the rows chosen from followed.
         let listing = crate::session::sessions().ok_or("That session is no longer waiting.")?;
-        let session = detached(&listing)
-            .into_iter()
-            .find(|session| session.id == id)
-            .ok_or("That session is no longer waiting.")?;
-        let saved = session.saved;
+        let session = listing.sessions.iter().find(|session| session.id == id);
+        let saved = session.and_then(arrangement).ok_or("That session is no longer waiting.")?;
         let index = self.free_index();
         let workspace_id = self.push_workspace(index, Some(saved.layout)).id;
         // Daemon pane to this window's tiled and floating panes.
@@ -492,55 +419,57 @@ mod tests {
         SessionInfo { id: id.into(), panes: panes.to_vec(), layout }
     }
 
-    fn sort(sessions: Vec<SessionInfo>) -> Vec<Detached> {
-        detached(&crate::session::Listing::of(sessions))
+    fn labels(sessions: Vec<SessionInfo>) -> Vec<String> {
+        let rows = session_rows(&crate::session::Listing::of(sessions));
+        rows.into_iter().map(|row| row.label).collect()
     }
 
     #[test]
     fn waiting_sessions_are_offered_and_shown_ones_are_not() {
-        let sessions = sort(vec![
+        let sessions = vec![
             session("a", layout(&[1, 2], &[]), &[pane(1, 0, Some("build")), pane(2, 0, None)]),
             // Another window is showing it.
             session("b", layout(&[3], &[]), &[pane(3, 1, None)]),
-            // Only its float is running, and is tiled.
-            session("d", layout(&[7], &[4]), &[pane(4, 0, None)]),
-            // In no session.
-            session("", String::new(), &[pane(5, 0, None)]),
-        ]);
-        let ids: Vec<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
-        // The shell in no session comes last, without a name.
-        assert_eq!(ids, ["a", "d", ""]);
-        assert_eq!(sessions[0].saved.panes, [1, 2]);
-        assert_eq!(sessions[0].label, "Session: build, cmd.exe");
-        assert!(sessions[0].detail.ends_with("/ 2 panes"));
-        assert_eq!(sessions[1].saved.panes, [4]);
-        assert!(sessions[1].saved.floats.is_empty());
-        assert_eq!(sessions[2].saved.panes, [5]);
+            // A window shows one of its shells: it is taken whole or not.
+            session("c", layout(&[6, 7], &[]), &[pane(6, 1, None), pane(7, 0, None)]),
+            // In no session: the one that waits is offered.
+            session("", String::new(), &[pane(5, 0, Some("stray")), pane(8, 1, None)]),
+        ];
+        let rows = session_rows(&crate::session::Listing::of(sessions));
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["session.a", "session."]);
+        assert_eq!(rows[0].label, "Session: build, cmd.exe");
+        assert_eq!(rows[0].shortcut.as_deref(), Some("2 panes"));
+        assert_eq!(rows[1].label, "Shells in no session: stray");
     }
 
     #[test]
-    fn a_layout_places_only_the_shells_the_daemon_says_are_the_sessions() {
-        // The daemon moved pane 2 to the session that named it last. The
-        // first one's layout has not caught up.
-        let sessions = sort(vec![
-            session("a", layout(&[1, 2], &[]), &[pane(1, 0, None)]),
-            session("b", layout(&[2], &[]), &[pane(2, 0, None)]),
-        ]);
-        assert_eq!(sessions.len(), 2);
-        assert_eq!((sessions[0].saved.panes.as_slice(), sessions[1].saved.panes.as_slice()), (&[1][..], &[2][..]));
-        // A shell of the session that its layout leaves out is not lost.
-        let sessions = sort(vec![session("a", layout(&[1], &[]), &[pane(1, 0, None), pane(3, 0, None)])]);
-        assert_eq!(sessions[1].id, "");
-        assert_eq!(sessions[1].saved.panes, [3]);
-    }
-
-    #[test]
-    fn a_description_tolerates_a_newer_one_and_refuses_another_version() {
-        let panes = [pane(4, 0, None)];
-        let newer = format!(r#"{{"version":{VERSION},"later":true,"panes":[4]}}"#);
-        assert_eq!(sort(vec![session("a", newer, &panes)])[0].id, "a");
+    fn a_session_is_listed_whatever_its_layout_says() {
+        // Listing reads no layout: one this build cannot read is a session
+        // all the same.
         let other = format!(r#"{{"version":{},"panes":[4]}}"#, VERSION + 1);
-        // Not understood, so its shell is offered without a layout.
-        assert_eq!(sort(vec![session("a", other, &panes)])[0].id, "");
+        assert_eq!(labels(vec![session("a", other, &[pane(4, 0, None)])]), ["Session: cmd.exe"]);
+        assert_eq!(labels(vec![session("a", "nonsense".into(), &[pane(4, 0, None)])]).len(), 1);
+    }
+
+    #[test]
+    fn a_session_is_taken_as_it_was_laid_out_with_every_shell_it_has() {
+        let panes = [pane(1, 0, None), pane(2, 0, None), pane(3, 0, None)];
+        // Its float is still a float; a shell the layout leaves out is tiled.
+        let saved = arrangement(&session("a", layout(&[2], &[1]), &panes)).unwrap();
+        assert_eq!(saved.panes, [2, 3]);
+        assert_eq!(saved.floats.len(), 1);
+        // Shells that have ended are gone from it; a float left alone is tiled.
+        let saved = arrangement(&session("a", layout(&[9], &[1]), &panes[..1])).unwrap();
+        assert_eq!(saved.panes, [1]);
+        assert!(saved.floats.is_empty());
+        // A newer description is read; another version is not, and its
+        // shells are tiled in the daemon's order.
+        let newer = format!(r#"{{"version":{VERSION},"later":true,"panes":[2,1]}}"#);
+        assert_eq!(arrangement(&session("a", newer, &panes[..2])).unwrap().panes, [2, 1]);
+        let other = format!(r#"{{"version":{},"panes":[2,1]}}"#, VERSION + 1);
+        assert_eq!(arrangement(&session("a", other, &panes[..2])).unwrap().panes, [1, 2]);
+        // One a window is showing cannot be taken.
+        assert!(arrangement(&session("a", layout(&[1], &[]), &[pane(1, 1, None)])).is_none());
     }
 }

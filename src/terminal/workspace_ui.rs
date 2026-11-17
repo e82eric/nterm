@@ -498,38 +498,42 @@ pub(crate) fn install_lua_helpers(lua: &mlua::Lua, nterm: &mlua::Table) -> mlua:
 }
 impl TerminalView {
     /// The rows of the picker of workspaces and sessions: this window's
-    /// workspaces, then the sessions no window shows. A window with no
-    /// terminal has no workspaces to show, and offers a new session after
-    /// those that wait; with none waiting it has no rows, and nothing to
-    /// ask.
-    pub(super) fn workspace_picker_rows(&mut self) -> Vec<crate::actions::Entry> {
+    /// workspaces, the sessions the daemon holds that no window shows, and
+    /// a new one.
+    pub(super) fn workspace_picker_rows(&self) -> Vec<crate::actions::Entry> {
         let window = self.has_panes();
-        let waiting = self.offer_waiting();
-        if !window && waiting.is_empty() {
-            self.offered = None;
-            return waiting;
-        }
         let options = workspace_picker_options(&self.workspaces, self.current, None);
         let mut entries = match options.source {
             crate::picker::config::Source::Workspaces(entries) if window => entries,
             _ => Vec::new(),
         };
-        entries.extend(waiting);
-        if !window {
-            entries.push(crate::actions::Entry {
+        if let Some(listing) = crate::session::sessions() {
+            entries.extend(super::restore::session_rows(&listing));
+        }
+        entries.push(if window {
+            crate::actions::Entry {
+                id: "workspace.new".into(),
+                label: "New workspace".into(),
+                shortcut: None,
+                action: AppAction::Workspace(WorkspaceAction::CreateWorkspace),
+            }
+        } else {
+            // A window with no terminal starts a shell once its picker has
+            // gone, whatever was chosen: see `chosen`.
+            crate::actions::Entry {
                 id: "session.new".into(),
                 label: "New session".into(),
                 shortcut: None,
                 action: AppAction::NewSession,
-            });
-        }
+            }
+        });
         entries
     }
 
     /// Open the picker of workspaces and sessions, or, `moving`, of where
     /// the active pane can be moved to. The window holds it, with or
     /// without a terminal: it is about no pane.
-    fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
+    pub(super) fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
         self.close_window_picker();
         let pane = if moving { self.active_pane() } else { None };
         if moving && pane.is_none() {
@@ -541,6 +545,7 @@ impl TerminalView {
             entry_picker(self.workspace_picker_rows())
         };
         self.show_in_window(ctx, options);
+        self.picker_follows = !moving;
     }
 
     /// Open the window's picker. Its rows are given to it, so it reads no
@@ -566,7 +571,7 @@ impl TerminalView {
     pub(super) fn close_window_picker(&mut self) {
         if let Some(picker) = self.window_picker.take() {
             picker.surrender_focus();
-            self.offered = None;
+            self.picker_follows = false;
             self.context.request_repaint();
         }
     }
@@ -584,6 +589,7 @@ impl TerminalView {
             .active_pane()
             .and_then(|pane| self.pane_mut(pane))
             .map(|pane| pane.picker_typography(ctx));
+        let rows = self.picker_follows.then(|| self.workspace_picker_rows());
         let builtin = self.picker_bindings.builtin_pickers;
         let padding = self.picker_bindings.cursor_scroll_padding;
         let picker = self.window_picker.as_mut()?;
@@ -592,6 +598,11 @@ impl TerminalView {
         }
         picker.builtin_pickers = builtin;
         picker.set_cursor_scroll_padding(padding);
+        // Its rows are what there is now: the daemon says when the
+        // sessions change, and rows that are what it has are left alone.
+        if let Some(rows) = rows {
+            picker.set_entries(ctx, rows);
+        }
         let action = picker.show_scoped(ctx, content, None, true)?;
         // Its rows run no Lua.
         if matches!(action, crate::picker::Action::Custom(_)) {
@@ -1449,7 +1460,6 @@ impl TerminalView {
         for mut p in self.closed_panes.drain(..) {
             p.destroy();
         }
-        self.follow_sessions();
         self.save_sessions();
         let exited: Vec<_> = self
             .workspaces

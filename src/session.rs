@@ -85,9 +85,6 @@ pub(crate) struct Adopt {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Listing {
     pub(crate) sessions: Vec<SessionInfo>,
-    /// Counts what the connection has given: a list with another number is
-    /// another list.
-    serial: u64,
     /// The connection that gave it. Its pane numbers mean nothing to
     /// another daemon.
     daemon: u64,
@@ -97,11 +94,6 @@ impl Listing {
     #[cfg(test)]
     pub(crate) fn of(sessions: Vec<SessionInfo>) -> Self {
         Self { sessions, ..Self::default() }
-    }
-
-    /// What tells this list from every other the process is given.
-    pub(crate) fn stamp(&self) -> (u64, u64) {
-        (self.daemon, self.serial)
     }
 
     /// What a pane needs to take the shell `pane`, if it is waiting.
@@ -419,7 +411,7 @@ fn open(number: u64) -> io::Result<Arc<Daemon>> {
             starting: Mutex::default(),
             programs: Mutex::default(),
             snapshots: Mutex::default(),
-            sessions: Mutex::new(Arc::new(Listing { sessions, serial: 0, daemon: number })),
+            sessions: Mutex::new(Arc::new(Listing { sessions, daemon: number })),
             next_request: AtomicU32::new(1),
             settings: Mutex::default(),
             gone: AtomicBool::new(false),
@@ -552,8 +544,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 let mut held = daemon.sessions.lock().unwrap();
                 // The daemon says again what it said at the greeting.
                 if held.sessions != sessions {
-                    let serial = held.serial + 1;
-                    *held = Arc::new(Listing { sessions, serial, daemon: daemon.number });
+                    *held = Arc::new(Listing { sessions, daemon: daemon.number });
                     drop(held);
                     CLIENT.wake_ui();
                 }
@@ -1177,7 +1168,6 @@ mod tests {
             size: Size { cols: 80, rows: 24, cell_width: 9, cell_height: 18 },
         });
         let listed = until("the shell", || sessions().filter(|held| !held.sessions.is_empty()));
-        assert_ne!(listed.stamp(), held.stamp());
         let pane = listed.sessions[0].panes[0].pane;
         assert_eq!(listed.sessions[0].id, "");
         // Nothing shows it, so it is there to take; no other shell is.
@@ -1206,7 +1196,6 @@ mod tests {
         assert_ne!(daemon().unwrap().number, first);
         let held = sessions().unwrap();
         assert!(held.sessions.is_empty());
-        assert_ne!(held.stamp(), listed.stamp());
 
         // Leaving waits for the queue to be written.
         daemon().unwrap().control(Control::Shutdown);
