@@ -30,6 +30,8 @@ pub(crate) const MAX_STORAGE: usize = 256 * 1024 * 1024;
 pub(crate) struct Policy {
     pub enabled: bool,
     pub allow_stream: bool,
+    /// Whether a client may start a command in a new pane beside its own.
+    pub allow_panes: bool,
     pub named: Vec<String>,
 }
 
@@ -48,6 +50,19 @@ pub(crate) enum Open {
     Stream {
         #[serde(default)]
         options: StreamOptions,
+    },
+    /// Not a picker: a new pane in the group the client's pane is in. The
+    /// result's value is the new pane's id.
+    Pane {
+        /// What runs in it. `None` is the configured shell.
+        #[serde(default)]
+        command: Option<String>,
+        /// Where it starts. `None` is where the client's pane is.
+        #[serde(default)]
+        cwd: Option<String>,
+        /// Whether the new pane takes focus.
+        #[serde(default)]
+        focus: bool,
     },
 }
 impl Open {
@@ -187,6 +202,19 @@ impl Policy {
             }
             Open::Stream { .. } if !self.allow_stream => {
                 return Err("streamed pickers are not permitted".into());
+            }
+            Open::Pane { .. } if !self.allow_panes => {
+                return Err("creating panes is not permitted".into());
+            }
+            Open::Pane { command, cwd, .. } => {
+                let invalid = |value: &Option<String>| {
+                    value
+                        .as_ref()
+                        .is_some_and(|v| v.is_empty() || v.len() > MAX_ITEM || v.contains('\0'))
+                };
+                if invalid(command) || invalid(cwd) {
+                    return Err("invalid pane command or directory".into());
+                }
             }
             Open::Stream { options } => {
                 if options.initial_query.len() > 4096

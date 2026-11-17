@@ -812,6 +812,95 @@ impl TerminalView {
         }
         group.rectangles(rect, &Self::float_group_style(style))
     }
+    /// A new pane in the group pane `from` is in, a float's or a workspace's
+    /// tiled panes, wherever that is shown or not. It starts where `from`
+    /// is unless `spawn` says. Returns the new pane's id.
+    pub(super) fn create_pane_beside(
+        &mut self,
+        from: u64,
+        mut spawn: super::pane::SpawnOptions,
+        focus: bool,
+        gl: &glow::Context,
+    ) -> Result<u64, String> {
+        spawn.validate()?;
+        if spawn.cwd.is_none() {
+            spawn.cwd = self
+                .tiled_ref(from)
+                .and_then(|pane| pane.pwd())
+                .filter(|pwd| std::path::Path::new(pwd).is_dir());
+        }
+        let float = self
+            .floating
+            .entries
+            .iter()
+            .find(|float| float.panes.contains(&from))
+            .map(|float| float.id);
+        if float.is_none() && !self.workspaces.iter().any(|w| w.panes.contains(&from)) {
+            return Err("the pane that asked has gone".into());
+        }
+        let pane = self.create_pane(gl, &spawn)?;
+        let id = self.add_terminal(pane);
+        let group = match float.and_then(|float| self.floating.get_mut(float)) {
+            Some(float) => &mut float.value,
+            None => {
+                let workspace = self.workspaces.iter_mut().find(|w| w.panes.contains(&from));
+                &mut workspace.expect("the workspace just found").group
+            }
+        };
+        group.panes.push(id);
+        if focus || group.focused.is_none() {
+            group.focus(id);
+        }
+        Ok(id)
+    }
+    /// Answers those who asked for a pane over the pipe, once it is known
+    /// whether its command started. A command that could not be started
+    /// leaves a pane that never has a process: one in the session daemon
+    /// closes, and one here stays to say that it is of no use. Either is an
+    /// error to whoever asked, not a pane, and the pane goes. Called before
+    /// the panes that are to close are closed, while they can still say.
+    #[cfg(any(windows, unix))]
+    fn answer_pipe_panes(&mut self) {
+        /// How long a command has to start. Starting one takes far less, so
+        /// one with no process by then is taken not to have started.
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+        let waiting = std::mem::take(&mut self.pipe_panes_starting);
+        for starting in waiting {
+            let id = starting.pane;
+            let pane = self.tiled_ref(id);
+            let started = pane.is_some_and(|pane| pane.shell_started());
+            let gone = pane.is_none_or(|pane| pane.should_close());
+            if started {
+                starting.session.finish(
+                    "accepted",
+                    serde_json::json!({"selected":[{"id":id.to_string(),"text":"","value":id}]}),
+                );
+            } else if gone || starting.since.elapsed() >= PATIENCE {
+                if !gone {
+                    let float = self.floating.entries.iter().find(|float| float.panes.contains(&id));
+                    match float.map(|float| float.id) {
+                        Some(float) => self.close_float_pane(float, id),
+                        None => drop(self.close_tiled(id)),
+                    }
+                }
+                let what = starting.command.as_deref().unwrap_or("the shell");
+                starting.session.finish(
+                    "error",
+                    serde_json::json!({
+                        "code":"pane_failed",
+                        "message":format!("could not start {what:?}; the error log may say why"),
+                    }),
+                );
+            } else {
+                self.pipe_panes_starting.push(starting);
+            }
+        }
+        if !self.pipe_panes_starting.is_empty() {
+            self.context.request_repaint_after(std::time::Duration::from_millis(20));
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    fn answer_pipe_panes(&mut self) {}
     /// A new float around a pane this window already has. Which workspace
     /// it belongs to is for the caller to say.
     pub(super) fn float_around(&mut self, pane: u64) -> u64 {
@@ -1647,6 +1736,7 @@ impl TerminalView {
             p.destroy();
         }
         self.save_sessions();
+        self.answer_pipe_panes();
         let exited: Vec<_> = self
             .workspaces
             .iter()
@@ -1930,8 +2020,26 @@ impl TerminalView {
         #[cfg(any(windows, unix))]
         {
             let origin_id = origin.and_then(|pane| self.pane_id(pane));
+            let mut asked = Vec::new();
             for (id, p) in &mut self.tiled {
                 p.handle_pipe_requests(&ctx, &bindings, origin_id == Some(*id));
+                asked.extend(p.pipe_panes.drain(..).map(|pane| (*id, pane)));
+            }
+            for (from, (spawn, focus, session)) in asked {
+                let command = spawn.command.clone();
+                match self.create_pane_beside(from, spawn, focus, gl) {
+                    // Answered once the command is seen to start, or not to.
+                    Ok(id) => self.pipe_panes_starting.push(super::Starting {
+                        pane: id,
+                        command,
+                        session,
+                        since: std::time::Instant::now(),
+                    }),
+                    Err(message) => session.finish(
+                        "error",
+                        serde_json::json!({"code":"pane_failed","message":message}),
+                    ),
+                }
             }
         }
         let mut action = None;

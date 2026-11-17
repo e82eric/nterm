@@ -18,11 +18,26 @@ pub(crate) mod workspace;
 pub(crate) mod workspace_ui;
 use pane::TerminalPane;
 
+/// A pane made for a client of a pane's pipe, until its command is seen to
+/// start or to have failed to.
+#[cfg(any(windows, unix))]
+struct Starting {
+    pane: u64,
+    /// What was asked to run, for saying what could not be.
+    command: Option<String>,
+    session: std::sync::Arc<crate::picker::pipe::Session>,
+    since: std::time::Instant,
+}
+
 pub(crate) struct TerminalView {
     /// Tiled terminals across all workspaces, by tiled ID. Which workspace
     /// each belongs to is in `Workspace::panes`.
     tiled: Vec<(u64, TerminalPane)>,
     closed_panes: Vec<TerminalPane>,
+    /// Panes asked for over a pane's pipe whose commands have yet to be seen
+    /// to start, and so whose askers have yet to be answered.
+    #[cfg(any(windows, unix))]
+    pipe_panes_starting: Vec<Starting>,
     workspaces: Vec<workspace::Workspace>,
     current: u64,
     previous: u64,
@@ -249,6 +264,8 @@ impl TerminalView {
             context: context.clone(),
             tiled: pane.into_iter().map(|pane| (0, pane)).collect(),
             closed_panes: Vec::new(),
+            #[cfg(any(windows, unix))]
+            pipe_panes_starting: Vec::new(),
             workspaces: vec![{
                 let mut w = workspace::Workspace::new(1, 1);
                 w.layout = picker_bindings.default_layout;

@@ -56,6 +56,7 @@ impl Shared {
 enum Capability {
     Named(String),
     Stream,
+    Pane,
 }
 impl Capability {
     fn permitted(&self, policy: &Policy) -> bool {
@@ -63,6 +64,7 @@ impl Capability {
             && match self {
                 Self::Named(name) => policy.named.contains(name),
                 Self::Stream => policy.allow_stream,
+                Self::Pane => policy.allow_panes,
             }
     }
 }
@@ -452,7 +454,7 @@ fn serve(
     }
     send(
         stream,
-        &json!({"type":"ready","version":1,"persistent":true,"proof":hex(&proof(token,endpoint,&nonce,&client_nonce,"server")),"capabilities":{"named":policy.named,"stream":policy.allow_stream},"limits":{"max_frame_bytes":MAX_FRAME,"max_item_bytes":MAX_ITEM,"max_batch_items":1024,"max_items":MAX_ITEMS,"max_storage_bytes":MAX_STORAGE,"in_flight_batches":1}}),
+        &json!({"type":"ready","version":1,"persistent":true,"proof":hex(&proof(token,endpoint,&nonce,&client_nonce,"server")),"capabilities":{"named":policy.named,"stream":policy.allow_stream,"panes":policy.allow_panes},"limits":{"max_frame_bytes":MAX_FRAME,"max_item_bytes":MAX_ITEM,"max_batch_items":1024,"max_items":MAX_ITEMS,"max_storage_bytes":MAX_STORAGE,"in_flight_batches":1}}),
         state,
     )?;
     struct Connected<'a>(&'a Shared);
@@ -525,6 +527,7 @@ fn serve_request(
     let capability = match &request {
         Open::Named { name, .. } => Capability::Named(name.clone()),
         Open::Stream { .. } => Capability::Stream,
+        Open::Pane { .. } => Capability::Pane,
     };
     let (session, rx) = Session::new(request_id);
     *state.active.lock().unwrap() = Some((session.clone(), capability));

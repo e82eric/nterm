@@ -57,8 +57,9 @@ try {
     }
 
     $target = Join-Path $PSScriptRoot 'target\release'
-    # The session daemon is a default member of the workspace.
-    foreach ($program in 'nterm.exe', 'nterm-daemon.exe') {
+    # The session daemon is a default member of the workspace, and npick
+    # is the client a shell in a pane asks nterm for pickers and panes with.
+    foreach ($program in 'nterm.exe', 'nterm-daemon.exe', 'npick.exe') {
         Copy-Item -LiteralPath (Join-Path $target $program) -Destination $bin -Force
     }
 }

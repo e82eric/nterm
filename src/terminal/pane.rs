@@ -309,6 +309,10 @@ pub(super) struct TerminalPane {
     search_worker: SnapshotSearchAdapter,
     copy_mode: CopyMode,
     quick_select: Option<ActiveQuickSelect>,
+    /// Panes a client of this pane's pipe asked for, for the window to make:
+    /// what to start, whether it takes focus, and who to answer.
+    #[cfg(any(windows, unix))]
+    pub(super) pipe_panes: Vec<(SpawnOptions, bool, std::sync::Arc<crate::picker::pipe::Session>)>,
     /// The open picker and the pages beneath it: pickers whose action showed
     /// another on top with `app:push_picker`. The top one shows; Escape comes
     /// back to the one beneath, and closing any other way drops them all.
@@ -430,6 +434,8 @@ impl TerminalPane {
             search_worker,
             copy_mode: command_blocks::copy_mode(),
             quick_select: None,
+            #[cfg(any(windows, unix))]
+            pipe_panes: Vec::new(),
             pages: PageStack::new(),
             picker_font,
             toasts: crate::toast::Toasts::default(),
@@ -862,6 +868,16 @@ impl TerminalPane {
 
     pub(super) fn should_close(&self) -> bool {
         self.wake.close.load(Ordering::Acquire)
+    }
+    /// Whether the pane's command has been started. One in the session
+    /// daemon has once the daemon has numbered its pane, which it does on
+    /// starting the command; one that could not be started closes instead.
+    /// A pane with a shell of its own cannot say, and is taken to have.
+    pub(super) fn shell_started(&self) -> bool {
+        match &self.session {
+            Some(session) => session.pane_id().is_some(),
+            None => true,
+        }
     }
     pub(super) fn set_corner_radius(&self, radius: f32) {
         self.painter.lock().set_corner_radius(radius);
@@ -1681,6 +1697,24 @@ impl TerminalPane {
                     if session.cancelled.load(Ordering::Acquire) {
                         continue;
                     }
+                    // A pane is the window's to make, and shows nothing over
+                    // this one, so it needs neither focus nor a free overlay.
+                    if let crate::picker::pipe::Open::Pane { command, cwd, focus } = request {
+                        let asked = crate::picker::pipe::Open::Pane { command, cwd, focus };
+                        if let Err(message) = bindings.pipe_policy.authorize(&asked) {
+                            session.finish(
+                                "error",
+                                serde_json::json!({"code":"capability_denied","message":message}),
+                            );
+                            continue;
+                        }
+                        let crate::picker::pipe::Open::Pane { command, cwd, focus } = asked else {
+                            continue;
+                        };
+                        self.pipe_panes.push((SpawnOptions { command, cwd, ..Default::default() }, focus, session));
+                        ctx.request_repaint();
+                        continue;
+                    }
                     if !interactive
                         || !self.pages.is_empty()
                         || self.search.active
@@ -1730,6 +1764,8 @@ impl TerminalPane {
             Open::Stream { options } => {
                 (crate::picker::config::Bindings::pipe_stream(options), None)
             }
+            // Taken by the window before a picker is thought of.
+            Open::Pane { .. } => (Err("not a picker".to_owned()), None),
         };
         let entry = match entry {
             Ok(entry) => entry,

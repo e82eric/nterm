@@ -5,6 +5,8 @@ them (Windows) or through the pane's Unix socket (Linux). `npick`, installed
 beside `nterm`, is the client on both; see [npick](#npick). For PowerShell
 there is also a script that starts no program: `Invoke-NtermPicker.ps1`, which
 requires PowerShell 7.3+.
+The same pipe can start a command in a new pane: see
+[Open a pane beside this one](#open-a-pane-beside-this-one).
 Pipe access is disabled by default. Add this to your returned Lua table, restart
 the application, then load the helper inside its newly launched shell:
 
@@ -127,6 +129,38 @@ and completion bindings, see [profile.example.ps1](../profile.example.ps1).
 Executable sources and command previews must be defined in allowlisted Lua
 pickers; clients cannot submit executable definitions.
 
+## Open a pane beside this one
+
+With `allow_panes = true` in `picker_pipe`, a program in a pane can ask for
+another pane beside its own:
+
+```sh
+npick --pane less -R notes.txt        # prints the new pane's id
+npick --pane --focus --cwd /src htop  # takes focus; starts in /src
+npick --pane                          # the configured shell
+```
+
+The pane is added to the group the asking pane is in: its workspace's tiled
+panes, or its float, whether or not that is what the window is showing. It
+starts in the caller's directory unless `--cwd` says, and keeps the focus
+where it was unless `--focus` is given. Everything after the command is the
+command's arguments; one with a space in it is passed on in quotes, and a
+single argument is taken as a whole command line, quotes and all. A pane in
+the session daemon closes when its command ends, so something that only
+prints needs to wait: a pager, or a shell that stays.
+
+`npick` answers once the command has started. One that cannot be started is
+an error (exit status 2), and its pane is closed.
+
+Unlike the picker requests, this lets a client choose what runs. It is a
+permission of its own and is off unless set; the checks on who may connect
+are the same.
+
+The request is `{"kind":"pane","command":"less -R notes.txt","cwd":"/src","focus":false}`,
+each field optional, and the result is `accepted` with the pane's id as its
+value, or an error with code `capability_denied` or `pane_failed`. The pane
+that asked does not need focus, and an open overlay does not make it `busy`.
+
 ## Picker pipe, protocol version 1
 
 The picker's messages are the same on both systems; how they travel differs.
@@ -212,6 +246,7 @@ picker_pipe = {
 },
 ```
 
+`allow_panes = true` also permits [panes](#open-a-pane-beside-this-one).
 All permissions default to disabled. Named pickers require an explicit
 allowlist, including builtin names such as `builtin.lines` if that is the
 name used by your configuration. Only named and streamed requests are supported.

@@ -149,7 +149,7 @@ impl Picker {
                 self.shared
                     .replace_source(ctx, self.source.provider(), query);
             }
-            pipe::Open::Named { .. } => {}
+            pipe::Open::Named { .. } | pipe::Open::Pane { .. } => {}
         }
         Ok(())
     }

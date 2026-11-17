@@ -36,12 +36,19 @@ mod unix {
 Usage: npick [OPTIONS] NAME [KEY=VALUE...]
        COMMAND | npick [OPTIONS]
        COMMAND | npick --stdin [OPTIONS] NAME [KEY=VALUE...]
+       npick --pane [--focus] [--cwd DIR] [COMMAND [ARG...]]
 
 Opens a picker in the nterm pane this shell runs in and prints the
 selected value. NAME opens a picker from nterm.lua; it must be listed in
 picker_pipe.named. Without NAME, each line of stdin is a candidate
 (picker_pipe.allow_stream must be true). With --stdin and NAME, stdin
 fills that named Items picker, which keeps its configured preview.
+
+With --pane, nothing is picked: COMMAND runs in a new pane beside this
+one, in the same workspace or float, and the pane's id is printed
+(picker_pipe.allow_panes must be true). The pane closes when COMMAND
+ends. Without COMMAND it runs the shell. Everything after COMMAND is its
+arguments.
 
 Options:
   -q, --query TEXT       initial query
@@ -53,6 +60,9 @@ Options:
       --json             each line is {\"text\": ..., \"value\": ...}
       --stdin            stream stdin into the named picker NAME
       --preview TEXT     show a text preview; {item} is the item's value
+      --pane             run COMMAND in a new pane instead of picking
+      --focus            with --pane, give the new pane focus
+      --cwd DIR          with --pane, where COMMAND starts (default: here)
   -h, --help             show this help
 
 Exit status: 0 selected, 130 cancelled, 2 error.";
@@ -71,6 +81,11 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         pub(crate) name: Option<String>,
         pub(crate) params: Vec<(String, String)>,
         pub(crate) help: bool,
+        pub(crate) pane: bool,
+        pub(crate) focus: bool,
+        pub(crate) cwd: Option<String>,
+        /// With `pane`, the command and its arguments.
+        pub(crate) command: Vec<String>,
     }
 
     fn field(option: &str, value: Option<String>) -> Result<usize, String> {
@@ -84,6 +99,11 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         let mut parsed = Args::default();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
+            // What follows a pane's command is the command's, options too.
+            if parsed.pane && !parsed.command.is_empty() {
+                parsed.command.push(arg);
+                continue;
+            }
             let (option, inline) = match arg.split_once('=') {
                 Some((option, value)) if option.starts_with("--") => {
                     (option.to_owned(), Some(value.to_owned()))
@@ -114,6 +134,9 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
                 "--value" => parsed.value = Some(field("--value", value())?),
                 "--json" => parsed.json = true,
                 "--stdin" => parsed.stdin = true,
+                "--pane" => parsed.pane = true,
+                "--focus" => parsed.focus = true,
+                "--cwd" => parsed.cwd = Some(value().ok_or("--cwd needs a directory")?),
                 "--preview" => parsed.preview = Some(value().ok_or("--preview needs a value")?),
                 "--" => {
                     for rest in args.by_ref() {
@@ -132,11 +155,44 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         if parsed.stdin && parsed.name.is_none() {
             return Err("--stdin needs a picker NAME".into());
         }
+        if !parsed.pane && (parsed.focus || parsed.cwd.is_some()) {
+            return Err("--focus and --cwd go with --pane".into());
+        }
+        if parsed.pane && (parsed.stdin || parsed.json || parsed.query.is_some()) {
+            return Err("--pane takes only --focus, --cwd and a command".into());
+        }
         Ok(parsed)
     }
 
+    /// One argument as it is written in a command line, so that it is read
+    /// back as one: in quotes if it has spaces, its own quotes escaped.
+    fn quoted(arg: &str) -> String {
+        if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+            return arg.to_owned();
+        }
+        let mut quoted = String::from("\"");
+        let mut slashes = 0;
+        for c in arg.chars() {
+            match c {
+                '\\' => slashes += 1,
+                // Backslashes before a quote would otherwise escape it.
+                '"' => {
+                    quoted.extend(std::iter::repeat_n('\\', slashes + 1));
+                    slashes = 0;
+                }
+                _ => slashes = 0,
+            }
+            quoted.push(c);
+        }
+        quoted.extend(std::iter::repeat_n('\\', slashes));
+        quoted.push('"');
+        quoted
+    }
+
     fn positional(parsed: &mut Args, arg: String) -> Result<(), String> {
-        if parsed.name.is_none() {
+        if parsed.pane {
+            parsed.command.push(arg);
+        } else if parsed.name.is_none() {
             parsed.name = Some(arg);
         } else {
             let (key, value) = arg
@@ -179,6 +235,26 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
     }
 
     pub(crate) fn request(args: &Args) -> Value {
+        if args.pane {
+            let mut request = Map::new();
+            request.insert("kind".into(), "pane".into());
+            request.insert("focus".into(), args.focus.into());
+            // One argument is a command line as given; several are joined
+            // into one.
+            match &args.command[..] {
+                [] => {}
+                [line] => drop(request.insert("command".into(), line.clone().into())),
+                several => {
+                    let line: Vec<_> = several.iter().map(|arg| quoted(arg)).collect();
+                    request.insert("command".into(), line.join(" ").into());
+                }
+            }
+            let here = || std::env::current_dir().ok()?.to_str().map(str::to_owned);
+            if let Some(cwd) = args.cwd.clone().or_else(here) {
+                request.insert("cwd".into(), cwd.into());
+            }
+            return Value::Object(request);
+        }
         if let Some(name) = &args.name {
             let mut params: Map<String, Value> = args
                 .params
@@ -226,7 +302,7 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         }
         let connection = client::connect()?;
         let request = request(&args);
-        let items = if args.name.is_some() && !args.stdin {
+        let items = if args.pane || (args.name.is_some() && !args.stdin) {
             None
         } else {
             if std::io::stdin().is_terminal() {
@@ -330,6 +406,31 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
             assert_eq!(streamed["params"]["commandName"], "ls");
             assert_eq!(streamed["stream"], true);
             assert!(request(&args(&["completions"])).get("stream").is_none());
+        }
+
+        #[test]
+        fn a_pane_takes_a_command_and_everything_after_it() {
+            let parsed = args(&["--pane", "--focus", "less", "-R", "my file.txt"]);
+            assert!(parsed.name.is_none());
+            let request = request(&parsed);
+            assert_eq!(request["kind"], "pane");
+            assert_eq!(request["focus"], true);
+            assert_eq!(request["command"], "less -R \"my file.txt\"");
+            let cwd = std::env::current_dir().unwrap();
+            assert_eq!(request["cwd"], cwd.to_str().unwrap());
+            // One argument is already a command line.
+            let line = request_of(&["--pane", "--cwd=/tmp", "less -R x"]);
+            assert_eq!(line["command"], "less -R x");
+            assert_eq!(line["cwd"], "/tmp");
+            assert!(request_of(&["--pane"]).get("command").is_none());
+            assert_eq!(quoted(r#"a "b" c\"#), r#""a \"b\" c\\""#);
+            for list in [&["--focus", "files"][..], &["--pane", "--stdin", "x"]] {
+                assert!(parse(list.iter().map(|s| s.to_string()).collect()).is_err());
+            }
+        }
+
+        fn request_of(list: &[&str]) -> Value {
+            request(&args(list))
         }
 
         #[test]
