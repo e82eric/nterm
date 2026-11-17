@@ -576,19 +576,27 @@ impl PickerSource {
     /// The rows of a command palette, or of a picker of workspaces or of
     /// sessions.
     fn rows(entries: &[crate::actions::Entry], workspaces: bool) -> Session {
-        let columns = if workspaces {
-            vec!["Workspace".into(), "Layout / panes".into()]
+        let columns: &[&str] = if workspaces {
+            &["#", "Workspace", "State", "Layout", "Panes", "Running"]
         } else {
-            vec!["Action".into(), "Shortcut".into()]
+            &["Action", "Shortcut"]
         };
-        let schema = StructuredSchema::new(columns).expect("valid command palette schema");
+        let schema =
+            StructuredSchema::new(columns.iter().map(|&column| column.to_owned()).collect())
+                .expect("valid command palette schema");
         let mut structured = StructuredStreamingStore::new(schema);
         for entry in entries {
+            // A row of workspaces has a cell for each column after its
+            // first; any other has its shortcut.
+            let rest: Vec<&str> = if workspaces {
+                entry.cells.iter().map(String::as_str).collect()
+            } else {
+                vec![entry.shortcut.as_deref().unwrap_or_default()]
+            };
+            let mut record = vec![entry.label.as_str()];
+            record.extend(rest.into_iter().chain(std::iter::repeat("")).take(columns.len() - 1));
             structured
-                .add_record(&csv::StringRecord::from(vec![
-                    entry.label.as_str(),
-                    entry.shortcut.as_deref().unwrap_or_default(),
-                ]))
+                .add_record(&csv::StringRecord::from(record))
                 .expect("palette row matches schema");
         }
         Session::Structured { snapshot: structured.snapshot() }
@@ -599,7 +607,13 @@ impl PickerSource {
     pub(super) fn set_entries(&mut self, rows: Vec<crate::actions::Entry>) -> bool {
         let Self::CommandPalette { runtime, entries, workspaces } = self else { return false };
         let shown = |entry: &crate::actions::Entry| {
-            (entry.id.clone(), entry.label.clone(), entry.shortcut.clone(), entry.action.clone())
+            (
+                entry.id.clone(),
+                entry.label.clone(),
+                entry.shortcut.clone(),
+                entry.cells.clone(),
+                entry.action.clone(),
+            )
         };
         if entries.iter().map(shown).eq(rows.iter().map(shown)) {
             return false;

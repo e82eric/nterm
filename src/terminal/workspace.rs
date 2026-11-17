@@ -197,13 +197,6 @@ pub(crate) fn named(text: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 impl Workspace {
-    /// What the pickers call it: its number, and its name when it has one.
-    pub fn title(&self) -> String {
-        match &self.name {
-            Some(name) => format!("Workspace {}: {name}", self.index),
-            None => format!("Workspace {}", self.index),
-        }
-    }
     pub fn new(id: u64, index: usize) -> Self {
         Self {
             id,

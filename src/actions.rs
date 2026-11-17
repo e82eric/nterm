@@ -244,6 +244,9 @@ pub(crate) struct Entry {
     pub(crate) id: String,
     pub(crate) label: String,
     pub(crate) shortcut: Option<String>,
+    /// The columns after the first in a picker of workspaces and sessions,
+    /// which has no shortcut column. A row with fewer leaves the rest empty.
+    pub(crate) cells: Vec<String>,
     pub(crate) action: AppAction,
 }
 
@@ -267,6 +270,7 @@ pub(crate) fn floating_pane_entry(id: u64, name: Option<&str>, title: &str, acti
             if active { " (active)" } else { "" }
         ),
         shortcut: None,
+        cells: Vec::new(),
         action: AppAction::RestoreFloatingPane(id),
     }
 }
@@ -348,6 +352,7 @@ pub(crate) fn catalog(bindings: &Bindings, copying: bool) -> Vec<Entry> {
                 id: id.into(),
                 label: label.into(),
                 shortcut: bindings.shortcut_for(&action),
+        cells: Vec::new(),
                 action,
             });
         }
@@ -358,6 +363,7 @@ pub(crate) fn catalog(bindings: &Bindings, copying: bool) -> Vec<Entry> {
             id: format!("workspace.{workspace_action}"),
             label: workspace_action.label(),
             shortcut: bindings.shortcut_for(&action),
+        cells: Vec::new(),
             action,
         });
     }
@@ -370,6 +376,7 @@ pub(crate) fn catalog(bindings: &Bindings, copying: bool) -> Vec<Entry> {
             _ => format!("Open picker: {name}"),
         },
         shortcut,
+        cells: Vec::new(),
         action: AppAction::OpenPicker(name.to_owned()),
     }));
     entries.extend(bindings.key_table_names().map(|name| {
@@ -378,6 +385,7 @@ pub(crate) fn catalog(bindings: &Bindings, copying: bool) -> Vec<Entry> {
             id: format!("key_table.{name}"),
             label: format!("Enter key table: {name}"),
             shortcut: bindings.shortcut_for(&action),
+        cells: Vec::new(),
             action,
         }
     }));
@@ -392,6 +400,7 @@ pub(crate) fn catalog(bindings: &Bindings, copying: bool) -> Vec<Entry> {
                     id: format!("quick_select.{name}"),
                     label: definition.label.clone(),
                     shortcut: bindings.shortcut_for(&action),
+        cells: Vec::new(),
                     action,
                 }
             }),
@@ -400,6 +409,7 @@ pub(crate) fn catalog(bindings: &Bindings, copying: bool) -> Vec<Entry> {
         id: format!("action.{name}"),
         label: action.label.clone(),
         shortcut: bindings.shortcut_for(&AppAction::Lua(name.to_owned())),
+        cells: Vec::new(),
         action: AppAction::Lua(name.to_owned()),
     }));
     entries

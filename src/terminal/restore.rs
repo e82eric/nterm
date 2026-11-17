@@ -117,45 +117,72 @@ pub(super) fn session_rows_key(listing: &crate::session::Listing) -> String {
     listing.sessions.iter().filter_map(key).collect()
 }
 
-/// A picker's rows for the sessions the daemon holds that nothing is
-/// showing: what runs in each, how many panes and where.
-pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::actions::Entry> {
-    let name = |pane: &PaneInfo| {
-        let title = pane.title.as_deref().filter(|title| !title.trim().is_empty());
-        let name = title.unwrap_or(&pane.command);
+/// How many panes a row says there are: the tiled ones, then each floating
+/// one, as `3 + 1 + 1`.
+pub(super) fn counted(tiled: usize, floats: usize) -> String {
+    let counts = std::iter::once(tiled).chain(std::iter::repeat_n(1, floats));
+    counts.map(|count| count.to_string()).collect::<Vec<_>>().join(" + ")
+}
+
+/// What a row calls a workspace or a session, and what it says runs there.
+/// One the user named is called by the name, and what its shells call
+/// themselves is said beside where the first of them is. One without a
+/// name is called by what its shells call themselves.
+pub(super) fn called(
+    name: Option<String>,
+    titles: &[String],
+    place: Option<&String>,
+) -> (String, String) {
+    let short = |title: &String| {
         // A path says less than the program it ends in.
-        let short = name.rsplit(['\\', '/']).next().filter(|short| !short.is_empty());
-        short.unwrap_or(name).to_owned()
+        let short = title.rsplit(['\\', '/']).next().filter(|short| !short.is_empty());
+        let short = short.unwrap_or(title);
+        short.chars().filter(|c| !c.is_control()).collect::<String>()
     };
+    // A shell that has not said what it is called says nothing here.
+    let titles: Vec<&String> = titles.iter().filter(|title| !title.trim().is_empty()).collect();
+    let mut names: Vec<String> = titles.iter().take(3).map(|title| short(title)).collect();
+    if titles.len() > names.len() {
+        names.push(format!("+{}", titles.len() - names.len()));
+    }
+    let names = names.join(", ");
+    let place = place.map(|pwd| self::place(pwd)).filter(|place| !place.is_empty());
+    let (name, running) = match name {
+        Some(name) => (name, [Some(names), place]),
+        None => (names, [None, place]),
+    };
+    (name, running.into_iter().flatten().collect::<Vec<_>>().join(" / "))
+}
+
+/// A picker's rows for the sessions the daemon holds that nothing is
+/// showing. Their cells are those of a workspace's row after its number,
+/// which a session has none of: its name or what runs in it, that it is
+/// detached, its layout, how many panes, and what runs and where.
+pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::actions::Entry> {
     let row = |session: &SessionInfo| {
         let panes = takeable(session);
-        if panes.is_empty() {
-            return None;
-        }
-        let mut names: Vec<String> = panes.iter().take(3).map(|pane| name(pane)).collect();
-        if panes.len() > names.len() {
-            names.push(format!("+{}", panes.len() - names.len()));
-        }
-        let count = match panes.len() {
-            1 => "1 pane".to_owned(),
-            count => format!("{count} panes"),
-        };
-        let kind = if session.id.is_empty() { "Shells in no session: " } else { "Session: " };
-        let names = names.join(", ");
-        let place = panes
+        let saved = arrangement(session)?;
+        let titles: Vec<String> = panes
             .iter()
-            .find_map(|pane| pane.pwd.as_deref().map(place))
-            .filter(|place| !place.is_empty());
-        // A session with a name is called by it, and what it runs moves
-        // over beside how many panes it has.
-        let (label, detail) = match session_name(session) {
-            Some(name) => (name, [Some(count), Some(names), place]),
-            None => (names, [Some(count), None, place]),
-        };
+            .map(|pane| {
+                let title = pane.title.as_deref().filter(|title| !title.trim().is_empty());
+                title.unwrap_or(&pane.command).to_owned()
+            })
+            .collect();
+        let place = panes.iter().find_map(|pane| pane.pwd.clone());
+        let (name, running) = called(session_name(session), &titles, place.as_ref());
+        let kind = if session.id.is_empty() { "Shells in no session: " } else { "" };
         Some(crate::actions::Entry {
             id: format!("session.{}", session.id),
-            label: format!("{kind}{label}"),
-            shortcut: Some(detail.into_iter().flatten().collect::<Vec<_>>().join(" / ")),
+            label: String::new(),
+            shortcut: None,
+            cells: vec![
+                format!("{kind}{name}"),
+                "detached".into(),
+                saved.layout.tag().to_owned(),
+                counted(saved.panes.len(), saved.floats.len()),
+                running,
+            ],
             action: AppAction::AttachSession(session.id.clone()),
         })
     };
@@ -555,7 +582,7 @@ mod tests {
 
     fn labels(sessions: Vec<SessionInfo>) -> Vec<String> {
         let rows = session_rows(&crate::session::Listing::of(sessions));
-        rows.into_iter().map(|row| row.label).collect()
+        rows.into_iter().map(|row| row.cells[0].clone()).collect()
     }
 
     #[test]
@@ -584,9 +611,9 @@ mod tests {
         let rows = session_rows(&crate::session::Listing::of(sessions));
         let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
         assert_eq!(ids, ["session.a", "session."]);
-        assert_eq!(rows[0].label, "Session: build, cmd.exe");
-        assert_eq!(rows[0].shortcut.as_deref(), Some("2 panes"));
-        assert_eq!(rows[1].label, "Shells in no session: stray");
+        assert_eq!(rows[0].cells[..2], ["build, cmd.exe", "detached"]);
+        assert_eq!(rows[0].cells[3..], ["2", ""]);
+        assert_eq!(rows[1].cells[0], "Shells in no session: stray");
     }
 
     #[test]
@@ -594,7 +621,7 @@ mod tests {
         // Listing reads no layout: one this build cannot read is a session
         // all the same.
         let other = format!(r#"{{"version":{},"panes":[4]}}"#, VERSION + 1);
-        assert_eq!(labels(vec![session("a", other, &[pane(4, false, None)])]), ["Session: cmd.exe"]);
+        assert_eq!(labels(vec![session("a", other, &[pane(4, false, None)])]), ["cmd.exe"]);
         assert_eq!(labels(vec![session("a", "nonsense".into(), &[pane(4, false, None)])]).len(), 1);
     }
 
@@ -603,15 +630,30 @@ mod tests {
         let named = format!(r#"{{"version":{VERSION},"panes":[1],"name":"build"}}"#);
         let listing = crate::session::Listing::of(vec![session("a", named, &[pane(1, false, None)])]);
         let rows = session_rows(&listing);
-        assert_eq!(rows[0].label, "Session: build");
-        assert_eq!(rows[0].shortcut.as_deref(), Some("1 pane / cmd.exe"));
+        // Its name, that nothing shows it, its layout, one tiled pane, and
+        // what runs there.
+        assert_eq!(rows[0].cells, ["build", "detached", "T", "1", "cmd.exe"]);
         // A name is read from a layout this build cannot lay out.
         let other = format!(r#"{{"version":{},"name":"later"}}"#, VERSION + 1);
         let listing = crate::session::Listing::of(vec![session("a", other, &[pane(1, false, None)])]);
-        assert_eq!(session_rows(&listing)[0].label, "Session: later");
+        assert_eq!(session_rows(&listing)[0].cells[0], "later");
         // What is typed is trimmed and kept to a line; nothing is no name.
         assert_eq!(workspace::named("  api\tserver\n "), Some("apiserver".into()));
         assert_eq!(workspace::named("   "), None);
+    }
+
+    #[test]
+    fn a_row_says_what_runs_where_and_how_many_panes() {
+        let titles = [r"C:\tools\cargo.exe".to_owned(), String::new(), "vim".to_owned()];
+        let place = "file://host/C:/src".to_owned();
+        // Without a name it is called by what runs, and one with no title
+        // is passed over.
+        assert_eq!(called(None, &titles, Some(&place)), ("cargo.exe, vim".into(), "C:/src".into()));
+        let named = called(Some("api".into()), &titles, Some(&place));
+        assert_eq!(named, ("api".into(), "cargo.exe, vim / C:/src".into()));
+        assert_eq!(called(None, &[], None), (String::new(), String::new()));
+        // Three tiled and two floating.
+        assert_eq!((counted(3, 2), counted(1, 0)), ("3 + 1 + 1".into(), "1".into()));
     }
 
     #[test]

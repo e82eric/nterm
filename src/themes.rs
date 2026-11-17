@@ -72,6 +72,7 @@ pub(crate) fn picker_options(names: Vec<String>) -> crate::picker::config::Optio
                     id: format!("theme.{name}"),
                     label: name.clone(),
                     shortcut: None,
+                    cells: Vec::new(),
                     action: crate::actions::AppAction::ApplyTheme(name),
                 })
                 .collect(),

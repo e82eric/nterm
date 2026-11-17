@@ -19,18 +19,23 @@ pub(crate) fn workspace_picker_options(
     Options {
         scope: Scope::Workspace,
         position: Position::Bottom,
-        sort: Sort::SourceOrder,
+        sort: Sort::Score,
         source: Source::Workspaces(
             workspaces
                 .iter()
                 .map(|w| crate::actions::Entry {
                     id: format!("workspace.{}", w.id),
-                    label: format!(
-                        "{}{}",
-                        w.title(),
-                        if w.id == current { " [current]" } else { "" }
-                    ),
-                    shortcut: Some(format!("{} / {} panes", w.layout.tag(), w.panes.len())),
+                    label: w.index.to_string(),
+                    shortcut: None,
+                    // Name, state, layout and panes. What runs, and what to
+                    // call one without a name, is for whoever has its panes
+                    // to say.
+                    cells: vec![
+                        w.name.clone().unwrap_or_default(),
+                        if w.id == current { "current" } else { "" }.to_owned(),
+                        w.layout.tag().to_owned(),
+                        w.panes.len().to_string(),
+                    ],
                     action: AppAction::SelectWorkspaceId(w.id),
                 })
                 .collect(),
@@ -49,7 +54,7 @@ pub(super) fn entry_picker(entries: Vec<crate::actions::Entry>) -> crate::picker
     Options {
         scope: Scope::Workspace,
         position: Position::Bottom,
-        sort: Sort::SourceOrder,
+        sort: Sort::Score,
         source: Source::Workspaces(entries),
         preview: Some(Preview::Host),
         preview_visible: true,
@@ -511,29 +516,43 @@ impl TerminalView {
             crate::picker::config::Source::Workspaces(entries) if window => entries,
             _ => Vec::new(),
         };
-        // All a workspace's row says is the user's doing.
+        // Each float after the tiled panes, as a session's row counts them.
+        for (entry, workspace) in entries.iter_mut().zip(&self.workspaces) {
+            let floats = workspace.floats.ids().len();
+            entry.cells[3] = super::restore::counted(workspace.panes.len(), floats);
+        }
+        // So far all a workspace's row says is the user's doing. What its
+        // shells call themselves and where they are is left out of what the
+        // rows are of, as for a session: see `session_rows_key`.
         let mut of: String =
-            entries.iter().map(|row| format!("{:?}{:?}", row.label, row.shortcut)).collect();
+            entries.iter().map(|row| format!("{:?}{:?}", row.label, row.cells)).collect();
+        for (entry, workspace) in entries.iter_mut().zip(&self.workspaces) {
+            let panes = workspace.panes.iter().filter_map(|id| self.tiled_ref(*id));
+            let titles: Vec<String> = panes.clone().map(|pane| pane.title()).collect();
+            let places: Vec<String> = panes.filter_map(|pane| pane.pwd()).collect();
+            let (name, running) =
+                super::restore::called(workspace.name.clone(), &titles, places.first());
+            entry.cells[0] = name;
+            entry.cells.push(running);
+        }
         if let Some(listing) = crate::session::sessions() {
             entries.extend(super::restore::session_rows(&listing));
             of.push_str(&super::restore::session_rows_key(&listing));
         }
+        // Under the names, as it has no number.
+        let new = |id: &str, name: &str, action| crate::actions::Entry {
+            id: id.into(),
+            label: String::new(),
+            shortcut: None,
+            cells: vec![name.into()],
+            action,
+        };
         entries.push(if window {
-            crate::actions::Entry {
-                id: "workspace.new".into(),
-                label: "New workspace".into(),
-                shortcut: None,
-                action: AppAction::Workspace(WorkspaceAction::CreateWorkspace),
-            }
+            new("workspace.new", "New workspace", AppAction::Workspace(WorkspaceAction::CreateWorkspace))
         } else {
             // A window with no terminal starts a shell once its picker has
             // gone, whatever was chosen: see `chosen`.
-            crate::actions::Entry {
-                id: "session.new".into(),
-                label: "New session".into(),
-                shortcut: None,
-                action: AppAction::NewSession,
-            }
+            new("session.new", "New session", AppAction::NewSession)
         });
         of.push_str(if window { "window" } else { "launch" });
         (entries, of)
@@ -704,6 +723,7 @@ impl TerminalView {
             id: format!("workspace.{}", w.id),
             label: format!("Workspace {}", w.index),
             shortcut: None,
+            cells: Vec::new(),
             action: AppAction::SelectWorkspaceId(w.id),
         }));
         super::PaletteContext {

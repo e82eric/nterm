@@ -1391,6 +1391,7 @@ fn structured_command_palette_returns_typed_action() {
                 id: "picker.files".into(),
                 label: "Open files".into(),
                 shortcut: Some("Ctrl+F".into()),
+                cells: Vec::new(),
                 action: crate::actions::AppAction::OpenPicker("files".into()),
             }]),
             params: [("query".into(), "/:Action=~files ".into())].into(),
