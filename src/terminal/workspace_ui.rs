@@ -599,6 +599,12 @@ impl TerminalView {
         if matches!(action, crate::picker::Action::Custom(_)) {
             return None;
         }
+        // A session ended from its row leaves the picker as it is: its row
+        // goes when the daemon says the session has.
+        if let crate::picker::Action::Execute(AppAction::EndSession(id)) = &action {
+            self.end_session(id);
+            return None;
+        }
         self.close_window_picker();
         Some(action)
     }
@@ -1175,8 +1181,8 @@ impl TerminalView {
                     self.workspace_request(Request::Remove(self.current), gl)?;
                 }
                 RenameWorkspace => self.rename_workspace_prompt(self.current, ctx),
-                DetachWorkspace => self.detach_workspace()?,
-                EndWorkspace => self.end_workspace(),
+                DetachWorkspace => self.detach_workspace(self.current)?,
+                EndWorkspace => self.end_workspace(self.current),
                 NextWorkspace | PreviousWorkspace => {
                     let i = self
                         .workspaces
@@ -1506,6 +1512,7 @@ impl TerminalView {
             .collect();
         self.close_floats(exited);
         self.note_daemon_loss();
+        self.stay_for_sessions();
     }
     pub(super) fn update_workspaces(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
         let ctx = ui.ctx().clone();

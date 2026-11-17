@@ -677,6 +677,22 @@ impl PickerSource {
             None
         }
     }
+    /// What else the selected row can be asked to do, in a picker with
+    /// rows for workspaces or sessions; see `RowCommand`.
+    pub(super) fn row_commands(&self) -> &'static [crate::actions::RowCommand] {
+        use crate::actions::{AppAction, RowCommand};
+        let of_workspaces = |action: &AppAction| {
+            matches!(action, AppAction::SelectWorkspaceId(_) | AppAction::AttachSession(_))
+        };
+        match self {
+            Self::CommandPalette { entries, .. }
+                if entries.iter().any(|entry| of_workspaces(&entry.action)) =>
+            {
+                &RowCommand::WORKSPACE
+            }
+            _ => &[],
+        }
+    }
     #[cfg(test)]
     pub(super) fn test_scrollback(store: Arc<SnapshotStore<Items>>) -> Self {
         Self::Scrollback(Runtime {

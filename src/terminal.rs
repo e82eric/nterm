@@ -49,6 +49,9 @@ pub(crate) struct TerminalView {
     app: std::rc::Rc<GhosttyApp>,
     /// Set by the status bar's close button; the app then closes this window.
     close_requested: bool,
+    /// A workspace was closed by its command this frame: a window that
+    /// leaves empty stays, to ask what to show next.
+    stay_open: bool,
     pane_drag: Option<pane_resize::Drag>,
     /// The `key_tables` entry whose keys are active, if any.
     key_table: Option<String>,
@@ -287,6 +290,7 @@ impl TerminalView {
             command_label,
             reload_source,
             close_requested: false,
+            stay_open: false,
             pane_drag: None,
             key_table: None,
             nudge_step: false,
@@ -564,6 +568,14 @@ impl TerminalView {
                 }
             }
             AppAction::RenameWorkspace { id, name } => self.rename_workspace(id, &name),
+            AppAction::RenameWorkspacePrompt(id) => self.rename_workspace_prompt(id, ctx),
+            AppAction::DetachWorkspaceId(id) => {
+                if let Err(error) = self.detach_workspace(id) {
+                    self.show_error("Workspace action failed", error);
+                }
+            }
+            AppAction::EndWorkspaceId(id) => self.end_workspace(id),
+            AppAction::EndSession(id) => self.end_session(&id),
             AppAction::AttachSession(id) => {
                 if let Err(error) = self.attach_session(&id, gl) {
                     self.show_error("Session could not be shown", error);
@@ -842,6 +854,8 @@ impl TerminalView {
     }
     pub(crate) fn update(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
         self.update_workspaces(ui, gl);
+        // A pane closed in the frame may have been the last.
+        self.stay_for_sessions();
         self.post_requests();
     }
 

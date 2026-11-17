@@ -582,6 +582,16 @@ impl Picker {
         } else {
             Vec::new()
         });
+        // Numbered after the keys' actions, which is how one is told from
+        // the other when it is chosen.
+        let commands = self.source.row_commands().iter().enumerate();
+        self.shared.set_commands(
+            commands
+                .map(|(at, command)| {
+                    nfm_egui::PickerCommand::custom(self.keys.len() + at, command.title())
+                })
+                .collect(),
+        );
         if interactive && !self.shared.keybinding_help_visible() && self.source.is_scrollback() {
             if self.split_parent.is_some()
                 && ctx.input_mut(|input| {
@@ -732,12 +742,32 @@ impl Picker {
                 None
             }
             Some(nfm_egui::PickerEvent::Accepted(selection)) => self.accept(selection),
-            Some(nfm_egui::PickerEvent::CustomAction { action, selection }) => self
-                .keys
-                .get(action)
-                .and_then(|binding| self.invoke_callback(binding.action.clone(), selection)),
+            Some(nfm_egui::PickerEvent::CustomAction { action, selection }) => {
+                match action.checked_sub(self.keys.len()) {
+                    None => self
+                        .keys
+                        .get(action)
+                        .and_then(|binding| self.invoke_callback(binding.action.clone(), selection)),
+                    Some(at) => self.row_command(at, selection),
+                }
+            }
             None => None,
         }
+    }
+    /// One of the source's row commands, chosen for the selected row. One
+    /// that has nothing to do with that row leaves the picker as it is.
+    fn row_command(
+        &self,
+        at: usize,
+        selection: nfm_egui::Selection<source::Candidate>,
+    ) -> Option<Action> {
+        let result = SearchResult {
+            node_index: selection.item.node_index,
+            score: 0,
+            path: selection.text,
+        };
+        let row = self.source.application_action(&result)?;
+        self.source.row_commands().get(at)?.of(&row).map(Action::Execute)
     }
     fn invoke_callback(
         &self,

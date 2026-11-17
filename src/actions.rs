@@ -6,6 +6,15 @@ pub(crate) enum AppAction {
     Workspace(WorkspaceAction),
     /// Picker results that refer to window-local IDs, not config indexes.
     SelectWorkspaceId(u64),
+    /// Ask for a name for a workspace of this window.
+    RenameWorkspacePrompt(u64),
+    /// Take a workspace of this window out of it; its shells stay in the
+    /// daemon.
+    DetachWorkspaceId(u64),
+    /// End every shell in a workspace of this window.
+    EndWorkspaceId(u64),
+    /// End every shell of a session waiting in the daemon, by its name.
+    EndSession(String),
     /// Call a workspace of this window `name`; nothing takes its name away.
     RenameWorkspace { id: u64, name: String },
     /// Show a session waiting in the session daemon as a workspace. The
@@ -38,6 +47,51 @@ pub(crate) enum AppAction {
     EnterKeyTable(String),
     ExitKeyTable,
     Lua(String),
+}
+
+/// Something to do with a picker's selected row other than what choosing
+/// it does. The picker lists them as its actions for the selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowCommand {
+    RenameWorkspace,
+    DetachWorkspace,
+    EndWorkspace,
+}
+
+impl RowCommand {
+    /// What the picker of workspaces and sessions offers for a row.
+    pub(crate) const WORKSPACE: [Self; 3] =
+        [Self::RenameWorkspace, Self::DetachWorkspace, Self::EndWorkspace];
+
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::RenameWorkspace => "Rename",
+            Self::DetachWorkspace => "Detach (its shells keep running)",
+            Self::EndWorkspace => "Close (ends its shells)",
+        }
+    }
+
+    /// The action for a row that `row` is the action of. `None` for a row
+    /// the command has nothing to do with: a waiting session is detached
+    /// already and is named where it is shown, and a row that makes a new
+    /// one is neither a workspace nor a session.
+    pub(crate) fn of(self, row: &AppAction) -> Option<AppAction> {
+        match (self, row) {
+            (Self::RenameWorkspace, AppAction::SelectWorkspaceId(id)) => {
+                Some(AppAction::RenameWorkspacePrompt(*id))
+            }
+            (Self::DetachWorkspace, AppAction::SelectWorkspaceId(id)) => {
+                Some(AppAction::DetachWorkspaceId(*id))
+            }
+            (Self::EndWorkspace, AppAction::SelectWorkspaceId(id)) => {
+                Some(AppAction::EndWorkspaceId(*id))
+            }
+            (Self::EndWorkspace, AppAction::AttachSession(id)) => {
+                Some(AppAction::EndSession(id.clone()))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl AppAction {
@@ -83,6 +137,10 @@ impl AppAction {
             Self::Workspace(_)
                 | Self::SelectWorkspaceId(_)
                 | Self::RenameWorkspace { .. }
+                | Self::RenameWorkspacePrompt(_)
+                | Self::DetachWorkspaceId(_)
+                | Self::EndWorkspaceId(_)
+                | Self::EndSession(_)
                 | Self::AttachSession(_)
                 | Self::NewSession
                 | Self::NewWindow

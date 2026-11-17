@@ -121,6 +121,13 @@ pub(crate) fn set_session(id: String, panes: Vec<PaneId>, layout: String) {
     }
 }
 
+/// End the shell of a daemon pane nothing here shows.
+pub(crate) fn close_pane(pane: PaneId) {
+    if let Some(daemon) = daemon() {
+        daemon.control(Control::Close { pane });
+    }
+}
+
 /// The sessions the daemon holds, as it last gave them. `None` without a
 /// connection.
 pub(crate) fn sessions() -> Option<Arc<Listing>> {

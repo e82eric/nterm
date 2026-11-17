@@ -361,12 +361,13 @@ impl TerminalView {
         }
     }
 
-    /// Take the current workspace out of this window and leave its session
+    /// Take a workspace out of this window and leave its session
     /// waiting in the daemon. The last workspace takes the window with it.
-    pub(super) fn detach_workspace(&mut self) -> Result<(), String> {
+    pub(super) fn detach_workspace(&mut self, id: u64) -> Result<(), String> {
         self.save_sessions();
-        let id = self.current;
-        let workspace = self.workspace();
+        let Some(workspace) = self.workspaces.iter().find(|w| w.id == id) else {
+            return Err("workspace does not exist".into());
+        };
         let kept = |pane: Option<&super::TerminalPane>| {
             pane.is_some_and(|pane| pane.session_pane().is_some())
         };
@@ -389,7 +390,7 @@ impl TerminalView {
             return Ok(());
         }
         // Gone from here and left in the daemon.
-        let at = self.workspaces.iter().position(|w| w.id == id).expect("current workspace");
+        let at = self.workspaces.iter().position(|w| w.id == id).expect("the workspace");
         let workspace = self.workspaces.remove(at);
         for pane in &workspace.panes {
             if let Some(at) = self.tiled.iter().position(|(id, _)| id == pane) {
@@ -406,22 +407,73 @@ impl TerminalView {
         }
         workspace::renumber(&mut self.workspaces);
         let exists = |id: u64| self.workspaces.iter().any(|w| w.id == id);
-        self.current =
-            if exists(self.previous) { self.previous } else { self.workspaces[0].id };
-        self.previous = self.current;
+        if self.current == id {
+            self.current =
+                if exists(self.previous) { self.previous } else { self.workspaces[0].id };
+        }
+        if !exists(self.previous) {
+            self.previous = self.current;
+        }
         self.context.request_repaint();
         Ok(())
     }
 
-    /// End every shell in the current workspace, and its session with them.
-    pub(super) fn end_workspace(&mut self) {
-        let workspace = self.workspace();
+    /// End every shell in a workspace, and its session with them. A window
+    /// this leaves without a terminal asks what to show next.
+    pub(super) fn end_workspace(&mut self, id: u64) {
+        self.stay_open = true;
+        let Some(workspace) = self.workspaces.iter().find(|w| w.id == id) else { return };
         let floats = workspace.floats.ids().to_vec();
         let panes = workspace.panes.clone();
         self.close_floats(floats);
         for pane in panes {
             let _ = self.close_tiled(pane);
         }
+    }
+
+    /// End every shell of a session nothing shows. The daemon forgets a
+    /// session once none of its shells runs, and says so, which takes its
+    /// row out of the picker.
+    pub(super) fn end_session(&self, id: &str) {
+        let Some(listing) = crate::session::sessions() else { return };
+        let Some(session) = listing.sessions.iter().find(|session| session.id == id) else {
+            return;
+        };
+        for pane in takeable(session) {
+            crate::session::close_pane(pane.pane);
+        }
+    }
+
+    /// A window whose last terminal has just gone stays when sessions wait
+    /// in the daemon, or when a workspace was closed by its command: it
+    /// asks what to show next, as a window just opened does. Otherwise it
+    /// closes, as `should_close` then says.
+    pub(super) fn stay_for_sessions(&mut self) {
+        let stay = std::mem::take(&mut self.stay_open);
+        if self.empty.is_some() || self.close_requested || self.has_panes() {
+            return;
+        }
+        if crate::session::status() != crate::session::Status::Connected {
+            return;
+        }
+        let waiting = crate::session::sessions()
+            .is_some_and(|listing| !session_rows(&listing).is_empty());
+        if !(stay || waiting) {
+            return;
+        }
+        // The workspace kept for the window to stand on is no session's
+        // any more, and its floats go as those of any emptied workspace.
+        let floats: Vec<u64> =
+            self.workspaces.iter().flat_map(|w| w.floats.ids().to_vec()).collect();
+        self.close_floats(floats);
+        for workspace in &mut self.workspaces {
+            workspace.session = None;
+            workspace.name = None;
+        }
+        self.close_window_picker();
+        self.key_table = None;
+        self.empty = Some(super::empty::Empty::Connecting);
+        self.context.request_repaint();
     }
 }
 
