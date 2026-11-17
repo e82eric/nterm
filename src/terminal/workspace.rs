@@ -41,6 +41,10 @@ pub(crate) struct Config {
     /// for its first shell to start in. With none a new workspace starts
     /// where the active pane is, without asking.
     pub new_roots: Vec<std::path::PathBuf>,
+    /// How many levels of folders inside each of `new_roots` are offered:
+    /// 1 is the folders directly inside a root, 2 those and the folders
+    /// inside each of them.
+    pub new_depth: i32,
     pub appearance: Appearance,
 }
 // Not `#[serde(flatten)]`: it disables `deny_unknown_fields`, and typos in
@@ -65,10 +69,18 @@ impl<'de> Deserialize<'de> for Config {
                 "workspaces.new_roots must contain nonempty paths",
             ));
         }
+        let new_depth: i32 = match fields.remove("new_depth") {
+            Some(depth) => serde_json::from_value(depth).map_err(D::Error::custom)?,
+            None => 1,
+        };
+        if new_depth < 1 {
+            return Err(D::Error::custom("workspaces.new_depth must be at least 1"));
+        }
         let appearance = serde_json::from_value(fields.into()).map_err(D::Error::custom)?;
         Ok(Self {
             default_layout,
             new_roots: new_roots.into_iter().map(Into::into).collect(),
+            new_depth,
             appearance,
         })
     }

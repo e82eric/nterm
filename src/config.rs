@@ -1078,6 +1078,11 @@ mod tests {
         assert_eq!(config.workspaces.appearance.inner_gap, 3.0);
         assert!(parse("return {workspaces={new_roots={''}}}").is_err());
         assert!(parse("return {workspaces={new_roots='C:/src'}}").is_err());
+        // How many levels of folders inside the roots: one, unless more is asked for.
+        assert_eq!(config.workspaces.new_depth, 1);
+        let deep = parse("return {workspaces={new_roots={'C:/src'},new_depth=2}}").unwrap();
+        assert_eq!(deep.workspaces.new_depth, 2);
+        assert!(parse("return {workspaces={new_depth=0}}").is_err());
         // There was once a `startup` function; it is refused like any unknown key.
         assert!(parse("return {startup=function() end}").is_err());
     }

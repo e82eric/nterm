@@ -1501,6 +1501,8 @@ pub(crate) struct Bindings {
     /// `workspaces.new_roots`: where a new workspace's directory is picked
     /// from. Empty for no picking.
     pub(crate) new_workspace_roots: Vec<std::path::PathBuf>,
+    /// `workspaces.new_depth`: how many levels of folders inside them.
+    pub(crate) new_workspace_depth: i32,
     pub(crate) pipe_policy: super::pipe::Policy,
     pub(crate) builtin_pickers: BuiltinPickers,
     pub(crate) cursor_scroll_padding: u32,
@@ -1520,6 +1522,8 @@ impl Bindings {
         self.workspace_appearance = workspaces.appearance;
         self.default_layout = workspaces.default_layout;
         self.new_workspace_roots = workspaces.new_roots;
+        // No `workspaces` table at all leaves it unset.
+        self.new_workspace_depth = workspaces.new_depth.max(1);
         Ok(self)
     }
 
@@ -1767,6 +1771,7 @@ impl Bindings {
             workspace_appearance: Default::default(),
             default_layout: Default::default(),
             new_workspace_roots: Vec::new(),
+            new_workspace_depth: 1,
             pipe_policy: super::pipe::Policy::default(),
             model,
             builtin_pickers: BuiltinPickers::default(),
