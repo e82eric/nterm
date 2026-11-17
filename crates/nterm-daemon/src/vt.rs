@@ -87,6 +87,8 @@ const CONTINUATION_MAX: usize = 1 << 20;
 const ENVELOPE_LEN: usize = 10;
 const RECORD_HEADER_LEN: usize = 10;
 const RECORD_READY: u16 = 5;
+const RECORD_FINISH: u16 = 6;
+const RECORD_KITTY_IMAGE_PAYLOAD: u16 = 9;
 
 unsafe extern "C" {
     fn ghostty_terminal_new(
@@ -298,12 +300,17 @@ extern "C" fn collect(userdata: *mut c_void, data: *const u8, len: usize) -> boo
     true
 }
 
-/// Collects a snapshot up to the end of its READY record and then refuses
-/// more, which stops the encoder before it walks the history.
+/// Collects a snapshot up to the end of its READY record, and with
+/// `pictures` the pixels of the pictures on screen, which come right after
+/// it. Then it refuses more, which stops the encoder before it walks the
+/// history.
 struct ScreenOnly {
     out: Vec<u8>,
     /// Where the next record header starts.
     next: usize,
+    pictures: bool,
+    /// READY has been collected; what follows is pixels or the end.
+    ready: bool,
     done: bool,
 }
 
@@ -318,14 +325,23 @@ extern "C" fn collect_screen(userdata: *mut c_void, data: *const u8, len: usize)
         let tag = u16::from_le_bytes([header[0], header[1]]);
         let payload = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
         let end = state.next + RECORD_HEADER_LEN + payload;
+        if state.ready && tag != RECORD_KITTY_IMAGE_PAYLOAD {
+            // The history starts here.
+            state.out.truncate(state.next);
+            state.done = true;
+            return false;
+        }
         if tag != RECORD_READY {
             state.next = end;
-        } else if state.out.len() >= end {
+        } else if state.out.len() < end {
+            break;
+        } else if state.pictures {
+            state.ready = true;
+            state.next = end;
+        } else {
             state.out.truncate(end);
             state.done = true;
             return false;
-        } else {
-            break;
         }
     }
     true
@@ -497,11 +513,18 @@ impl Terminal {
     }
 
     /// The visible screen, modes and any unfinished escape sequence: a
-    /// snapshot that ends at its READY record. It carries the page the screen
+    /// snapshot cut before its history. It carries the page the screen
     /// sits on, so some recent history comes along, but the cost does not
-    /// grow with the history.
-    pub fn screen(&mut self) -> Vec<u8> {
-        let mut state = ScreenOnly { out: Vec::new(), next: ENVELOPE_LEN, done: false };
+    /// grow with the history. With `pictures` it has the pixels of the
+    /// pictures on screen too; without, only where each one is.
+    pub fn screen(&mut self, pictures: bool) -> Vec<u8> {
+        let mut state = ScreenOnly {
+            out: Vec::new(),
+            next: ENVELOPE_LEN,
+            pictures,
+            ready: false,
+            done: false,
+        };
         let writer = Writer { write: collect_screen, userdata: (&raw mut state).cast() };
         // Refusing bytes after READY makes the encoder report a failed write.
         let result = unsafe { ghostty_snapshot_encode(self.raw, writer) };
@@ -624,7 +647,7 @@ fn report(size: Size) -> SizeReport {
     }
 }
 
-/// Whether the last record of a snapshot is READY rather than FINISH.
+/// Whether a snapshot was cut before its history: it has no FINISH record.
 fn is_screen_only(bytes: &[u8]) -> bool {
     let mut next = ENVELOPE_LEN;
     let mut last = 0u16;
@@ -634,7 +657,7 @@ fn is_screen_only(bytes: &[u8]) -> bool {
             u32::from_le_bytes([bytes[next + 2], bytes[next + 3], bytes[next + 4], bytes[next + 5]]);
         next += RECORD_HEADER_LEN + payload as usize;
     }
-    last == RECORD_READY
+    last != RECORD_FINISH
 }
 
 #[cfg(test)]
@@ -694,19 +717,29 @@ mod tests {
     #[test]
     fn a_png_a_program_shows_is_kept_and_what_is_not_one_is_refused() {
         let mut terminal = terminal();
-        let plain = terminal.screen().len();
+        let plain = terminal.screen(false).len();
         let reply = terminal.feed(&show(7, &noise_png(64, 64)));
         assert_eq!(String::from_utf8_lossy(&reply), "\x1b_Gi=7;OK\x1b\\");
         // The picture takes rows: what follows it is under it, as it is on
         // the UI's screen.
         let cursor = terminal.feed(b"\x1b[6n");
         assert_ne!(cursor, b"\x1b[1;1R", "{:?}", String::from_utf8_lossy(&cursor));
-        // The screen a UI is sent says there is a picture and where, and
-        // the whole snapshot has its pixels. The screen does not: they come
-        // after its READY record, where a screen ends.
-        let screen = terminal.screen();
-        assert!(screen.len() > plain && screen.len() < plain + 64 * 64 * 3);
-        assert!(terminal.snapshot().len() >= plain + 64 * 64 * 3);
+        // A screen without pictures says there is one and where. With
+        // them it has the pixels too, as the whole snapshot does.
+        let pixels = 64 * 64 * 3;
+        let screen = terminal.screen(false);
+        assert!(screen.len() > plain && screen.len() < plain + pixels);
+        let pictured = terminal.screen(true);
+        assert!(pictured.len() >= screen.len() + pixels);
+        assert!(pictured.starts_with(&screen));
+        assert!(terminal.snapshot().len() >= plain + pixels);
+        // Both decode to the same screen.
+        assert_eq!(Terminal::decode(&pictured).unwrap().text(), terminal.text());
+        // Once the picture has scrolled into the history its pixels are
+        // not part of the screen.
+        let _ = terminal.feed("
+".repeat(200).as_bytes());
+        assert!(terminal.screen(true).len() < plain + pixels);
 
         // What is not a PNG is refused, and the terminal goes on.
         let mut terminal = self::terminal();
@@ -752,7 +785,7 @@ mod tests {
         assert_eq!(terminal.feed(b"\x05"), b"here");
 
         // A snapshot's mirror is a separate terminal and keeps none of it.
-        let mut mirror = Terminal::decode(&terminal.screen()).unwrap();
+        let mut mirror = Terminal::decode(&terminal.screen(false)).unwrap();
         assert_eq!(mirror.feed(b"\x1b[>q"), b"\x1bP>|libghostty\x1b\\");
     }
 
@@ -832,7 +865,7 @@ mod tests {
         assert!(terminal.total_rows() > 4000);
 
         let whole = terminal.snapshot();
-        let screen = terminal.screen();
+        let screen = terminal.screen(false);
         assert!(screen.len() * 10 < whole.len(), "{} vs {}", screen.len(), whole.len());
         assert_eq!(&whole[..screen.len()], &screen[..]);
 
@@ -860,7 +893,7 @@ mod tests {
         let mut terminal = terminal();
         let _ = terminal.feed("x".repeat(100).as_bytes());
         let _ = terminal.resize(size(120, 24));
-        let mut mirror = Terminal::decode(&terminal.screen()).unwrap();
+        let mut mirror = Terminal::decode(&terminal.screen(false)).unwrap();
         assert_eq!(mirror.grid(), (120, 24));
         assert_eq!(mirror.text().trim_end(), "x".repeat(100));
     }

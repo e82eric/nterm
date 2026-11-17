@@ -149,8 +149,10 @@ impl State {
         }
     }
 
+    /// The screen a UI starts from when it takes the pane, with the pixels
+    /// of the pictures on it.
     fn send_screen(&mut self, pane: PaneId, to: &Outbox) -> bool {
-        let frame = Frame::Screen { pane, bytes: self.terminal.screen() }.encode();
+        let frame = Frame::Screen { pane, bytes: self.terminal.screen(true) }.encode();
         to.send(frame).is_ok()
     }
 }
