@@ -85,6 +85,9 @@ pub(crate) struct Picker {
 /// What a page reports the user did, for the pane to act on.
 pub(crate) enum Action {
     Execute(crate::actions::AppAction),
+    /// As `Execute`, but the pages stay as they are, as they do through a
+    /// copy. Once done, the picker is given its rows again and says `said`.
+    Stay { action: crate::actions::AppAction, said: String },
     /// Run a Lua action.
     Custom(CustomAction),
     /// Escape: leave this page for the one beneath.
@@ -585,7 +588,17 @@ impl Picker {
             }
         }
         let appearance = self.appearance(ctx);
-        self.shared.set_bindings(if self.pipe_session.is_none() {
+        // A row command's key is bound to it as it is numbered below.
+        let row_keys = self.source.row_commands().iter().enumerate().filter_map(|(at, command)| {
+            let (modifiers, key) = command.key()?;
+            Some(nfm_egui::PickerBinding {
+                trigger: nfm_egui::PickerTrigger::Key(key),
+                modifiers,
+                action: nfm_egui::PickerAction::Custom(self.keys.len() + at),
+                description: None,
+            })
+        });
+        let bindings: Vec<_> = if self.pipe_session.is_none() {
             self.keys
                 .iter()
                 .enumerate()
@@ -598,10 +611,12 @@ impl Picker {
                     action: nfm_egui::PickerAction::Custom(action),
                     description: Some(binding.description.clone()),
                 })
+                .chain(row_keys)
                 .collect()
         } else {
             Vec::new()
-        });
+        };
+        self.shared.set_bindings(bindings);
         // Numbered after the keys' actions, which is how one is told from
         // the other when it is chosen.
         let commands = self.source.row_commands().iter().enumerate();
@@ -792,8 +807,17 @@ impl Picker {
             score: 0,
             path: selection.text,
         };
-        let row = self.source.application_action(&result)?;
-        self.source.row_commands().get(at)?.of(&row).map(Action::Execute)
+        let command = *self.source.row_commands().get(at)?;
+        let row = self.source.entry(&result)?;
+        let action = command.of(row)?;
+        Some(match command.keeps_picker() {
+            true => Action::Stay { action, said: command.done(row) },
+            false => Action::Execute(action),
+        })
+    }
+    /// Say `text` over the results for a moment, as a copy is confirmed.
+    pub(crate) fn notify(&mut self, ctx: &egui::Context, text: String) {
+        self.shared.notify(ctx, text);
     }
     fn invoke_callback(
         &self,

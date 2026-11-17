@@ -4,6 +4,7 @@ use crate::graphics as glow;
 use ghostty_app::GhosttyApp;
 
 mod empty;
+mod folders;
 pub(crate) mod floating;
 pub(crate) mod ghostty_app;
 mod layout;
@@ -85,6 +86,9 @@ pub(crate) struct TerminalView {
     /// What the rows `window_picker` was last given are of; see
     /// `workspace_picker_rows`.
     window_picker_rows: String,
+    /// What that picker was last told to say, and when: new rows take it
+    /// away, and it is said again while it would still have been showing.
+    picker_said: Option<(String, std::time::Instant)>,
 }
 
 /// A terminal taken out of one window on its way to a new window.
@@ -290,6 +294,7 @@ impl TerminalView {
             empty: None,
             window_picker: None,
             window_picker_rows: String::new(),
+            picker_said: None,
             picker_bindings,
             floating_padding,
             floating: Default::default(),

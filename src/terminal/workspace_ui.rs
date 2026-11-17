@@ -46,6 +46,8 @@ pub(crate) fn workspace_picker_options(
 /// How much of the window's height the picker of workspaces takes. Most of
 /// it is the preview, where the selected workspace is drawn small.
 const PICKER_HEIGHT: f32 = 0.75;
+/// How long a picker says what it was told to: `nfm_egui`'s notice.
+const PICKER_NOTICE: std::time::Duration = std::time::Duration::from_secs(2);
 /// A picker over rows that each run an action, placed like the workspace
 /// picker. Its preview is room left empty, for the selected
 /// workspace to be drawn in.
@@ -548,13 +550,29 @@ impl TerminalView {
             cells: vec![name.into()],
             action,
         };
-        entries.push(if window {
-            new("workspace.new", "New workspace", AppAction::Workspace(WorkspaceAction::CreateWorkspace))
+        // With folders to start one in, each is a row that does. Without,
+        // or until they are found, one row makes a new workspace where the
+        // window is.
+        let folders = super::folders::known(&self.picker_bindings.new_workspace_roots);
+        if !folders.is_empty() {
+            of.push_str(&format!("folders {}", super::folders::version()));
+        } else if window {
+            let create = AppAction::Workspace(WorkspaceAction::CreateWorkspace);
+            entries.push(new("workspace.new", "New workspace", create));
         } else {
             // A window with no terminal starts a shell once its picker has
             // gone, whatever was chosen: see `chosen`.
-            new("session.new", "New session", AppAction::NewSession)
-        });
+            entries.push(new("session.new", "New session", AppAction::NewSession));
+        }
+        entries.extend(folders.into_iter().map(|path| crate::actions::Entry {
+            id: format!("workspace.in.{path}"),
+            label: String::new(),
+            shortcut: None,
+            // No workspace yet, so no name under theirs: its state, and
+            // where it is where they say what runs.
+            cells: vec![String::new(), "new".into(), String::new(), String::new(), path.clone()],
+            action: AppAction::CreateWorkspaceIn(Some(path)),
+        }));
         of.push_str(if window { "window" } else { "launch" });
         (entries, of)
     }
@@ -564,6 +582,8 @@ impl TerminalView {
     /// to it, so it reads no terminal.
     pub(super) fn open_workspace_picker(&mut self, ctx: &egui::Context) {
         self.close_window_picker();
+        // What it lists of the folders is what was last found; look again.
+        super::folders::scan(&self.picker_bindings.new_workspace_roots, ctx);
         let (rows, of) = self.workspace_picker_rows();
         self.window_picker_rows = of;
         self.window_picker = Some(Box::new(crate::picker::Picker::start_replacing(
@@ -576,6 +596,12 @@ impl TerminalView {
             &self.picker_bindings.prompt_patterns,
             None,
         )));
+        // One opened again as a window empties says what emptied it.
+        if let (Some(picker), Some((said, at))) = (self.window_picker.as_mut(), &self.picker_said)
+            && at.elapsed() < PICKER_NOTICE
+        {
+            picker.notify(ctx, said.clone());
+        }
         ctx.request_repaint();
     }
 
@@ -613,16 +639,36 @@ impl TerminalView {
         if of != self.window_picker_rows {
             self.window_picker_rows = of;
             picker.set_entries(ctx, rows);
+            // New rows take away what the picker was saying.
+            if let Some((said, at)) = &self.picker_said
+                && at.elapsed() < PICKER_NOTICE
+            {
+                picker.notify(ctx, said.clone());
+            }
         }
         let action = picker.show_scoped(ctx, content, None, true)?;
         // Its rows run no Lua.
         if matches!(action, crate::picker::Action::Custom(_)) {
             return None;
         }
-        // A session ended from its row leaves the picker as it is: its row
-        // goes when the daemon says the session has.
-        if let crate::picker::Action::Execute(AppAction::EndSession(id)) = &action {
-            self.end_session(id);
+        // Done to a row with the picker left open. Its rows change as the
+        // window and the daemon do, and it says what was done.
+        if let crate::picker::Action::Stay { action, said } = action {
+            let done = match action {
+                AppAction::DetachWorkspaceId(id) => self.detach_workspace(id),
+                AppAction::EndWorkspaceId(id) => Ok(self.end_workspace(id)),
+                AppAction::EndSession(id) => Ok(self.end_session(&id)),
+                _ => Ok(()),
+            };
+            match done {
+                Ok(()) => {
+                    if let Some(picker) = self.window_picker.as_mut() {
+                        picker.notify(ctx, said.clone());
+                    }
+                    self.picker_said = Some((said, std::time::Instant::now()));
+                }
+                Err(error) => self.show_error("Workspace action failed", error),
+            }
             return None;
         }
         self.close_window_picker();

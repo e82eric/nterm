@@ -1886,7 +1886,9 @@ impl TerminalPane {
         from_copy: bool,
     ) -> Option<crate::actions::AppAction> {
         match action {
-            crate::picker::Action::Execute(action) => return Some(action),
+            crate::picker::Action::Execute(action) | crate::picker::Action::Stay { action, .. } => {
+                return Some(action);
+            }
             crate::picker::Action::Cancel | crate::picker::Action::Close => {
                 self.restore_copy(generation, from_copy)
             }

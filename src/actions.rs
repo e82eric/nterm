@@ -66,6 +66,35 @@ impl RowCommand {
     pub(crate) const WORKSPACE: [Self; 3] =
         [Self::RenameWorkspace, Self::DetachWorkspace, Self::EndWorkspace];
 
+    /// Whether the picker stays open through the command, as it does
+    /// through a copy: its rows are given again and it says what was done.
+    /// Not one that asks something of its own over the picker.
+    pub(crate) fn keeps_picker(self) -> bool {
+        matches!(self, Self::DetachWorkspace | Self::EndWorkspace)
+    }
+
+    /// What the picker says once the command has been done to `row`.
+    pub(crate) fn done(self, row: &Entry) -> String {
+        let what = match self {
+            Self::RenameWorkspace => "Renamed",
+            Self::DetachWorkspace => "Detached",
+            Self::EndWorkspace => "Closed",
+        };
+        format!("{what} {}", row.described())
+    }
+
+    /// The key that does the command to the selected row without its being
+    /// chosen from the picker's list of them. Chords the picker and the
+    /// field typed in have no use for: Ctrl+X never arrives as a key, being
+    /// that field's cut.
+    pub(crate) fn key(self) -> Option<(egui::Modifiers, egui::Key)> {
+        match self {
+            Self::RenameWorkspace => None,
+            Self::DetachWorkspace => Some((egui::Modifiers::CTRL, egui::Key::D)),
+            Self::EndWorkspace => Some((egui::Modifiers::CTRL, egui::Key::Q)),
+        }
+    }
+
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::RenameWorkspace => "Rename",
@@ -78,8 +107,8 @@ impl RowCommand {
     /// the command has nothing to do with: a waiting session is detached
     /// already and is named where it is shown, and a row that makes a new
     /// one is neither a workspace nor a session.
-    pub(crate) fn of(self, row: &AppAction) -> Option<AppAction> {
-        match (self, row) {
+    pub(crate) fn of(self, row: &Entry) -> Option<AppAction> {
+        match (self, &row.action) {
             (Self::RenameWorkspace, AppAction::SelectWorkspaceId(id)) => {
                 Some(AppAction::RenameWorkspacePrompt(*id))
             }
@@ -252,6 +281,21 @@ pub(crate) struct Entry {
     /// which has no shortcut column. A row with fewer leaves the rest empty.
     pub(crate) cells: Vec<String>,
     pub(crate) action: AppAction,
+}
+
+impl Entry {
+    /// What a row of workspaces or sessions is of, for saying what was done
+    /// to it: "workspace 2 (name)", or "session name".
+    pub(crate) fn described(&self) -> String {
+        let name = self.cells.first().map_or("", String::as_str);
+        match &self.action {
+            AppAction::SelectWorkspaceId(_) if name.is_empty() => {
+                format!("workspace {}", self.label)
+            }
+            AppAction::SelectWorkspaceId(_) => format!("workspace {} ({name})", self.label),
+            _ => format!("session {name}"),
+        }
+    }
 }
 
 pub(crate) fn floating_pane_entry(id: u64, title: &str, active: bool) -> Entry {
@@ -427,6 +471,31 @@ pub(crate) struct LuaAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_row_command_says_what_it_did_to_which_row() {
+        let row = |label: &str, name: &str, action| Entry {
+            id: String::new(),
+            label: label.into(),
+            shortcut: None,
+            cells: vec![name.into()],
+            action,
+        };
+        let workspace = row("2", "nterm", AppAction::SelectWorkspaceId(7));
+        assert_eq!(RowCommand::EndWorkspace.done(&workspace), "Closed workspace 2 (nterm)");
+        assert_eq!(RowCommand::DetachWorkspace.done(&workspace), "Detached workspace 2 (nterm)");
+        let unnamed = row("3", "", AppAction::SelectWorkspaceId(8));
+        assert_eq!(RowCommand::EndWorkspace.done(&unnamed), "Closed workspace 3");
+        // A session has no number; its name is under the workspaces' names.
+        let session = row("", "build", AppAction::AttachSession("a".into()));
+        assert_eq!(RowCommand::EndWorkspace.done(&session), "Closed session build");
+        // The picker stays through what changes its rows, not through a
+        // command that asks something over it, and those have a key each.
+        let keys: Vec<_> = RowCommand::WORKSPACE.iter().filter_map(|command| command.key()).collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert!(RowCommand::WORKSPACE.iter().all(|command| command.key().is_some() == command.keeps_picker()));
+        assert!(!RowCommand::RenameWorkspace.keeps_picker());
+    }
     #[test]
     fn floating_entries_use_stable_ids_and_titles_and_mark_active() {
         let named = floating_pane_entry(7, "tools", true);
