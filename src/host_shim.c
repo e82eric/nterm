@@ -573,6 +573,10 @@ void nterm_host_output(NtermHost *host, const uint8_t *bytes, size_t len) {
     if (host && host->surface) ghostty_surface_host_output(host->surface, bytes, len);
 }
 
+
+void nterm_host_resized(NtermHost *host, uint16_t cols, uint16_t rows) {
+    if (host && host->surface) ghostty_surface_host_resized(host->surface, cols, rows);
+}
 void nterm_host_resync(NtermHost *host, const uint8_t *snapshot, size_t len) {
     if (host && host->surface) ghostty_surface_host_resync(host->surface, snapshot, len);
 }

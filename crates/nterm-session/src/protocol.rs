@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -207,6 +207,10 @@ pub enum Frame {
     /// which the daemon passes on unread. A program's frames carry channel
     /// 0; the daemon knows a program by its connection.
     Shell { channel: u32, bytes: Vec<u8> },
+    /// The pane's terminal was resized here, between the output before and
+    /// the output after. A UI resizes its copy at the same point, which
+    /// keeps the two the same.
+    Resized { pane: PaneId, cols: u16, rows: u16 },
     /// A whole ghostty snapshot, answering `Control::Snapshot`.
     Snapshot { request: u32, bytes: Vec<u8> },
 }
@@ -216,6 +220,7 @@ const KIND_OUTPUT: u8 = 1;
 const KIND_INPUT: u8 = 2;
 const KIND_SCREEN: u8 = 3;
 const KIND_SNAPSHOT: u8 = 4;
+const KIND_RESIZED: u8 = 6;
 const KIND_SHELL: u8 = 5;
 
 impl Frame {
@@ -230,6 +235,11 @@ impl Frame {
             Self::Output { pane, bytes } => (KIND_OUTPUT, Some(*pane), bytes.as_slice().into()),
             Self::Input { pane, bytes } => (KIND_INPUT, Some(*pane), bytes.as_slice().into()),
             Self::Screen { pane, bytes } => (KIND_SCREEN, Some(*pane), bytes.as_slice().into()),
+            Self::Resized { pane, cols, rows } => (
+                KIND_RESIZED,
+                Some(*pane),
+                [cols.to_le_bytes(), rows.to_le_bytes()].concat().into(),
+            ),
             Self::Shell { channel, bytes } => (KIND_SHELL, Some(*channel), bytes.as_slice().into()),
             Self::Snapshot { request, bytes } => {
                 (KIND_SNAPSHOT, Some(*request), bytes.as_slice().into())
@@ -274,6 +284,14 @@ impl Frame {
             KIND_INPUT => Ok(Self::Input { pane: id, bytes }),
             KIND_SCREEN => Ok(Self::Screen { pane: id, bytes }),
             KIND_SNAPSHOT => Ok(Self::Snapshot { request: id, bytes }),
+            KIND_RESIZED => match bytes.as_slice() {
+                [c0, c1, r0, r1] => Ok(Self::Resized {
+                    pane: id,
+                    cols: u16::from_le_bytes([*c0, *c1]),
+                    rows: u16::from_le_bytes([*r0, *r1]),
+                }),
+                _ => Err(invalid("resized frame")),
+            },
             KIND_SHELL => Ok(Self::Shell { channel: id, bytes }),
             // A frame kind from a newer version.
             _ => Ok(Self::Control(Control::Unknown)),

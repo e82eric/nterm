@@ -569,7 +569,10 @@ fn converse(
                 }
                 continue;
             }
-            Frame::Output { .. } | Frame::Screen { .. } | Frame::Snapshot { .. } => continue,
+            Frame::Output { .. }
+            | Frame::Screen { .. }
+            | Frame::Resized { .. }
+            | Frame::Snapshot { .. } => continue,
         };
         let missing = |request: Option<u32>, pane: PaneId| {
             fail(request, format!("no pane {pane}"));
@@ -659,11 +662,11 @@ fn converse(
                     ));
                 }
                 state.resize(&pane, size);
-                // A UI reflows its own copy, and not always from the size
-                // this one came from; the daemon's copy replaces it.
-                let frame =
-                    Frame::Screen { pane: pane_id, bytes: state.terminal.screen() }.encode();
-                state.send(frame);
+                // Between the output before the resize and the output after,
+                // so the UI resizes its copy at the same point and the copy
+                // stays the same as this.
+                let (cols, rows) = (state.size.cols, state.size.rows);
+                state.send(Frame::Resized { pane: pane_id, cols, rows }.encode());
             }
             Control::Snapshot { request, pane: pane_id } => {
                 let Some(pane) = session.pane(pane_id) else {

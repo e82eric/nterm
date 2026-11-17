@@ -127,6 +127,10 @@ impl Ui {
                 // A UI's terminal is silent: its replies are dropped.
                 let _ = self.mirror.as_mut().expect("screen before output").feed(bytes);
             }
+            Frame::Resized { cols, rows, .. } => {
+                let mirror = self.mirror.as_mut().expect("screen before a resize");
+                let _ = mirror.resize(size(*cols, *rows));
+            }
             Frame::Control(Control::Sessions { sessions }) => {
                 self.sessions = Some(sessions.clone());
             }
@@ -146,6 +150,43 @@ impl Ui {
                 return frame;
             }
         }
+    }
+
+    /// Ask for the daemon's terminal and compare it with the mirror at the
+    /// point in the output where it was made. The mirror is kept, not
+    /// replaced. Returns what differs, if anything does.
+    fn differs_from_daemon(&mut self, pane: PaneId) -> Option<String> {
+        let mut theirs = self.snapshot(pane);
+        let ours = self.mirror.as_mut().unwrap();
+        let (their_grid, our_grid) = (theirs.grid(), ours.grid());
+        let cursor = |terminal: &mut Terminal| {
+            String::from_utf8_lossy(&terminal.feed(b"[6n")).replace('', "")
+        };
+        let (their_cursor, our_cursor) = (cursor(&mut theirs), cursor(&mut *ours));
+        // The rows from the top of the screen down to the cursor.
+        let rows: usize = their_cursor
+            .trim_start_matches('[')
+            .split(';')
+            .next()
+            .and_then(|row| row.parse().ok())
+            .unwrap_or(1);
+        let tail = |terminal: &mut Terminal| -> Vec<String> {
+            let text = terminal.text();
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(rows)..].iter().map(|l| l.to_string()).collect()
+        };
+        let (their_rows, our_rows) = (tail(&mut theirs), tail(&mut *ours));
+        if their_grid == our_grid && their_cursor == our_cursor && their_rows == our_rows {
+            return None;
+        }
+        let rows_off: Vec<usize> = (0..their_rows.len().max(our_rows.len()))
+            .filter(|&row| their_rows.get(row) != our_rows.get(row))
+            .collect();
+        Some(format!(
+            "grid daemon {their_grid:?} copy {our_grid:?}, cursor daemon {their_cursor} copy 
+             {our_cursor}, rows that differ {rows_off:?} of {}",
+            their_rows.len()
+        ))
     }
 
     fn control(&mut self, mut wanted: impl FnMut(&Control) -> bool) -> Control {
@@ -256,10 +297,10 @@ fn lifecycle(session: &str) {
     ui.input(pane.pane, "echo first-marker\r");
     ui.until_text("the echoed line", |text| text.contains("\nfirst-marker"));
 
-    // Resize: the daemon sends its own reflowed screen, and the shell sees
-    // the new width.
+    // Resize: the daemon says where in the output its terminal changed
+    // size, and the shell sees the new width.
     ui.send(Control::Resize { pane: pane.pane, size: size(100, 30) });
-    ui.frame(|frame| matches!(frame, Frame::Screen { .. }));
+    ui.frame(|frame| matches!(frame, Frame::Resized { .. }));
     assert_eq!(ui.mirror.as_mut().unwrap().grid(), (100, 30));
     ui.input(pane.pane, "mode con\r");
     ui.until_text("the new width", |text| {
@@ -704,4 +745,69 @@ fn uis_are_told_of_the_sessions_as_they_change() {
     ui.send(Control::Close { pane: b });
     other.sessions("none", |told| told.is_empty());
     ui.shutdown();
+}
+#[test]
+fn a_copy_resized_in_order_stays_the_same_as_the_daemon() {
+    each_conpty("ordered", ordered_resizes);
+}
+
+/// A UI's copy is resized where the daemon's terminal was, and never given
+/// the screen again. After every step it must be what the daemon has.
+fn ordered_resizes(name: &str) {
+    let session = session(name);
+    let mut ui = Ui::connect(&session);
+    let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+    ui.send(Control::Attach { request: 0, pane: pane.pane, size: size(80, 24) });
+    ui.frame(|frame| matches!(frame, Frame::Screen { .. }));
+    // More than a screen of lines, some of them longer than the screen is
+    // wide, so there is history and there are wrapped lines.
+    ui.input(
+        pane.pane,
+        "for /l %i in (1,1,60) do @echo line-%i-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+         bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-%i\r",
+    );
+    ui.until_text("the lines", |text| text.contains("b-60\n"));
+    ui.input(pane.pane, "echo settled\r");
+    ui.until_text("the prompt", |text| text.contains("\nsettled"));
+
+    let mut failures = Vec::new();
+    let steps: [(u16, u16); 12] = [
+        (80, 40),
+        (80, 12),
+        (60, 12),
+        (120, 30),
+        (40, 10),
+        (200, 50),
+        (80, 24),
+        (81, 24),
+        (79, 24),
+        (30, 60),
+        (160, 8),
+        (80, 24),
+    ];
+    for (at, (cols, rows)) in steps.into_iter().enumerate() {
+        ui.send(Control::Resize { pane: pane.pane, size: size(cols, rows) });
+        ui.frame(|frame| matches!(frame, Frame::Resized { .. }));
+        if let Some(what) = ui.differs_from_daemon(pane.pane) {
+            failures.push(format!("step {at} to {cols}x{rows}, at once: {what}"));
+        }
+        let marker = format!("step-{at}-done");
+        ui.input(pane.pane, &format!("echo {marker}\r"));
+        ui.until_text("the step's echo", |text| text.contains(&format!("\n{marker}")));
+        if let Some(what) = ui.differs_from_daemon(pane.pane) {
+            failures.push(format!("step {at} to {cols}x{rows}, after output: {what}"));
+        }
+    }
+    // Several sizes with no time between them, as a dragged edge sends.
+    for cols in (60..=120).step_by(3) {
+        ui.send(Control::Resize { pane: pane.pane, size: size(cols, 30) });
+    }
+    ui.input(pane.pane, "echo dragged\r");
+    ui.until_text("the echo after the drag", |text| text.contains("\ndragged"));
+    std::thread::sleep(Duration::from_millis(500));
+    if let Some(what) = ui.differs_from_daemon(pane.pane) {
+        failures.push(format!("after a drag: {what}"));
+    }
+    ui.shutdown();
+    assert!(failures.is_empty(), "{name}:\n{}", failures.join("\n"));
 }

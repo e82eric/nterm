@@ -91,6 +91,9 @@ pub(crate) struct HostBackend {
     pub(crate) resize: extern "C" fn(*mut c_void, u16, u16, u32, u32),
     pub(crate) spawn: extern "C" fn(*mut c_void, *const HostSpawn),
     pub(crate) settings: extern "C" fn(*mut c_void, *const HostSettings),
+    /// The host says when the surface's terminal changes size, with
+    /// `nterm_host_resized`; the surface never reflows on its own.
+    pub(crate) ordered: bool,
 }
 
 /// ghostty_host_spawn_s: the process a surface would have started.
@@ -436,6 +439,7 @@ unsafe extern "C" {
     ) -> *mut Host;
     pub(crate) fn nterm_host_destroy(host: *mut Host);
     pub(crate) fn nterm_host_output(host: *mut Host, bytes: *const u8, len: usize);
+    pub(crate) fn nterm_host_resized(host: *mut Host, cols: u16, rows: u16);
     pub(crate) fn nterm_host_resync(host: *mut Host, snapshot: *const u8, len: usize);
     pub(crate) fn nterm_window_attach(window: *mut c_void);
     pub(crate) fn nterm_window_detach(window: *mut c_void);

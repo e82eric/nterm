@@ -547,7 +547,12 @@ impl Terminal {
         if result != 0 || raw.is_null() {
             return Err(format!("snapshot decode failed ({result})"));
         }
-        Ok(Self::adopt(raw))
+        let mut terminal = Self::adopt(raw);
+        // A snapshot does not carry this; see `new`.
+        if cfg!(windows) {
+            terminal.set(OPT_RESIZE_PULL_SCROLLBACK, &false);
+        }
+        Ok(terminal)
     }
 
     /// The text of the screen and history, one line per row.

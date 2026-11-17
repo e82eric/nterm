@@ -525,6 +525,13 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                     });
                 }
             }
+            Frame::Resized { pane, cols, rows } => {
+                if let Some(link) = daemon.pane(pane) {
+                    link.with_host(|host| unsafe {
+                        ghostty_ffi::nterm_host_resized(host, cols, rows);
+                    });
+                }
+            }
             Frame::Screen { pane, bytes } => {
                 if let Some(link) = daemon.pane(pane) {
                     link.with_host(|host| unsafe {
@@ -760,6 +767,9 @@ impl Link {
             resize: on_resize,
             spawn: on_spawn,
             settings: on_settings,
+            // The daemon says where in the output its terminal changed
+            // size, and the copy changes there.
+            ordered: true,
         }
     }
 
@@ -1004,7 +1014,8 @@ extern "C" fn on_write(userdata: *mut c_void, bytes: *const u8, len: usize) {
     });
 }
 
-/// The surface reflowed to a new size.
+/// The surface has a new size. Its terminal keeps the old one until the
+/// daemon says where in the output the size changed.
 extern "C" fn on_resize(userdata: *mut c_void, cols: u16, rows: u16, width: u32, height: u32) {
     crate::native_error::ffi_boundary("send a resize to the session daemon", || {
         if cols == 0 || rows == 0 {
