@@ -11,10 +11,6 @@ pub(crate) enum AppAction {
     AttachSession(String),
     /// The launch picker's choice of a new session over the waiting ones.
     NewSession,
-    MovePaneToWorkspaceId {
-        pane: crate::terminal::PaneRef,
-        workspace: u64,
-    },
     ReloadConfig,
     NewWindow,
     ShowMessages,
@@ -86,7 +82,6 @@ impl AppAction {
                 | Self::SelectWorkspaceId(_)
                 | Self::AttachSession(_)
                 | Self::NewSession
-                | Self::MovePaneToWorkspaceId { .. }
                 | Self::NewWindow
                 | Self::ReloadConfig
                 | Self::ShowMessages

@@ -14,7 +14,6 @@ pub(crate) enum HostRequest {
 pub(crate) fn workspace_picker_options(
     workspaces: &[Workspace],
     current: u64,
-    pane: Option<PaneRef>,
 ) -> crate::picker::config::Options {
     use crate::picker::config::*;
     Options {
@@ -32,13 +31,7 @@ pub(crate) fn workspace_picker_options(
                         if w.id == current { " [current]" } else { "" }
                     ),
                     shortcut: Some(format!("{} / {} panes", w.layout.tag(), w.panes.len())),
-                    action: match pane {
-                        Some(pane) => AppAction::MovePaneToWorkspaceId {
-                            pane,
-                            workspace: w.id,
-                        },
-                        None => AppAction::SelectWorkspaceId(w.id),
-                    },
+                    action: AppAction::SelectWorkspaceId(w.id),
                 })
                 .collect(),
         ),
@@ -68,7 +61,6 @@ pub(crate) enum WorkspaceAction {
     /// End every shell in the workspace.
     EndWorkspace,
     WorkspacePicker,
-    MovePaneToWorkspacePicker,
     /// Moves the focused pane, or the visible float, into a new workspace.
     MovePaneToNewWorkspace,
     /// Moves the focused pane, or the visible float, into a new window.
@@ -128,7 +120,6 @@ impl WorkspaceAction {
         Self::DetachWorkspace,
         Self::EndWorkspace,
         Self::WorkspacePicker,
-        Self::MovePaneToWorkspacePicker,
         Self::MovePaneToNewWorkspace,
         Self::MovePaneToNewWindow,
         Self::NextWorkspace,
@@ -198,7 +189,6 @@ impl WorkspaceAction {
             DetachWorkspace => "DetachWorkspace".into(),
             EndWorkspace => "EndWorkspace".into(),
             WorkspacePicker => "WorkspacePicker".into(),
-            MovePaneToWorkspacePicker => "MovePaneToWorkspacePicker".into(),
             MovePaneToNewWorkspace => "MovePaneToNewWorkspace".into(),
             MovePaneToNewWindow => "MovePaneToNewWindow".into(),
             NextWorkspace => "NextWorkspace".into(),
@@ -315,7 +305,6 @@ impl WorkspaceAction {
             | DetachWorkspace
             | EndWorkspace
             | WorkspacePicker
-            | MovePaneToWorkspacePicker
             | MovePaneToNewWorkspace
             | MovePaneToNewWindow
             | NextWorkspace
@@ -502,7 +491,7 @@ impl TerminalView {
     /// a new one.
     pub(super) fn workspace_picker_rows(&self) -> Vec<crate::actions::Entry> {
         let window = self.has_panes();
-        let options = workspace_picker_options(&self.workspaces, self.current, None);
+        let options = workspace_picker_options(&self.workspaces, self.current);
         let mut entries = match options.source {
             crate::picker::config::Source::Workspaces(entries) if window => entries,
             _ => Vec::new(),
@@ -530,38 +519,18 @@ impl TerminalView {
         entries
     }
 
-    /// Open the picker of workspaces and sessions, or, `moving`, of where
-    /// the active pane can be moved to. The window holds it, with or
-    /// without a terminal: it is about no pane.
-    pub(super) fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
+    /// Open the picker of workspaces and sessions. The window holds it,
+    /// with or without a terminal: it is about no pane. Its rows are given
+    /// to it, so it reads no terminal.
+    pub(super) fn open_workspace_picker(&mut self, ctx: &egui::Context) {
         self.close_window_picker();
-        let pane = if moving { self.active_pane() } else { None };
-        if moving && pane.is_none() {
-            return;
-        }
-        let options = if moving {
-            workspace_picker_options(&self.workspaces, self.current, pane)
-        } else {
-            entry_picker(self.workspace_picker_rows())
-        };
-        self.show_in_window(ctx, options);
-        self.picker_follows = !moving;
-    }
-
-    /// Open the window's picker. Its rows are given to it, so it reads no
-    /// terminal.
-    pub(super) fn show_in_window(
-        &mut self,
-        ctx: &egui::Context,
-        options: crate::picker::config::Options,
-    ) {
         self.window_picker = Some(Box::new(crate::picker::Picker::start_replacing(
             std::ptr::null_mut(),
             None,
             false,
             0,
             ctx.clone(),
-            options,
+            entry_picker(self.workspace_picker_rows()),
             &self.picker_bindings.prompt_patterns,
             None,
         )));
@@ -571,7 +540,6 @@ impl TerminalView {
     pub(super) fn close_window_picker(&mut self) {
         if let Some(picker) = self.window_picker.take() {
             picker.surrender_focus();
-            self.picker_follows = false;
             self.context.request_repaint();
         }
     }
@@ -589,7 +557,7 @@ impl TerminalView {
             .active_pane()
             .and_then(|pane| self.pane_mut(pane))
             .map(|pane| pane.picker_typography(ctx));
-        let rows = self.picker_follows.then(|| self.workspace_picker_rows());
+        let rows = self.workspace_picker_rows();
         let builtin = self.picker_bindings.builtin_pickers;
         let padding = self.picker_bindings.cursor_scroll_padding;
         let picker = self.window_picker.as_mut()?;
@@ -600,9 +568,7 @@ impl TerminalView {
         picker.set_cursor_scroll_padding(padding);
         // Its rows are what there is now: the daemon says when the
         // sessions change, and rows that are what it has are left alone.
-        if let Some(rows) = rows {
-            picker.set_entries(ctx, rows);
-        }
+        picker.set_entries(ctx, rows);
         let action = picker.show_scoped(ctx, content, None, true)?;
         // Its rows run no Lua.
         if matches!(action, crate::picker::Action::Custom(_)) {
@@ -1146,9 +1112,7 @@ impl TerminalView {
                         self.move_pane_to_new_window(pane)?;
                     }
                 }
-                WorkspacePicker | MovePaneToWorkspacePicker => {
-                    self.open_workspace_picker(ctx, action == MovePaneToWorkspacePicker);
-                }
+                WorkspacePicker => self.open_workspace_picker(ctx),
                 RemoveWorkspace => {
                     self.workspace_request(Request::Remove(self.current), gl)?;
                 }
@@ -1439,7 +1403,7 @@ impl TerminalView {
                 palette.muted_text,
             );
             if response.clicked() {
-                self.open_workspace_picker(ui.ctx(), false);
+                self.open_workspace_picker(ui.ctx());
             }
         }
         ui.interact(

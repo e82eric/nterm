@@ -60,9 +60,6 @@ pub(crate) struct TerminalView {
     sessions_sent: std::collections::HashMap<String, String>,
     /// Why the window has no terminal, while it has none and is to stay.
     empty: Option<empty::Empty>,
-    /// Whether the window's picker lists the workspaces and sessions, and
-    /// so is given them again as they change.
-    picker_follows: bool,
     /// The picker of workspaces and sessions, while it is open. It is the
     /// window's and not a pane's: it is about no pane, and a window with no
     /// terminal shows it too.
@@ -296,7 +293,6 @@ impl TerminalView {
             sessions: Default::default(),
             sessions_sent: Default::default(),
             empty: None,
-            picker_follows: false,
             window_picker: None,
             picker_bindings,
             floating_padding,
@@ -557,11 +553,6 @@ impl TerminalView {
             // The row of the picker a window without a terminal asks with,
             // which acts on it itself.
             AppAction::NewSession => {}
-            AppAction::MovePaneToWorkspaceId { pane, workspace } => {
-                if let Err(error) = self.move_pane_to_workspace(pane, workspace, gl) {
-                    self.show_error("Workspace action failed", error);
-                }
-            }
             AppAction::ReloadConfig => match self.reload_source.reload() {
                 Ok(config) => {
                     if config.theme.is_some()

@@ -559,16 +559,6 @@ impl PickerSource {
             {
                 "SESSIONS"
             }
-            Self::CommandPalette { entries, .. }
-                if entries.first().is_some_and(|entry| {
-                    matches!(
-                        entry.action,
-                        crate::actions::AppAction::MovePaneToWorkspaceId { .. }
-                    )
-                }) =>
-            {
-                "MOVE PANE TO WORKSPACE"
-            }
             Self::FileSystem(_) => "FILESYSTEM PICKER",
             Self::Scrollback(_) => "SCROLLBACK PICKER",
             Self::Items { .. } => "ITEMS PICKER",

@@ -1422,38 +1422,22 @@ fn workspace_picker_uses_workspace_bottom_and_returns_stable_targets() {
     use crate::terminal::{workspace::Workspace, workspace_ui::workspace_picker_options};
     let first = Workspace::new(41, 1);
     let second = Workspace::new(97, 2);
-    use crate::terminal::PaneRef;
-    for pane in [None, Some(PaneRef::Tiled(123)), Some(PaneRef::Floating(5))] {
-        let ctx = egui::Context::default();
-        let mut options = workspace_picker_options(&[first.clone(), second.clone()], 41, pane);
-        assert_eq!(options.scope, config::Scope::Workspace);
-        assert!(matches!(options.position, config::Position::Bottom));
-        options.params.insert("query".into(), "2".into());
-        let mut picker = Picker::start(std::ptr::null_mut(), None, false, 0, ctx.clone(), options);
-        let selected = wait_selection(&ctx, &mut picker);
-        assert!(selected.text.contains("2"));
-        assert_eq!(
-            picker.source.label(),
-            if pane.is_some() {
-                "MOVE PANE TO WORKSPACE"
-            } else {
-                "WORKSPACES"
-            }
-        );
-        let (action, _) = frame(
-            &ctx,
-            &mut picker,
-            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
-        );
-        let expected = match pane {
-            Some(pane) => AppAction::MovePaneToWorkspaceId {
-                pane,
-                workspace: 97,
-            },
-            None => AppAction::SelectWorkspaceId(97),
-        };
-        assert!(matches!(action, Some(Action::Execute(action)) if action == expected));
-    }
+    let ctx = egui::Context::default();
+    let mut options = workspace_picker_options(&[first, second], 41);
+    assert_eq!(options.scope, config::Scope::Workspace);
+    assert!(matches!(options.position, config::Position::Bottom));
+    options.params.insert("query".into(), "2".into());
+    let mut picker = Picker::start(std::ptr::null_mut(), None, false, 0, ctx.clone(), options);
+    let selected = wait_selection(&ctx, &mut picker);
+    assert!(selected.text.contains("2"));
+    assert_eq!(picker.source.label(), "WORKSPACES");
+    let (action, _) = frame(
+        &ctx,
+        &mut picker,
+        vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    let expected = AppAction::SelectWorkspaceId(97);
+    assert!(matches!(action, Some(Action::Execute(action)) if action == expected));
 }
 
 #[test]

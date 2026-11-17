@@ -83,11 +83,11 @@ connection indicator. Index 10 is displayed as `0`, matching its shortcut.
 workspaces through the shortcut or palette.
 
 The command palette also exposes remove, creation, previous/next/
-last workspace, move-pane workspace picker, move pane to new workspace,
+last workspace, move pane to new workspace,
 move pane to new window, tile-reversed, and horizontal-grid. Bind their
 action names in Lua: `RemoveWorkspace`, `CreateWorkspace`, `NextWorkspace`,
 `PreviousWorkspace`, `LastWorkspace`,
-`MovePaneToWorkspacePicker`, `MovePaneToNewWorkspace`, `MovePaneToNewWindow`,
+`MovePaneToNewWorkspace`, `MovePaneToNewWindow`,
 `SetTileReversed`, and `SetHorizontalGrid`.
 
 `ResizeLeft`, `ResizeRight`, `ResizeUp`, and `ResizeDown` move a shared divider

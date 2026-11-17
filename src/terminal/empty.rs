@@ -98,7 +98,7 @@ impl TerminalView {
                 Status::Off => self.first_shell(gl),
                 Status::Connected => {
                     // Ask what to show: a session that waits, or a new one.
-                    self.open_workspace_picker(&ctx, false);
+                    self.open_workspace_picker(&ctx);
                     Some(Empty::Choose)
                 }
             },
@@ -107,11 +107,16 @@ impl TerminalView {
                 self.close_window_picker();
                 Some(Empty::Connecting)
             }
-            Empty::Choose if self.window_picker.is_none() => self.first_shell(gl),
-            Empty::Choose => match self.show_window_picker(&ctx, content) {
-                None => Some(Empty::Choose),
-                Some(action) => self.chosen(action, &ctx, gl),
-            },
+            // While the picker is open the window waits. Once it has gone,
+            // what was chosen is done.
+            Empty::Choose => {
+                let action = self.show_window_picker(&ctx, content);
+                if self.window_picker.is_some() {
+                    Some(Empty::Choose)
+                } else {
+                    self.chosen(action, &ctx, gl)
+                }
+            }
             // Another window asked again, and it is under way or done.
             Empty::Unavailable { .. } if matches!(now, Status::Connecting | Status::Connected) => {
                 Some(Empty::Connecting)
@@ -150,11 +155,11 @@ impl TerminalView {
     /// starts a shell.
     fn chosen(
         &mut self,
-        action: crate::picker::Action,
+        action: Option<crate::picker::Action>,
         ctx: &egui::Context,
         gl: &glow::Context,
     ) -> Option<Empty> {
-        if let crate::picker::Action::Execute(action) = action {
+        if let Some(crate::picker::Action::Execute(action)) = action {
             self.execute_action(action, false, ctx, gl);
         }
         if self.has_panes() { None } else { self.first_shell(gl) }
