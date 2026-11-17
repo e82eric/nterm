@@ -63,7 +63,7 @@ pub(crate) fn start(
             crate::error_log::error("picker command", "Command failed", &message);
             *error.lock().unwrap() = Some(message);
             PublishingStreamingItemStoreWithPayload::new(store).complete();
-            ctx.request_repaint();
+            crate::app::wake(&ctx);
             return None;
         }
     };
@@ -116,7 +116,7 @@ pub(crate) fn start(
                     }
                 }
             }
-            ctx.request_repaint();
+            crate::app::wake(&ctx);
         }),
         failed: Arc::new(|message| {
             crate::error_log::error("picker command", "Command failed", message)
@@ -175,7 +175,7 @@ pub(crate) fn start_file(
             crate::error_log::error("picker file", "File failed", &message);
             *error.lock().unwrap() = Some(message);
             PublishingStreamingItemStoreWithPayload::new(store).complete();
-            ctx.request_repaint();
+            crate::app::wake(&ctx);
             return None;
         }
     };
@@ -191,7 +191,7 @@ pub(crate) fn start_file(
     };
     let control = StreamControl {
         cancelled,
-        changed: Arc::new(move || ctx.request_repaint()),
+        changed: Arc::new(move || crate::app::wake(&ctx)),
         failed: Arc::new(|message| crate::error_log::error("picker file", "File failed", message)),
     };
     match file::start(source, sink, control) {
@@ -265,7 +265,7 @@ pub(crate) fn start_structured(
         move |rows: &mut StructuredStreamingStore| {
             store.publish(rows.snapshot());
             store.complete();
-            ctx.request_repaint();
+            crate::app::wake(&ctx);
         }
     };
     let (program, args, cwd) = match resolve(&options, &params) {
@@ -325,7 +325,7 @@ pub(crate) fn start_structured(
                             pending.drain(..start);
                             if start > 0 {
                                 store.publish(rows.snapshot());
-                                ctx.request_repaint();
+                                crate::app::wake(&ctx);
                             }
                             !too_many
                         },

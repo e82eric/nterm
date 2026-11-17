@@ -184,6 +184,6 @@ extern "C" fn nterm_app_issue(userdata: *mut c_void, operation: *const c_char, c
         if issues.len() < 32 && !issues.contains(&issue) {
             issues.push(issue);
         }
-        state.context.request_repaint();
+        crate::app::wake(&state.context);
     });
 }

@@ -389,7 +389,7 @@ impl PickerSource {
                         if let Err(message) = captured {
                             *error.lock().unwrap() = Some(message);
                             complete_document_source(&document_items);
-                            ctx.request_repaint();
+                            crate::app::wake(&ctx);
                             return;
                         }
                     }
@@ -459,14 +459,14 @@ impl PickerSource {
                             if batch >= 128 {
                                 document_items.publish(publisher.snapshot());
                                 batch = 0;
-                                ctx.request_repaint();
+                                crate::app::wake(&ctx);
                             }
                         }
                         bottom = start;
                     }
                     document_items.publish(publisher.snapshot());
                     document_items.complete();
-                    ctx.request_repaint();
+                    crate::app::wake(&ctx);
                 },
                 move |message| {
                     crate::error_log::error("picker", "Scrollback worker failed", &message);
@@ -474,7 +474,7 @@ impl PickerSource {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()) = Some(message);
                     complete_document_source(&failure_store);
-                    failure_ctx.request_repaint();
+                    crate::app::wake(&failure_ctx);
                 },
             )
         } else {

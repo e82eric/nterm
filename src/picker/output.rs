@@ -39,7 +39,7 @@ impl Output {
                 nfm_output::run_lines(spec, &writer, move |report| {
                     // The page is gone if nothing receives; the run ends with it.
                     send.send(report).ok();
-                    wake.request_repaint();
+                    crate::app::wake(&wake);
                 })
                 .map(|()| Some(Lines::new(filter, receive, writer.clone(), options.format)))
             }

@@ -149,6 +149,28 @@ mod command_label_tests {
 static APP_PROXY: std::sync::OnceLock<winit::event_loop::EventLoopProxy<UserEvent>> =
     std::sync::OnceLock::new();
 static APP_WAKE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REPAINT_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Have every window draw, from any thread.
+///
+/// Asking the egui context is heard only on the UI thread. From another
+/// thread it is asked of the root viewport, which no window is, and egui
+/// passes on a request only when it is sooner than the last one it passed on
+/// for that viewport. That is forgotten when the viewport next runs, and the
+/// root runs only when a window opens or closes. So after the first request
+/// the rest are dropped, and what a thread finished shows at the next key.
+///
+/// With no event loop, as in a test, the context is all there is to ask.
+pub(crate) fn wake(ctx: &egui::Context) {
+    use std::sync::atomic::Ordering;
+    let Some(proxy) = APP_PROXY.get() else { return ctx.request_repaint() };
+    if !REPAINT_PENDING.swap(true, Ordering::AcqRel)
+        && proxy.send_event(UserEvent::Repaint(Instant::now())).is_err()
+    {
+        REPAINT_PENDING.store(false, Ordering::Release);
+    }
+}
+
 
 // The shared native app outlives any particular pane's callback userdata.
 #[unsafe(no_mangle)]
@@ -599,6 +621,7 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
                 }
             }
             UserEvent::Repaint(deadline) => {
+                REPAINT_PENDING.store(false, std::sync::atomic::Ordering::Release);
                 for window in self.windows.values_mut() {
                     window.presentation.repaint_at(deadline);
                 }

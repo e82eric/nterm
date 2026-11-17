@@ -201,7 +201,7 @@ extern "C" fn nterm_close(userdata: *mut c_void) {
     crate::native_error::ffi_boundary("handle native callback nterm_close", || {
         let state = unsafe { &*(userdata.cast::<WakeState>()) };
         state.close.store(true, Ordering::Release);
-        state.context.request_repaint();
+        crate::app::wake(&state.context);
     });
 }
 
@@ -221,7 +221,7 @@ extern "C" fn nterm_write_clipboard(userdata: *mut c_void, bytes: *const u8, len
         let text =
             String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(bytes, len) }).into_owned();
         *state.clipboard_text.lock().unwrap() = Some(text);
-        state.context.request_repaint();
+        crate::app::wake(&state.context);
     });
 }
 
@@ -362,7 +362,7 @@ extern "C" fn nterm_runtime_issue(
         {
             issues.push((operation, cause));
         }
-        state.context.request_repaint();
+        crate::app::wake(&state.context);
     });
 }
 

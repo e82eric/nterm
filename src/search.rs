@@ -266,7 +266,7 @@ pub(crate) struct SnapshotSearchAdapter {
 impl SnapshotSearchAdapter {
     pub(crate) fn new(ctx: egui::Context) -> Self {
         Self {
-            service: SearchService::new(move || ctx.request_repaint()),
+            service: SearchService::new(move || crate::app::wake(&ctx)),
             document: None,
             ticket: None,
         }
