@@ -738,7 +738,9 @@ impl TerminalPane {
             frame_ready_pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
             title: std::sync::Mutex::new(String::new()),
-            pwd: std::sync::Mutex::new(None),
+            // Until the shell reports its own, it is where it was started: a
+            // pane made beside this one before then starts there too.
+            pwd: std::sync::Mutex::new(options.cwd.clone()),
             runtime_issues: std::sync::Mutex::new(Vec::new()),
             clipboard_text: std::sync::Mutex::new(None),
         });

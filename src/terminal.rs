@@ -320,6 +320,25 @@ impl TerminalView {
         Ok(pane)
     }
 
+    /// `spawn` for a new shell, which starts where the active pane's shell
+    /// is unless it names a directory. Ghostty hands a new terminal the
+    /// focused one's directory itself, but only once it has seen the shell
+    /// report it: a pane taken from the session daemon has not until its
+    /// next prompt, and the daemon would start the shell in its own
+    /// directory.
+    fn beside_active(&self, mut spawn: pane::SpawnOptions) -> pane::SpawnOptions {
+        if spawn.cwd.is_none() {
+            let active = match self.visible_float() {
+                Some(float) => Some(&float.value.pane),
+                None => self.focused_id().and_then(|id| self.tiled_ref(id)),
+            };
+            spawn.cwd = active
+                .and_then(|pane| pane.pwd())
+                .filter(|pwd| std::path::Path::new(pwd).is_dir());
+        }
+        spawn
+    }
+
     /// Requests made since the last call, in order, for the app to carry out.
     pub(crate) fn take_requests(&mut self) -> Vec<WindowRequest> {
         self.requests_posted = false;
@@ -454,7 +473,7 @@ impl TerminalView {
         let result = match request {
             Request::Create(options) => {
                 self.floating.validate_create(&options, self.floats())?;
-                let pane = self.create_pane(gl, &options.spawn())?;
+                let pane = self.create_pane(gl, &self.beside_active(options.spawn()))?;
                 let id = self
                     .floating
                     .insert(options.name, FloatingTerminal { pane });

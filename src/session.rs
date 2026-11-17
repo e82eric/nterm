@@ -846,9 +846,12 @@ impl Link {
         drop(state);
         // What the shell told the terminal before this UI was there.
         let wake = self.wake as *mut c_void;
+        // The daemon has the URL the shell wrote; the terminal here would
+        // have told the path in it.
+        let pwd = info.pwd.as_deref().map(url_path);
         for (text, tell) in [
             (&info.title, nterm_title as unsafe extern "C" fn(*mut c_void, *const std::ffi::c_char)),
-            (&info.pwd, nterm_pwd),
+            (&pwd, nterm_pwd),
         ] {
             if let Some(text) = text.as_deref().and_then(|text| std::ffi::CString::new(text).ok()) {
                 unsafe { tell(wake, text.as_ptr()) };
@@ -1047,6 +1050,35 @@ extern "C" fn on_resize(userdata: *mut c_void, cols: u16, rows: u16, width: u32,
         drop(state);
         link.daemon.control(Control::Resize { pane, size });
     });
+}
+
+/// The path in the URL a shell reports its directory as, such as
+/// `file://host/C:/my%20src`, with what the URL escaped put back. Text that
+/// is not a URL is taken as the path.
+pub(crate) fn url_path(pwd: &str) -> String {
+    let path = match pwd.split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("", |at| &rest[at..]),
+        None => return pwd.to_owned(),
+    };
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut rest = path.as_bytes();
+    while let [first, after @ ..] = rest {
+        let escaped = (*first == b'%')
+            .then(|| after.get(..2))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+        match escaped {
+            Some(byte) => {
+                bytes.push(byte);
+                rest = &after[2..];
+            }
+            None => {
+                bytes.push(*first);
+                rest = after;
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 extern "C" fn on_spawn(userdata: *mut c_void, spawn: *const HostSpawn) {

@@ -794,7 +794,7 @@ mod tests {
         let mut terminal = terminal();
         assert_eq!(terminal.title(), None);
         assert_eq!(terminal.pwd(), None);
-        terminal.feed(b"\x1b]2;build log\x07\x1b]7;file://host/C:/src\x07");
+        let _ = terminal.feed(b"\x1b]2;build log\x07\x1b]7;file://host/C:/src\x07");
         assert_eq!(terminal.title().as_deref(), Some("build log"));
         assert_eq!(terminal.pwd().as_deref(), Some("file://host/C:/src"));
     }

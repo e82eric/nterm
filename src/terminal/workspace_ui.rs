@@ -896,7 +896,7 @@ impl TerminalView {
                 }
                 // Spawn before publishing the workspace so failures leave the
                 // workspace collection and focus untouched.
-                let pane = self.create_pane(gl, &Default::default())?;
+                let pane = self.create_pane(gl, &self.beside_active(Default::default()))?;
                 let pane_id = self.next_pane;
                 self.next_pane += 1;
                 self.tiled.push((pane_id, pane));
@@ -957,7 +957,7 @@ impl TerminalView {
                 if !self.workspaces.iter().any(|w| w.id == target) {
                     return Err("workspace does not exist".into());
                 }
-                let pane = self.create_pane(gl, &spawn)?;
+                let pane = self.create_pane(gl, &self.beside_active(spawn))?;
                 let id = self.next_pane;
                 self.next_pane += 1;
                 self.tiled.push((id, pane));

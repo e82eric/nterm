@@ -429,6 +429,10 @@ mod tests {
     #[test]
     fn a_reported_directory_is_shown_as_a_path() {
         assert_eq!(place("kitty-shell-cwd://localhost/C:/src/nterm"), "C:/src/nterm");
+        // A new pane is started in the path, as the shell would spell it.
+        let path = crate::session::url_path;
+        assert_eq!(path("file://host/C:/my%20src/caf%C3%A9"), "/C:/my src/café");
+        assert_eq!(path("C:\\src\\100%"), "C:\\src\\100%");
         assert_eq!(place("file://host/home/me"), "/home/me");
         assert_eq!(place("C:/src"), "C:/src");
         assert_eq!(place("file://host"), "");
