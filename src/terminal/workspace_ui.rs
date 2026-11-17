@@ -518,7 +518,8 @@ impl TerminalView {
         };
         // Each float after the tiled panes, as a session's row counts them.
         for (entry, workspace) in entries.iter_mut().zip(&self.workspaces) {
-            let floats = workspace.floats.ids().len();
+            let floats = workspace.floats.ids().iter().filter_map(|id| self.floating.get(*id));
+            let floats = floats.map(|float| float.panes.len());
             entry.cells[3] = super::restore::counted(workspace.panes.len(), floats);
         }
         // So far all a workspace's row says is the user's doing. What its
@@ -709,11 +710,11 @@ impl TerminalView {
         let mut entries: Vec<_> = floats
             .ids()
             .iter()
-            .filter_map(|id| self.floating.get(*id))
-            .map(|p| {
+            .filter_map(|id| Some((self.floating.get(*id)?, self.float_pane(*id)?)))
+            .map(|(p, pane)| {
                 crate::actions::floating_pane_entry(
                     p.id,
-                    &p.title(),
+                    &pane.title(),
                     floats.visible() == Some(p.id),
                 )
             })
@@ -730,14 +731,100 @@ impl TerminalView {
             config_issues: self.messages.config_issues().to_vec(),
         }
     }
-    pub(super) fn visible_float(&self) -> Option<&floating::Entry<super::FloatingTerminal>> {
+    pub(super) fn visible_float(&self) -> Option<&floating::Entry<workspace::Group>> {
         self.floating.get(self.floats().visible()?)
     }
-    pub(super) fn visible_float_mut(
-        &mut self,
-    ) -> Option<&mut floating::Entry<super::FloatingTerminal>> {
-        let id = self.floats().visible()?;
-        self.floating.get_mut(id)
+    /// The pane a float has focus on: the one that is the float wherever a
+    /// float is treated as one terminal.
+    pub(super) fn float_pane_id(&self, float: u64) -> Option<u64> {
+        let group = &self.floating.get(float)?.value;
+        group.focused.or_else(|| group.panes.first().copied())
+    }
+    pub(super) fn float_pane(&self, float: u64) -> Option<&super::TerminalPane> {
+        self.tiled_ref(self.float_pane_id(float)?)
+    }
+    pub(super) fn visible_float_pane(&self) -> Option<&super::TerminalPane> {
+        self.float_pane(self.floats().visible()?)
+    }
+    /// Keeps a terminal as a pane of this window and returns its new id.
+    /// Which group shows it is for the caller to say.
+    pub(super) fn add_terminal(&mut self, pane: super::TerminalPane) -> u64 {
+        let id = self.next_pane;
+        self.next_pane += 1;
+        self.tiled.push((id, pane));
+        id
+    }
+    /// Takes a terminal out of this window. Its group is for the caller to
+    /// take it out of.
+    pub(super) fn take_terminal(&mut self, id: u64) -> Option<super::TerminalPane> {
+        let at = self.tiled.iter().position(|(i, _)| *i == id)?;
+        Some(self.tiled.remove(at).1)
+    }
+    /// The group the pane keys act on: the shown float's, or else the
+    /// workspace's tiled panes.
+    pub(super) fn active_group(&self) -> &workspace::Group {
+        match self.visible_float() {
+            Some(float) => &float.value,
+            None => &self.workspace().group,
+        }
+    }
+    pub(super) fn active_group_mut(&mut self) -> &mut workspace::Group {
+        match self.floats().visible() {
+            Some(id) if self.floating.get(id).is_some() => {
+                &mut self.floating.get_mut(id).expect("the float just found").value
+            }
+            _ => &mut self.workspace_mut().group,
+        }
+    }
+    /// Whether a float is shown that is one pane. The move and resize keys
+    /// then act on the float itself, as there is nothing in it to move.
+    pub(super) fn float_is_whole(&self) -> bool {
+        self.visible_float().is_some_and(|float| float.panes.len() <= 1)
+    }
+    /// How the panes of a float are laid out inside it. The float's frame is
+    /// around them all, so they keep a gap from it and cast no shadows.
+    pub(super) fn float_group_style(style: &workspace::Appearance) -> workspace::Appearance {
+        let mut style = style.clone();
+        style.outer_gap = style.inner_gap;
+        style.shadow_size = 0.0;
+        style
+    }
+    /// Where each pane of the shown float goes, in the float's `rect`. One
+    /// pane is the whole float.
+    pub(super) fn float_rects(
+        &self,
+        rect: egui::Rect,
+        style: &workspace::Appearance,
+    ) -> Vec<(u64, egui::Rect)> {
+        match self.visible_float() {
+            Some(float) => Self::group_rects(float, rect, style),
+            None => Vec::new(),
+        }
+    }
+    /// Where each pane of a float's `group` goes, in the float's `rect`.
+    pub(super) fn group_rects(
+        group: &workspace::Group,
+        rect: egui::Rect,
+        style: &workspace::Appearance,
+    ) -> Vec<(u64, egui::Rect)> {
+        if let [only] = group.panes[..] {
+            return vec![(only, rect)];
+        }
+        group.rectangles(rect, &Self::float_group_style(style))
+    }
+    /// A new float around a pane this window already has. Which workspace
+    /// it belongs to is for the caller to say.
+    pub(super) fn float_around(&mut self, pane: u64) -> u64 {
+        let mut group = workspace::Group::default();
+        group.layout = self.picker_bindings.default_layout;
+        group.panes.push(pane);
+        group.focused = Some(pane);
+        self.floating.insert(group)
+    }
+    /// A new float around a new terminal.
+    pub(super) fn add_float(&mut self, pane: super::TerminalPane) -> u64 {
+        let pane = self.add_terminal(pane);
+        self.float_around(pane)
     }
     /// Closes floats in any workspace. Their terminals are released next
     /// frame, after this frame's paint callbacks.
@@ -746,9 +833,24 @@ impl TerminalView {
             for w in &mut self.workspaces {
                 w.floats.remove(id);
             }
-            if let Some(float) = self.floating.remove(id) {
-                self.closed_panes.push(float.pane);
+            for pane in self.floating.remove(id).map(|group| group.panes).unwrap_or_default() {
+                if let Some(pane) = self.take_terminal(pane) {
+                    self.closed_panes.push(pane);
+                }
             }
+        }
+    }
+    /// Closes one pane of a float, and the float with its last.
+    pub(super) fn close_float_pane(&mut self, float: u64, pane: u64) {
+        let Some(entry) = self.floating.get_mut(float) else {
+            return;
+        };
+        if entry.panes.len() <= 1 {
+            return self.close_floats([float]);
+        }
+        entry.value.remove(pane);
+        if let Some(pane) = self.take_terminal(pane) {
+            self.closed_panes.push(pane);
         }
     }
     pub(super) fn prune_workspaces(&mut self) {
@@ -768,13 +870,7 @@ impl TerminalView {
             return Err("a workspace needs at least one tiled pane".into());
         }
         let workspace = w.id;
-        let at = self
-            .tiled
-            .iter()
-            .position(|(i, _)| *i == id)
-            .ok_or("pane does not exist")?;
-        let (_, pane) = self.tiled.remove(at);
-        let float = self.floating.insert(super::FloatingTerminal { pane });
+        let float = self.float_around(id);
         let w = self
             .workspaces
             .iter_mut()
@@ -784,8 +880,22 @@ impl TerminalView {
         w.floats.add(float);
         Ok((workspace, float))
     }
-    /// Moves a float's terminal into its workspace's tiled panes, after the
-    /// focused pane, and focuses it. Returns the new tiled pane ID.
+    /// Takes the pane a float has focus on out of the float, which goes when
+    /// that was its last. The pane stays in the window, in no group.
+    fn take_from_float(&mut self, float: u64) -> Option<u64> {
+        let pane = self.float_pane_id(float)?;
+        let group = &mut self.floating.get_mut(float)?.value;
+        group.remove(pane);
+        if group.panes.is_empty() {
+            self.floating.remove(float);
+            for w in &mut self.workspaces {
+                w.floats.remove(float);
+            }
+        }
+        Some(pane)
+    }
+    /// Moves the pane a float has focus on into its workspace's tiled panes,
+    /// after the focused pane, and focuses it. Returns the pane's ID.
     pub(super) fn tile_float(&mut self, id: u64) -> Result<u64, String> {
         let workspace = self
             .workspaces
@@ -793,19 +903,14 @@ impl TerminalView {
             .find(|w| w.floats.contains(id))
             .ok_or("floating pane does not exist")?
             .id;
-        let float = self
-            .floating
-            .remove(id)
+        let pane_id = self
+            .take_from_float(id)
             .ok_or("floating pane does not exist")?;
-        let pane_id = self.next_pane;
-        self.next_pane += 1;
-        self.tiled.push((pane_id, float.pane));
         let w = self
             .workspaces
             .iter_mut()
             .find(|w| w.id == workspace)
             .unwrap();
-        w.floats.remove(id);
         w.floats.hide();
         let at = w
             .panes
@@ -891,16 +996,10 @@ impl TerminalView {
                 self.prune_workspaces();
                 self.tiled.remove(at).1
             }
-            PaneRef::Floating(id) => {
-                let float = self
-                    .floating
-                    .remove(id)
-                    .ok_or("floating pane does not exist")?;
-                for w in &mut self.workspaces {
-                    w.floats.remove(id);
-                }
-                float.pane
-            }
+            PaneRef::Floating(id) => self
+                .take_from_float(id)
+                .and_then(|pane| self.take_terminal(pane))
+                .ok_or("floating pane does not exist")?,
         };
         self.requests
             .push(super::WindowRequest::MovePaneToNewWindow(super::MovedPane(
@@ -1219,17 +1318,24 @@ impl TerminalView {
                 LastWorkspace => {
                     self.select_workspace(self.previous)?;
                 }
-                // Creates in the layer that has focus: a float while one is shown.
+                // Creates in the group that has focus: one more pane in the
+                // float while one is shown.
                 CreatePane => {
                     if self.floats().visible().is_some() {
-                        self.floating_request(floating::Request::Create(Default::default()), gl)?;
+                        let pane = self.create_pane(gl, &self.beside_active(Default::default()))?;
+                        let id = self.add_terminal(pane);
+                        let group = self.active_group_mut();
+                        group.panes.push(id);
+                        group.focus(id);
                     } else {
                         self.workspace_request(Request::CreatePane(Default::default()), gl)?;
                     }
                 }
                 ClosePane => {
-                    if let Some(id) = self.floats().visible() {
-                        self.close_floats([id]);
+                    if let Some(float) = self.floats().visible() {
+                        if let Some(pane) = self.float_pane_id(float) {
+                            self.close_float_pane(float, pane);
+                        }
                     } else if let Some(id) = self.focused_id() {
                         self.close_tiled(id)?;
                     }
@@ -1242,17 +1348,17 @@ impl TerminalView {
                     }
                 }
                 MoveToMain => {
-                    let w = self.workspace_mut();
+                    let w = self.active_group_mut();
                     if let Some(i) = w.panes.iter().position(|p| Some(*p) == w.focused) {
                         let id = w.panes.remove(i);
                         w.panes.insert(0, id);
                     }
                 }
                 ResetLayout => {
-                    let w = self.workspace_mut();
-                    w.main_ratio = 0.5;
-                    w.weights_mut().clear();
-                    w.floats.set_size(None);
+                    let group = self.active_group_mut();
+                    group.main_ratio = 0.5;
+                    group.weights_mut().clear();
+                    self.floats_mut().set_size(None);
                 }
                 ResizeLeft | ResizeRight | ResizeUp | ResizeDown | ResizeFarLeft
                 | ResizeFarRight | ResizeFarUp | ResizeFarDown => {
@@ -1268,20 +1374,21 @@ impl TerminalView {
                         action,
                         ResizeFarLeft | ResizeFarRight | ResizeFarUp | ResizeFarDown
                     );
-                    // A shown float covers the tiled panes, so its edges move.
-                    // A key table's nudge modifier makes a small step.
+                    // A shown float of one pane has only its own edges to
+                    // move. A key table's nudge modifier makes a small step.
                     let nudge = std::mem::take(&mut self.nudge_step);
-                    if !self.resize_float_with_keys(horizontal, far, forward, nudge) {
-                        self.workspace_mut()
+                    let whole = self.float_is_whole();
+                    if !(whole && self.resize_float_with_keys(horizontal, far, forward, nudge)) {
+                        self.active_group_mut()
                             .resize_by(horizontal, far, forward, nudge);
                     }
                 }
-                SetTile => self.workspace_mut().set_layout(Layout::Tile),
-                SetTileReversed => self.workspace_mut().set_layout(Layout::TileReversed),
-                SetMonocle => self.workspace_mut().set_layout(Layout::Monocle),
-                SetDeck => self.workspace_mut().set_layout(Layout::Deck),
-                SetGrid => self.workspace_mut().set_layout(Layout::Grid),
-                SetHorizontalGrid => self.workspace_mut().set_layout(Layout::HorizontalGrid),
+                SetTile => self.active_group_mut().set_layout(Layout::Tile),
+                SetTileReversed => self.active_group_mut().set_layout(Layout::TileReversed),
+                SetMonocle => self.active_group_mut().set_layout(Layout::Monocle),
+                SetDeck => self.active_group_mut().set_layout(Layout::Deck),
+                SetGrid => self.active_group_mut().set_layout(Layout::Grid),
+                SetHorizontalGrid => self.active_group_mut().set_layout(Layout::HorizontalGrid),
                 CenterFloat => self.center_float(),
                 FocusLeft | FocusRight | FocusUp | FocusDown | MoveLeft | MoveRight | MoveUp
                 | MoveDown | MoveFarLeft | MoveFarRight | MoveFarUp | MoveFarDown => {
@@ -1313,20 +1420,31 @@ impl TerminalView {
             MoveFarDown => (Motion::Down, true, true),
             _ => return,
         };
-        // While a float is shown, focus keys cycle the workspace's floats and
-        // move keys move it, as resize keys resize it.
+        let bounds = ctx.content_rect();
+        let style = self.picker_bindings.workspace_appearance.clone();
+        // While a float is shown the keys act in it. Focus with nowhere to
+        // go in it goes to the workspace's next float, and the move keys move
+        // a float of one pane, as the resize keys resize it.
         if self.floats().visible().is_some() {
-            if moving {
+            if moving && self.float_is_whole() {
                 let nudge = std::mem::take(&mut self.nudge_step);
                 self.move_float_with_keys(motion, far, nudge);
-            } else {
+                return;
+            }
+            let rect = self.floating_rect_for(bounds);
+            if moving && far {
+                let style = Self::float_group_style(&style);
+                self.active_group_mut().move_far(motion, rect, &style);
+                return;
+            }
+            let rects = self.float_rects(rect, &style);
+            let changed = self.active_group_mut().navigate(motion, moving, &rects);
+            if !changed && !moving {
                 let next = matches!(motion, Motion::Down | Motion::Right);
                 self.floats_mut().cycle(next);
             }
             return;
         }
-        let bounds = ctx.content_rect();
-        let style = self.picker_bindings.workspace_appearance.clone();
         if far {
             self.workspace_mut().move_far(motion, bounds, &style);
             return;
@@ -1336,7 +1454,8 @@ impl TerminalView {
     }
     fn workspace_bar_detail(&self, font: &egui::FontId) -> egui::text::LayoutJob {
         let palette = crate::colors::palette();
-        let w = self.workspace();
+        // Of the group the pane keys act on: the shown float's, if any.
+        let w = self.active_group();
         let pane = w.pane_number();
         let mut job = egui::text::LayoutJob::default();
         let mut append = |text: &str, color: egui::Color32| {
@@ -1522,14 +1641,16 @@ impl TerminalView {
         for id in exited {
             let _ = self.close_tiled(id);
         }
-        let exited: Vec<_> = self
+        let exited: Vec<(u64, u64)> = self
             .floating
             .entries
             .iter()
-            .filter(|p| p.should_close())
-            .map(|p| p.id)
+            .flat_map(|float| float.panes.iter().map(|pane| (float.id, *pane)))
+            .filter(|(_, pane)| self.tiled_ref(*pane).is_some_and(|p| p.should_close()))
             .collect();
-        self.close_floats(exited);
+        for (float, pane) in exited {
+            self.close_float_pane(float, pane);
+        }
         self.note_daemon_loss();
         self.stay_for_sessions();
     }
@@ -1586,9 +1707,6 @@ impl TerminalView {
         for (_, pane) in &mut self.tiled {
             pane.workspace_bounds = Some(content);
         }
-        for pane in &mut self.floating.entries {
-            pane.workspace_bounds = Some(content);
-        }
         let mut style = self
             .workspace()
             .appearance
@@ -1618,7 +1736,10 @@ impl TerminalView {
         };
         let resizing = self.resize_with_mouse(ui, content, &style, resizable, !picker_active);
         let rects = self.workspace().rectangles(content, &style);
-        if !floating_active && !picker_active && !resizing {
+        let floating_rect = self.floating_rect_for(content);
+        // The shown float's panes, which are what a press can reach then.
+        let float_rects = self.float_rects(floating_rect, &floating_style);
+        if !picker_active && !resizing {
             if let Some(pos) = ui.input(|i| {
                 if i.pointer.any_pressed() {
                     i.pointer.interact_pos()
@@ -1626,11 +1747,20 @@ impl TerminalView {
                     None
                 }
             }) {
-                if let Some((id, _)) = rects.iter().find(|(_, r)| r.contains(pos)) {
-                    self.workspace_mut().focus(*id);
+                let pressed = if floating_active { &float_rects } else { &rects };
+                if let Some((id, _)) = pressed.iter().find(|(_, r)| r.contains(pos)) {
+                    self.active_group_mut().focus(*id);
                 }
             }
         }
+        // A float of one pane is moved and resized whole; in one of several
+        // the keys act on its panes.
+        let float_whole = self.float_is_whole();
+        let float_focus = self.visible_float().and_then(|float| float.focused);
+        let float_focused_rect = float_rects
+            .iter()
+            .find(|(id, _)| float_focus == Some(*id))
+            .copied();
         let focus = self.focused_id();
         // Activate the destination first: deactivating the old pane first can
         // briefly blur the shared native app and wake every terminal renderer.
@@ -1640,13 +1770,9 @@ impl TerminalView {
                 p.set_active(&ctx, true, focused_window);
             }
         }
+        let target_id = target.and_then(|pane| self.pane_id(pane));
         for (id, p) in &mut self.tiled {
-            if target != Some(PaneRef::Tiled(*id)) {
-                p.set_active(&ctx, false, focused_window);
-            }
-        }
-        for p in &mut self.floating.entries {
-            if target != Some(PaneRef::Floating(p.id)) {
+            if target_id != Some(*id) {
                 p.set_active(&ctx, false, focused_window);
             }
         }
@@ -1664,10 +1790,18 @@ impl TerminalView {
             .far
             .is_some_and(|far| crate::config::keybindings::holds(held, far));
         let focused_rect = rects.iter().find(|(id, _)| focus == Some(*id));
-        let floating_rect = self.floating_rect_for(content);
         let overlay = if self.key_table_resizes() {
-            let edges = if floating_active {
+            let edges = if float_whole {
                 resize_keys::float_resize_edges(far)
+            } else if floating_active {
+                match float_focused_rect {
+                    Some((id, r)) => {
+                        let style = Self::float_group_style(&floating_style);
+                        let dividers = self.active_group().dividers(floating_rect, &style);
+                        resize_keys::tile_resize_edges(r, id, &dividers, far)
+                    }
+                    None => Vec::new(),
+                }
             } else if let Some((id, r)) = focused_rect {
                 let dividers = self.workspace().dividers(content, &style);
                 resize_keys::tile_resize_edges(*r, *id, &dividers, far)
@@ -1676,8 +1810,10 @@ impl TerminalView {
             };
             KeyOverlay::Resize { edges, far }
         } else if self.key_table_moves() {
-            let sides = if floating_active {
+            let sides = if float_whole {
                 resize_keys::float_sides(floating_rect, content)
+            } else if floating_active {
+                self.active_group().move_sides(&float_rects)
             } else {
                 self.workspace().move_sides(&rects)
             };
@@ -1725,7 +1861,7 @@ impl TerminalView {
         }
         let key_hints = self.key_table.as_deref().map_or_else(Vec::new, |name| {
             let table = self.picker_bindings.key_table_keys(name);
-            resize_keys::hints(&table, modifiers, overlay.edges(), far, floating_active)
+            resize_keys::hints(&table, modifiers, overlay.edges(), far, float_whole)
         });
         // Layouts that hide panes show where the focused one sits among them.
         let w = self.workspace();
@@ -1746,15 +1882,15 @@ impl TerminalView {
                 }
             }
         }
-        let floating_inner = floating_style.content_rect(floating_rect);
-        let visible = self.floats().visible();
-        for p in &mut self.floating.entries {
-            let active = Some(p.id) == visible;
-            if active {
-                p.resize(floating_inner, scale);
-                let padding = (floating_rect.width() - floating_inner.width()) / 2.0;
-                p.set_corner_radius((floating_style.corner_radius - padding).max(0.0) * scale);
+        for (id, r) in &float_rects {
+            let inner = floating_style.content_rect(*r);
+            if let Some(p) = self.tiled_mut(*id) {
                 p.update_modes(&ctx);
+                if p.resize(inner, scale) {
+                    p.refresh_decorations();
+                }
+                let padding = (r.width() - inner.width()) / 2.0;
+                p.set_corner_radius((floating_style.corner_radius - padding).max(0.0) * scale);
             }
         }
         if let Some(a) = shortcut {
@@ -1762,7 +1898,7 @@ impl TerminalView {
         }
         let origin = self.active_pane();
         let bounds = if self.floats().visible().is_some() {
-            Some(floating_inner)
+            float_focused_rect.map(|(_, r)| floating_style.content_rect(r))
         } else {
             self.focused_id().and_then(|id| {
                 rects.iter().find(|(i, _)| *i == id).map(|(_, r)| {
@@ -1777,13 +1913,9 @@ impl TerminalView {
         let bindings = self.picker_bindings.clone();
         #[cfg(any(windows, unix))]
         {
-            let interactive = |pane| origin == Some(pane);
+            let origin_id = origin.and_then(|pane| self.pane_id(pane));
             for (id, p) in &mut self.tiled {
-                p.handle_pipe_requests(&ctx, &bindings, interactive(PaneRef::Tiled(*id)));
-            }
-            for p in &mut self.floating.entries {
-                let active = interactive(PaneRef::Floating(p.id));
-                p.handle_pipe_requests(&ctx, &bindings, active);
+                p.handle_pipe_requests(&ctx, &bindings, origin_id == Some(*id));
             }
         }
         let mut action = None;
@@ -1841,11 +1973,16 @@ impl TerminalView {
         } else {
             KeyOverlay::None
         };
-        self.show_floating(ui, content, floating_rect, &floating_style, &float_overlay);
+        self.show_floating(
+            ui,
+            content,
+            floating_rect,
+            &floating_style,
+            &float_overlay,
+            &float_rects,
+            float_focus,
+        );
         for (_, p) in &self.tiled {
-            p.drain_clipboard(&ctx);
-        }
-        for p in &self.floating.entries {
             p.drain_clipboard(&ctx);
         }
         self.toasts

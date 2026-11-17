@@ -16,7 +16,7 @@
 
 use super::{
     TerminalPane, TerminalView,
-    workspace::{Appearance, Workspace},
+    workspace::{Appearance, Group, Workspace},
 };
 use crate::{actions::AppAction, graphics as glow};
 use std::time::{Duration, Instant};
@@ -38,8 +38,9 @@ pub(super) struct Peek {
     /// The session's layout. Its pane ids are the daemon's pane numbers.
     workspace: Workspace,
     panes: Vec<Looking>,
-    /// The floating pane that was showing, one of `panes`.
-    float: Option<u32>,
+    /// The float that was showing, its panes among `panes`. Its pane ids
+    /// are the daemon's pane numbers too.
+    float: Option<Group>,
     asked: Instant,
 }
 
@@ -134,14 +135,21 @@ impl TerminalView {
             }
         };
         let backdrop = || painter.rect_filled(frame.expand(MARGIN / 2.0), 2.0, palette.background);
-        // A floating pane, over the tiled ones, which it dims as in the
-        // window.
-        let float = |padding, pane: &TerminalPane, wanted: Option<[u32; 2]>| {
-            let rect = place(Self::floating_rect(content, padding), content, frame);
+        // A float, over the tiled panes, which it dims as in the window, with
+        // its panes laid out in it. `pane` draws one of them in its place.
+        let float = |padding, group: &Group, pane: &dyn Fn(u64, egui::Rect)| {
+            let whole = Self::floating_rect(content, padding);
             painter.rect_filled(frame, 0.0, palette.background.gamma_multiply(DIM));
-            painter.rect_filled(rect, 0.0, palette.background);
-            draw(Some(pane), rect, wanted);
-            outline(rect, true);
+            painter.rect_filled(place(whole, content, frame), 0.0, palette.background);
+            let several = group.panes.len() > 1;
+            for (id, rect) in Self::group_rects(group, whole, style) {
+                let rect = place(rect, content, frame);
+                pane(id, rect);
+                if several {
+                    outline(rect, group.focused == Some(id));
+                }
+            }
+            outline(place(whole, content, frame), !several);
         };
         let tile = |rect: egui::Rect| {
             let rect = place(rect, content, frame).shrink(0.5);
@@ -159,7 +167,7 @@ impl TerminalView {
                 }
                 if let Some(floating) = floating {
                     let padding = workspace.floats.size().or(self.floating_padding);
-                    float(padding, &floating.value.pane, None);
+                    float(padding, &floating.value, &|pane, rect| draw(self.tiled_ref(pane), rect, None));
                 }
             }
             AppAction::AttachSession(_) => {
@@ -179,8 +187,12 @@ impl TerminalView {
                     }
                     outline(rect, peek.float.is_none() && peek.workspace.focused == Some(pane));
                 }
-                if let Some(looking) = peek.float.and_then(|float| looking(u64::from(float))) {
-                    float(self.floating_padding, &looking.pane, wanted(looking));
+                if let Some(group) = &peek.float {
+                    float(self.floating_padding, group, &|pane, rect| {
+                        if let Some(looking) = looking(pane) {
+                            draw(Some(&looking.pane), rect, wanted(looking));
+                        }
+                    });
                 }
             }
             _ => {}

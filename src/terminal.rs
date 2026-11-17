@@ -38,7 +38,7 @@ pub(crate) struct TerminalView {
     /// Shared so per-frame borrows can clone it cheaply; copy-on-write edits.
     picker_bindings: std::rc::Rc<crate::picker::config::Bindings>,
     floating_padding: Option<crate::config::FloatingPadding>,
-    floating: floating::Panes<FloatingTerminal>,
+    floating: floating::Panes<workspace::Group>,
     /// Work for the app to do after this window's frame; see `post_requests`.
     requests: Vec<WindowRequest>,
     /// Whether a `UserEvent::WindowRequests` is on its way to the app.
@@ -72,10 +72,6 @@ pub(crate) struct TerminalView {
     window_picker_rows: String,
 }
 
-struct FloatingTerminal {
-    pane: TerminalPane,
-}
-
 /// A terminal taken out of one window on its way to a new window.
 pub(crate) struct MovedPane(TerminalPane);
 
@@ -98,32 +94,8 @@ struct PaletteContext {
     config_issues: Vec<String>,
 }
 
-impl std::ops::Deref for FloatingTerminal {
-    type Target = TerminalPane;
-
-    fn deref(&self) -> &Self::Target {
-        &self.pane
-    }
-}
-
-impl std::ops::DerefMut for FloatingTerminal {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.pane
-    }
-}
-
-impl FloatingTerminal {
-    fn destroy(&mut self) {
-        self.pane.destroy();
-    }
-
-    fn acquire_frame(&mut self) -> bool {
-        self.pane.acquire_frame()
-    }
-}
-
-/// A terminal in this window. Tiled and floating panes have separate ID
-/// spaces, so a reference says which kind it is.
+/// A terminal in this window: a tiled pane by its id, or the pane a float
+/// has focus on by the float's id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneRef {
     Tiled(u64),
@@ -144,8 +116,8 @@ impl TerminalView {
     /// The visible float, else the focused tiled pane, if the window has
     /// a terminal at all.
     fn active_pane_opt(&self) -> Option<&TerminalPane> {
-        if let Some(float) = self.visible_float() {
-            Some(&float.pane)
+        if let Some(pane) = self.visible_float_pane() {
+            Some(pane)
         } else {
             self.focused_id()
                 .and_then(|id| self.tiled_ref(id))
@@ -341,10 +313,9 @@ impl TerminalView {
     /// directory.
     fn beside_active(&self, mut spawn: pane::SpawnOptions) -> pane::SpawnOptions {
         if spawn.cwd.is_none() {
-            let active = match self.visible_float() {
-                Some(float) => Some(&float.value.pane),
-                None => self.focused_id().and_then(|id| self.tiled_ref(id)),
-            };
+            let active = self
+                .visible_float_pane()
+                .or_else(|| self.focused_id().and_then(|id| self.tiled_ref(id)));
             spawn.cwd = active
                 .and_then(|pane| pane.pwd())
                 .filter(|pwd| std::path::Path::new(pwd).is_dir());
@@ -393,9 +364,6 @@ impl TerminalView {
         for (_, pane) in &mut self.tiled {
             acquired |= pane.acquire_frame();
         }
-        for floating in &mut self.floating.entries {
-            acquired |= floating.acquire_frame();
-        }
         acquired |= self.acquire_peek_frames();
         acquired
     }
@@ -408,16 +376,16 @@ impl TerminalView {
             .map(PaneRef::Floating)
             .or_else(|| self.focused_id().map(PaneRef::Tiled))
     }
-    fn pane_mut(&mut self, pane: PaneRef) -> Option<&mut TerminalPane> {
+    /// The id of the terminal a reference is to.
+    fn pane_id(&self, pane: PaneRef) -> Option<u64> {
         match pane {
-            PaneRef::Tiled(id) => self.tiled_mut(id),
-            PaneRef::Floating(id) => self
-                .floating
-                .entries
-                .iter_mut()
-                .find(|p| p.id == id)
-                .map(|p| &mut p.value.pane),
+            PaneRef::Tiled(id) => Some(id),
+            PaneRef::Floating(id) => self.float_pane_id(id),
         }
+    }
+    fn pane_mut(&mut self, pane: PaneRef) -> Option<&mut TerminalPane> {
+        let id = self.pane_id(pane)?;
+        self.tiled_mut(id)
     }
     fn run_picker_callback(&mut self, origin: PaneRef, gl: &glow::Context, ctx: &egui::Context) {
         let Some(pane) = self.pane_mut(origin) else {
@@ -488,9 +456,7 @@ impl TerminalView {
             Request::Create(options) => {
                 self.floating.validate_create(&options)?;
                 let pane = self.create_pane(gl, &self.beside_active(options.spawn()))?;
-                let id = self
-                    .floating
-                    .insert(FloatingTerminal { pane });
+                let id = self.add_float(pane);
                 self.floats_mut().add(id);
                 serde_json::to_value(describe(self, self.current, Some(id))).unwrap()
             }
@@ -604,9 +570,6 @@ impl TerminalView {
                         for (_, pane) in &mut self.tiled {
                             pane.refresh_picker_font(ctx);
                         }
-                        for floating in &mut self.floating.entries {
-                            floating.refresh_picker_font(ctx);
-                        }
                     }
                     self.picker_bindings = std::rc::Rc::new(config.bindings);
                     #[cfg(any(windows, unix))]
@@ -614,9 +577,6 @@ impl TerminalView {
                         let policy = &self.picker_bindings.pipe_policy;
                         for (_, pane) in &self.tiled {
                             pane.set_pipe_policy(policy);
-                        }
-                        for floating in &self.floating.entries {
-                            floating.set_pipe_policy(policy);
                         }
                     }
                     self.floating_padding = config.padding;
@@ -634,19 +594,8 @@ impl TerminalView {
                     .expect("builtin themes picker");
                 let palette = self.palette_context();
                 let bindings = self.picker_bindings.clone();
-                let pane = if self.floats().visible().is_some() {
-                    &mut self
-                        .visible_float_mut()
-                        .expect("floating action target")
-                        .pane
-                } else {
-                    let Some(id) = self.focused_id() else {
-                        return;
-                    };
-                    let Some(pane) = self.tiled_mut(id) else {
-                        return;
-                    };
-                    pane
+                let Some(pane) = self.active_pane().and_then(|pane| self.pane_mut(pane)) else {
+                    return;
                 };
                 pane.open_picker(ctx, entry, None, &bindings, &palette);
             }
@@ -812,6 +761,10 @@ impl TerminalView {
         }
     }
 
+    /// Draws the shown float over the tiled panes: its frame at `rect`, and
+    /// each of its panes at its place in `panes`. `focus` is the pane with
+    /// focus, which is framed when there are several.
+    #[allow(clippy::too_many_arguments)]
     fn show_floating(
         &self,
         ui: &egui::Ui,
@@ -819,10 +772,20 @@ impl TerminalView {
         rect: egui::Rect,
         style: &workspace::Appearance,
         overlay: &resize_keys::KeyOverlay,
+        panes: &[(u64, egui::Rect)],
+        focus: Option<u64>,
     ) {
         let Some(floating) = self.visible_float() else {
             return;
         };
+        // Also when its layout shows one of them at a time.
+        let several = floating.panes.len() > 1;
+        let hides_panes = match floating.layout {
+            workspace::Layout::Monocle => floating.panes.len() > 1,
+            workspace::Layout::Deck => floating.panes.len() > 2,
+            _ => false,
+        };
+        let inside = Self::float_group_style(style);
         let layer_id = egui::LayerId::new(egui::Order::Middle, egui::Id::new("floating-terminal"));
         egui::Area::new(layer_id.id)
             .order(layer_id.order)
@@ -840,20 +803,40 @@ impl TerminalView {
                     resize_keys::DIM
                 };
                 painter.rect_filled(content, 0.0, palette.background.gamma_multiply(dim));
-                // The overlay replaces the focus highlight while shown.
-                style.paint_frame(painter, rect, overlay.is_none());
+                // The overlay replaces the focus highlight while shown. With
+                // several panes the highlight is on the one with focus.
+                style.paint_frame(painter, rect, overlay.is_none() && !several);
                 painter.rect_filled(rect, style.corner_radius, palette.background);
-                painter.add(egui::PaintCallback {
-                    rect: style.content_rect(rect),
-                    callback: floating.paint_callback(),
-                });
+                for (id, pane_rect) in panes {
+                    if pane_rect.width() < 1.0 || pane_rect.height() < 1.0 {
+                        continue;
+                    }
+                    if several {
+                        let highlight = focus == Some(*id) && overlay.is_none();
+                        inside.paint_frame(painter, *pane_rect, highlight);
+                    }
+                    if let Some(terminal) = self.tiled_ref(*id) {
+                        painter.add(egui::PaintCallback {
+                            rect: style.content_rect(*pane_rect),
+                            callback: terminal.paint_callback(),
+                        });
+                    }
+                    // Where the pane sits among those the layout hides.
+                    if hides_panes && focus == Some(*id) {
+                        let (number, count) = (floating.pane_number(), floating.panes.len());
+                        Self::paint_pane_dots(painter, *pane_rect, number, count);
+                    }
+                }
                 let ids = self.floats().ids();
                 if ids.len() > 1 {
                     let position = ids.iter().position(|id| *id == floating.id).unwrap_or(0) + 1;
                     Self::paint_pane_dots(painter, rect, position, ids.len());
                 }
-                // The overlay, drawn last, over the terminal.
-                overlay.paint(painter, rect, style.corner_radius, style.border_width);
+                // The overlay, drawn last, over the terminal: on the float
+                // when the keys act on it, or else on the pane they act on.
+                let marked = panes.iter().find(|(id, _)| several && focus == Some(*id));
+                let marked = marked.map_or(rect, |(_, pane_rect)| *pane_rect);
+                overlay.paint(painter, marked, style.corner_radius, style.border_width);
             });
         ui.ctx().move_to_top(layer_id);
     }
@@ -875,10 +858,8 @@ impl TerminalView {
             self.show_notice("Messages", "No messages.".into());
             return;
         }
-        if let Some(floating) = self.visible_float_mut() {
-            floating.open_messages(ctx, &issues);
-        } else if let Some(p) = self.focused_id().and_then(|id| self.tiled_mut(id)) {
-            p.open_messages(ctx, &issues);
+        if let Some(pane) = self.active_pane().and_then(|pane| self.pane_mut(pane)) {
+            pane.open_messages(ctx, &issues);
         }
     }
 
@@ -1143,10 +1124,7 @@ impl TerminalView {
     pub(crate) fn destroy(&mut self) {
         self.save_sessions();
         self.drop_peek();
-        for mut floating in self.floating.entries.drain(..) {
-            floating.pane.keep_shell();
-            floating.destroy();
-        }
+        self.floating.entries.clear();
         for mut pane in self.closed_panes.drain(..) {
             pane.destroy();
         }

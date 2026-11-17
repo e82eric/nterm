@@ -10,7 +10,7 @@
 //! Everything here runs on the UI thread.
 
 use super::{
-    FloatingTerminal, TerminalView,
+    TerminalView,
     workspace::{self, Appearance, Layout},
 };
 use crate::{actions::AppAction, graphics as glow};
@@ -37,26 +37,50 @@ struct Saved {
     /// What the user called the workspace.
     name: Option<String>,
 }
-
+/// A float. Sessions kept before a float could hold several panes say only
+/// `pane`, and a build from then shows only that one.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Float {
+    /// The pane with focus.
     pane: u32,
+    /// Every pane in order, `pane` among them. Empty for `pane` alone.
+    panes: Vec<u32>,
+    layout: Option<Layout>,
+    main_ratio: Option<f32>,
+    weights: BTreeMap<Layout, BTreeMap<u32, f32>>,
+}
+
+impl Float {
+    fn all(&self) -> Vec<u32> {
+        if self.panes.is_empty() { vec![self.pane] } else { self.panes.clone() }
+    }
 }
 
 impl Saved {
     /// Every shell the workspace holds, tiled and floating.
     fn members(&self) -> Vec<u32> {
-        self.panes.iter().copied().chain(self.floats.iter().map(|float| float.pane)).collect()
+        self.panes.iter().copied().chain(self.floats.iter().flat_map(Float::all)).collect()
     }
 
     /// Cut down to the shells `keep` accepts. Floats belong to a workspace,
     /// which needs a tiled pane: left without one, they are tiled.
     fn keep_only(&mut self, mut keep: impl FnMut(u32) -> bool) {
         self.panes.retain(|pane| keep(*pane));
-        self.floats.retain(|float| keep(float.pane));
+        for float in &mut self.floats {
+            float.panes = float.all();
+            float.panes.retain(|pane| keep(*pane));
+            // A float is known by the pane with focus, which may have gone.
+            if !float.panes.contains(&float.pane) {
+                if self.visible_float == Some(float.pane) {
+                    self.visible_float = float.panes.first().copied();
+                }
+                float.pane = float.panes.first().copied().unwrap_or(float.pane);
+            }
+        }
+        self.floats.retain(|float| !float.panes.is_empty());
         if self.panes.is_empty() {
-            self.panes = self.floats.drain(..).map(|float| float.pane).collect();
+            self.panes = self.floats.drain(..).flat_map(|float| float.panes).collect();
             self.visible_float = None;
         }
     }
@@ -116,10 +140,10 @@ pub(super) fn session_rows_key(listing: &crate::session::Listing) -> String {
     listing.sessions.iter().filter_map(key).collect()
 }
 
-/// How many panes a row says there are: the tiled ones, then each floating
-/// one, as `3 + 1 + 1`.
-pub(super) fn counted(tiled: usize, floats: usize) -> String {
-    let counts = std::iter::once(tiled).chain(std::iter::repeat_n(1, floats));
+/// How many panes a row says there are: the tiled ones, then those in each
+/// float, as `3 + 1 + 2`.
+pub(super) fn counted(tiled: usize, floats: impl IntoIterator<Item = usize>) -> String {
+    let counts = std::iter::once(tiled).chain(floats);
     counts.map(|count| count.to_string()).collect::<Vec<_>>().join(" + ")
 }
 
@@ -179,7 +203,7 @@ pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::acti
                 format!("{kind}{name}"),
                 "detached".into(),
                 saved.layout.tag().to_owned(),
-                counted(saved.panes.len(), saved.floats.len()),
+                counted(saved.panes.len(), saved.floats.iter().map(|float| float.all().len())),
                 running,
             ],
             action: AppAction::AttachSession(session.id.clone()),
@@ -223,11 +247,12 @@ pub(super) struct Waiting {
     /// Its tiled panes as it lays them out. Their ids are the daemon's pane
     /// numbers.
     pub(super) workspace: workspace::Workspace,
-    /// The shells to look at: the tiled ones, and the floating one that
+    /// The shells to look at: the tiled ones, and those of the float that
     /// was showing.
     pub(super) shells: Vec<crate::session::Adopt>,
-    /// The floating pane that was showing, by the daemon's pane number.
-    pub(super) float: Option<u32>,
+    /// The float that was showing: how its panes are laid out, their ids
+    /// the daemon's pane numbers too.
+    pub(super) float: Option<workspace::Group>,
 }
 
 /// A session waiting in the daemon, as the daemon last described it. `None`
@@ -235,27 +260,42 @@ pub(super) struct Waiting {
 pub(super) fn waiting_workspace(id: &str) -> Option<Waiting> {
     let listing = crate::session::sessions()?;
     let saved = listing.sessions.iter().find(|session| session.id == id).and_then(arrangement)?;
+    // A group as saved, its pane ids the daemon's pane numbers.
+    let group = |layout: Layout,
+                 ratio: Option<f32>,
+                 inside: &[u32],
+                 focused: Option<u32>,
+                 weights: &BTreeMap<Layout, BTreeMap<u32, f32>>| {
+        let mut group = workspace::Group { layout, ..Default::default() };
+        if let Some(ratio) = ratio.filter(|ratio| ratio.is_finite()) {
+            group.main_ratio = ratio.clamp(0.1, 0.9);
+        }
+        group.panes = inside.iter().map(|pane| u64::from(*pane)).collect();
+        group.pane_weights = weights
+            .iter()
+            .map(|(layout, weights)| {
+                let weights = weights.iter().map(|(pane, weight)| (u64::from(*pane), *weight));
+                (*layout, weights.collect())
+            })
+            .collect();
+        let focused = focused.filter(|pane| inside.contains(pane)).or(inside.first().copied());
+        if let Some(pane) = focused {
+            group.focus(u64::from(pane));
+        }
+        group
+    };
     let mut shown = workspace::Workspace::new(0, 0);
-    shown.layout = saved.layout;
-    if let Some(ratio) = saved.main_ratio.filter(|ratio| ratio.is_finite()) {
-        shown.main_ratio = ratio.clamp(0.1, 0.9);
-    }
-    shown.panes = saved.panes.iter().map(|pane| u64::from(*pane)).collect();
-    shown.pane_weights = saved
-        .weights
-        .iter()
-        .map(|(layout, weights)| {
-            let weights = weights.iter().map(|(pane, weight)| (u64::from(*pane), *weight));
-            (*layout, weights.collect())
-        })
-        .collect();
+    shown.group = group(saved.layout, saved.main_ratio, &saved.panes, saved.focused, &saved.weights);
     shown.appearance = saved.appearance.clone().filter(|appearance| appearance.validate().is_ok());
-    let focused = saved.focused.filter(|pane| saved.panes.contains(pane));
-    if let Some(pane) = focused.or(saved.panes.first().copied()) {
-        shown.focus(u64::from(pane));
-    }
-    let float = saved.visible_float.filter(|pane| saved.floats.iter().any(|f| f.pane == *pane));
-    let shells = saved.panes.iter().chain(&float).filter_map(|pane| listing.adopt(*pane)).collect();
+    let float = saved
+        .visible_float
+        .and_then(|pane| saved.floats.iter().find(|float| float.pane == pane));
+    let inside = float.map(Float::all).unwrap_or_default();
+    let float = float.map(|float| {
+        let layout = float.layout.unwrap_or_default();
+        group(layout, float.main_ratio, &inside, Some(float.pane), &float.weights)
+    });
+    let shells = saved.panes.iter().chain(&inside).filter_map(|pane| listing.adopt(*pane)).collect();
     Some(Waiting { workspace: shown, shells, float })
 }
 
@@ -287,8 +327,37 @@ impl TerminalView {
             return Err("None of the session's shells could be shown.".into());
         }
         for float in &saved.floats {
-            let Some(pane) = self.adopt(float.pane, &listing, gl) else { continue };
-            let id = self.floating.insert(FloatingTerminal { pane });
+            // Daemon pane to this window's pane, for this float.
+            let mut inside: HashMap<u32, u64> = HashMap::new();
+            let mut order = Vec::new();
+            for number in float.all() {
+                let Some(pane) = self.adopt(number, &listing, gl) else { continue };
+                let pane = self.add_terminal(pane);
+                inside.insert(number, pane);
+                order.push(pane);
+            }
+            let Some(first) = order.first().copied() else { continue };
+            let id = self.float_around(first);
+            let group = &mut self.floating.get_mut(id).expect("the float just made").value;
+            group.panes = order;
+            if let Some(layout) = float.layout {
+                group.layout = layout;
+            }
+            if let Some(ratio) = float.main_ratio.filter(|ratio| ratio.is_finite()) {
+                group.main_ratio = ratio.clamp(0.1, 0.9);
+            }
+            group.pane_weights = float
+                .weights
+                .iter()
+                .map(|(layout, weights)| {
+                    let weights = weights
+                        .iter()
+                        .filter_map(|(pane, weight)| Some((*inside.get(pane)?, *weight)))
+                        .collect();
+                    (*layout, weights)
+                })
+                .collect();
+            group.focus(inside.get(&float.pane).copied().unwrap_or(first));
             floating.insert(float.pane, id);
             self.workspace_by_id(workspace_id).floats.add(id);
         }
@@ -376,7 +445,26 @@ impl TerminalView {
             return None;
         }
         let float = |id: &u64| {
-            self.floating.get(*id)?.value.pane.session_pane()
+            let entry = self.floating.get(*id)?;
+            let panes: Vec<u32> = entry.panes.iter().filter_map(number).collect();
+            let focused = entry.focused.as_ref().and_then(number);
+            Some(Float {
+                pane: focused.or(panes.first().copied())?,
+                layout: Some(entry.layout),
+                main_ratio: Some(entry.main_ratio),
+                weights: entry
+                    .pane_weights
+                    .iter()
+                    .map(|(layout, weights)| {
+                        let weights = weights
+                            .iter()
+                            .filter_map(|(id, weight)| Some((number(id)?, *weight)))
+                            .collect();
+                        (*layout, weights)
+                    })
+                    .collect(),
+                panes,
+            })
         };
         let weights = workspace
             .pane_weights
@@ -396,14 +484,8 @@ impl TerminalView {
             focused: workspace.focused.as_ref().and_then(number),
             weights,
             appearance: workspace.appearance.clone(),
-            floats: workspace
-                .floats
-                .ids()
-                .iter()
-                .filter_map(float)
-                .map(|pane| Float { pane })
-                .collect(),
-            visible_float: workspace.floats.visible().and_then(|id| float(&id)),
+            floats: workspace.floats.ids().iter().filter_map(float).collect(),
+            visible_float: workspace.floats.visible().and_then(|id| float(&id)).map(|float| float.pane),
             name: workspace.name.clone(),
             panes,
         })
@@ -444,7 +526,11 @@ impl TerminalView {
                 .floats
                 .ids()
                 .iter()
-                .all(|float| kept(self.floating.get(*float).map(|entry| &entry.value.pane)));
+                .all(|float| {
+                    self.floating.get(*float).is_some_and(|entry| {
+                        entry.panes.iter().all(|pane| kept(self.tiled_ref(*pane)))
+                    })
+                });
         // One the daemon has not been told of could not be shown again.
         let told = workspace.session.as_ref().is_some_and(|session| !session.sent.is_empty());
         if !(told && all_kept) {
@@ -460,17 +546,14 @@ impl TerminalView {
         // Gone from here and left in the daemon.
         let at = self.workspaces.iter().position(|w| w.id == id).expect("the workspace");
         let workspace = self.workspaces.remove(at);
-        for pane in &workspace.panes {
-            if let Some(at) = self.tiled.iter().position(|(id, _)| id == pane) {
-                let (_, mut pane) = self.tiled.remove(at);
+        let mut panes = workspace.panes.clone();
+        for float in workspace.floats.ids() {
+            panes.extend(self.floating.remove(*float).map(|group| group.panes).unwrap_or_default());
+        }
+        for pane in panes {
+            if let Some(mut pane) = self.take_terminal(pane) {
                 pane.keep_shell();
                 self.closed_panes.push(pane);
-            }
-        }
-        for float in workspace.floats.ids() {
-            if let Some(mut float) = self.floating.remove(*float) {
-                float.pane.keep_shell();
-                self.closed_panes.push(float.pane);
             }
         }
         workspace::renumber(&mut self.workspaces);
@@ -568,7 +651,7 @@ mod tests {
         let saved = Saved {
             version: VERSION,
             panes: panes.to_vec(),
-            floats: floats.iter().map(|pane| Float { pane: *pane }).collect(),
+            floats: floats.iter().map(|pane| Float { pane: *pane, ..Float::default() }).collect(),
             ..Saved::default()
         };
         serde_json::to_string(&saved).unwrap()
@@ -651,7 +734,7 @@ mod tests {
         assert_eq!(named, ("api".into(), "cargo.exe, vim / C:/src".into()));
         assert_eq!(called(None, &[], None), (String::new(), String::new()));
         // Three tiled and two floating.
-        assert_eq!((counted(3, 2), counted(1, 0)), ("3 + 1 + 1".into(), "1".into()));
+        assert_eq!((counted(3, [1, 2]), counted(1, [])), ("3 + 1 + 2".into(), "1".into()));
     }
 
     #[test]
@@ -693,5 +776,49 @@ mod tests {
         assert_eq!(arrangement(&session("a", other, &panes[..2])).unwrap().panes, [1, 2]);
         // One a window is showing cannot be taken.
         assert!(arrangement(&session("a", layout(&[1], &[]), &[pane(1, true, None)])).is_none());
+    }
+
+    /// A session's layout as its panes are there to take, by `arrangement`.
+    fn taken(saved: &Saved, panes: &[u32]) -> Saved {
+        let panes: Vec<PaneInfo> = panes.iter().map(|number| pane(*number, false, None)).collect();
+        arrangement(&session("a", serde_json::to_string(saved).unwrap(), &panes)).unwrap()
+    }
+
+    #[test]
+    fn a_float_kept_as_one_pane_is_a_float_of_that_pane() {
+        let old = format!(r#"{{"version":{VERSION},"panes":[1],"floats":[{{"pane":2,"name":"x"}}]}}"#);
+        let panes = [pane(1, false, None), pane(2, false, None)];
+        let saved = arrangement(&session("a", old, &panes)).unwrap();
+        assert_eq!(saved.floats.len(), 1);
+        assert_eq!(saved.floats[0].all(), [2]);
+    }
+
+    #[test]
+    fn a_float_keeps_the_panes_still_waiting_and_goes_with_its_last() {
+        let float = Float { pane: 3, panes: vec![2, 3, 4], ..Float::default() };
+        let saved = Saved {
+            version: VERSION,
+            panes: vec![1],
+            floats: vec![float, Float { pane: 5, ..Float::default() }],
+            visible_float: Some(3),
+            ..Saved::default()
+        };
+        // The float's focused pane and the other float's only pane have gone.
+        let saved = taken(&saved, &[1, 2, 4]);
+        assert_eq!(saved.floats.len(), 1);
+        assert_eq!(saved.floats[0].all(), [2, 4]);
+        // Known by a pane it still has, as is the float that was showing.
+        assert_eq!(saved.floats[0].pane, 2);
+        assert_eq!(saved.visible_float, Some(2));
+        assert_eq!(saved.members(), [1, 2, 4]);
+    }
+
+    #[test]
+    fn floats_left_without_a_tiled_pane_are_tiled_with_all_their_panes() {
+        let float = Float { pane: 2, panes: vec![2, 3], ..Float::default() };
+        let saved = Saved { version: VERSION, panes: vec![1], floats: vec![float], ..Saved::default() };
+        let saved = taken(&saved, &[2, 3]);
+        assert_eq!(saved.panes, [2, 3]);
+        assert!(saved.floats.is_empty());
     }
 }

@@ -1,7 +1,7 @@
 //! What each workspace layout decides: where panes go, what resizing does, and
 //! how focus moves. Each layout is one type implementing `Arrange`;
 //! `Layout::arrange` maps the configured layout to it.
-use super::workspace::{Appearance, Layout, Workspace};
+use super::workspace::{Appearance, Layout, Group};
 use egui::{Rect, pos2};
 use std::{collections::BTreeMap, ops::Range};
 
@@ -196,7 +196,7 @@ pub(super) struct DividerAt {
 }
 
 impl Splits {
-    fn pair_group(&self, w: &Workspace, a: u64, b: u64) -> Option<Range<usize>> {
+    fn pair_group(&self, w: &Group, a: u64, b: u64) -> Option<Range<usize>> {
         self.groups
             .iter()
             .find(|g| w.panes[(*g).clone()].windows(2).any(|p| p == [a, b]))
@@ -207,7 +207,7 @@ impl Splits {
     /// minimum. `rects` are this layout's rectangles.
     pub(super) fn dividers(
         &self,
-        w: &Workspace,
+        w: &Group,
         area: &Area,
         rects: &[(u64, Rect)],
     ) -> Vec<DividerAt> {
@@ -249,7 +249,7 @@ impl Splits {
     /// there. `rects` are this layout's rectangles before the move.
     pub(super) fn move_divider(
         &self,
-        w: &mut Workspace,
+        w: &mut Group,
         area: &Area,
         rects: &[(u64, Rect)],
         id: DividerId,
@@ -295,7 +295,7 @@ impl Splits {
             }
         }
     }
-    fn rectangles(&self, w: &Workspace, area: &Area) -> Vec<(u64, Rect)> {
+    fn rectangles(&self, w: &Group, area: &Area) -> Vec<(u64, Rect)> {
         let ratio = match self.main {
             Side::First => w.main_ratio,
             Side::Second => 1.0 - w.main_ratio,
@@ -309,17 +309,17 @@ impl Splits {
     }
 }
 
-/// A layout's behavior. `Workspace` checks the shared preconditions first:
+/// A layout's behavior. `Group` checks the shared preconditions first:
 /// every method sees at least two panes, and `index` is the focused pane's
 /// position in `w.panes`.
 pub(super) trait Arrange {
     /// How the layout divides space, or `None` when nothing is split. The
     /// default `rectangles` and `resize` follow it.
-    fn splits(&self, _w: &Workspace) -> Option<Splits> {
+    fn splits(&self, _w: &Group) -> Option<Splits> {
         None
     }
     /// Where each visible pane goes. The default lays out `splits`.
-    fn rectangles(&self, w: &Workspace, area: &Area) -> Vec<(u64, Rect)> {
+    fn rectangles(&self, w: &Group, area: &Area) -> Vec<(u64, Rect)> {
         match self.splits(w) {
             Some(splits) => splits.rectangles(w, area),
             None => vec![(w.panes[0], area.rect)],
@@ -327,12 +327,12 @@ pub(super) trait Arrange {
     }
     /// Reorders panes so the focused one is on screen, after focus, layout,
     /// or pane order changes. The default does nothing.
-    fn reveal(&self, _w: &mut Workspace) {}
+    fn reveal(&self, _w: &mut Group) {}
     /// Moves a divider on the focused pane's edge along `axis`: the outer
     /// split, or within its side of `splits` the one before it, or with
     /// `far` the one after it, by `step` of the space they share: positive
     /// moves it right or down.
-    fn resize(&self, w: &mut Workspace, index: usize, axis: Axis, far: bool, step: f32) {
+    fn resize(&self, w: &mut Group, index: usize, axis: Axis, far: bool, step: f32) {
         let Some(splits) = self.splits(w) else {
             return;
         };
@@ -346,7 +346,7 @@ pub(super) trait Arrange {
     /// nearest visible pane in that direction.
     fn target(
         &self,
-        w: &Workspace,
+        w: &Group,
         index: usize,
         motion: Motion,
         rects: &[(u64, Rect)],
@@ -356,7 +356,7 @@ pub(super) trait Arrange {
     /// Moves focus and returns whether anything changed.
     fn focus(
         &self,
-        w: &mut Workspace,
+        w: &mut Group,
         index: usize,
         motion: Motion,
         rects: &[(u64, Rect)],
@@ -372,7 +372,7 @@ pub(super) trait Arrange {
     /// default swaps it with `target`, keeping focus on it.
     fn move_pane(
         &self,
-        w: &mut Workspace,
+        w: &mut Group,
         index: usize,
         motion: Motion,
         rects: &[(u64, Rect)],
@@ -384,7 +384,7 @@ pub(super) trait Arrange {
         true
     }
     /// The focused pane's 1-based number in the status bar.
-    fn pane_number(&self, w: &Workspace, index: usize) -> usize {
+    fn pane_number(&self, w: &Group, index: usize) -> usize {
         let _ = w;
         index + 1
     }
@@ -408,7 +408,7 @@ struct Tile {
     main: Side,
 }
 impl Arrange for Tile {
-    fn splits(&self, w: &Workspace) -> Option<Splits> {
+    fn splits(&self, w: &Group) -> Option<Splits> {
         let (main, stack) = (0..1, 1..w.panes.len());
         Some(Splits {
             axis: Axis::X,
@@ -427,7 +427,7 @@ struct Grid {
     split: Axis,
 }
 impl Arrange for Grid {
-    fn splits(&self, w: &Workspace) -> Option<Splits> {
+    fn splits(&self, w: &Group) -> Option<Splits> {
         let half = w.panes.len() / 2;
         Some(Splits {
             axis: self.split,
@@ -441,12 +441,12 @@ impl Arrange for Grid {
 /// panes have no screen position.
 struct Monocle;
 impl Arrange for Monocle {
-    fn rectangles(&self, w: &Workspace, area: &Area) -> Vec<(u64, Rect)> {
+    fn rectangles(&self, w: &Group, area: &Area) -> Vec<(u64, Rect)> {
         vec![(w.focused.unwrap_or(w.panes[0]), area.rect)]
     }
     fn target(
         &self,
-        w: &Workspace,
+        w: &Group,
         index: usize,
         motion: Motion,
         _: &[(u64, Rect)],
@@ -461,7 +461,7 @@ impl Arrange for Monocle {
 pub(super) struct Deck;
 impl Deck {
     /// Rotates the deck while focus stays on the selected side.
-    pub(super) fn cycle(w: &mut Workspace, forward: bool) {
+    pub(super) fn cycle(w: &mut Group, forward: bool) {
         let n = w.panes.len();
         if n < 2 {
             return;
@@ -491,7 +491,7 @@ impl Deck {
 impl Arrange for Deck {
     /// Only the main pane and the visible stack pane are laid out, one per
     /// side, so only the outer split resizes.
-    fn splits(&self, _w: &Workspace) -> Option<Splits> {
+    fn splits(&self, _w: &Group) -> Option<Splits> {
         Some(Splits {
             axis: Axis::X,
             main: Side::First,
@@ -500,7 +500,7 @@ impl Arrange for Deck {
     }
     /// Rotates the stack so a focused hidden pane comes to slot 1, as SWM
     /// does on arrange. Rotating keeps the stack's cyclic order.
-    fn reveal(&self, w: &mut Workspace) {
+    fn reveal(&self, w: &mut Group) {
         if let Some(position) = w.panes.iter().position(|id| Some(*id) == w.focused)
             && position > 1
         {
@@ -511,7 +511,7 @@ impl Arrange for Deck {
     /// two visible panes; up/down cycle the deck.
     fn move_pane(
         &self,
-        w: &mut Workspace,
+        w: &mut Group,
         index: usize,
         motion: Motion,
         _: &[(u64, Rect)],
@@ -526,7 +526,7 @@ impl Arrange for Deck {
         true
     }
     /// Up/down cycle the deck; left focuses the main pane, right the stack.
-    fn focus(&self, w: &mut Workspace, index: usize, motion: Motion, _: &[(u64, Rect)]) -> bool {
+    fn focus(&self, w: &mut Group, index: usize, motion: Motion, _: &[(u64, Rect)]) -> bool {
         match motion {
             Motion::Down => Self::cycle(w, true),
             Motion::Up => Self::cycle(w, false),
@@ -544,7 +544,7 @@ impl Arrange for Deck {
     }
     /// Cycling rotates `panes`, so number panes by creation order instead;
     /// IDs only increase.
-    fn pane_number(&self, w: &Workspace, index: usize) -> usize {
+    fn pane_number(&self, w: &Group, index: usize) -> usize {
         let id = w.panes[index];
         w.panes.iter().filter(|p| **p < id).count() + 1
     }
@@ -560,7 +560,7 @@ fn order_target(panes: usize, index: usize, motion: Motion) -> usize {
 /// The nearest visible pane in the motion's direction, topmost or leftmost
 /// on a tie, or list order when the focused pane is not on screen.
 fn spatial_target(
-    w: &Workspace,
+    w: &Group,
     index: usize,
     motion: Motion,
     rects: &[(u64, Rect)],
@@ -597,14 +597,14 @@ fn spatial_target(
 }
 /// Moves the outer split. With the main pane on the second side, growing the
 /// first part shrinks the main pane.
-fn resize_main(w: &mut Workspace, delta: f32, reversed: bool) {
+fn resize_main(w: &mut Group, delta: f32, reversed: bool) {
     let sign = if reversed { -1.0 } else { 1.0 };
     w.main_ratio = (w.main_ratio + sign * delta).clamp(0.1, 0.9);
 }
 /// Moves the divider between the focused pane and a neighbor in `group`: the
 /// one before it, or with `far` the one after it, or whichever it has. Keeps
 /// each pane at least 5% of the pair's combined weight.
-fn resize_within(w: &mut Workspace, index: usize, group: Range<usize>, far: bool, delta: f32) {
+fn resize_within(w: &mut Group, index: usize, group: Range<usize>, far: bool, delta: f32) {
     if !group.contains(&index) || group.len() < 2 {
         return;
     }
@@ -630,14 +630,14 @@ fn resize_within(w: &mut Workspace, index: usize, group: Range<usize>, far: bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn workspace(layout: Layout, panes: &[u64], focused: u64) -> Workspace {
-        let mut w = Workspace::new(1, 1);
+    fn workspace(layout: Layout, panes: &[u64], focused: u64) -> Group {
+        let mut w = Group::default();
         w.layout = layout;
         w.panes = panes.to_vec();
         w.focus(focused);
         w
     }
-    fn rects(w: &Workspace) -> Vec<(u64, Rect)> {
+    fn rects(w: &Group) -> Vec<(u64, Rect)> {
         let bounds = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
         w.rectangles(bounds, &Appearance::default())
     }

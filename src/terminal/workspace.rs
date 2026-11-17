@@ -162,10 +162,11 @@ pub(crate) struct Session {
     /// The layout the daemon was last told, to tell it only of changes.
     pub sent: String,
 }
+/// Panes arranged by a layout: which they are and in what order, the one
+/// with focus, the layout and the sizes it gives them. A workspace has one
+/// for its tiled panes, and each of its floats is one.
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct Workspace {
-    pub id: u64,
-    pub index: usize,
+pub(crate) struct Group {
     pub panes: Vec<u64>,
     pub focused: Option<u64>,
     pub layout: Layout,
@@ -173,6 +174,26 @@ pub(crate) struct Workspace {
     /// Each layout's pane sizes within its groups, by pane ID; a missing pane
     /// weighs 1.0. Kept per layout because layouts group panes differently.
     pub pane_weights: BTreeMap<Layout, BTreeMap<u64, f32>>,
+}
+impl Default for Group {
+    fn default() -> Self {
+        Self {
+            panes: Vec::new(),
+            focused: None,
+            layout: Layout::Tile,
+            main_ratio: 0.5,
+            pane_weights: Default::default(),
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct Workspace {
+    pub id: u64,
+    pub index: usize,
+    /// Its tiled panes. A workspace is used as its group wherever only the
+    /// panes and their layout matter.
+    #[serde(flatten)]
+    pub group: Group,
     pub appearance: Option<Appearance>,
     /// What the user called it. It names the session its shells are too.
     pub name: Option<String>,
@@ -201,17 +222,26 @@ impl Workspace {
         Self {
             id,
             index,
-            panes: Vec::new(),
-            focused: None,
-            layout: Layout::Tile,
-            main_ratio: 0.5,
-            pane_weights: Default::default(),
+            group: Group::default(),
             appearance: None,
             name: None,
             floats: Default::default(),
             session: None,
         }
     }
+}
+impl std::ops::Deref for Workspace {
+    type Target = Group;
+    fn deref(&self) -> &Group {
+        &self.group
+    }
+}
+impl std::ops::DerefMut for Workspace {
+    fn deref_mut(&mut self) -> &mut Group {
+        &mut self.group
+    }
+}
+impl Group {
     pub fn focus(&mut self, id: u64) {
         self.focused = Some(id);
         self.reveal();

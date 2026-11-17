@@ -329,7 +329,7 @@ impl TerminalView {
         };
         // Bounds are set when the float is first laid out; before that there
         // is nothing on screen to move or resize.
-        let Some(bounds) = self.floating.get(id).and_then(|f| f.pane.workspace_bounds) else {
+        let Some(bounds) = self.float_pane(id).and_then(|pane| pane.workspace_bounds) else {
             return;
         };
         let rect = place(self.floating_rect_for(bounds), bounds);
@@ -357,9 +357,19 @@ impl TerminalView {
                 Some((Grip::Divider { id: d.id, offset }, axis_cursor(d.axis)))
             }
             Resizable::Float { rect, inner } => {
-                let edges = float_edges(rect, inner, pos)?;
-                let offset = pos - edges.anchor(rect);
-                Some((Grip::Float { edges, offset }, edges.cursor()))
+                if let Some(edges) = float_edges(rect, inner, pos) {
+                    let offset = pos - edges.anchor(rect);
+                    return Some((Grip::Float { edges, offset }, edges.cursor()));
+                }
+                // Inside the frame, the dividers between the float's panes.
+                let style = Self::float_group_style(style);
+                let d = self
+                    .active_group()
+                    .dividers(rect, &style)
+                    .into_iter()
+                    .find(|d| hit(d).contains(pos))?;
+                let offset = coordinate(d.axis, pos) - d.at;
+                Some((Grip::Divider { id: d.id, offset }, axis_cursor(d.axis)))
             }
         }
     }
@@ -393,8 +403,19 @@ impl TerminalView {
                 }
                 Some(edges.cursor())
             }
-            // A float was shown or hidden mid-drag.
-            _ => None,
+            // A divider between the shown float's panes. One of the tiled
+            // panes' is not found here, a float having been shown mid-drag.
+            (Grip::Divider { id, offset }, Resizable::Float { rect, .. }) => {
+                let style = Self::float_group_style(style);
+                let group = self.active_group_mut();
+                let d = group.dividers(rect, &style).into_iter().find(|d| d.id == id)?;
+                if let Some(pos) = pos {
+                    group.move_divider(rect, &style, id, coordinate(d.axis, pos) - offset);
+                }
+                Some(axis_cursor(d.axis))
+            }
+            // The float was hidden mid-drag.
+            (Grip::Float { .. }, Resizable::Panes) => None,
         }
     }
 }
