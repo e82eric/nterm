@@ -1014,11 +1014,11 @@ impl TerminalPane {
             .top()
             .is_some_and(|p| p.scope() == crate::picker::config::Scope::Workspace)
     }
-    /// What has been typed into the workspace picker, when it is open.
-    pub(super) fn workspace_picker_query(&self) -> Option<String> {
-        let page = self.pages.top()?;
+    /// The workspace picker, when it is open.
+    pub(super) fn workspace_picker_mut(&mut self) -> Option<&mut crate::picker::Picker> {
+        let page = self.pages.top_mut()?;
         (page.scope() == crate::picker::config::Scope::Workspace)
-            .then(|| page.picker().map(crate::picker::Picker::query))
+            .then(|| page.picker_mut())
             .flatten()
     }
     pub(super) fn cancel_workspace_picker(&mut self) {

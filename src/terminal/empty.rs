@@ -97,7 +97,7 @@ impl TerminalView {
                 Status::Lost => Some(Empty::Unavailable { lost: true, reason: String::new() }),
                 Status::Off => self.first_shell(gl),
                 Status::Connected => {
-                    let waiting = self.chooser(&ctx, None);
+                    let waiting = self.chooser(&ctx);
                     match waiting {
                         Some(picker) => Some(Empty::Choose(picker)),
                         None => self.first_shell(gl),
@@ -111,15 +111,16 @@ impl TerminalView {
                 Some(Empty::Connecting)
             }
             // Another window took a session, or left one: the choice is
-            // made again from what waits now, with what was typed into it.
-            Empty::Choose(picker) if self.sessions_changed() => {
-                let query = picker.query();
-                picker.surrender_focus();
-                drop(picker);
-                ctx.request_repaint();
-                match self.chooser(&ctx, Some(query)) {
-                    Some(picker) => Some(Empty::Choose(picker)),
-                    None => self.first_shell(gl),
+            // given what waits now, and stays as it is otherwise.
+            Empty::Choose(mut picker) if self.sessions_changed() => {
+                let rows = self.chooser_rows();
+                if rows.is_empty() {
+                    picker.surrender_focus();
+                    drop(picker);
+                    self.first_shell(gl)
+                } else {
+                    picker.set_entries(&ctx, rows);
+                    Some(Empty::Choose(picker))
                 }
             }
             Empty::Choose(mut picker) => match picker.show_scoped(&ctx, content, None, true) {
@@ -162,18 +163,13 @@ impl TerminalView {
         self.toasts.show(&ctx, content, egui::Id::new("window-toasts"), None, 0.0);
     }
 
-    /// The picker that asks which waiting session to show, with `query`
-    /// typed into it. `None` when
-    /// none waits.
-    fn chooser(
-        &mut self,
-        ctx: &egui::Context,
-        query: Option<String>,
-    ) -> Option<Box<crate::picker::Picker>> {
+    /// The rows of the choice at launch: the waiting sessions, and a new
+    /// one. None when no session waits.
+    fn chooser_rows(&mut self) -> Vec<crate::actions::Entry> {
         let mut entries = self.offer_waiting();
         if entries.is_empty() {
             self.offered = None;
-            return None;
+            return entries;
         }
         entries.push(crate::actions::Entry {
             id: "session.new".into(),
@@ -181,10 +177,17 @@ impl TerminalView {
             shortcut: None,
             action: AppAction::NewSession,
         });
-        let mut options = super::workspace_ui::entry_picker(entries);
-        if let Some(query) = query {
-            options.params.insert("query".into(), query);
+        entries
+    }
+
+    /// The picker that asks which waiting session to show. `None` when
+    /// none waits.
+    fn chooser(&mut self, ctx: &egui::Context) -> Option<Box<crate::picker::Picker>> {
+        let entries = self.chooser_rows();
+        if entries.is_empty() {
+            return None;
         }
+        let options = super::workspace_ui::entry_picker(entries);
         // Its rows are given to it, so it reads no terminal.
         Some(Box::new(crate::picker::Picker::start_replacing(
             std::ptr::null_mut(),

@@ -62,7 +62,7 @@ pub(crate) struct TerminalView {
     empty: Option<empty::Empty>,
     /// What the open picker that offers the waiting sessions was made from,
     /// while there is one.
-    offered: Option<restore::Offered>,
+    offered: Option<(u64, u64)>,
 }
 
 struct FloatingTerminal {

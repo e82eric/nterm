@@ -145,9 +145,20 @@ impl Picker {
         }
         Ok(())
     }
-    /// What has been typed into it.
-    pub(crate) fn query(&self) -> String {
-        self.shared.query().to_owned()
+    /// Give a picker of workspaces or sessions its rows again, keeping what
+    /// is typed in it. Rows that are what it has are left alone, with the
+    /// selection; returns whether they were not.
+    pub(crate) fn set_entries(
+        &mut self,
+        ctx: &egui::Context,
+        entries: Vec<crate::actions::Entry>,
+    ) -> bool {
+        if !self.source.set_entries(entries) {
+            return false;
+        }
+        let query = self.shared.query().to_owned();
+        self.shared.replace_source(ctx, self.source.provider(), query);
+        true
     }
     pub(crate) fn bind_pipe_search_wake(
         &self,

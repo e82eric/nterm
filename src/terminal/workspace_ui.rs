@@ -497,32 +497,26 @@ pub(crate) fn install_lua_helpers(lua: &mlua::Lua, nterm: &mlua::Table) -> mlua:
     )
 }
 impl TerminalView {
-    /// The sessions no window shows can be taken from the workspace picker
-    /// too.
-    fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
-        self.show_workspace_picker(ctx, moving, None);
+    /// The rows of the workspace picker: this window's workspaces, and the
+    /// sessions no window shows, which can be taken from it too.
+    pub(super) fn workspace_picker_rows(&mut self) -> Vec<crate::actions::Entry> {
+        let options = workspace_picker_options(&self.workspaces, self.current, None);
+        let crate::picker::config::Source::Workspaces(mut entries) = options.source else {
+            return Vec::new();
+        };
+        entries.extend(self.offer_waiting());
+        entries
     }
 
-    /// `query` is what the picker starts with typed into it.
-    pub(super) fn show_workspace_picker(
-        &mut self,
-        ctx: &egui::Context,
-        moving: bool,
-        query: Option<String>,
-    ) {
+    fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
         let pane = if moving { self.active_pane() } else { None };
         if moving && pane.is_none() {
             return;
         }
         let mut options = workspace_picker_options(&self.workspaces, self.current, pane);
         self.offered = None;
-        if let (false, crate::picker::config::Source::Workspaces(entries)) =
-            (moving, &mut options.source)
-        {
-            entries.extend(self.offer_waiting());
-        }
-        if let Some(query) = query {
-            options.params.insert("query".into(), query);
+        if !moving {
+            options.source = crate::picker::config::Source::Workspaces(self.workspace_picker_rows());
         }
         let bindings = self.picker_bindings.clone();
         let palette = self.palette_context();

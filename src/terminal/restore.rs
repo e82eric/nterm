@@ -170,63 +170,51 @@ fn entries(sessions: &[Detached]) -> Vec<crate::actions::Entry> {
         .collect()
 }
 
-/// What a picker that offers the waiting sessions was made from: the list,
-/// and the rows it gave. The daemon gives a new list for changes that the
-/// rows do not show, and the picker is made again only when they differ.
-pub(super) struct Offered {
-    stamp: (u64, u64),
-    rows: Vec<(String, String, Option<String>)>,
-}
-
-/// What differs between two sets of rows that a picker would show.
-fn shown(rows: &[crate::actions::Entry]) -> Vec<(String, String, Option<String>)> {
-    rows.iter().map(|row| (row.id.clone(), row.label.clone(), row.shortcut.clone())).collect()
-}
-
 impl TerminalView {
-    /// A picker's rows for the sessions that are waiting now. They are
-    /// remembered, for `sessions_changed` to tell when the picker is out of
-    /// date.
+    /// A picker's rows for the sessions that are waiting now. Which list
+    /// they were made from is remembered, for `sessions_changed`.
     pub(super) fn offer_waiting(&mut self) -> Vec<crate::actions::Entry> {
         let Some(listing) = crate::session::sessions() else {
             self.offered = None;
             return Vec::new();
         };
-        let rows = entries(&detached(&listing));
-        self.offered = Some(Offered { stamp: listing.stamp(), rows: shown(&rows) });
-        rows
+        self.offered = Some(listing.stamp());
+        entries(&detached(&listing))
     }
 
-    /// Whether the picker that `offer_waiting` last gave rows to would show
-    /// other rows now.
-    pub(super) fn sessions_changed(&mut self) -> bool {
-        let Some(offered) = &mut self.offered else { return false };
-        let Some(listing) = crate::session::sessions() else { return false };
-        if listing.stamp() == offered.stamp {
-            return false;
-        }
-        offered.stamp = listing.stamp();
-        shown(&entries(&detached(&listing))) != offered.rows
+    /// Whether the daemon has given another list since `offer_waiting` last
+    /// made rows. Another list need not make other rows.
+    pub(super) fn sessions_changed(&self) -> bool {
+        let now = crate::session::sessions().map(|listing| listing.stamp());
+        self.offered.is_some() && now.is_some() && now != self.offered
     }
 
-    /// Every frame: the workspace picker is made again, with what was typed
-    /// into it, when the sessions it offers have changed.
+    /// Every frame: the open workspace picker is given its rows again when
+    /// the daemon has given another list. It stays open, with what is typed
+    /// in it, and is left alone if the rows are what it has.
     pub(super) fn follow_sessions(&mut self) {
         if self.offered.is_none() || self.empty.is_some() {
             return;
         }
-        let query = self
+        let open = self
             .active_pane()
             .and_then(|pane| self.pane_mut(pane))
-            .and_then(|pane| pane.workspace_picker_query());
-        let Some(query) = query else {
-            // The picker has closed.
+            .is_some_and(|pane| pane.workspace_picker_active());
+        if !open {
             self.offered = None;
             return;
-        };
-        if self.sessions_changed() {
-            let ctx = self.context.clone();
-            self.show_workspace_picker(&ctx, false, Some(query));
+        }
+        if !self.sessions_changed() {
+            return;
+        }
+        let rows = self.workspace_picker_rows();
+        let ctx = self.context.clone();
+        if let Some(picker) = self
+            .active_pane()
+            .and_then(|pane| self.pane_mut(pane))
+            .and_then(|pane| pane.workspace_picker_mut())
+        {
+            picker.set_entries(&ctx, rows);
         }
     }
 

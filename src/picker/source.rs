@@ -62,6 +62,9 @@ pub(super) enum PickerSource {
     CommandPalette {
         runtime: Runtime,
         entries: Vec<crate::actions::Entry>,
+        /// Whether the rows are workspaces and sessions, which have other
+        /// columns than actions have.
+        workspaces: bool,
     },
     FileSystem(Runtime),
     Scrollback(Runtime),
@@ -265,23 +268,7 @@ impl PickerSource {
             }
             crate::picker::config::Source::CommandPalette(entries)
             | crate::picker::config::Source::Workspaces(entries) => {
-                let columns = if matches!(options.source, config::Source::Workspaces(_)) {
-                    vec!["Workspace".into(), "Layout / panes".into()]
-                } else {
-                    vec!["Action".into(), "Shortcut".into()]
-                };
-                let schema = StructuredSchema::new(columns).expect("valid command palette schema");
-                let mut structured = StructuredStreamingStore::new(schema);
-                for entry in entries {
-                    structured
-                        .add_record(&csv::StringRecord::from(vec![
-                            entry.label.as_str(),
-                            entry.shortcut.as_deref().unwrap_or_default(),
-                        ]))
-                        .expect("palette row matches schema");
-                }
-                let snapshot = structured.snapshot();
-                Session::Structured { snapshot }
+                Self::rows(entries, matches!(options.source, config::Source::Workspaces(_)))
             }
             crate::picker::config::Source::Scrollback { .. } => Session::Document {
                 store: Arc::new(SnapshotStore::new_append_only()),
@@ -505,6 +492,7 @@ impl PickerSource {
                 Self::CommandPalette {
                     runtime,
                     entries: entries.clone(),
+                    workspaces: matches!(options.source, config::Source::Workspaces(_)),
                 }
             }
             config::Source::FileSystem(_) => Self::FileSystem(runtime),
@@ -594,6 +582,41 @@ impl PickerSource {
             }
             Self::CommandPalette { .. } => "COMMAND PALETTE",
         }
+    }
+    /// The rows of a command palette, or of a picker of workspaces or of
+    /// sessions.
+    fn rows(entries: &[crate::actions::Entry], workspaces: bool) -> Session {
+        let columns = if workspaces {
+            vec!["Workspace".into(), "Layout / panes".into()]
+        } else {
+            vec!["Action".into(), "Shortcut".into()]
+        };
+        let schema = StructuredSchema::new(columns).expect("valid command palette schema");
+        let mut structured = StructuredStreamingStore::new(schema);
+        for entry in entries {
+            structured
+                .add_record(&csv::StringRecord::from(vec![
+                    entry.label.as_str(),
+                    entry.shortcut.as_deref().unwrap_or_default(),
+                ]))
+                .expect("palette row matches schema");
+        }
+        Session::Structured { snapshot: structured.snapshot() }
+    }
+    /// Give a picker of workspaces or sessions its rows again. Whoever
+    /// shows them has then to be given the provider again too. Returns
+    /// whether they differ from the rows it had.
+    pub(super) fn set_entries(&mut self, rows: Vec<crate::actions::Entry>) -> bool {
+        let Self::CommandPalette { runtime, entries, workspaces } = self else { return false };
+        let shown = |entry: &crate::actions::Entry| {
+            (entry.id.clone(), entry.label.clone(), entry.shortcut.clone(), entry.action.clone())
+        };
+        if entries.iter().map(shown).eq(rows.iter().map(shown)) {
+            return false;
+        }
+        runtime.session = Self::rows(&rows, *workspaces);
+        *entries = rows;
+        true
     }
     pub(super) fn provider(&self) -> Arc<Provider> {
         Arc::new(match &self.runtime().session {
