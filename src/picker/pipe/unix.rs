@@ -245,18 +245,12 @@ impl Service {
     pub fn enabled(&self) -> bool {
         self.shared.policy.lock().unwrap().enabled
     }
-    /// Apply the current Lua policy. The shell arguments exist for the
-    /// Windows ancestry check; the socket's user check replaces it here.
+    /// Apply the current Lua policy. The shell arguments are not used: the
+    /// socket's user check and its private directory decide who may ask.
     #[cfg(test)]
-    pub fn update(&self, policy: &Policy, shell_pid: u32, expected_creation: u64) {
+    pub fn update(&self, policy: &Policy, _shell_pid: u32, _expected_creation: u64) {
         self.set_policy(policy);
-        self.identify_shell(shell_pid, expected_creation);
     }
-    /// Unix checks the peer user and a private socket directory, not the shell.
-    pub fn shell_identified(&self) -> bool {
-        true
-    }
-    pub fn identify_shell(&self, _shell_pid: u32, _expected_creation: u64) {}
     /// Applies a new policy, cancelling an active request it no longer permits.
     pub fn set_policy(&self, policy: &Policy) {
         *self.shared.policy.lock().unwrap() = policy.clone();

@@ -1,268 +1,19 @@
-# Requires PowerShell 7.3+ (the clean block discards interrupted connections).
-# Dot-source this file from your profile. Secrets are read only from the
-# current shell environment; they are never written to stdout or disk.
+# Requires PowerShell 7.3+ (the clean block discards an interrupted request).
+# Dot-source this file from your profile.
+#
+# A picker is asked for through the session daemon that runs this shell. The
+# daemon names its pipe and the pane in the shell's environment, and passes the
+# request to the window showing the pane. There is no secret to keep and no
+# connection to hold: one connection is one request.
+#
+# Both switches are accepted for profiles that pass them. Nothing is compiled,
+# so there is nothing to prepare in the background.
 param([switch]$BackgroundInitialize, [switch]$FreshConnection)
 
-$script:NtermPickerFreshConnection = [bool]$FreshConnection
-
-if (-not ($ExecutionContext.SessionState.PSVariable.Get('script:NtermPickerInitialization'))) {
-    $script:NtermPickerInitialization = $null
-}
-
-if (-not ($ExecutionContext.SessionState.PSVariable.Get('script:NtermPickerConnection'))) {
-    $script:NtermPickerConnection = $null
-}
-
+# Kept for profiles that call it: no connection is held between requests.
 function Disconnect-NtermPicker {
     [CmdletBinding()]
     param()
-    if ($null -ne $script:NtermPickerInitialization) { Initialize-NtermPickerClient }
-    if ($null -ne $script:NtermPickerConnection) {
-        $script:NtermPickerConnection.Client.Dispose()
-        $script:NtermPickerConnection = $null
-    }
-}
-
-$script:NtermPickerClientSource = @'
-using System;
-using System.IO;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
-using System.Security.Cryptography;
-using Microsoft.Win32.SafeHandles;
-
-public sealed class NtermPickerPipeV2 : IDisposable {
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern SafeFileHandle CreateFile(string name, uint access, uint share,
-        IntPtr attributes, uint disposition, uint flags, IntPtr template);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    static extern bool GetHandleInformation(SafeFileHandle handle, out uint flags);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern bool WaitNamedPipe(string name, uint timeout);
-    readonly FileStream stream;
-    readonly BlockingCollection<string> incoming = new BlockingCollection<string>(4);
-    readonly object writer = new object();
-    readonly CancellationTokenSource stop = new CancellationTokenSource();
-    readonly Task reader;
-    Timer cancellation;
-    volatile Exception failure;
-    string activeRequest;
-    public bool IsAlive { get { return disposed == 0 && failure == null; } }
-    public void BeginRequest(string id) {
-        lock (writer) {
-            if (activeRequest != null) throw new InvalidOperationException("Picker client is already busy");
-            if (!IsAlive) throw new IOException("Picker connection is closed");
-            activeRequest = id;
-        }
-    }
-    public void EndRequest() {
-        lock (writer) {
-            activeRequest = null;
-            if (cancellation != null) { cancellation.Dispose(); cancellation = null; }
-        }
-    }
-    int disposed;
-
-    public NtermPickerPipeV2(string endpoint) {
-        if (String.IsNullOrEmpty(endpoint) || !endpoint.StartsWith("nterm-picker-") ||
-            endpoint.IndexOf('\\') >= 0 || endpoint.IndexOf('/') >= 0)
-            throw new ArgumentException("Invalid nterm picker endpoint");
-        string path = @"\\.\pipe\" + endpoint;
-        SafeFileHandle handle = null;
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (true) {
-            // Precise data/synchronize rights, no FILE_CREATE_PIPE_INSTANCE.
-            // OVERLAPPED | SQOS_PRESENT | IDENTIFICATION | CONTEXT_TRACKING.
-            handle = CreateFile(path, 0x00100003, 0, IntPtr.Zero, 3, 0x40150000, IntPtr.Zero);
-            if (!handle.IsInvalid) break;
-            int error = Marshal.GetLastWin32Error(); handle.Dispose();
-            if ((error != 231 && error != 2) || DateTime.UtcNow >= deadline)
-                throw new IOException("Cannot connect to nterm picker pipe (Win32 " + error + ")");
-            WaitNamedPipe(path, 100); Thread.Sleep(20);
-        }
-        uint flags;
-        if (!GetHandleInformation(handle, out flags) || (flags & 1) != 0) {
-            handle.Dispose(); throw new IOException("Picker handle must not be inheritable");
-        }
-        try { stream = new FileStream(handle, FileAccess.ReadWrite, 1, true); }
-        catch { handle.Dispose(); throw; }
-        reader = Task.Run(() => {
-            try {
-                while (!stop.IsCancellationRequested) {
-                    var header = ReadExact(4); uint size = BitConverter.ToUInt32(header, 0);
-                    if (size == 0 || size > 1048576) throw new IOException("Invalid picker frame size");
-                    var text = new UTF8Encoding(false, true).GetString(ReadExact((int)size));
-                    incoming.Add(text, stop.Token);
-                }
-            } catch (Exception error) { if (!stop.IsCancellationRequested) failure = error; }
-        });
-    }
-    byte[] ReadExact(int length) {
-        var bytes = new byte[length]; int offset = 0;
-        while (offset < length) {
-            int count = stream.ReadAsync(bytes, offset, length-offset, stop.Token).GetAwaiter().GetResult();
-            if (count == 0) throw new EndOfStreamException("nterm picker disconnected");
-            offset += count;
-        }
-        return bytes;
-    }
-    public void Send(string json) {
-        var bytes = Encoding.UTF8.GetBytes(json);
-        if (bytes.Length == 0 || bytes.Length > 1048576) throw new IOException("Picker frame exceeds 1 MiB");
-        lock (writer) {
-            using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(stop.Token)) {
-                timeout.CancelAfter(5000);
-                var header = BitConverter.GetBytes((uint)bytes.Length);
-                stream.WriteAsync(header, 0, 4, timeout.Token).GetAwaiter().GetResult();
-                stream.WriteAsync(bytes, 0, bytes.Length, timeout.Token).GetAwaiter().GetResult();
-                stream.FlushAsync(timeout.Token).GetAwaiter().GetResult();
-            }
-        }
-    }
-    // Short waits let PowerShell observe Ctrl+C instead of blocking indefinitely.
-    public string Next(int milliseconds) {
-        string value;
-        if (incoming.TryTake(out value, milliseconds)) return value;
-        if (failure != null) throw new IOException("nterm picker connection ended", failure);
-        return null;
-    }
-    public static string Nonce() { return Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant(); }
-    public static string Proof(string token, string endpoint, string server, string client, string role) {
-        using (var data = new MemoryStream()) {
-            foreach (string part in new [] { "nterm-picker/1", endpoint, server, client, role }) {
-                var bytes = Encoding.UTF8.GetBytes(part);
-                data.Write(BitConverter.GetBytes((uint)bytes.Length)); data.Write(bytes);
-            }
-            using (var mac = new HMACSHA256(Encoding.UTF8.GetBytes(token)))
-                return Convert.ToHexString(mac.ComputeHash(data.ToArray())).ToLowerInvariant();
-        }
-    }
-    public static bool Verify(string expected, string actual) {
-        if (actual == null || actual.Length != 64) return false;
-        try { return CryptographicOperations.FixedTimeEquals(Convert.FromHexString(expected), Convert.FromHexString(actual)); }
-        catch (FormatException) { return false; }
-    }
-    public void CancelAfter(string requestId, int milliseconds) {
-        cancellation = new Timer(_ => {
-            lock (writer) {
-                if (activeRequest != requestId) return;
-                try { Send("{\"type\":\"cancel\",\"request_id\":\"" + requestId + "\"}"); }
-                catch { Dispose(); }
-            }
-        }, null, milliseconds, Timeout.Infinite);
-    }
-    public void Dispose() {
-        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-        if (cancellation != null) cancellation.Dispose();
-        stop.Cancel(); stream.Dispose();
-        // The reader observes cancellation; no pipe handle is transferred.
-    }
-}
-'@
-
-# This script runs either here or in the background runspace. It returns the
-# authenticated client object, which stays in this process and is never delegated.
-$script:NtermPickerConnectScript = {
-    param([string]$Source, [string]$Endpoint, [string]$Token)
-    $ErrorActionPreference = 'Stop'
-    if (-not ('NtermPickerPipeV2' -as [type])) {
-        Add-Type -TypeDefinition $Source -ErrorAction Stop
-    }
-    if (-not $Endpoint -or -not $Token) { return }
-    $client = $null
-    function Receive-AuthenticationMessage {
-        $deadline = [datetime]::UtcNow.AddSeconds(10)
-        while ([datetime]::UtcNow -lt $deadline) {
-            $raw = $client.Next(100)
-            if ($null -ne $raw) {
-                $message = ConvertFrom-Json -InputObject $raw -AsHashtable
-                if ($message.type -eq 'error') {
-                    $client.Send((ConvertTo-Json -Compress @{type='received';request_id=$message.request_id}))
-                    throw "nterm picker rejected the connection ($($message.code)): $($message.message)"
-                }
-                return $message
-            }
-        }
-        throw 'Timed out authenticating nterm picker connection.'
-    }
-    try {
-        $client = [NtermPickerPipeV2]::new($Endpoint)
-        $challenge = Receive-AuthenticationMessage
-        if ($challenge.type -ne 'challenge' -or $challenge.version -ne 1 -or $challenge.nonce -notmatch '^[0-9a-f]{64}$') {
-            throw 'Invalid picker authentication challenge.'
-        }
-        $nonce = [NtermPickerPipeV2]::Nonce()
-        $proof = [NtermPickerPipeV2]::Proof($Token, $Endpoint, $challenge.nonce, $nonce, 'client')
-        $client.Send((ConvertTo-Json -Compress @{type='authenticate';version=1;client_nonce=$nonce;proof=$proof}))
-        $ready = Receive-AuthenticationMessage
-        if ($ready.type -ne 'ready') { throw 'Picker pipe is disabled or authentication was rejected.' }
-        $expected = [NtermPickerPipeV2]::Proof($Token, $Endpoint, $challenge.nonce, $nonce, 'server')
-        if (-not [NtermPickerPipeV2]::Verify($expected, $ready.proof)) { throw 'Picker server authentication failed.' }
-        @{
-            Client=$client; Endpoint=$Endpoint; Token=$Token
-            Persistent=($ready.ContainsKey('persistent') -and $ready.persistent -eq $true)
-        }
-        $client = $null # Ownership passes to the caller or background output.
-    } finally { if ($null -ne $client) { $client.Dispose() } }
-}
-
-function Save-NtermPickerInitialConnection($Connection) {
-    if ($null -eq $Connection) { return }
-    if (-not $script:NtermPickerFreshConnection -and $Connection.Persistent -and $Connection.Endpoint -eq $env:NTERM_PICKER_ENDPOINT -and
-        $Connection.Token -eq $env:NTERM_PICKER_TOKEN -and $Connection.Client.IsAlive) {
-        $script:NtermPickerConnection = $Connection
-    } else { $Connection.Client.Dispose() }
-}
-
-function Initialize-NtermPickerClient {
-    if ($null -ne $script:NtermPickerInitialization) {
-        $initialization = $script:NtermPickerInitialization
-        try {
-            $connections = $initialization.PowerShell.EndInvoke($initialization.Pending)
-            foreach ($connection in $connections) { Save-NtermPickerInitialConnection $connection }
-            if ($initialization.PowerShell.HadErrors) {
-                Write-Verbose 'Picker background initialization did not connect; the next request will try again.'
-            }
-        } catch {
-            Write-Verbose 'Picker background initialization did not complete; the next request will try again.'
-        } finally {
-            $initialization.PowerShell.Dispose()
-            $script:NtermPickerInitialization = $null
-        }
-    }
-    if (-not ('NtermPickerPipeV2' -as [type])) {
-        Add-Type -TypeDefinition $script:NtermPickerClientSource -ErrorAction Stop
-    }
-}
-
-# Loading outside nterm still defines the function and compiles its client.
-# Startup connection errors must not break the user's PowerShell profile.
-$cached = $script:NtermPickerConnection
-$alreadyConnected = $null -ne $cached -and $cached.Endpoint -eq $env:NTERM_PICKER_ENDPOINT -and
-    $cached.Token -eq $env:NTERM_PICKER_TOKEN -and $cached.Client.IsAlive
-if (($FreshConnection -or -not $alreadyConnected) -and $null -eq $script:NtermPickerInitialization) {
-    Disconnect-NtermPicker
-    if ($BackgroundInitialize) {
-        $loader = [PowerShell]::Create()
-        try {
-            if ($FreshConnection) {
-                [void]$loader.AddScript('param($source); if (-not ("NtermPickerPipeV2" -as [type])) { Add-Type -TypeDefinition $source -ErrorAction Stop }').AddArgument($script:NtermPickerClientSource)
-            } else {
-                [void]$loader.AddScript($script:NtermPickerConnectScript.ToString()).AddArgument($script:NtermPickerClientSource).AddArgument($env:NTERM_PICKER_ENDPOINT).AddArgument($env:NTERM_PICKER_TOKEN)
-            }
-            $script:NtermPickerInitialization = @{PowerShell=$loader; Pending=$loader.BeginInvoke()}
-        } catch { $loader.Dispose(); throw }
-    } elseif ($FreshConnection) {
-        Initialize-NtermPickerClient
-    } else {
-        try {
-            $connection = & $script:NtermPickerConnectScript $script:NtermPickerClientSource $env:NTERM_PICKER_ENDPOINT $env:NTERM_PICKER_TOKEN
-            Save-NtermPickerInitialConnection $connection
-        } catch { Write-Verbose 'Picker startup connection did not complete; the next request will try again.' }
-    }
 }
 
 function Invoke-NtermPicker {
@@ -276,13 +27,15 @@ function Invoke-NtermPicker {
         [Parameter(ParameterSetName='Stream')][Parameter(ParameterSetName='Named')][string] $DisplayProperty,
         [Parameter(ParameterSetName='Stream')][Parameter(ParameterSetName='Named')][string] $ValueProperty,
         [switch] $PassThruResult,
-        [switch] $FreshConnection = $script:NtermPickerFreshConnection,
+        # Accepted for profiles that pass it: every request has its own connection.
+        [switch] $FreshConnection,
+        # The request is cancelled this long after the picker opens. It is
+        # looked at between items and while waiting, not while whatever feeds
+        # the pipeline is itself waiting.
         [ValidateRange(0, 86400)][int] $CancelAfterSeconds = 0
     )
     begin {
-        $client = $null
-        $requestComplete = $false
-        $persistent = $false
+        $pipe = $null
         $result = $null
         $batch = [System.Collections.Generic.List[object]]::new()
         $sequence = 0L
@@ -292,32 +45,97 @@ function Invoke-NtermPicker {
         # Piping into -Name streams the items of a configured Items picker.
         $streaming = $PSCmdlet.ParameterSetName -eq 'Stream' -or $MyInvocation.ExpectingInput -or
             $PSBoundParameters.ContainsKey('InputObject')
-        $endpoint = $env:NTERM_PICKER_ENDPOINT
-        if (-not $endpoint -or -not $env:NTERM_PICKER_TOKEN) {
-            throw 'Run this function inside a newly launched nterm shell with picker pipe support.'
+        $pane = [uint32]0
+        if (-not $env:NTERM_DAEMON_PIPE -or -not [uint32]::TryParse($env:NTERM_PANE, [ref]$pane)) {
+            throw 'Run this function inside an nterm pane whose shell the session daemon runs.'
+        }
+        # The name came from the environment. Only its last part is used, and
+        # on this machine, so it cannot lead to another one.
+        if ($env:NTERM_DAEMON_PIPE -cnotmatch '\A\\\\\.\\pipe\\(nterm-session-[A-Za-z0-9_-]+)\z') {
+            throw "Not an nterm session daemon's pipe."
+        }
+        $pipeName = $Matches[1]
+        # The daemon's frames: a length, a kind, and for all but a control
+        # message a number. A picker message is kind 5 and its number is the
+        # conversation, which the daemon knows by the connection: 0 from here.
+        $maxMessage = 1048576
+        # What is being read: the four bytes of a length, then that many.
+        $reading = @{ Buffer = [byte[]]::new(4); Offset = 0; Length = $true; Pending = $null; CancelAt = $null }
+
+        function Send-PickerFrame([byte] $kind, [string] $json) {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+            if ($bytes.Length -eq 0 -or $bytes.Length -gt $maxMessage) { throw 'Picker message exceeds 1 MiB.' }
+            $head = if ($kind -eq 0) { 1 } else { 5 }
+            $frame = [byte[]]::new(4 + $head + $bytes.Length)
+            [System.BitConverter]::GetBytes([uint32]($head + $bytes.Length)).CopyTo($frame, 0)
+            $frame[4] = $kind
+            [System.Array]::Copy($bytes, 0, $frame, 4 + $head, $bytes.Length)
+            if (-not $pipe.WriteAsync($frame, 0, $frame.Length).Wait(5000)) {
+                throw 'Timed out sending to the nterm session daemon.'
+            }
         }
         function Send-PickerMessage($message) {
-            $client.Send((ConvertTo-Json -InputObject $message -Depth 32 -Compress))
+            Send-PickerFrame 5 (ConvertTo-Json -InputObject $message -Depth 32 -Compress)
+        }
+        # The next message's JSON, or nothing when none is complete within
+        # the wait. Short waits let PowerShell observe Ctrl+C.
+        function Read-PickerFrame([int] $milliseconds) {
+            $waited = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($true) {
+                if ($null -eq $reading.Pending) {
+                    $reading.Pending = $pipe.ReadAsync($reading.Buffer, $reading.Offset,
+                        $reading.Buffer.Length - $reading.Offset)
+                }
+                $left = [Math]::Max(0, $milliseconds - $waited.ElapsedMilliseconds)
+                try {
+                    if (-not $reading.Pending.Wait([int]$left)) { return $null }
+                    $count = $reading.Pending.Result
+                } catch { throw 'The nterm picker connection ended.' }
+                $reading.Pending = $null
+                if ($count -eq 0) { throw 'The nterm session daemon closed the connection.' }
+                $reading.Offset += $count
+                if ($reading.Offset -lt $reading.Buffer.Length) { continue }
+                $whole = $reading.Buffer
+                $reading.Offset = 0
+                if ($reading.Length) {
+                    $size = [System.BitConverter]::ToUInt32($whole, 0)
+                    if ($size -eq 0 -or $size -gt $maxMessage + 5) { throw 'Invalid frame size.' }
+                    $reading.Buffer = [byte[]]::new($size)
+                    $reading.Length = $false
+                    continue
+                }
+                $reading.Buffer = [byte[]]::new(4)
+                $reading.Length = $true
+                $start = if ($whole[0] -eq 0) { 1 } elseif ($whole[0] -eq 5) { 5 } else { -1 }
+                if ($start -lt 0 -or $whole.Length -lt $start) { continue }
+                return [System.Text.UTF8Encoding]::new($false, $true).GetString($whole, $start, $whole.Length - $start)
+            }
+        }
+        function Send-PickerCancelWhenDue {
+            if ($null -ne $reading.CancelAt -and [datetime]::UtcNow -ge $reading.CancelAt) {
+                $reading.CancelAt = $null
+                Send-PickerMessage @{ type='cancel'; request_id=$requestId }
+            }
+        }
+        # A message of this request, or what the daemon says in the picker's
+        # place: that it will not pass the request on, or that the window
+        # ended it without an answer.
+        function Read-PickerMessage([string] $raw) {
+            $message = ConvertFrom-Json -InputObject $raw -AsHashtable
+            if ($message.type -eq 'shell_closed') { throw 'nterm ended the picker request.' }
+            if ($message.type -eq 'error') {
+                if ($message.code) { throw "nterm picker rejected the request ($($message.code)): $($message.message)" }
+                throw "The nterm session daemon refused the request: $($message.message)"
+            }
+            if ($message.request_id -ne $requestId) { throw 'Picker response belongs to a different request.' }
+            $message
         }
         function Receive-PickerMessage([int] $timeoutSeconds = 0) {
             $deadline = if ($timeoutSeconds) { [datetime]::UtcNow.AddSeconds($timeoutSeconds) } else { [datetime]::MaxValue }
             while ([datetime]::UtcNow -lt $deadline) {
-                $raw = $client.Next(100)
-                if ($null -ne $raw) {
-                    $message = ConvertFrom-Json -InputObject $raw -AsHashtable
-                    if ($message.type -eq 'error') {
-                        Send-PickerMessage @{ type='received'; request_id=$message.request_id }
-                        throw "nterm picker rejected the connection ($($message.code)): $($message.message)"
-                    }
-                    if ($message.type -in @('opened', 'ack', 'input_complete', 'result', 'idle') -and $message.request_id -ne $requestId) {
-                        throw 'Picker response belongs to a different request.'
-                    }
-                    if ($message.type -eq 'result') {
-                        $client.EndRequest()
-                        Send-PickerMessage @{ type='received'; request_id=$requestId }
-                    }
-                    return $message
-                }
+                Send-PickerCancelWhenDue
+                $raw = Read-PickerFrame 100
+                if ($null -ne $raw) { return Read-PickerMessage $raw }
             }
             throw 'Timed out waiting for nterm picker response.'
         }
@@ -330,21 +148,17 @@ function Invoke-NtermPicker {
             $batch.Clear()
         }
         try {
-            Initialize-NtermPickerClient
-            if ($FreshConnection) { Disconnect-NtermPicker }
-            $cached = $script:NtermPickerConnection
-            if ($null -ne $cached -and $cached.Endpoint -eq $endpoint -and
-                $cached.Token -eq $env:NTERM_PICKER_TOKEN -and $cached.Client.IsAlive) {
-                $client = $cached.Client
-                $persistent = $true
-            } else {
-                Disconnect-NtermPicker
-                $connection = & $script:NtermPickerConnectScript $script:NtermPickerClientSource $endpoint $env:NTERM_PICKER_TOKEN
-                $client = $connection.Client
-                $persistent = $connection.Persistent
-                if ($persistent -and -not $FreshConnection) { $script:NtermPickerConnection = $connection }
-            }
-            $client.BeginRequest($requestId)
+            # The daemon may learn who this is and nothing more. What is sent
+            # may hold the shell's history, so it goes only to a pipe that is
+            # this user's: CurrentUserOnly refuses any other.
+            $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $pipeName,
+                [System.IO.Pipes.PipeDirection]::InOut,
+                [System.IO.Pipes.PipeOptions]'Asynchronous, CurrentUserOnly',
+                [System.Security.Principal.TokenImpersonationLevel]::Identification,
+                [System.IO.HandleInheritability]::None)
+            try { $pipe.Connect(5000) }
+            catch [System.TimeoutException] { throw 'The nterm session daemon is not running.' }
+            Send-PickerFrame 0 ('{"type":"shell","pane":' + $pane + '}')
             $request = switch ($PSCmdlet.ParameterSetName) {
                 Named {
                     $strings = @{}
@@ -366,21 +180,24 @@ function Invoke-NtermPicker {
             $reply = Receive-PickerMessage 15
             if ($reply.type -eq 'result') { $result = $reply }
             elseif ($reply.type -ne 'opened') { throw 'Unexpected picker open response.' }
-            if ($CancelAfterSeconds -and $null -eq $result) { $client.CancelAfter($requestId, $CancelAfterSeconds * 1000) }
+            if ($CancelAfterSeconds -and $null -eq $result) {
+                $reading.CancelAt = [datetime]::UtcNow.AddSeconds($CancelAfterSeconds)
+            }
         } catch {
-            if ($null -ne $client) { $client.Dispose() }
+            # Closing the connection is how the daemon, and through it the
+            # window, learns that this request is over.
+            if ($null -ne $pipe) { $pipe.Dispose() }
             throw
         }
     }
     process {
         if ($streaming -and $null -eq $result -and $PSBoundParameters.ContainsKey('InputObject')) {
             try {
-                $raw = $client.Next(0)
+                Send-PickerCancelWhenDue
+                $raw = Read-PickerFrame 0
                 if ($null -ne $raw) {
-                    $reply = ConvertFrom-Json -InputObject $raw -AsHashtable
-                    if ($reply.type -ne 'result' -or $reply.request_id -ne $requestId) { throw 'Unexpected picker response during streaming.' }
-                    $client.EndRequest()
-                    Send-PickerMessage @{ type='received'; request_id=$requestId }
+                    $reply = Read-PickerMessage $raw
+                    if ($reply.type -ne 'result') { throw 'Unexpected picker response during streaming.' }
                     $result = $reply
                 }
                 if ($null -eq $result) {
@@ -392,7 +209,7 @@ function Invoke-NtermPicker {
                     if ($batch.Count -ge 8) { $result = Flush-PickerItems; $sequence++ }
                 }
             } catch {
-                $client.Dispose()
+                $pipe.Dispose()
                 throw
             }
         }
@@ -410,13 +227,6 @@ function Invoke-NtermPicker {
                 }
             }
             while ($null -eq $result) { $result = Receive-PickerMessage }
-            if ($persistent) {
-                $idle = Receive-PickerMessage 10
-                if ($idle.type -ne 'idle') { throw 'Picker connection did not return to idle.' }
-                Send-PickerMessage @{ type='received'; request_id=$requestId }
-            }
-            $client.EndRequest()
-            $requestComplete = $true
             if ($result.status -eq 'error') { throw "Picker request failed ($($result.code)): $($result.message)" }
             if ($PassThruResult) { $result }
             elseif ($result.status -eq 'accepted') {
@@ -427,10 +237,10 @@ function Invoke-NtermPicker {
                 }
             }
         } finally {
-            if ($null -ne $client -and ($FreshConnection -or -not $persistent -or -not $requestComplete)) { $client.Dispose() }
+            if ($null -ne $pipe) { $pipe.Dispose() }
         }
     }
     clean {
-        if ($null -ne $client -and ($FreshConnection -or -not $persistent -or -not $requestComplete)) { $client.Dispose() }
+        if ($null -ne $pipe) { $pipe.Dispose() }
     }
 }

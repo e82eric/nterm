@@ -576,5 +576,3 @@ void nterm_host_output(NtermHost *host, const uint8_t *bytes, size_t len) {
 void nterm_host_resync(NtermHost *host, const uint8_t *snapshot, size_t len) {
     if (host && host->surface) ghostty_surface_host_resync(host->surface, snapshot, len);
 }
-uint64_t nterm_host_shell_pid(NtermHost *host) { return ghostty_surface_shell_pid(host->surface); }
-uint64_t nterm_host_shell_creation_time(NtermHost *host) { return ghostty_surface_shell_creation_time(host->surface); }

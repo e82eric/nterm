@@ -15,6 +15,7 @@ use crate::{
 use nterm_session::{
     GHOSTTY_REVISION,
     pipe::{Connection, Listener},
+    shell::{DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE},
     protocol::{Control, Frame, PROTOCOL_VERSION, PaneId, PaneInfo, Size, TerminalSettings},
 };
 use std::{
@@ -34,8 +35,12 @@ pub struct Options {
     pub idle: Duration,
 }
 
-/// Encoded frames on their way to one UI.
+/// Encoded frames on their way to one UI, or to one program in a shell.
 type Outbox = Sender<Vec<u8>>;
+
+/// Queued in place of a frame: write what was queued before it, then close
+/// the connection. No frame is empty.
+const CLOSE: &[u8] = &[];
 
 struct Session {
     name: String,
@@ -46,7 +51,23 @@ struct Session {
     settings: Mutex<TerminalSettings>,
     blobs: Mutex<HashMap<String, String>>,
     clients: Mutex<HashMap<u64, Outbox>>,
+    /// The conversations under way between programs in shells and UIs.
+    channels: Mutex<HashMap<u32, Channel>>,
+    next_channel: AtomicU32,
 }
+
+/// A program in a pane's shell talking to the UI attached to that pane. The
+/// daemon passes their messages on unread. It lasts until either ends it, or
+/// the UI leaves the pane.
+struct Channel {
+    pane: PaneId,
+    /// The UI's client number and the way to it.
+    ui: u64,
+    ui_outbox: Outbox,
+    /// The way to the program.
+    shell: Outbox,
+}
+
 
 struct Pane {
     id: PaneId,
@@ -127,11 +148,31 @@ impl Session {
         }
     }
 
+    /// End the conversations `which` picks. Each program is told and its
+    /// connection closed; the UI is told too unless it is the one that has
+    /// gone.
+    fn end_channels(&self, which: impl Fn(u32, &Channel) -> bool, tell_ui: bool) {
+        let ended: Vec<(u32, Channel)> = {
+            let mut channels = self.channels.lock().unwrap();
+            let numbers: Vec<u32> =
+                channels.iter().filter(|(n, c)| which(**n, c)).map(|(n, _)| *n).collect();
+            numbers.into_iter().filter_map(|n| Some((n, channels.remove(&n)?))).collect()
+        };
+        for (number, channel) in ended {
+            let _ = channel.shell.send(Frame::Control(Control::ShellClosed { channel: 0 }).encode());
+            let _ = channel.shell.send(CLOSE.to_vec());
+            if tell_ui {
+                let closed = Control::ShellClosed { channel: number };
+                let _ = channel.ui_outbox.send(Frame::Control(closed).encode());
+            }
+        }
+    }
+
     fn spawn(
         self: &Arc<Self>,
         command: String,
         cwd: Option<String>,
-        env: Vec<(String, String)>,
+        mut env: Vec<(String, String)>,
         size: Size,
     ) -> Result<Arc<Pane>, String> {
         if size.cols == 0 || size.rows == 0 {
@@ -140,12 +181,29 @@ impl Session {
         // The settings are in place before the shell can write a byte.
         let settings = self.settings.lock().unwrap().clone();
         let terminal = Terminal::new(size, &settings)?;
+        // The shell is told which pane it is, so the number is taken before
+        // it is started. One whose shell does not start is not used again.
+        let id = self.next_pane.fetch_add(1, Ordering::Relaxed);
+        // With none given the shell has the daemon's own, and still does.
+        if env.is_empty() {
+            env = std::env::vars_os()
+                .map(|(key, value)| {
+                    (key.to_string_lossy().into_owned(), value.to_string_lossy().into_owned())
+                })
+                .collect();
+        }
+        let ours = [DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE];
+        env.retain(|(key, _)| !ours.contains(&key.as_str()));
+        if let Ok(pipe) = nterm_session::pipe::name(&self.name) {
+            env.push((PIPE_VARIABLE.into(), pipe));
+        }
+        env.push((DAEMON_VARIABLE.into(), self.name.clone()));
+        env.push((PANE_VARIABLE.into(), id.to_string()));
         let spawned = conpty::spawn(&command, cwd.as_deref(), &env, size.cols, size.rows)
             .map_err(|error| error.to_string())?;
         let conpty::Spawned { console, output, input, process } = spawned;
 
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
-        let id = self.next_pane.fetch_add(1, Ordering::Relaxed);
         let pane = Arc::new(Pane {
             id,
             command,
@@ -229,6 +287,7 @@ impl Session {
                 if closing || session.clients.lock().unwrap().is_empty() {
                     session.panes.lock().unwrap().remove(&pane.id);
                 }
+                session.end_channels(|_, channel| channel.pane == pane.id, true);
                 session.broadcast(Control::Exited { pane: pane.id, code });
             })
             .map_err(|error| error.to_string())?;
@@ -255,6 +314,8 @@ pub fn run(options: Options) -> io::Result<()> {
         settings: Mutex::default(),
         blobs: Mutex::default(),
         clients: Mutex::default(),
+        channels: Mutex::default(),
+        next_channel: AtomicU32::new(1),
     });
     log(format_args!(
         "serving session {:?}, pid {}, ghostty {GHOSTTY_REVISION}, conpty {}",
@@ -307,6 +368,11 @@ fn serve(session: &Arc<Session>, connection: Connection) {
         std::thread::spawn(move || {
             let Ok(mut writer) = connection.writer() else { return };
             for frame in queued {
+                if frame == CLOSE {
+                    // Asked for: what came before it has been written.
+                    connection.close();
+                    break;
+                }
                 if writer.write_all(&frame).is_err() {
                     // Wake the reading side; this UI is gone.
                     connection.close();
@@ -339,6 +405,8 @@ fn serve(session: &Arc<Session>, connection: Connection) {
             session.panes.lock().unwrap().remove(&pane.id);
         }
     }
+    // After it has left every pane, so no program finds it there.
+    session.end_channels(|_, channel| channel.ui == id, false);
     // With every sender gone the writer sends what is queued and ends.
     drop(outbox);
     let _ = writer.join();
@@ -365,6 +433,9 @@ fn converse(
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
         Err(error) => return Err(error),
     };
+    if let Frame::Control(Control::Shell { pane }) = first {
+        return relay(session, connection, &mut reader, pane, outbox);
+    }
     let Frame::Control(Control::Hello { protocol, ghostty }) = first else {
         fail(None, "expected hello".into());
         return Err(io::Error::new(io::ErrorKind::InvalidData, "no hello"));
@@ -400,6 +471,13 @@ fn converse(
             }
             Frame::Control(control) => control,
             // Frames only the daemon sends.
+            Frame::Shell { channel, bytes } => {
+                let channels = session.channels.lock().unwrap();
+                if let Some(to) = channels.get(&channel).filter(|c| c.ui == id) {
+                    let _ = to.shell.send(Frame::Shell { channel: 0, bytes }.encode());
+                }
+                continue;
+            }
             Frame::Output { .. } | Frame::Screen { .. } | Frame::Snapshot { .. } => continue,
         };
         let missing = |request: Option<u32>, pane: PaneId| {
@@ -449,10 +527,12 @@ fn converse(
                     send(Control::Exited { pane: pane_id, code });
                 }
             }
-            Control::Detach { pane } => {
-                if let Some(pane) = session.pane(pane) {
+            Control::Detach { pane: pane_id } => {
+                if let Some(pane) = session.pane(pane_id) {
                     pane.state.lock().unwrap().subscribers.retain(|(client, _)| *client != id);
                 }
+                // After it has left the pane, so no program finds it there.
+                session.end_channels(|_, c| c.pane == pane_id && c.ui == id, false);
             }
             Control::Resize { pane: pane_id, size } => {
                 let Some(pane) = session.pane(pane_id) else {
@@ -477,6 +557,9 @@ fn converse(
             }
             Control::Close { pane: pane_id } => {
                 let Some(pane) = session.pane(pane_id) else { continue };
+                // An exit that follows is this client's doing, and the log
+                // of a lost shell says so.
+                log(format_args!("pane {pane_id}: client {id} asks to close it"));
                 let mut state = pane.state.lock().unwrap();
                 if state.exited.is_some() {
                     drop(state);
@@ -515,9 +598,63 @@ fn converse(
             Control::BlobRemove { key } => {
                 session.blobs.lock().unwrap().remove(&key);
             }
+            Control::ShellClosed { channel } => {
+                session.end_channels(|number, c| number == channel && c.ui == id, false);
+            }
             Control::Shutdown => session.shutdown(),
             // A second hello, the daemon's own messages, or something newer.
             _ => {}
         }
     }
+}
+
+/// A program in a pane's shell. What it sends goes to the UI showing the
+/// pane, until one of them is done or the UI leaves the pane.
+fn relay(
+    session: &Arc<Session>,
+    connection: &Connection,
+    reader: &mut impl io::Read,
+    pane_id: PaneId,
+    outbox: &Outbox,
+) -> io::Result<()> {
+    let refuse = |message: String| {
+        log(format_args!("program {} refused for pane {pane_id}: {message}", connection.peer_pid()));
+        let _ = outbox.send(Frame::Control(Control::Error { request: None, message }).encode());
+        Ok(())
+    };
+    let Some(pane) = session.pane(pane_id) else {
+        return refuse(format!("no pane {pane_id}"));
+    };
+    let number = session.next_channel.fetch_add(1, Ordering::Relaxed);
+    let ui = {
+        // Under the pane's lock, as leaving a pane is: a UI that leaves
+        // either is not found here or finds the channel to end.
+        let state = pane.state.lock().unwrap();
+        let Some((ui, ui_outbox)) = state.subscribers.last().cloned() else {
+            drop(state);
+            return refuse("no window is showing this pane".into());
+        };
+        session.channels.lock().unwrap().insert(
+            number,
+            Channel { pane: pane_id, ui, ui_outbox: ui_outbox.clone(), shell: outbox.clone() },
+        );
+        ui_outbox
+    };
+    let _ = ui.send(Frame::Control(Control::ShellOpen { channel: number, pane: pane_id }).encode());
+    loop {
+        match Frame::read(reader) {
+            Ok(Frame::Shell { bytes, .. }) => {
+                if ui.send(Frame::Shell { channel: number, bytes }.encode()).is_err() {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    // Still there: the program went first, and the UI has to be told.
+    if session.channels.lock().unwrap().remove(&number).is_some() {
+        let _ = ui.send(Frame::Control(Control::ShellClosed { channel: number }).encode());
+    }
+    Ok(())
 }

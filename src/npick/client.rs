@@ -3,13 +3,20 @@
 //!
 //! Included by the `npick` binary and by the Unix server's tests, so it only
 //! uses `super::protocol`, serde_json, crossbeam-channel and getrandom.
+#[cfg(unix)]
 use super::protocol::{MAX_FRAME, hex, proof};
 use serde_json::{Value, json};
+#[cfg(unix)]
 use std::{
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Read},
     os::unix::net::UnixStream,
-    time::{Duration, Instant},
+    time::Instant,
 };
+use std::{io::Write, time::Duration};
+
+/// The most one message may hold.
+#[cfg(windows)]
+const MAX_FRAME: usize = 1024 * 1024;
 
 /// One streamed candidate: what the picker shows and what it returns.
 #[derive(Clone, Debug, PartialEq)]
@@ -33,10 +40,12 @@ const MAX_BATCH_ITEMS: usize = 1024;
 const MAX_BATCH_BYTES: usize = MAX_FRAME / 4;
 const POLL: Duration = Duration::from_millis(50);
 
-struct Connection {
+#[cfg(unix)]
+pub(crate) struct Connection {
     stream: UnixStream,
     buffer: Vec<u8>,
 }
+#[cfg(unix)]
 impl Connection {
     fn send(&mut self, value: &Value) -> Result<(), String> {
         let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
@@ -79,6 +88,15 @@ impl Connection {
         }
     }
     /// Wait up to `timeout` for the next message.
+    /// Confirm the result, so the pane's pipe is not closed under it.
+    fn received(&mut self) {
+        let _ = self.send(&json!({"type":"received","request_id":REQUEST_ID}));
+        if let Ok(idle) = self.recv(Duration::from_secs(5))
+            && idle["type"] == "idle"
+        {
+            let _ = self.send(&json!({"type":"received","request_id":REQUEST_ID}));
+        }
+    }
     fn recv(&mut self, timeout: Duration) -> Result<Value, String> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -92,6 +110,7 @@ impl Connection {
     }
 }
 
+#[cfg(unix)]
 fn nonce() -> Result<String, String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| format!("unable to generate a nonce: {e}"))?;
@@ -100,7 +119,56 @@ fn nonce() -> Result<String, String> {
 
 /// Connect and authenticate. `endpoint` is the socket path from
 /// NTERM_PICKER_ENDPOINT, which is also part of the HMAC transcript.
-fn connect(endpoint: &str, token: &str) -> Result<Connection, String> {
+/// To the pane this shell runs in, which its environment names.
+#[cfg(unix)]
+pub(crate) fn connect() -> Result<Connection, String> {
+    let variable = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let endpoint = variable("NTERM_PICKER_ENDPOINT")
+        .ok_or("not running in an nterm pane (NTERM_PICKER_ENDPOINT is not set)")?;
+    let token = variable("NTERM_PICKER_TOKEN").ok_or("NTERM_PICKER_TOKEN is not set")?;
+    connect_to(&endpoint, &token)
+}
+
+/// The session daemon runs this shell and knows which pane shows it. It
+/// has checked who is asking, so there is nothing to prove to the pane.
+#[cfg(windows)]
+pub(crate) struct Connection(nterm_session::shell::Program);
+
+#[cfg(windows)]
+pub(crate) fn connect() -> Result<Connection, String> {
+    nterm_session::shell::Program::from_environment()
+        .ok_or("not running in an nterm pane whose shell the session daemon runs")?
+        .map(Connection)
+        .map_err(|error| format!("unable to reach the session daemon: {error}"))
+}
+
+#[cfg(windows)]
+impl Connection {
+    fn send(&mut self, value: &Value) -> Result<(), String> {
+        let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_FRAME {
+            return Err("request exceeds the 1 MiB frame limit".into());
+        }
+        self.0.send(&bytes).map_err(|e| format!("connection lost: {e}"))
+    }
+    fn poll(&mut self) -> Result<Option<Value>, String> {
+        use nterm_session::shell::Event;
+        match self.0.receive(POLL) {
+            None => Ok(None),
+            Some(Event::Message(bytes)) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| format!("invalid message from terminal: {e}")),
+            Some(Event::Closed) => Err("the terminal ended the request".into()),
+            Some(Event::Refused(why)) => Err(why),
+            Some(Event::Lost) => Err("the session daemon closed the connection".into()),
+        }
+    }
+    /// The daemon keeps the result until it is read; nothing to confirm.
+    fn received(&mut self) {}
+}
+
+#[cfg(unix)]
+fn connect_to(endpoint: &str, token: &str) -> Result<Connection, String> {
     let stream = UnixStream::connect(endpoint)
         .map_err(|e| format!("unable to connect to {endpoint}: {e}"))?;
     stream
@@ -203,12 +271,10 @@ fn next_batch(items: &crossbeam_channel::Receiver<Item>, next_id: &mut u64) -> O
 /// Open `request` (the `request` object of an `open` message) and wait for
 /// its result. Stream requests send `items` until the channel closes.
 pub(crate) fn run(
-    endpoint: &str,
-    token: &str,
+    mut connection: Connection,
     request: Value,
     items: Option<crossbeam_channel::Receiver<Item>>,
 ) -> Result<Outcome, String> {
-    let mut connection = connect(endpoint, token)?;
     connection.send(&json!({"type":"open","request_id":REQUEST_ID,"request":request}))?;
     let mut opened = false;
     let mut in_flight = false;
@@ -242,14 +308,7 @@ pub(crate) fn run(
             Some("opened") => opened = true,
             Some("ack" | "input_complete") => in_flight = false,
             Some("result") => {
-                connection.send(&json!({"type":"received","request_id":REQUEST_ID}))?;
-                // Let the server finish the request cleanly before closing.
-                if let Ok(idle) = connection.recv(Duration::from_secs(5)) {
-                    if idle["type"] == "idle" {
-                        let _ =
-                            connection.send(&json!({"type":"received","request_id":REQUEST_ID}));
-                    }
-                }
+                connection.received();
                 return match message["status"].as_str() {
                     Some("accepted") => {
                         Ok(Outcome::Accepted(message["selected"][0]["value"].clone()))

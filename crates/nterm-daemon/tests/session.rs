@@ -481,3 +481,170 @@ fn an_attach_is_answered_and_an_exclusive_one_is_refused_when_taken() {
     second.frame(|frame| matches!(frame, Frame::Screen { .. }));
     second.shutdown();
 }
+
+/// Set in a pane's shell to make this test program stand in for one that
+/// talks to the UI, such as npick. See `a_program_in_a_shell`.
+const PROGRAM: &str = "NTERM_TEST_PROGRAM";
+
+/// Not a test of its own: run from a pane's shell by the tests below. It
+/// sends `ask`, then prints what comes back, and leaves when told `quit`.
+#[test]
+fn a_program_in_a_shell() {
+    use nterm_session::shell::{Event, Program};
+    if std::env::var_os(PROGRAM).is_none() {
+        return;
+    }
+    let mut program = Program::from_environment().expect("in a pane").expect("connect");
+    program.send(b"ask").unwrap();
+    loop {
+        match program.receive(WAIT).expect("nothing came") {
+            Event::Message(bytes) if bytes == b"quit" => std::process::exit(0),
+            Event::Message(bytes) => println!("got:{}", String::from_utf8_lossy(&bytes)),
+            Event::Closed => break println!("was:closed"),
+            Event::Refused(why) => break println!("was:refused:{why}"),
+            Event::Lost => break println!("was:lost"),
+        }
+    }
+    std::process::exit(0);
+}
+
+impl Ui {
+    /// A shell in a new pane, shown by this UI.
+    fn shell(&mut self) -> PaneId {
+        let pane = self.spawn("cmd.exe /d /q /k prompt $G$S", size(200, 24)).pane;
+        self.show(pane);
+        pane
+    }
+
+    fn show(&mut self, pane: PaneId) {
+        self.send(Control::Attach { request: 0, pane, size: size(200, 24), exclusive: false });
+        self.frame(|frame| matches!(frame, Frame::Screen { .. }));
+    }
+
+    /// Start the program in the pane's shell.
+    fn run_program(&mut self, pane: PaneId) {
+        let this = std::env::current_exe().unwrap();
+        let line = format!(
+            "set {PROGRAM}=1&\"{}\" --exact a_program_in_a_shell --nocapture\r",
+            this.display()
+        );
+        self.input(pane, &line);
+    }
+
+    /// Start the program and take its conversation as far as its first
+    /// message.
+    fn program(&mut self, pane: PaneId) -> u32 {
+        self.run_program(pane);
+        let Control::ShellOpen { channel, pane: opened } =
+            self.control(|c| matches!(c, Control::ShellOpen { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(opened, pane);
+        assert_eq!(self.said(), (channel, "ask".to_owned()));
+        channel
+    }
+
+    /// The program's next message.
+    fn said(&mut self) -> (u32, String) {
+        match self.frame(|frame| matches!(frame, Frame::Shell { .. })) {
+            Frame::Shell { channel, bytes } => (channel, String::from_utf8(bytes).unwrap()),
+            _ => unreachable!(),
+        }
+    }
+
+    fn say(&mut self, channel: u32, text: &str) {
+        Frame::Shell { channel, bytes: text.as_bytes().to_vec() }.write(&mut self.writer).unwrap();
+    }
+
+    fn sees(&mut self, text: &str) {
+        self.until_text(text, |screen| screen.contains(text));
+    }
+
+    fn closed(&mut self, channel: u32) {
+        self.control(|c| matches!(c, Control::ShellClosed { channel: n } if *n == channel));
+    }
+}
+
+#[test]
+fn a_program_and_the_ui_showing_its_pane_talk_until_either_is_done() {
+    let session = session("relay");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+
+    // The shell is told where it is.
+    ui.input(pane, "echo at:%NTERM_DAEMON%:%NTERM_PANE%:%NTERM_DAEMON_PIPE%\r");
+    ui.sees(&format!("at:{session}:{pane}:{}", pipe::name(&session).unwrap()));
+
+    // Both ways, and the UI is done first: the program is told.
+    let channel = ui.program(pane);
+    ui.say(channel, "answer");
+    ui.sees("got:answer");
+    ui.send(Control::ShellClosed { channel });
+    ui.sees("was:closed");
+
+    // The program is done first: the UI is told.
+    let next = ui.program(pane);
+    assert_ne!(next, channel);
+    ui.say(next, "quit");
+    ui.closed(next);
+
+    // Nothing is passed to a conversation that is over.
+    ui.say(next, "late");
+    ui.panes();
+    ui.shutdown();
+}
+
+#[test]
+fn a_program_is_told_when_the_ui_leaves_its_pane() {
+    let session = session("relay-leave");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+
+    // The UI lets go of the pane.
+    ui.program(pane);
+    ui.send(Control::Detach { pane });
+    ui.panes();
+    ui.show(pane);
+    ui.sees("was:closed");
+
+    // The UI goes altogether.
+    ui.input(pane, "cls\r");
+    ui.until_text("a cleared screen", |screen| !screen.contains("was:closed"));
+    ui.program(pane);
+    // The pipe closes with the last handle to it.
+    ui.connection.close();
+    drop(ui);
+    let mut ui = Ui::connect(&session);
+    ui.show(pane);
+    ui.sees("was:closed");
+
+    // The shell is ended under the program: the UI is told that too.
+    let mut other = Ui::connect(&session);
+    let second = other.shell();
+    let channel = other.program(second);
+    other.send(Control::Close { pane: second });
+    other.closed(channel);
+    ui.shutdown();
+}
+
+#[test]
+fn a_program_is_refused_for_no_pane_or_with_no_ui() {
+    use nterm_session::shell::{Event, Program};
+    let session = session("relay-refuse");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(200, 24)).pane;
+
+    let nowhere = Program::connect(&session, pane + 100).unwrap();
+    assert!(matches!(nowhere.receive(WAIT), Some(Event::Refused(_))));
+
+    // Nothing shows the pane. Its screen is read without showing it.
+    ui.run_program(pane);
+    let wanted = "was:refused:no window is showing this pane";
+    let deadline = Instant::now() + WAIT;
+    while !ui.snapshot(pane).text().contains(wanted) {
+        assert!(Instant::now() < deadline, "the program was not refused");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ui.shutdown();
+}

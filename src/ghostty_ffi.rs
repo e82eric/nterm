@@ -439,8 +439,6 @@ unsafe extern "C" {
     pub(crate) fn nterm_host_resync(host: *mut Host, snapshot: *const u8, len: usize);
     pub(crate) fn nterm_window_attach(window: *mut c_void);
     pub(crate) fn nterm_window_detach(window: *mut c_void);
-    pub(crate) fn nterm_host_shell_pid(host: *mut Host) -> u64;
-    pub(crate) fn nterm_host_shell_creation_time(host: *mut Host) -> u64;
     pub(crate) fn nterm_host_resize(host: *mut Host, width: u32, height: u32, scale: f64);
     pub(crate) fn nterm_host_focus(host: *mut Host, focused: bool);
     pub(crate) fn nterm_host_take_frame(host: *mut Host, frame: *mut GpuFrame) -> bool;

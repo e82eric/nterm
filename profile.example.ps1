@@ -5,9 +5,9 @@
 # Outside an nterm pane this file does nothing, so your other bindings stay.
 param([string[]]$PickerRoots = @((Get-Location).Path))
 
-if (-not ($env:NTERM_PICKER_ENDPOINT -and $env:NTERM_PICKER_TOKEN)) { return }
+if (-not $env:NTERM_DAEMON_PIPE) { return }
 if (-not (Get-Command Invoke-NtermPicker -CommandType Function -ErrorAction SilentlyContinue)) {
-    . (Join-Path $PSScriptRoot 'Invoke-NtermPicker.ps1') -BackgroundInitialize -FreshConnection
+    . (Join-Path $PSScriptRoot 'Invoke-NtermPicker.ps1')
 }
 if (-not (Get-Command Invoke-NtermPicker -CommandType Function -ErrorAction SilentlyContinue)) { return }
 

@@ -144,7 +144,8 @@ restarting.
 - **[The shell pipe](docs/picker-pipe.md)** opens a picker from the command
   line. `Get-ChildItem | Invoke-NtermPicker` shows the piped objects and returns
   the selection to the pipeline. Piping into a named picker uses its Lua preview
-  and actions. On Linux, use `npick`. The pipe is disabled until enabled in Lua.
+  and actions. `npick` does the same from any shell. The pipe is disabled until
+  enabled in Lua.
 
 #### Example: fzf-style shell pickers
 

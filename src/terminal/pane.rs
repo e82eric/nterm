@@ -103,8 +103,12 @@ impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDoc
 }
 
 struct WakeState {
-    #[cfg(any(windows, unix))]
+    /// The pane's own pipe, where its shell is its own. A shell in the
+    /// session daemon is reached through the daemon.
+    #[cfg(unix)]
     pipe: Option<crate::picker::pipe::Service>,
+    /// Whether the configuration lets programs in the shell open pickers.
+    pipe_enabled: AtomicBool,
     context: egui::Context,
     proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
     /// Read on native threads; changes when the pane moves to another window.
@@ -120,7 +124,7 @@ struct WakeState {
 
 impl WakeState {
     fn picker_environment(&self) -> (std::ffi::CString, std::ffi::CString) {
-        #[cfg(any(windows, unix))]
+        #[cfg(unix)]
         if let Some(pipe) = &self.pipe {
             return (
                 std::ffi::CString::new(pipe.endpoint.clone()).unwrap(),
@@ -465,7 +469,7 @@ impl TerminalPane {
 
     pub(super) fn destroy(&mut self) {
         self.pages.apply(Outcome::Close);
-        #[cfg(any(windows, unix))]
+        #[cfg(unix)]
         {
             self.wake.pipe.take();
         }
@@ -697,22 +701,17 @@ pub(super) struct PaneStatus<'a> {
     pub(super) pipe_status: Option<bool>,
 }
 
-/// The service `npick` reaches a new pane through. A pane about to take a
-/// shell left in the session daemon gets the one that shell was started
-/// with, so that `npick` run from it still arrives.
-#[cfg(any(windows, unix))]
-fn picker_service(
-    ctx: &egui::Context,
-    start: &crate::session::Start,
-) -> Result<crate::picker::pipe::Service, String> {
-    #[cfg(windows)]
-    if let crate::session::Start::Adopt(adopt) = start
-        && let Some((endpoint, token)) = adopt.picker.clone()
-        && let Ok(service) =
-            crate::picker::pipe::Service::restored(ctx.clone(), endpoint, token)
-    {
-        return Ok(service);
-    }
+/// Have a pane's window draw. `wake` is the pane's `WakeState`. From the
+/// session thread, where asking the egui context would not be heard.
+pub(crate) fn wake_from_session(wake: *mut c_void) {
+    let state = unsafe { &*(wake.cast::<WakeState>()) };
+    let _ = state.proxy.send_event(UserEvent::PickerWake { window_id: state.window_id() });
+}
+
+/// The pipe `npick` reaches a pane through, when the pane runs its own
+/// shell. A shell in the session daemon is reached through the daemon.
+#[cfg(unix)]
+fn picker_service(ctx: &egui::Context) -> Result<crate::picker::pipe::Service, String> {
     crate::picker::pipe::Service::new(ctx.clone())
 }
 
@@ -733,11 +732,9 @@ impl TerminalPane {
     ) -> Result<Self, crate::native_error::FatalError> {
         use crate::native_error::FatalError;
         let mut wake = Box::new(WakeState {
-            #[cfg(any(windows, unix))]
-            pipe: Some(
-                picker_service(ctx, &options.start)
-                    .map_err(|e| FatalError::new("create secure picker pipe", e))?,
-            ),
+            #[cfg(unix)]
+            pipe: None,
+            pipe_enabled: AtomicBool::new(false),
             context: ctx.clone(),
             proxy,
             window_id: AtomicU64::new(window.id.into()),
@@ -748,11 +745,6 @@ impl TerminalPane {
             runtime_issues: std::sync::Mutex::new(Vec::new()),
             clipboard_text: std::sync::Mutex::new(None),
         });
-        #[cfg(any(windows, unix))]
-        if let Some(pipe) = &wake.pipe {
-            pipe.bind_window(wake.proxy.clone(), wake.window_id());
-        }
-        let (picker_endpoint, picker_token) = wake.picker_environment();
         let text = |value: &Option<String>, what: &'static str| {
             value
                 .as_ref()
@@ -765,6 +757,15 @@ impl TerminalPane {
         let userdata: *mut c_void = (&mut *wake as *mut WakeState).cast();
         let session = crate::session::Link::prepare(userdata, &options.start)
             .map_err(|e| FatalError::new("show a running shell", e))?;
+        // A shell of the pane's own is reached by a pipe of the pane's own.
+        #[cfg(unix)]
+        if session.is_none() {
+            let pipe = picker_service(ctx)
+                .map_err(|e| FatalError::new("create secure picker pipe", e))?;
+            pipe.bind_window(wake.proxy.clone(), wake.window_id());
+            wake.pipe = Some(pipe);
+        }
+        let (picker_endpoint, picker_token) = wake.picker_environment();
         let backend = session.as_ref().map(|session| session.backend());
         let asked = ghostty_ffi::HostOptions {
             userdata,
@@ -804,7 +805,7 @@ impl TerminalPane {
         self.wake
             .window_id
             .store(window_id.into(), Ordering::Release);
-        #[cfg(any(windows, unix))]
+        #[cfg(unix)]
         if let Some(pipe) = &self.wake.pipe {
             pipe.bind_window(self.wake.proxy.clone(), window_id);
         }
@@ -892,20 +893,7 @@ impl TerminalPane {
             accent,
             separator,
             detail,
-            pipe_status: {
-                #[cfg(any(windows, unix))]
-                {
-                    self.wake
-                        .pipe
-                        .as_ref()
-                        .filter(|pipe| pipe.enabled())
-                        .map(|pipe| pipe.connected())
-                }
-                #[cfg(not(any(windows, unix)))]
-                {
-                    None
-                }
-            },
+            pipe_status: self.program_status(),
         }
     }
 
@@ -1601,10 +1589,32 @@ impl TerminalPane {
         }
         ctx.request_repaint();
     }
+    /// Whether a program in the shell is connected to the pane, or `None`
+    /// when the configuration lets none open pickers.
+    fn program_status(&self) -> Option<bool> {
+        #[cfg(unix)]
+        if let Some(pipe) = &self.wake.pipe {
+            return Some(pipe.connected()).filter(|_| pipe.enabled());
+        }
+        let session = self.session.as_ref()?;
+        Some(session.has_program()).filter(|_| self.wake.pipe_enabled.load(Ordering::Acquire))
+    }
+    /// What a program in the shell asks next: through the pane's own pipe,
+    /// or through the session daemon.
+    #[cfg(any(windows, unix))]
+    fn next_request(&self) -> Option<crate::picker::pipe::Event> {
+        #[cfg(unix)]
+        if let Some(pipe) = &self.wake.pipe {
+            return pipe.events.try_recv().ok();
+        }
+        self.session.as_ref()?.request()
+    }
     /// Applies the configured pipe policy. The window calls this when the pane
     /// is created and when configuration reloads.
     #[cfg(any(windows, unix))]
     pub(super) fn set_pipe_policy(&self, policy: &crate::picker::pipe::Policy) {
+        self.wake.pipe_enabled.store(policy.enabled, Ordering::Release);
+        #[cfg(unix)]
         if let Some(pipe) = &self.wake.pipe {
             pipe.set_policy(policy);
         }
@@ -1617,29 +1627,6 @@ impl TerminalPane {
         interactive: bool,
     ) {
         use crate::picker::pipe::Event;
-        // The shell may start after the pane; identify it once it exists.
-        if let Some(pipe) = self.wake.pipe.as_ref().filter(|p| !p.shell_identified()) {
-            // A shell in the session daemon is known to the daemon, not to
-            // the surface.
-            let (pid, created) = match &self.session {
-                Some(session) => {
-                    let shell = session.shell();
-                    // The daemon has the shell: leave what `npick` needs to
-                    // reach it with the daemon, for the UI after this one.
-                    if shell.0 != 0
-                        && let Some(pane) = session.pane_id()
-                    {
-                        crate::session::save_picker_identity(pane, &pipe.endpoint, &pipe.token);
-                    }
-                    shell
-                }
-                None => (
-                    unsafe { ghostty_ffi::nterm_host_shell_pid(self.host) } as u32,
-                    unsafe { ghostty_ffi::nterm_host_shell_creation_time(self.host) },
-                ),
-            };
-            pipe.identify_shell(pid, created);
-        }
         if self
             .pages
             .top()
@@ -1660,11 +1647,7 @@ impl TerminalPane {
                 ctx.request_repaint();
                 break;
             }
-            let event = self
-                .wake
-                .pipe
-                .as_ref()
-                .and_then(|pipe| pipe.events.try_recv().ok());
+            let event = self.next_request();
             let Some(event) = event else {
                 break;
             };

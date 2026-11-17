@@ -9,13 +9,13 @@ use std::sync::{
 };
 
 // Shared with the npick client binary, so it depends only on hmac and sha2.
+#[cfg_attr(not(unix), allow(dead_code))]
 mod protocol;
-pub(crate) use protocol::{MAX_FRAME, hex, proof, verify_proof};
+pub(crate) mod relay;
+pub(crate) use protocol::MAX_FRAME;
+#[cfg(any(unix, test))]
+pub(crate) use protocol::{hex, proof, verify_proof};
 
-#[cfg(windows)]
-mod windows;
-#[cfg(windows)]
-pub(crate) use windows::Service;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -78,6 +78,8 @@ pub(crate) struct Item {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Message {
+    /// Only a pane's own pipe is proved to; the session daemon checks who asks.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Authenticate {
         version: u32,
         client_nonce: String,

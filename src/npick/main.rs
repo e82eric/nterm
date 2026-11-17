@@ -14,16 +14,8 @@
 #[path = "../picker/pipe/protocol.rs"]
 mod protocol;
 
-#[cfg(unix)]
 mod client;
 
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("npick: only supported on Unix; use Invoke-NtermPicker on Windows");
-    std::process::exit(2);
-}
-
-#[cfg(unix)]
 fn main() {
     let code = match unix::main(std::env::args().skip(1).collect()) {
         Ok(code) => code,
@@ -35,7 +27,6 @@ fn main() {
     std::process::exit(code);
 }
 
-#[cfg(unix)]
 mod unix {
     use super::client::{self, Item, Outcome};
     use serde_json::{Map, Value, json};
@@ -233,14 +224,7 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
             println!("{USAGE}");
             return Ok(0);
         }
-        let endpoint = std::env::var("NTERM_PICKER_ENDPOINT")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .ok_or("not running in an nterm pane (NTERM_PICKER_ENDPOINT is not set)")?;
-        let token = std::env::var("NTERM_PICKER_TOKEN")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .ok_or("NTERM_PICKER_TOKEN is not set")?;
+        let connection = client::connect()?;
         let request = request(&args);
         let items = if args.name.is_some() && !args.stdin {
             None
@@ -252,7 +236,7 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
             }
             Some(read_stdin(args)?)
         };
-        match client::run(&endpoint, &token, request, items)? {
+        match client::run(connection, request, items)? {
             Outcome::Accepted(value) => {
                 let mut stdout = std::io::stdout().lock();
                 let _ = match value {

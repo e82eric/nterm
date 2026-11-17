@@ -1,9 +1,11 @@
 use serde::Deserialize;
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn new_token() -> Result<String, crate::native_error::FatalError> {
     token_with_random(getrandom::fill)
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn token_with_random(
     fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
 ) -> Result<String, crate::native_error::FatalError> {

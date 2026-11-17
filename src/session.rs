@@ -14,7 +14,14 @@
 //! not: the shells stay in the daemon, and the next nterm opens a pane on
 //! each of them.
 
-use crate::ghostty_ffi::{self, Host, HostSettings, HostSpawn, SurfaceSize};
+use crate::{
+    ghostty_ffi::{self, Host, HostSettings, HostSpawn, SurfaceSize},
+    picker::pipe::{
+        Event,
+        relay::{self, Request},
+    },
+};
+use crossbeam_channel::{Receiver, Sender};
 use nterm_session::{
     DEFAULT_SESSION, GHOSTTY_REVISION,
     pipe::{self, Connection},
@@ -29,7 +36,7 @@ use std::{
     io,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
@@ -69,10 +76,6 @@ pub(crate) enum Start {
 #[derive(Clone, Debug)]
 pub(crate) struct Adopt {
     pub(crate) info: PaneInfo,
-    /// The picker endpoint and token in the shell's environment, which the
-    /// UI that started it left, so that `npick` run from it reaches the
-    /// pane showing it now.
-    pub(crate) picker: Option<(String, String)>,
     /// The connection whose listing this came from.
     daemon: u64,
 }
@@ -93,13 +96,7 @@ impl Listing {
     /// What a pane needs to take the shell `pane`, if it is waiting.
     pub(crate) fn adopt(&self, pane: PaneId) -> Option<Adopt> {
         let info = self.panes.iter().find(|info| info.pane == pane && waiting(info))?.clone();
-        let key = picker_key(pane);
-        let picker = self
-            .blobs
-            .iter()
-            .find(|(name, _)| *name == key)
-            .and_then(|(_, value)| serde_json::from_str(value).ok());
-        Some(Adopt { info, picker, daemon: self.daemon })
+        Some(Adopt { info, daemon: self.daemon })
     }
 }
 
@@ -124,16 +121,6 @@ pub(crate) fn waiting(pane: &PaneInfo) -> bool {
     pane.exited.is_none() && pane.attached == 0
 }
 
-fn picker_key(pane: PaneId) -> String {
-    format!("picker/{pane}")
-}
-
-/// Keep a pane's picker endpoint and token for the next UI.
-pub(crate) fn save_picker_identity(pane: PaneId, endpoint: &str, token: &str) {
-    if let Ok(value) = serde_json::to_string(&(endpoint, token)) {
-        set_blob(picker_key(pane), value);
-    }
-}
 
 /// Keep something in the daemon for the next UI. Does nothing without a
 /// connection.
@@ -383,6 +370,9 @@ struct Daemon {
     /// Links waiting for the daemon to answer a `Spawn` or an `Attach`, by
     /// request.
     starting: Mutex<HashMap<u32, Arc<Link>>>,
+    /// The programs in shells that are talking to panes here, by the
+    /// daemon's number for each conversation.
+    programs: Mutex<HashMap<u32, Program>>,
     /// Who waits for each snapshot asked for, by request.
     snapshots: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
     /// Listings asked for, by request, until they are taken.
@@ -495,6 +485,7 @@ fn open(number: u64) -> io::Result<Arc<Daemon>> {
             outbox: Mutex::new(Some(outbox)),
             panes: Mutex::default(),
             starting: Mutex::default(),
+            programs: Mutex::default(),
             snapshots: Mutex::default(),
             listings: Mutex::default(),
             at_connect: Mutex::new(Some(held.listing)),
@@ -532,6 +523,71 @@ fn write(daemon: &Daemon, mut writer: impl io::Write, queued: mpsc::Receiver<Out
             }
         }
     }
+}
+
+/// A program in a pane's shell that is talking to the pane.
+struct Program {
+    link: Arc<Link>,
+    /// What it asked, once it has.
+    request: Option<Request>,
+}
+
+impl Daemon {
+    /// A conversation is over. `tell` when the daemon does not know: the
+    /// picker answered, or the program broke the protocol.
+    fn end_program(&self, channel: u32, tell: bool) {
+        let Some(program) = self.programs.lock().unwrap().remove(&channel) else { return };
+        if let Some(request) = &program.request {
+            request.gone();
+        }
+        if tell {
+            self.control(Control::ShellClosed { channel });
+        }
+        program.link.programs.fetch_sub(1, Ordering::AcqRel);
+        program.link.wake_pane();
+    }
+}
+
+/// A message from a program in a shell.
+fn said(daemon: &Arc<Daemon>, channel: u32, bytes: &[u8]) {
+    let mut programs = daemon.programs.lock().unwrap();
+    let Some(program) = programs.get_mut(&channel) else { return };
+    let event = match &mut program.request {
+        Some(request) => request.accept(bytes),
+        None => Request::open(bytes).map(|(request, event, replies)| {
+            program.request = Some(request);
+            answer(daemon.clone(), channel, replies);
+            Some(event)
+        }),
+    };
+    match event {
+        Ok(Some(event)) => {
+            let _ = program.link.requests.0.send(event);
+            program.link.wake_pane();
+        }
+        Ok(None) => {}
+        Err(_) => {
+            drop(programs);
+            daemon.end_program(channel, true);
+        }
+    }
+}
+
+/// Pass a picker's replies to the program that asked, as they come. They
+/// come from the UI thread and from the picker's own.
+fn answer(daemon: Arc<Daemon>, channel: u32, replies: Receiver<serde_json::Value>) {
+    let pass = move || {
+        for reply in replies {
+            let Ok(bytes) = serde_json::to_vec(&reply) else { break };
+            daemon.send(Frame::Shell { channel, bytes });
+            if relay::last(&reply) {
+                break;
+            }
+        }
+        // Answered, or dropped with no answer: either way it is over.
+        daemon.end_program(channel, true);
+    };
+    let _ = std::thread::Builder::new().name("picker replies".into()).spawn(pass);
 }
 
 /// The reader thread.
@@ -587,6 +643,18 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                     link.attached();
                 }
             }
+            Frame::Control(Control::ShellOpen { channel, pane }) => match daemon.pane(pane) {
+                Some(link) => {
+                    link.programs.fetch_add(1, Ordering::AcqRel);
+                    link.wake_pane();
+                    let program = Program { link, request: None };
+                    daemon.programs.lock().unwrap().insert(channel, program);
+                }
+                // The pane went as the program came.
+                None => daemon.control(Control::ShellClosed { channel }),
+            },
+            Frame::Shell { channel, bytes } => said(daemon, channel, &bytes),
+            Frame::Control(Control::ShellClosed { channel }) => daemon.end_program(channel, false),
             Frame::Control(Control::Exited { pane, .. }) => {
                 if let Some(link) = daemon.pane(pane) {
                     link.close_pane();
@@ -614,6 +682,10 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
     daemon.connection.close();
     daemon.snapshots.lock().unwrap().clear();
     daemon.listings.lock().unwrap().clear();
+    let programs: Vec<u32> = daemon.programs.lock().unwrap().keys().copied().collect();
+    for channel in programs {
+        daemon.end_program(channel, false);
+    }
     let mut links: Vec<Arc<Link>> = daemon.panes.lock().unwrap().drain().map(|(_, l)| l).collect();
     links.extend(daemon.starting.lock().unwrap().drain().map(|(_, link)| link));
     if !links.is_empty() {
@@ -671,8 +743,6 @@ struct State {
     size: Option<Size>,
     /// Input typed before the shell is this link's.
     queued_input: Vec<u8>,
-    /// The shell's pid and creation time, or zeros while unknown.
-    shell: (u32, u64),
 }
 
 impl State {
@@ -701,6 +771,10 @@ pub(crate) struct Link {
     daemon: Arc<Daemon>,
     /// Whether the shell was taken, not started by this pane.
     adopted: bool,
+    /// What programs in the shell ask of the pane, for the pane to take.
+    requests: (Sender<Event>, Receiver<Event>),
+    /// How many programs in the shell are talking to the pane.
+    programs: AtomicUsize,
     /// The pane's `WakeState`, for telling the UI the shell has ended.
     wake: usize,
     /// The surface, or zero before it exists and after it is destroyed. Held
@@ -749,13 +823,14 @@ impl Link {
         let link = Arc::new(Link {
             daemon,
             adopted: matches!(want, Want::Adopt(_)),
+            requests: crossbeam_channel::unbounded(),
+            programs: AtomicUsize::new(0),
             wake: wake as usize,
             host: Mutex::new(0),
             state: Mutex::new(State {
                 phase: Phase::Sizing { want, grid: None },
                 size: None,
                 queued_input: Vec::new(),
-                shell: (0, 0),
             }),
         });
         Ok(Some(link))
@@ -845,7 +920,6 @@ impl Link {
         let pane = info.pane;
         let size = state.size.unwrap_or(info.size);
         state.phase = Phase::Attaching { pane, sent: size };
-        state.shell = (info.pid, info.creation_time);
         drop(state);
         // What the shell told the terminal before this UI was there.
         let wake = self.wake as *mut c_void;
@@ -914,11 +988,6 @@ impl Link {
         }
     }
 
-    /// The shell's pid and creation time, or zeros while unknown.
-    pub(crate) fn shell(&self) -> (u32, u64) {
-        self.state.lock().unwrap().shell
-    }
-
     /// The pane's whole terminal as the daemon holds it, history included.
     /// The surface keeps only its screen, so anything that reads history
     /// asks here. Waits for the answer. `Ok(None)` before the shell has
@@ -942,6 +1011,24 @@ impl Link {
         bytes.map(Some).ok_or(())
     }
 
+    /// Have the pane's window draw: a program in the shell has asked
+    /// something, or has gone.
+    fn wake_pane(&self) {
+        if *self.host.lock().unwrap() != 0 {
+            crate::terminal::wake_pane_from_session(self.wake as *mut c_void);
+        }
+    }
+
+    /// What a program in the shell asks next, if anything.
+    pub(crate) fn request(&self) -> Option<Event> {
+        self.requests.1.try_recv().ok()
+    }
+
+    /// Whether a program in the shell is talking to the pane.
+    pub(crate) fn has_program(&self) -> bool {
+        self.programs.load(Ordering::Acquire) > 0
+    }
+
     /// Tell the UI this pane's shell is gone. The pane then closes, which
     /// comes back here as `detach`.
     fn close_pane(&self) {
@@ -963,9 +1050,16 @@ impl Link {
             _ => return,
         };
         self.daemon.panes.lock().unwrap().remove(&pane);
+        // The daemon ends its side of these when the pane is let go.
+        let programs: Vec<u32> = {
+            let programs = self.daemon.programs.lock().unwrap();
+            let mine = programs.iter().filter(|(_, p)| std::ptr::eq(&*p.link, self));
+            mine.map(|(channel, _)| *channel).collect()
+        };
+        for channel in programs {
+            self.daemon.end_program(channel, false);
+        }
         self.daemon.control(if end == End::Close && ours {
-            // Nothing will run `npick` from it again.
-            remove_blob(picker_key(pane));
             Control::Close { pane }
         } else {
             Control::Detach { pane }

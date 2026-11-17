@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -142,6 +142,19 @@ pub enum Control {
     /// Every blob whose key starts with `prefix`.
     BlobList { request: u32, prefix: String },
     BlobRemove { key: String },
+    /// The first message of a program running in pane `pane`'s shell, in
+    /// place of `Hello`. What it sends from then on, in `Frame::Shell`, is
+    /// passed to the UI attached to the pane, and what that UI answers is
+    /// passed back. Refused with `Error` when there is no such pane or no UI is
+    /// attached to it. Any program of the user may name any pane.
+    Shell { pane: PaneId },
+    /// To a UI: a program in `pane`'s shell has connected, and `channel`
+    /// is its conversation.
+    ShellOpen { channel: u32, pane: PaneId },
+    /// The conversation is over. From a UI: it has finished with the
+    /// program. To a UI: the program has gone. To the program, with
+    /// channel 0: the UI has finished, or has gone.
+    ShellClosed { channel: u32 },
     /// End every shell and the daemon.
     Shutdown,
 
@@ -186,6 +199,10 @@ pub enum Frame {
     /// The visible screen and modes, as a ghostty snapshot that ends at its
     /// READY record. The output that follows continues from it.
     Screen { pane: PaneId, bytes: Vec<u8> },
+    /// One message between a program in a shell and the UI showing it,
+    /// which the daemon passes on unread. A program's frames carry channel
+    /// 0; the daemon knows a program by its connection.
+    Shell { channel: u32, bytes: Vec<u8> },
     /// A whole ghostty snapshot, answering `Control::Snapshot`.
     Snapshot { request: u32, bytes: Vec<u8> },
 }
@@ -195,6 +212,7 @@ const KIND_OUTPUT: u8 = 1;
 const KIND_INPUT: u8 = 2;
 const KIND_SCREEN: u8 = 3;
 const KIND_SNAPSHOT: u8 = 4;
+const KIND_SHELL: u8 = 5;
 
 impl Frame {
     /// The frame as it travels, length first.
@@ -208,6 +226,7 @@ impl Frame {
             Self::Output { pane, bytes } => (KIND_OUTPUT, Some(*pane), bytes.as_slice().into()),
             Self::Input { pane, bytes } => (KIND_INPUT, Some(*pane), bytes.as_slice().into()),
             Self::Screen { pane, bytes } => (KIND_SCREEN, Some(*pane), bytes.as_slice().into()),
+            Self::Shell { channel, bytes } => (KIND_SHELL, Some(*channel), bytes.as_slice().into()),
             Self::Snapshot { request, bytes } => {
                 (KIND_SNAPSHOT, Some(*request), bytes.as_slice().into())
             }
@@ -251,6 +270,7 @@ impl Frame {
             KIND_INPUT => Ok(Self::Input { pane: id, bytes }),
             KIND_SCREEN => Ok(Self::Screen { pane: id, bytes }),
             KIND_SNAPSHOT => Ok(Self::Snapshot { request: id, bytes }),
+            KIND_SHELL => Ok(Self::Shell { channel: id, bytes }),
             // A frame kind from a newer version.
             _ => Ok(Self::Control(Control::Unknown)),
         }
