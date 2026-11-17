@@ -137,6 +137,10 @@ impl LineNumbers {
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub(crate) enum Preview {
+    /// Room for whoever shows the picker to draw in, which the picker
+    /// leaves empty: see `Picker::previewed`. Not one a configuration names.
+    #[serde(skip)]
+    Host,
     Text {
         #[serde(default)]
         line_numbers: Option<LineNumbers>,
@@ -203,16 +207,19 @@ impl Preview {
             | Self::Dynamic { line_numbers, .. }
             | Self::Scrollback { line_numbers, .. }
             | Self::Command { line_numbers, .. } => *line_numbers,
+            Self::Host => None,
         }
     }
 
-    fn line_numbers_mut(&mut self) -> &mut Option<LineNumbers> {
+    /// `None` for a preview that has no lines of its own to number.
+    fn line_numbers_mut(&mut self) -> Option<&mut Option<LineNumbers>> {
         match self {
             Self::Text { line_numbers, .. }
             | Self::Ansi { line_numbers, .. }
             | Self::Dynamic { line_numbers, .. }
             | Self::Scrollback { line_numbers, .. }
-            | Self::Command { line_numbers, .. } => line_numbers,
+            | Self::Command { line_numbers, .. } => Some(line_numbers),
+            Self::Host => None,
         }
     }
 
@@ -569,8 +576,7 @@ impl Definition {
                     .unwrap_or(8192),
             );
         }
-        if let Some(preview) = &mut preview {
-            let line_numbers = preview.line_numbers_mut();
+        if let Some(line_numbers) = preview.as_mut().and_then(Preview::line_numbers_mut) {
             *line_numbers = line_numbers.or(defaults.preview_line_numbers);
         }
         if let Some(preview) = &preview {

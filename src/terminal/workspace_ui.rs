@@ -42,7 +42,7 @@ pub(crate) fn workspace_picker_options(
 /// it is the preview, where the selected workspace is drawn small.
 const PICKER_HEIGHT: f32 = 0.75;
 /// A picker over rows that each run an action, placed like the workspace
-/// picker. It has a preview with no text of its own, for the selected
+/// picker. Its preview is room left empty, for the selected
 /// workspace to be drawn in.
 pub(super) fn entry_picker(entries: Vec<crate::actions::Entry>) -> crate::picker::config::Options {
     use crate::picker::config::*;
@@ -51,7 +51,7 @@ pub(super) fn entry_picker(entries: Vec<crate::actions::Entry>) -> crate::picker
         position: Position::Bottom,
         sort: Sort::SourceOrder,
         source: Source::Workspaces(entries),
-        preview: Some(Preview::Text { line_numbers: None, text: String::new(), wrap: false }),
+        preview: Some(Preview::Host),
         preview_visible: true,
         height: Some(PICKER_HEIGHT),
         ..Options::default()
