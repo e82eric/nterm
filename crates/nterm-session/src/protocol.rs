@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -136,6 +136,9 @@ pub enum Control {
         size: Size,
     },
     Detach { pane: PaneId },
+    /// Send the pane's screen once, as it is. The pane is not resized, its
+    /// output does not follow, and the asker does not count as showing it.
+    Peek { pane: PaneId },
     /// The daemon resizes and sends the pane's screen again.
     Resize { pane: PaneId, size: Size },
     /// Ask for the whole terminal, history included.

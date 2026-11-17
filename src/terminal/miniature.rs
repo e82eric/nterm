@@ -1,19 +1,60 @@
-//! A small drawing of a workspace, in the preview of the picker of
-//! workspaces.
+//! A small drawing of a workspace or of a waiting session, in the preview
+//! of the picker of workspaces.
 //!
 //! Every pane keeps the last frame its terminal drew, also while its
 //! workspace is hidden, and a hidden terminal goes on drawing as its shell
 //! writes. The miniature of a workspace is those frames, drawn smaller and
 //! laid out as the workspace lays out its panes. Nothing is drawn again for
 //! it.
+//!
+//! A waiting session has no panes here. While its row is selected, a pane
+//! is made for each of its shells that only looks: it is the size the
+//! shell's terminal has in the daemon, it is given that terminal's screen,
+//! and it asks for the screen again every so often. It has no shell, takes
+//! no input, and the daemon does not count it as showing the session. Its
+//! frames are drawn like any other pane's.
 
-use super::{TerminalPane, TerminalView, workspace::Appearance};
-use crate::actions::AppAction;
+use super::{
+    TerminalPane, TerminalView,
+    workspace::{Appearance, Workspace},
+};
+use crate::{actions::AppAction, graphics as glow};
+use std::time::{Duration, Instant};
 
 /// The gap around the miniature inside the preview, in points.
 const MARGIN: f32 = 6.0;
 /// How much of what is behind a floating pane still shows, as in the window.
 const DIM: f32 = 90.0 / 255.0;
+/// How often a waiting session's screens are asked for again.
+const REFRESH: Duration = Duration::from_secs(1);
+/// The pixels a looking pane is given until it has said how big its cells
+/// are. Any size with room for a grid does.
+const FIRST: [u32; 2] = [640, 480];
+
+/// The waiting session whose row is selected, and the panes looking at it.
+pub(super) struct Peek {
+    /// The session's id; empty for the shells no session describes.
+    session: String,
+    /// The session's layout. Its pane ids are the daemon's pane numbers.
+    workspace: Workspace,
+    panes: Vec<Looking>,
+    /// The floating pane that was showing, one of `panes`.
+    float: Option<u32>,
+    asked: Instant,
+}
+
+/// A pane that looks at one of a waiting session's shells.
+struct Looking {
+    /// The daemon's number for the pane looked at.
+    number: u32,
+    /// The grid that pane's terminal has.
+    grid: [u16; 2],
+    /// The pixels this pane needs to have that grid, once its cells' size
+    /// is known. It takes them some time after it is given them, and its
+    /// frames before then are not shown.
+    pixels: Option<[u32; 2]>,
+    pane: TerminalPane,
+}
 
 /// The largest rectangle shaped like `content` that fits the middle of
 /// `preview`, with the margin around it. `None` when nothing useful fits.
@@ -50,19 +91,29 @@ fn keep_shape(rect: egui::Rect, size: [u32; 2]) -> egui::Rect {
 
 impl TerminalView {
     /// With the window's picker showing a preview for one of this window's
-    /// workspaces, draw the workspace small in the middle of the preview.
-    /// `content` is where the current workspace's panes are laid out.
-    /// Called every frame the picker is shown.
-    pub(super) fn show_miniature(&self, ctx: &egui::Context, content: egui::Rect, style: &Appearance) {
-        let Some((action, preview)) = self.window_picker.as_ref().and_then(|picker| picker.previewed())
-        else {
-            return;
+    /// workspaces or for a waiting session, draw it small in the middle of
+    /// the preview. `content` is where the window lays out its panes.
+    /// Called every frame: it also makes and drops the panes that look at a
+    /// waiting session as the selection changes.
+    pub(super) fn show_miniature(
+        &mut self,
+        ctx: &egui::Context,
+        content: egui::Rect,
+        style: &Appearance,
+        gl: &glow::Context,
+    ) {
+        let selected = self.window_picker.as_ref().and_then(|picker| picker.previewed()).cloned();
+        let session = match &selected {
+            Some((AppAction::AttachSession(id), _)) => Some(id.as_str()),
+            _ => None,
         };
-        let AppAction::SelectWorkspaceId(id) = action else { return };
-        let Some(workspace) = self.workspaces.iter().find(|workspace| workspace.id == *id) else {
-            return;
-        };
-        let Some(frame) = fit(*preview, content.size()) else { return };
+        if self.peek.as_ref().map(|peek| peek.session.as_str()) != session {
+            self.drop_peek();
+            self.peek = session.map(|id| self.open_peek(id, gl));
+        }
+        self.refresh_peek(ctx);
+        let Some((action, preview)) = selected else { return };
+        let Some(frame) = fit(preview, content.size()) else { return };
         let palette = crate::colors::palette();
         // Above the picker, which is drawn in its own layer.
         let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("workspace-miniature"));
@@ -71,33 +122,150 @@ impl TerminalView {
             let color = if focused { palette.accent } else { palette.border };
             painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, color), egui::StrokeKind::Inside);
         };
-        // A pane's frame keeps its own shape wherever it is put.
-        let draw = |pane: Option<&TerminalPane>, rect: egui::Rect| {
+        // A pane's frame keeps its own shape wherever it is put. `wanted`
+        // for a pane that is to be drawn only at one size: a frame of
+        // another is from before it had the size of the pane it looks at.
+        let draw = |pane: Option<&TerminalPane>, rect: egui::Rect, wanted: Option<[u32; 2]>| {
             // A pane that has never been shown has nothing to draw.
-            if let Some((callback, size)) = pane.and_then(|pane| pane.miniature()) {
+            if let Some((callback, size)) = pane.and_then(|pane| pane.miniature())
+                && wanted.is_none_or(|wanted| wanted == size)
+            {
                 painter.add(egui::PaintCallback { rect: keep_shape(rect, size), callback });
             }
         };
-        painter.rect_filled(frame.expand(MARGIN / 2.0), 2.0, palette.background);
-        let floating = workspace.floats.visible().and_then(|id| self.floating.get(id));
-        for (pane, rect) in workspace.rectangles(content, style) {
-            let rect = place(rect, content, frame).shrink(0.5);
-            if rect.width() < 1.0 || rect.height() < 1.0 {
-                continue;
-            }
-            draw(self.tiled_ref(pane), rect);
-            outline(rect, floating.is_none() && workspace.focused == Some(pane));
-        }
-        // The floating pane, over the tiled ones, which it dims as in the
+        let backdrop = || painter.rect_filled(frame.expand(MARGIN / 2.0), 2.0, palette.background);
+        // A floating pane, over the tiled ones, which it dims as in the
         // window.
-        if let Some(floating) = floating {
-            let padding = workspace.floats.size().or(self.floating_padding);
+        let float = |padding, pane: &TerminalPane, wanted: Option<[u32; 2]>| {
             let rect = place(Self::floating_rect(content, padding), content, frame);
             painter.rect_filled(frame, 0.0, palette.background.gamma_multiply(DIM));
             painter.rect_filled(rect, 0.0, palette.background);
-            draw(Some(&floating.value.pane), rect);
+            draw(Some(pane), rect, wanted);
             outline(rect, true);
+        };
+        let tile = |rect: egui::Rect| {
+            let rect = place(rect, content, frame).shrink(0.5);
+            (rect.width() >= 1.0 && rect.height() >= 1.0).then_some(rect)
+        };
+        match action {
+            AppAction::SelectWorkspaceId(id) => {
+                let Some(workspace) = self.workspaces.iter().find(|w| w.id == id) else { return };
+                let floating = workspace.floats.visible().and_then(|id| self.floating.get(id));
+                backdrop();
+                for (pane, rect) in workspace.rectangles(content, style) {
+                    let Some(rect) = tile(rect) else { continue };
+                    draw(self.tiled_ref(pane), rect, None);
+                    outline(rect, floating.is_none() && workspace.focused == Some(pane));
+                }
+                if let Some(floating) = floating {
+                    let padding = workspace.floats.size().or(self.floating_padding);
+                    float(padding, &floating.value.pane, None);
+                }
+            }
+            AppAction::AttachSession(_) => {
+                let Some(peek) = self.peek.as_ref().filter(|peek| !peek.panes.is_empty()) else {
+                    return;
+                };
+                let looking = |number: u64| {
+                    peek.panes.iter().find(|looking| u64::from(looking.number) == number)
+                };
+                // One with no pixels yet has no frame to show either.
+                let wanted = |looking: &Looking| Some(looking.pixels.unwrap_or_default());
+                backdrop();
+                for (pane, rect) in peek.workspace.rectangles(content, style) {
+                    let Some(rect) = tile(rect) else { continue };
+                    if let Some(looking) = looking(pane) {
+                        draw(Some(&looking.pane), rect, wanted(looking));
+                    }
+                    outline(rect, peek.float.is_none() && peek.workspace.focused == Some(pane));
+                }
+                if let Some(looking) = peek.float.and_then(|float| looking(u64::from(float))) {
+                    float(self.floating_padding, &looking.pane, wanted(looking));
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// Panes that look at each shell a waiting session shows. One that
+    /// cannot be looked at comes back with no panes, so that it is not
+    /// asked about again every frame.
+    fn open_peek(&mut self, id: &str, gl: &glow::Context) -> Peek {
+        let mut peek = Peek {
+            session: id.to_owned(),
+            workspace: Workspace::new(0, 0),
+            panes: Vec::new(),
+            float: None,
+            asked: Instant::now(),
+        };
+        let Some(waiting) = super::restore::waiting_workspace(id) else { return peek };
+        peek.workspace = waiting.workspace;
+        peek.float = waiting.float;
+        for shell in waiting.shells {
+            let number = shell.info.pane;
+            let grid = [shell.info.size.cols, shell.info.size.rows];
+            let options = super::pane::SpawnOptions {
+                start: crate::session::Start::Look(Box::new(shell)),
+                ..Default::default()
+            };
+            let Ok(pane) = self.create_pane(gl, &options) else { continue };
+            if !pane.looks() {
+                // Shells are not kept in a daemon, and it has one of its own.
+                self.closed_panes.push(pane);
+                continue;
+            }
+            peek.panes.push(Looking { number, grid, pixels: None, pane });
+        }
+        peek
+    }
+
+    /// Keep the looking panes at their sizes, which is also what lets each
+    /// ask for its first screen, and ask for the screens again when due.
+    fn refresh_peek(&mut self, ctx: &egui::Context) {
+        let Some(peek) = &mut self.peek else { return };
+        let scale = ctx.pixels_per_point();
+        let again = peek.asked.elapsed() >= REFRESH;
+        for Looking { grid, pixels, pane, .. } in &mut peek.panes {
+            let [width, height] = pixels.unwrap_or(FIRST);
+            let size = egui::vec2(width as f32, height as f32) / scale;
+            pane.resize(egui::Rect::from_min_size(egui::Pos2::ZERO, size), scale);
+            if pixels.is_none()
+                && let Some((extra, cell)) = pane.pixel_metrics()
+            {
+                *pixels = Some([
+                    u32::from(grid[0]) * cell[0] + extra[0],
+                    u32::from(grid[1]) * cell[1] + extra[1],
+                ]);
+                ctx.request_repaint();
+            }
+            if again {
+                pane.look_again();
+            }
+        }
+        if again {
+            peek.asked = Instant::now();
+        }
+        if !peek.panes.is_empty() {
+            ctx.request_repaint_after(REFRESH);
+        }
+    }
+
+    /// Stop looking at a waiting session. Its panes are destroyed with the
+    /// others that have closed.
+    pub(super) fn drop_peek(&mut self) {
+        if let Some(peek) = self.peek.take() {
+            self.closed_panes.extend(peek.panes.into_iter().map(|looking| looking.pane));
+        }
+    }
+
+    /// Take the latest frame of each looking pane. True if any had one.
+    pub(super) fn acquire_peek_frames(&mut self) -> bool {
+        let Some(peek) = &mut self.peek else { return false };
+        let mut acquired = false;
+        for looking in &mut peek.panes {
+            acquired |= looking.pane.acquire_frame();
+        }
+        acquired
     }
 }
 

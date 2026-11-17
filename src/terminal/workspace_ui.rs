@@ -1815,7 +1815,7 @@ impl TerminalView {
             self.execute_action(action, self.floats().visible().is_some(), &ctx, gl);
         }
         // The selected workspace, small, in the picker's preview.
-        self.show_miniature(&ctx, content, &style);
+        self.show_miniature(&ctx, content, &style, gl);
         self.show_mode_status(ui, status, &key_hints);
         let float_overlay = if floating_active {
             overlay

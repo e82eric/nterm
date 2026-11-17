@@ -73,6 +73,11 @@ pub(crate) enum Start {
     Shell,
     /// Take this one, which the daemon is running with nothing showing it.
     Adopt(Box<Adopt>),
+    /// Only look at this one, which the daemon is running: the pane is
+    /// given its screen, and again when it asks. It has no shell, sends
+    /// nothing typed, and the daemon does not count it as showing the
+    /// shell. Its terminal sizes itself, as nothing is to stay in step.
+    Look(Box<Adopt>),
 }
 
 /// A shell to take, as a listing gave it.
@@ -308,6 +313,8 @@ struct Daemon {
     /// The writer thread's queue; `None` once the connection is gone.
     outbox: Mutex<Option<mpsc::Sender<Out>>>,
     panes: Mutex<HashMap<PaneId, Arc<Link>>>,
+    /// Links that only look at a pane, by the pane looked at.
+    looking: Mutex<HashMap<PaneId, Arc<Link>>>,
     /// Links waiting for the daemon to answer a `Spawn` or an `Attach`, by
     /// request.
     starting: Mutex<HashMap<u32, Arc<Link>>>,
@@ -412,6 +419,7 @@ fn open(number: u64) -> io::Result<Arc<Daemon>> {
             connection,
             outbox: Mutex::new(Some(outbox)),
             panes: Mutex::default(),
+            looking: Mutex::default(),
             starting: Mutex::default(),
             programs: Mutex::default(),
             snapshots: Mutex::default(),
@@ -540,7 +548,11 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 }
             }
             Frame::Screen { pane, bytes } => {
-                if let Some(link) = daemon.pane(pane) {
+                // A pane shown here, or else one that only looks at it.
+                let link = daemon
+                    .pane(pane)
+                    .or_else(|| daemon.looking.lock().unwrap().get(&pane).cloned());
+                if let Some(link) = link.filter(|link| link.fresh(&bytes)) {
                     link.with_host(|host| unsafe {
                         ghostty_ffi::nterm_host_resync(host, bytes.as_ptr(), bytes.len());
                     });
@@ -609,6 +621,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
     *daemon.outbox.lock().unwrap() = None;
     daemon.connection.close();
     daemon.snapshots.lock().unwrap().clear();
+    daemon.looking.lock().unwrap().clear();
     let programs: Vec<u32> = daemon.programs.lock().unwrap().keys().copied().collect();
     for channel in programs {
         daemon.end_program(channel, false);
@@ -646,6 +659,8 @@ enum Want {
     Spawn(Option<SpawnSpec>),
     /// Take a shell the daemon is running.
     Adopt(PaneInfo),
+    /// Only look at a shell the daemon is running.
+    Look(PaneInfo),
 }
 
 /// Where a link is. It moves down this list, or from anywhere to `Closed`.
@@ -660,6 +675,9 @@ enum Phase {
     Attaching { pane: PaneId, sent: Size },
     /// `pane` is this link's: its output comes here and input goes to it.
     Attached { pane: PaneId, sent: Size },
+    /// This link only looks at `pane`, whose screen it has asked for. It
+    /// is not attached: nothing follows the screen, and nothing is sent.
+    Looking { pane: PaneId },
     /// Over: the pane was closed, or the daemon refused or went away.
     Closed,
 }
@@ -670,6 +688,8 @@ struct State {
     size: Option<Size>,
     /// Input typed before the shell is this link's.
     queued_input: Vec<u8>,
+    /// The screen a link that only looks was last given.
+    looked: Vec<u8>,
 }
 
 impl State {
@@ -698,6 +718,8 @@ pub(crate) struct Link {
     daemon: Arc<Daemon>,
     /// Whether the shell was taken, not started by this pane.
     adopted: bool,
+    /// Whether this link only looks at a pane: see `Start::Look`.
+    looks: bool,
     /// What programs in the shell ask of the pane, for the pane to take.
     requests: (Sender<Event>, Receiver<Event>),
     /// How many programs in the shell are talking to the pane.
@@ -730,7 +752,7 @@ impl Link {
         let daemon = daemon();
         let want = match (start, &daemon) {
             (Start::Shell, _) => Want::Spawn(None),
-            (Start::Adopt(_), None) => {
+            (Start::Adopt(_) | Start::Look(_), None) => {
                 return Err("the session daemon cannot be reached".into());
             }
             (Start::Adopt(adopt), Some(daemon)) => {
@@ -739,6 +761,13 @@ impl Link {
                     return Err(format!("shell {pane} was in a daemon that has gone"));
                 }
                 Want::Adopt(adopt.info.clone())
+            }
+            (Start::Look(look), Some(daemon)) => {
+                if look.daemon != daemon.number {
+                    let pane = look.info.pane;
+                    return Err(format!("shell {pane} was in a daemon that has gone"));
+                }
+                Want::Look(look.info.clone())
             }
         };
         let Some(daemon) = daemon else {
@@ -750,12 +779,14 @@ impl Link {
         let link = Arc::new(Link {
             daemon,
             adopted: matches!(want, Want::Adopt(_)),
+            looks: matches!(want, Want::Look(_)),
             requests: crossbeam_channel::unbounded(),
             programs: AtomicUsize::new(0),
             wake: wake as usize,
             host: Mutex::new(0),
             state: Mutex::new(State {
                 phase: Phase::Sizing { want, grid: None },
+                looked: Vec::new(),
                 size: None,
                 queued_input: Vec::new(),
             }),
@@ -776,7 +807,7 @@ impl Link {
             settings: on_settings,
             // The daemon says where in the output its terminal changed
             // size, and the copy changes there.
-            ordered: true,
+            ordered: !self.looks,
         }
     }
 
@@ -795,6 +826,21 @@ impl Link {
             return false;
         };
         let now = (surface.columns, surface.rows);
+        if let Want::Look(info) = want {
+            // The screen is asked for once this terminal has the grid the
+            // shell's has, so that nothing of it is reflowed.
+            let pane = info.pane;
+            if now != (info.size.cols, info.size.rows) {
+                let changed = *grid != Some(now);
+                *grid = Some(now);
+                return changed;
+            }
+            state.phase = Phase::Looking { pane };
+            drop(state);
+            self.daemon.looking.lock().unwrap().insert(pane, self.clone());
+            self.daemon.control(Control::Peek { pane });
+            return false;
+        }
         if now.0 == 0 || now.1 == 0 || *grid != Some(now) {
             *grid = Some(now);
             return true;
@@ -820,6 +866,8 @@ impl Link {
                     size,
                 });
             }
+            // Dealt with above.
+            Want::Look(_) => {}
             Want::Spawn(None) => {
                 drop(state);
                 self.refused("The shell could not be started", "The terminal did not describe it.");
@@ -911,6 +959,34 @@ impl Link {
         self.close_pane();
     }
 
+    /// Whether this link only looks at a pane of the daemon.
+    pub(crate) fn looks(&self) -> bool {
+        self.looks
+    }
+
+    /// Ask for the screen of the pane looked at again. Does nothing before
+    /// the first was asked for, or for a link that does not only look.
+    pub(crate) fn look_again(&self) {
+        if let Phase::Looking { pane } = self.state.lock().unwrap().phase {
+            self.daemon.control(Control::Peek { pane });
+        }
+    }
+
+    /// Whether a screen the daemon sent is to be shown. A link that only
+    /// looks asks for the screen over and over, and one the same as the
+    /// last is left alone: the terminal is not rebuilt and nothing redraws.
+    fn fresh(&self, screen: &[u8]) -> bool {
+        if !self.looks {
+            return true;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.looked == screen {
+            return false;
+        }
+        state.looked = screen.to_vec();
+        true
+    }
+
     /// The daemon's pane: known at once for a shell taken over, and once
     /// the daemon has answered for one this pane started.
     pub(crate) fn pane_id(&self) -> Option<PaneId> {
@@ -975,6 +1051,14 @@ impl Link {
     pub(crate) fn detach(&self, end: End) {
         *self.host.lock().unwrap() = 0;
         let phase = std::mem::replace(&mut self.state.lock().unwrap().phase, Phase::Closed);
+        if let Phase::Looking { pane } = phase {
+            // The daemon was never told of this link.
+            let mut looking = self.daemon.looking.lock().unwrap();
+            if looking.get(&pane).is_some_and(|link| std::ptr::eq(Arc::as_ptr(link), self)) {
+                looking.remove(&pane);
+            }
+            return;
+        }
         let (pane, ours) = match phase {
             Phase::Attached { pane, .. } => (pane, true),
             // The daemon has not said the shell is this link's. One this
@@ -1015,7 +1099,7 @@ extern "C" fn on_write(userdata: *mut c_void, bytes: *const u8, len: usize) {
                 drop(state);
                 link.daemon.send(Frame::Input { pane, bytes: bytes.to_vec() });
             }
-            Phase::Closed => {}
+            Phase::Closed | Phase::Looking { .. } => {}
             _ if state.queued_input.len() + bytes.len() <= QUEUED_INPUT_MAX => {
                 state.queued_input.extend_from_slice(bytes);
             }

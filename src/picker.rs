@@ -672,6 +672,12 @@ impl Picker {
                     path: selection.text.clone(),
                 })
                 .map(|action| (action, rect)),
+            // While a new query runs the picker keeps the old rows painted
+            // but names no selection. Keep what was drawn for the old one
+            // until the new results say what is selected.
+            (Some(rect), None) if output.busy && !self.shared.is_closed() => {
+                self.previewed.take().map(|(action, _)| (action, rect))
+            }
             _ => None,
         };
         if let Some(preview) = &mut self.resolved_preview {

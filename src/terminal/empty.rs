@@ -112,6 +112,9 @@ impl TerminalView {
             // what was chosen is done.
             Empty::Choose => {
                 let action = self.show_window_picker(&ctx, content);
+                // The selected session, small, in the picker's preview.
+                let style = self.picker_bindings.workspace_appearance.clone();
+                self.show_miniature(&ctx, content, &style, gl);
                 if self.window_picker.is_some() {
                     Some(Empty::Choose)
                 } else {

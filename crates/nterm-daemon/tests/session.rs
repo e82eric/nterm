@@ -519,6 +519,33 @@ fn an_attach_is_answered_and_refused_when_the_pane_is_shown() {
     second.shutdown();
 }
 
+#[test]
+fn a_look_is_sent_the_screen_and_takes_nothing() {
+    let session = session("look");
+    let mut first = Ui::connect(&session);
+    let mut second = Ui::connect(&session);
+    let pane = first.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+
+    // The screen comes, and again when asked again.
+    for _ in 0..2 {
+        second.send(Control::Peek { pane: pane.pane });
+        second.frame(|frame| matches!(frame, Frame::Screen { .. }));
+    }
+    // The pane is as it was: its size, and nothing showing it.
+    let listed = second.panes();
+    assert_eq!((listed[0].size, listed[0].attached), (size(80, 24), false));
+
+    // So another UI can have it.
+    first.send(Control::Attach { request: 21, pane: pane.pane, size: size(80, 24) });
+    let answer = first.control(|c| matches!(c, Control::Attached { .. } | Control::Error { .. }));
+    assert!(matches!(answer, Control::Attached { request: 21, .. }));
+
+    // A pane that is not there is nothing to one only looking.
+    second.send(Control::Peek { pane: pane.pane + 100 });
+    second.panes();
+    second.shutdown();
+}
+
 /// Set in a pane's shell to make this test program stand in for one that
 /// talks to the UI, such as npick. See `a_program_in_a_shell`.
 const PROGRAM: &str = "NTERM_TEST_PROGRAM";

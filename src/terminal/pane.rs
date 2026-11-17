@@ -469,6 +469,34 @@ impl TerminalPane {
             .then(|| (crate::painter::miniature(Arc::clone(&self.painter), size), size))
     }
 
+    /// Whether this pane only looks at a pane of the session daemon.
+    pub(super) fn looks(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| session.looks())
+    }
+
+    /// Ask the daemon for the screen of the pane looked at again.
+    pub(super) fn look_again(&self) {
+        if let Some(session) = &self.session {
+            session.look_again();
+        }
+    }
+
+    /// Of the pane's pixels at its last layout, those that are not cells:
+    /// padding, and what is left over from a whole cell. With the size of a
+    /// cell. `None` before the terminal has a grid.
+    pub(super) fn pixel_metrics(&self) -> Option<([u32; 2], [u32; 2])> {
+        let surface = unsafe { ghostty_ffi::nterm_host_surface_size(self.host) };
+        let cell = [surface.cell_width_px, surface.cell_height_px];
+        if surface.columns == 0 || surface.rows == 0 || cell[0] == 0 || cell[1] == 0 {
+            return None;
+        }
+        let extra = [
+            self.size[0].saturating_sub(u32::from(surface.columns) * cell[0]),
+            self.size[1].saturating_sub(u32::from(surface.rows) * cell[1]),
+        ];
+        Some((extra, cell))
+    }
+
     /// The session daemon's pane this one shows, once known.
     pub(super) fn session_pane(&self) -> Option<u32> {
         self.session.as_ref().and_then(|session| session.pane_id())

@@ -149,10 +149,10 @@ impl State {
         }
     }
 
-    /// The screen a UI starts from when it takes the pane, with the pixels
-    /// of the pictures on it.
-    fn send_screen(&mut self, pane: PaneId, to: &Outbox) -> bool {
-        let frame = Frame::Screen { pane, bytes: self.terminal.screen(true) }.encode();
+    /// The pane's screen, for a UI to start from when it takes the pane
+    /// or to look at. `pictures` for the pixels of the pictures on it.
+    fn send_screen(&mut self, pane: PaneId, to: &Outbox, pictures: bool) -> bool {
+        let frame = Frame::Screen { pane, bytes: self.terminal.screen(pictures) }.encode();
         to.send(frame).is_ok()
     }
 }
@@ -620,11 +620,18 @@ fn converse(
                 info.attached = true;
                 send(Control::Attached { request, info });
                 state.shown =
-                    state.send_screen(pane_id, outbox).then(|| (id, outbox.clone()));
+                    state.send_screen(pane_id, outbox, true).then(|| (id, outbox.clone()));
                 if let Some(code) = state.exited {
                     send(Control::Exited { pane: pane_id, code });
                 }
                 session.sessions_changed();
+            }
+            Control::Peek { pane: pane_id } => {
+                // A pane that has gone is not an error to one only looking.
+                // It asks again and again, so it is not sent pixels.
+                if let Some(pane) = session.pane(pane_id) {
+                    pane.state.lock().unwrap().send_screen(pane_id, outbox, false);
+                }
             }
             Control::Detach { pane: pane_id } => {
                 if let Some(pane) = session.pane(pane_id) {

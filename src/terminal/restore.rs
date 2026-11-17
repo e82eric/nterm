@@ -192,10 +192,53 @@ fn arrangement(session: &SessionInfo) -> Option<Saved> {
     Some(saved)
 }
 
+/// A waiting session, for drawing it small.
+pub(super) struct Waiting {
+    /// Its tiled panes as it lays them out. Their ids are the daemon's pane
+    /// numbers.
+    pub(super) workspace: workspace::Workspace,
+    /// The shells to look at: the tiled ones, and the floating one that
+    /// was showing.
+    pub(super) shells: Vec<crate::session::Adopt>,
+    /// The floating pane that was showing, by the daemon's pane number.
+    pub(super) float: Option<u32>,
+}
+
+/// A session waiting in the daemon, as the daemon last described it. `None`
+/// when it is not waiting.
+pub(super) fn waiting_workspace(id: &str) -> Option<Waiting> {
+    let listing = crate::session::sessions()?;
+    let saved = listing.sessions.iter().find(|session| session.id == id).and_then(arrangement)?;
+    let mut shown = workspace::Workspace::new(0, 0);
+    shown.layout = saved.layout;
+    if let Some(ratio) = saved.main_ratio.filter(|ratio| ratio.is_finite()) {
+        shown.main_ratio = ratio.clamp(0.1, 0.9);
+    }
+    shown.panes = saved.panes.iter().map(|pane| u64::from(*pane)).collect();
+    shown.pane_weights = saved
+        .weights
+        .iter()
+        .map(|(layout, weights)| {
+            let weights = weights.iter().map(|(pane, weight)| (u64::from(*pane), *weight));
+            (*layout, weights.collect())
+        })
+        .collect();
+    shown.appearance = saved.appearance.clone().filter(|appearance| appearance.validate().is_ok());
+    let focused = saved.focused.filter(|pane| saved.panes.contains(pane));
+    if let Some(pane) = focused.or(saved.panes.first().copied()) {
+        shown.focus(u64::from(pane));
+    }
+    let float = saved.visible_float.filter(|pane| saved.floats.iter().any(|f| f.pane == *pane));
+    let shells = saved.panes.iter().chain(&float).filter_map(|pane| listing.adopt(*pane)).collect();
+    Some(Waiting { workspace: shown, shells, float })
+}
+
 impl TerminalView {
     /// Show a waiting session as a new workspace of this window, and go to
     /// it. In a window that had no terminal it is the only workspace.
     pub(super) fn attach_session(&mut self, id: &str, gl: &glow::Context) -> Result<(), String> {
+        // Nothing looks at the session once it is shown.
+        self.drop_peek();
         // The sessions as they are now, which the rows chosen from followed.
         let listing = crate::session::sessions().ok_or("That session is no longer waiting.")?;
         let session = listing.sessions.iter().find(|session| session.id == id);

@@ -52,6 +52,9 @@ pub(crate) struct TerminalView {
     /// A workspace was closed by its command this frame: a window that
     /// leaves empty stays, to ask what to show next.
     stay_open: bool,
+    /// The waiting session whose row the picker has selected, and the
+    /// panes that look at it.
+    peek: Option<miniature::Peek>,
     pane_drag: Option<pane_resize::Drag>,
     /// The `key_tables` entry whose keys are active, if any.
     key_table: Option<String>,
@@ -291,6 +294,7 @@ impl TerminalView {
             reload_source,
             close_requested: false,
             stay_open: false,
+            peek: None,
             pane_drag: None,
             key_table: None,
             nudge_step: false,
@@ -392,6 +396,7 @@ impl TerminalView {
         for floating in &mut self.floating.entries {
             acquired |= floating.acquire_frame();
         }
+        acquired |= self.acquire_peek_frames();
         acquired
     }
 
@@ -1137,6 +1142,7 @@ impl TerminalView {
     /// them.
     pub(crate) fn destroy(&mut self) {
         self.save_sessions();
+        self.drop_peek();
         for mut floating in self.floating.entries.drain(..) {
             floating.pane.keep_shell();
             floating.destroy();
