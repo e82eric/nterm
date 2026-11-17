@@ -869,6 +869,7 @@ impl Definition {
         // A file streams through the command picker's source.
         let label = matches!(source, Source::TextFile(_)).then_some("FILE PICKER");
         let mut options = Options {
+            height: None,
             scope,
             position,
             result_rows,
@@ -1214,6 +1215,10 @@ pub(crate) struct Options {
     pub(crate) preview_visible: bool,
     /// The header label, in place of the one named for the source.
     pub(crate) label: Option<&'static str>,
+    /// The part of its bounds' height the picker takes, the preview getting
+    /// what the results leave. Without it the preview has a set number of
+    /// rows.
+    pub(crate) height: Option<f32>,
 }
 
 /// What a prompt does with the text typed.
@@ -1401,6 +1406,7 @@ impl Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            height: None,
             scope: Scope::Pane,
             result_rows: default_result_rows(),
             position: Position::Bottom,

@@ -9,6 +9,7 @@ pub(crate) struct Compositor {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    smooth: wgpu::Sampler,
 }
 
 /// Per-draw values, as immediate data. Must match `Pane` in the shader and
@@ -20,7 +21,9 @@ struct PaneImmediates {
     texture_scale: [f32; 2],
     background: [f32; 4],
     radius: f32,
-    _padding: [f32; 3],
+    /// Above zero for a miniature: the frame is drawn smaller than it is.
+    miniature: f32,
+    _padding: [f32; 2],
 }
 
 const SHADER: &str = r#"
@@ -29,10 +32,12 @@ struct Pane {
     texture_scale: vec2<f32>,
     background: vec4<f32>,
     radius: f32,
+    miniature: f32,
 }
 var<immediate> pane: Pane;
 @group(0) @binding(0) var terminal_texture: texture_2d<f32>;
 @group(0) @binding(1) var terminal_sampler: sampler;
+@group(0) @binding(2) var smooth_sampler: sampler;
 struct Vertex { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }
 @vertex fn vs(@builtin(vertex_index) i: u32) -> Vertex {
     let p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0))[i];
@@ -51,7 +56,21 @@ struct Vertex { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f3
     if (coverage == 0.0) { discard; }
     let p = in.uv * pane.texture_scale;
     // Sample unconditionally: derivatives need uniform control flow.
-    let c = textureSampleLevel(terminal_texture, terminal_sampler, p, 0.0);
+    var c = textureSampleLevel(terminal_texture, terminal_sampler, p, 0.0);
+    if (pane.miniature > 0.0) {
+        // One pixel covers many of the frame's. Average sixteen smoothed
+        // samples spread over what it covers, which holds to an eighth of
+        // the size.
+        let step = pane.texture_scale / pane.pane_size;
+        var sum = vec4(0.0);
+        for (var y = 0; y < 4; y++) {
+            for (var x = 0; x < 4; x++) {
+                let at = p + ((vec2(f32(x), f32(y)) + 0.5) / 4.0 - 0.5) * step;
+                sum += textureSampleLevel(terminal_texture, smooth_sampler, at, 0.0);
+            }
+        }
+        c = sum / 16.0;
+    }
     // Colors are premultiplied, so coverage scales every channel.
     return select(c, pane.background, p.x >= 1.0 || p.y >= 1.0) * coverage;
 }
@@ -78,6 +97,12 @@ impl Compositor {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -121,10 +146,18 @@ impl Compositor {
             label: Some("Ghostty terminal composition"),
             ..Default::default()
         });
+        // A miniature is not.
+        let smooth = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Ghostty terminal miniature"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         Self {
             pipeline,
             layout,
             sampler,
+            smooth,
         }
     }
 }
@@ -185,11 +218,15 @@ impl TerminalPainter {
         self.current = None;
     }
 
+    /// Draw the current frame over the callback's rectangle. `miniature` is
+    /// the pane's size in pixels, for a drawing of the whole pane fitted to
+    /// a smaller rectangle; without it the frame is drawn pixel for pixel.
     fn paint(
         &mut self,
         info: &egui::PaintCallbackInfo,
         pass: &mut wgpu::RenderPass<'static>,
         compositor: &Compositor,
+        miniature: Option<[f32; 2]>,
     ) {
         let Some(frame) = &self.current else {
             return;
@@ -211,21 +248,30 @@ impl TerminalPainter {
                             binding: 1,
                             resource: wgpu::BindingResource::Sampler(&compositor.sampler),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&compositor.smooth),
+                        },
                     ],
                 })
         });
         let background = crate::colors::palette().background;
         let immediates = PaneImmediates {
             pane_size: [width, height],
-            texture_scale: frame_texture_scale(frame.size, [width, height]),
+            // A miniature shows as much of the frame as the pane does.
+            texture_scale: frame_texture_scale(frame.size, miniature.unwrap_or([width, height])),
             background: [
                 f32::from(background.r()) / 255.0,
                 f32::from(background.g()) / 255.0,
                 f32::from(background.b()) / 255.0,
                 1.0,
             ],
-            radius: self.radius.min(width.min(height) / 2.0),
-            _padding: [0.0; 3],
+            radius: match miniature {
+                Some(_) => 0.0,
+                None => self.radius.min(width.min(height) / 2.0),
+            },
+            miniature: if miniature.is_some() { 1.0 } else { 0.0 },
+            _padding: [0.0; 2],
         };
         pass.set_pipeline(&compositor.pipeline);
         pass.set_bind_group(0, &*group, &[]);
@@ -257,6 +303,8 @@ pub(crate) type PaintCallback = Arc<dyn std::any::Any + Send + Sync>;
 
 struct Callback {
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
+    /// See `TerminalPainter::paint`.
+    miniature: Option<[f32; 2]>,
 }
 
 impl egui_wgpu::CallbackTrait for Callback {
@@ -267,7 +315,7 @@ impl egui_wgpu::CallbackTrait for Callback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         if let Some(compositor) = resources.get::<Compositor>() {
-            self.painter.lock().paint(&info, pass, compositor);
+            self.painter.lock().paint(&info, pass, compositor, self.miniature);
         }
     }
 }
@@ -275,7 +323,18 @@ impl egui_wgpu::CallbackTrait for Callback {
 /// The paint callback that draws `painter`'s current frame. The caller sets
 /// the rectangle when adding it to a painter.
 pub(crate) fn callback(painter: Arc<egui::mutex::Mutex<TerminalPainter>>) -> PaintCallback {
-    egui_wgpu::Callback::new_paint_callback(egui::Rect::NOTHING, Callback { painter }).callback
+    let callback = Callback { painter, miniature: None };
+    egui_wgpu::Callback::new_paint_callback(egui::Rect::NOTHING, callback).callback
+}
+
+/// A paint callback that draws all of `painter`'s current frame, from a
+/// pane `size` pixels large, scaled to fit the rectangle it is given.
+pub(crate) fn miniature(
+    painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
+    size: [u32; 2],
+) -> PaintCallback {
+    let callback = Callback { painter, miniature: Some([size[0] as f32, size[1] as f32]) };
+    egui_wgpu::Callback::new_paint_callback(egui::Rect::NOTHING, callback).callback
 }
 
 #[cfg(test)]

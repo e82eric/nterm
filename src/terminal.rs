@@ -7,6 +7,7 @@ mod empty;
 pub(crate) mod floating;
 pub(crate) mod ghostty_app;
 mod layout;
+mod miniature;
 mod pane;
 pub(crate) use pane::close_from_session as close_pane_from_session;
 pub(crate) use pane::wake_from_session as wake_pane_from_session;

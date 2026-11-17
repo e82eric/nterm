@@ -25,6 +25,9 @@ use std::sync::{
 
 type Items = nfm_search_core::store::StreamingItemSnapshotWithPayload<SnapshotCellRange>;
 const RESULT_ROWS: usize = 7;
+/// About how many rows a picker takes besides its results and its preview:
+/// the query, the column headings and the gaps between the parts.
+const FRAME_ROWS: usize = 4;
 
 /// Ghostty owns source readers, terminal snapshots and Lua callbacks.
 /// The shared NFM control owns query input, streaming search and picker drawing.
@@ -44,6 +47,9 @@ pub(crate) struct Picker {
     command_preview: Option<preview::CommandPreview>,
     resolved_preview: Option<preview::ResolvedPreview>,
     snapshot_preview: Option<Arc<preview::SnapshotPreview>>,
+    /// The selected row's action and where its preview was last drawn, for
+    /// rows that run actions.
+    previewed: Option<(crate::actions::AppAction, egui::Rect)>,
     callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     request_params: std::collections::BTreeMap<String, String>,
     enter_action: config::EnterAction,
@@ -59,6 +65,8 @@ pub(crate) struct Picker {
     pub(crate) builtin_pickers: config::BuiltinPickers,
     result_rows: usize,
     preview_rows: usize,
+    /// See `config::Options::height`.
+    height: Option<f32>,
     line_split: bool,
     /// Overrides the source's label; see `config::Options::label`.
     label: Option<&'static str>,
@@ -418,6 +426,7 @@ impl Picker {
             from_copy,
             typography: font::Typography::default(),
             snapshot_preview,
+            previewed: None,
             command_preview,
             resolved_preview,
             callback: options.callback,
@@ -431,6 +440,7 @@ impl Picker {
             builtin_pickers: config::BuiltinPickers::default(),
             result_rows,
             preview_rows,
+            height: options.height,
             line_split: false,
             label: options.label,
             host: host as usize,
@@ -489,6 +499,11 @@ impl Picker {
         bounds: egui::Rect,
     ) -> Option<Action> {
         self.show_in_bounds_mode(ctx, bounds, true)
+    }
+    /// The action of the row whose preview is showing, and the preview's
+    /// rectangle, as of the last frame drawn.
+    pub(crate) fn previewed(&self) -> Option<&(crate::actions::AppAction, egui::Rect)> {
+        self.previewed.as_ref()
     }
     pub(crate) fn show_scoped(
         &mut self,
@@ -623,10 +638,32 @@ impl Picker {
             }
         }
         self.shared.set_error(self.error.lock().unwrap().clone());
+        if let Some(part) = self.height {
+            // The preview gets the rows the results and the picker's own
+            // lines leave of that part of the bounds.
+            let rows = (bounds.height() * part / self.typography.row_height.max(1.0)) as usize;
+            let rows = rows.saturating_sub(self.result_rows + FRAME_ROWS).max(4);
+            if rows != self.preview_rows {
+                self.preview_rows = rows;
+                let visible = self.shared.preview_visible();
+                self.shared.set_presentation(self.result_rows, rows, visible);
+            }
+        }
         let output = self
             .shared
             .show(ctx, self.placement(bounds), &appearance, !interactive);
         let selection = output.selection();
+        self.previewed = match (output.preview_rect, &selection) {
+            (Some(rect), Some(selection)) if !self.shared.is_closed() => self
+                .source
+                .application_action(&SearchResult {
+                    node_index: selection.item.node_index,
+                    score: 0,
+                    path: selection.text.clone(),
+                })
+                .map(|action| (action, rect)),
+            _ => None,
+        };
         if let Some(preview) = &mut self.resolved_preview {
             if output.preview_rect.is_some() && !self.shared.is_closed() {
                 if let Some(selection) = selection {

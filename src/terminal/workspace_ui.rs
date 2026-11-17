@@ -38,8 +38,12 @@ pub(crate) fn workspace_picker_options(
         ..Options::default()
     }
 }
+/// How much of the window's height the picker of workspaces takes. Most of
+/// it is the preview, where the selected workspace is drawn small.
+const PICKER_HEIGHT: f32 = 0.75;
 /// A picker over rows that each run an action, placed like the workspace
-/// picker.
+/// picker. It has a preview with no text of its own, for the selected
+/// workspace to be drawn in.
 pub(super) fn entry_picker(entries: Vec<crate::actions::Entry>) -> crate::picker::config::Options {
     use crate::picker::config::*;
     Options {
@@ -47,6 +51,9 @@ pub(super) fn entry_picker(entries: Vec<crate::actions::Entry>) -> crate::picker
         position: Position::Bottom,
         sort: Sort::SourceOrder,
         source: Source::Workspaces(entries),
+        preview: Some(Preview::Text { line_numbers: None, text: String::new(), wrap: false }),
+        preview_visible: true,
+        height: Some(PICKER_HEIGHT),
         ..Options::default()
     }
 }
@@ -1800,6 +1807,8 @@ impl TerminalView {
         if let Some(crate::picker::Action::Execute(action)) = self.show_window_picker(&ctx, content) {
             self.execute_action(action, self.floats().visible().is_some(), &ctx, gl);
         }
+        // The selected workspace, small, in the picker's preview.
+        self.show_miniature(&ctx, content, &style);
         self.show_mode_status(ui, status, &key_hints);
         let float_overlay = if floating_active {
             overlay

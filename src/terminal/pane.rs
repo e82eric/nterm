@@ -298,6 +298,8 @@ pub(super) struct TerminalPane {
     painter: Arc<egui::mutex::Mutex<TerminalPainter>>,
     paint_callback: crate::painter::PaintCallback,
     size: [u32; 2],
+    /// The pixels of the frame the painter holds; zero before the first.
+    frame_size: [u32; 2],
     scale: f32,
     focused: bool,
     active: bool,
@@ -418,6 +420,7 @@ impl TerminalPane {
             painter,
             paint_callback,
             size: [0, 0],
+            frame_size: [0, 0],
             scale: 0.0,
             focused: false,
             active: false,
@@ -451,8 +454,19 @@ impl TerminalPane {
         if !unsafe { ghostty_ffi::nterm_host_take_frame(self.host, &mut frame) } {
             return false;
         }
+        self.frame_size = [frame.width, frame.height];
         self.painter.lock().replace_frame(frame);
         true
+    }
+
+    /// A callback that draws the pane's last frame fitted to a smaller
+    /// rectangle, and the frame's pixels: it is the size the pane had when
+    /// it was drawn, which may not be the one it has now. `None` for a pane
+    /// that has not drawn.
+    pub(super) fn miniature(&self) -> Option<(crate::painter::PaintCallback, [u32; 2])> {
+        let size = self.frame_size;
+        (size[0] != 0 && size[1] != 0)
+            .then(|| (crate::painter::miniature(Arc::clone(&self.painter), size), size))
     }
 
     /// The session daemon's pane this one shows, once known.
