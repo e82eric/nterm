@@ -113,7 +113,11 @@ pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::acti
         Some(crate::actions::Entry {
             id: format!("session.{}", session.id),
             label: format!("{kind}{}", names.join(", ")),
-            shortcut: Some(match panes.iter().find_map(|pane| pane.pwd.clone()) {
+            shortcut: Some(match panes
+                .iter()
+                .find_map(|pane| pane.pwd.as_deref().map(place))
+                .filter(|place| !place.is_empty())
+            {
                 Some(place) => format!("{count} / {place}"),
                 None => count,
             }),
@@ -121,6 +125,18 @@ pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::acti
         })
     };
     listing.sessions.iter().filter_map(row).collect()
+}
+
+/// The directory in what a shell reported, which is a URL such as
+/// `kitty-shell-cwd://host/C:/src`: the path alone, and a drive without the
+/// slash before it.
+fn place(pwd: &str) -> String {
+    let path = match pwd.split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("", |at| &rest[at..]),
+        None => pwd,
+    };
+    let drive = path.strip_prefix('/').filter(|rest| rest.as_bytes().get(1) == Some(&b':'));
+    drive.unwrap_or(path).to_owned()
 }
 
 /// How a session being taken is laid out: as its window left it, cut down
@@ -408,6 +424,14 @@ mod tests {
     fn labels(sessions: Vec<SessionInfo>) -> Vec<String> {
         let rows = session_rows(&crate::session::Listing::of(sessions));
         rows.into_iter().map(|row| row.label).collect()
+    }
+
+    #[test]
+    fn a_reported_directory_is_shown_as_a_path() {
+        assert_eq!(place("kitty-shell-cwd://localhost/C:/src/nterm"), "C:/src/nterm");
+        assert_eq!(place("file://host/home/me"), "/home/me");
+        assert_eq!(place("C:/src"), "C:/src");
+        assert_eq!(place("file://host"), "");
     }
 
     #[test]

@@ -600,6 +600,10 @@ fn converse(
                     fail(Some(request), format!("pane {pane_id} is already shown"));
                     continue;
                 }
+                log(format_args!(
+                    "pane {pane_id}: client {id} attaches at {}x{}, was {}x{}",
+                    size.cols, size.rows, state.size.cols, state.size.rows
+                ));
                 state.resize(&pane, size);
                 state.subscribers.retain(|(client, _)| *client != id);
                 let mut info = pane.info_of(&mut state);
@@ -644,6 +648,12 @@ fn converse(
                     continue;
                 };
                 let mut state = pane.state.lock().unwrap();
+                if (size.cols, size.rows) != (state.size.cols, state.size.rows) {
+                    log(format_args!(
+                        "pane {pane_id}: resized to {}x{}, was {}x{}",
+                        size.cols, size.rows, state.size.cols, state.size.rows
+                    ));
+                }
                 state.resize(&pane, size);
                 // A UI reflows its own copy, and not always from the size
                 // this one came from; the daemon's copy replaces it.

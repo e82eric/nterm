@@ -10,6 +10,7 @@ return {
     { key = "j", mods = "CTRL|SHIFT", action = "SelectWorkspace:1" },
     { key = "k", mods = "CTRL|SHIFT", action = "SelectWorkspace:2" },
     { key = "g", mods = "CTRL|SHIFT", action = "SetGrid" },
+    { key = "t", mods = "CTRL|SHIFT", action = "SetHorizontalGrid" },
     { key = "d", mods = "CTRL|SHIFT", action = "DetachWorkspace" },
     { key = "z", mods = "CTRL|SHIFT", action = "EndWorkspace" },
     { key = "o", mods = "CTRL|SHIFT", action = "WorkspacePicker" },
