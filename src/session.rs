@@ -43,7 +43,10 @@ use std::{
 };
 
 /// How long copy mode, search and the pickers wait for a pane's history.
-const SNAPSHOT_WAIT: Duration = Duration::from_secs(5);
+/// The window does not draw meanwhile. A full history comes in well under a
+/// tenth of a second, so this is only how long a daemon that is stuck holds
+/// the window.
+const SNAPSHOT_WAIT: Duration = Duration::from_secs(1);
 
 /// How long a launch waits for the connection before it goes on without.
 
