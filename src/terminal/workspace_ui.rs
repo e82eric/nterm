@@ -510,12 +510,8 @@ impl TerminalView {
     /// a new one. With them, what they are rows of: an open picker is given
     /// its rows again when that changes, and not for a waiting shell's new
     /// title or directory, which its row shows as they were. Rows given
-    /// again take the selection back to the first. Without `list_folders`
-    /// the folders have no rows, and what the rows are of is the same.
-    pub(super) fn workspace_picker_rows(
-        &self,
-        list_folders: bool,
-    ) -> (Vec<crate::actions::Entry>, String) {
+    /// again take the selection back to the first.
+    pub(super) fn workspace_picker_rows(&self) -> (Vec<crate::actions::Entry>, String) {
         let window = self.has_panes();
         let options = workspace_picker_options(&self.workspaces, self.current);
         let mut entries = match options.source {
@@ -554,17 +550,10 @@ impl TerminalView {
             cells: vec![name.into()],
             action,
         };
-        // With folders to start one in, each is a row that does. Without,
-        // or until they are found, one row makes a new workspace where the
-        // window is.
-        let roots = &self.picker_bindings.new_workspace_roots;
-        let depth = self.picker_bindings.new_workspace_depth;
-        let folders = match list_folders {
-            true => super::folders::known(roots, depth),
-            false => Vec::new(),
-        };
-        if super::folders::any_known(roots, depth) {
-            of.push_str(&format!("folders {}", super::folders::version()));
+        // With folders to start one in, the picker goes on to list each it
+        // finds. Without, one row makes a new workspace where the window is.
+        if !self.picker_bindings.new_workspace_roots.is_empty() {
+            of.push_str("folders");
         } else if window {
             let create = AppAction::Workspace(WorkspaceAction::CreateWorkspace);
             entries.push(new("workspace.new", "New workspace", create));
@@ -573,15 +562,6 @@ impl TerminalView {
             // gone, whatever was chosen: see `chosen`.
             entries.push(new("session.new", "New session", AppAction::NewSession));
         }
-        entries.extend(folders.into_iter().map(|path| crate::actions::Entry {
-            id: format!("workspace.in.{path}"),
-            label: String::new(),
-            shortcut: None,
-            // No workspace yet, so no name under theirs: its state, and
-            // where it is where they say what runs.
-            cells: vec![String::new(), "new".into(), String::new(), String::new(), path.clone()],
-            action: AppAction::CreateWorkspaceIn(Some(path)),
-        }));
         of.push_str(if window { "window" } else { "launch" });
         (entries, of)
     }
@@ -591,10 +571,7 @@ impl TerminalView {
     /// to it, so it reads no terminal.
     pub(super) fn open_workspace_picker(&mut self, ctx: &egui::Context) {
         self.close_window_picker();
-        // What it lists of the folders is what was last found; look again.
-        let bindings = &self.picker_bindings;
-        super::folders::scan(&bindings.new_workspace_roots, bindings.new_workspace_depth, ctx);
-        let (rows, of) = self.workspace_picker_rows(true);
+        let (rows, of) = self.workspace_picker_rows();
         self.window_picker_rows = of;
         self.window_picker = Some(Box::new(crate::picker::Picker::start_replacing(
             std::ptr::null_mut(),
@@ -606,6 +583,11 @@ impl TerminalView {
             &self.picker_bindings.prompt_patterns,
             None,
         )));
+        // After those rows, the folders a new one can be started in.
+        let bindings = &self.picker_bindings;
+        if let Some(picker) = self.window_picker.as_mut() {
+            picker.list_folders(ctx, &bindings.new_workspace_roots, bindings.new_workspace_depth);
+        }
         // One opened again as a window empties says what emptied it.
         if let (Some(picker), Some((said, at))) = (self.window_picker.as_mut(), &self.picker_said)
             && at.elapsed() < PICKER_NOTICE
@@ -635,10 +617,7 @@ impl TerminalView {
             .active_pane()
             .and_then(|pane| self.pane_mut(pane))
             .map(|pane| pane.picker_typography(ctx));
-        // Without a row for each folder, which there can be thousands of:
-        // those are made only when the rows are to be given again.
-        let (_, of) = self.workspace_picker_rows(false);
-        let fresh = (of != self.window_picker_rows).then(|| self.workspace_picker_rows(true));
+        let (rows, of) = self.workspace_picker_rows();
         let builtin = self.picker_bindings.builtin_pickers;
         let padding = self.picker_bindings.cursor_scroll_padding;
         let picker = self.window_picker.as_mut()?;
@@ -649,7 +628,7 @@ impl TerminalView {
         picker.set_cursor_scroll_padding(padding);
         // The daemon says when the sessions change. Rows of what the picker
         // already has rows of are left alone.
-        if let Some((rows, of)) = fresh {
+        if of != self.window_picker_rows {
             self.window_picker_rows = of;
             picker.set_entries(ctx, rows);
             // New rows take away what the picker was saying.
@@ -699,7 +678,7 @@ impl TerminalView {
             position: Position::Bottom,
             source: Source::FileSystem(FileOptions {
                 roots: self.picker_bindings.new_workspace_roots.clone(),
-                // The folders of a root, and not what is in them.
+                // As many levels of folders as the picker of workspaces lists.
                 max_depth: self.picker_bindings.new_workspace_depth,
                 files_only: false,
                 directories_only: true,

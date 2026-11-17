@@ -173,6 +173,19 @@ impl Picker {
         self.shared.replace_source(ctx, self.source.provider(), query);
         true
     }
+    /// Have a picker of workspaces list, after its rows, a row for each
+    /// folder inside `roots` to `depth` levels, as each is found.
+    pub(crate) fn list_folders(
+        &mut self,
+        ctx: &egui::Context,
+        roots: &[std::path::PathBuf],
+        depth: i32,
+    ) {
+        if self.source.list_folders(roots, depth) {
+            let query = self.shared.query().to_owned();
+            self.shared.replace_source(ctx, self.source.provider(), query);
+        }
+    }
     pub(crate) fn bind_pipe_search_wake(
         &self,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<crate::app::UserEvent>,
@@ -809,9 +822,9 @@ impl Picker {
         };
         let command = *self.source.row_commands().get(at)?;
         let row = self.source.entry(&result)?;
-        let action = command.of(row)?;
+        let action = command.of(&row)?;
         Some(match command.keeps_picker() {
-            true => Action::Stay { action, said: command.done(row) },
+            true => Action::Stay { action, said: command.done(&row) },
             false => Action::Execute(action),
         })
     }

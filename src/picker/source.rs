@@ -10,6 +10,7 @@ use nfm_search_core::snapshot_store::SnapshotStore;
 use nfm_search_core::store::ItemsSource;
 use nfm_search_core::store::PublishingStreamingItemStoreWithPayload;
 use std::sync::{
+    Mutex,
     Arc,
     atomic::{AtomicBool, Ordering},
 };
@@ -38,6 +39,14 @@ enum Session {
     StructuredCommand {
         store: Arc<SnapshotStore<StructuredStreamingSnapshot>>,
     },
+    /// The rows of a picker of workspaces, and after them one for each
+    /// folder a scan goes on finding; see `FolderRows`.
+    Folders {
+        store: Arc<SnapshotStore<StructuredStreamingSnapshot>>,
+        groups: Option<Arc<[u8]>>,
+        found: Arc<FolderRows>,
+        scan: nfm_file_system::walker::FileWalkerScan,
+    },
     FileSystem {
         store: Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>,
         scan: nfm_file_system::walker::FileWalkerScan,
@@ -46,8 +55,103 @@ enum Session {
 }
 impl Session {
     fn stop(&self) {
-        if let Self::FileSystem { scan, .. } = self {
+        if let Self::FileSystem { scan, .. } | Self::Folders { scan, .. } = self {
             scan.cancel();
+        }
+    }
+}
+
+/// What a picker of workspaces lists after the rows it was given: a row for
+/// each folder a scan finds, added as it is found. However many folders
+/// there are, the first are to choose from at once, and no row is made
+/// twice.
+#[derive(Default)]
+struct FolderRows(Mutex<FoundFolders>);
+#[derive(Default)]
+struct FoundFolders {
+    /// The rows, and where they are published; none until `begin`.
+    rows: Option<(StructuredStreamingStore, Arc<SnapshotStore<StructuredStreamingSnapshot>>)>,
+    /// The folders that have a row, in the order of their rows.
+    folders: Vec<String>,
+    /// How many of the scan's entries have been read.
+    read: usize,
+    /// Whether the scan has ended.
+    done: bool,
+}
+impl FolderRows {
+    /// The row of a folder: one that starts a workspace in it.
+    fn entry(path: String) -> crate::actions::Entry {
+        crate::actions::Entry {
+            id: format!("workspace.in.{path}"),
+            label: String::new(),
+            shortcut: None,
+            // No workspace yet, so no name under theirs: its state, and
+            // where it is where they say what runs.
+            cells: vec![String::new(), "new".into(), String::new(), String::new(), path.clone()],
+            action: crate::actions::AppAction::CreateWorkspaceIn(Some(path)),
+        }
+    }
+    fn add(rows: &mut StructuredStreamingStore, path: &str) {
+        rows.add_record(&csv::StringRecord::from(vec!["", "", "new", "", "", path]))
+            .expect("folder row matches schema");
+    }
+    /// Begin again with `entries` as the rows before the folders', which
+    /// are those found so far. Returns where the rows are published from
+    /// now on, and the group each of `entries` is in.
+    fn begin(
+        &self,
+        entries: &[crate::actions::Entry],
+    ) -> (Arc<SnapshotStore<StructuredStreamingSnapshot>>, Option<Arc<[u8]>>) {
+        let (mut rows, groups) = PickerSource::structured(entries, true);
+        let store = Arc::new(SnapshotStore::new());
+        let mut found = self.0.lock().unwrap();
+        for folder in &found.folders {
+            Self::add(&mut rows, folder);
+        }
+        store.publish(rows.snapshot());
+        if found.done {
+            store.complete();
+        }
+        found.rows = Some((rows, store.clone()));
+        (store, groups)
+    }
+}
+impl nfm_file_system::walker::ScanEventSink for FolderRows {
+    fn snapshot(&self, snapshot: Arc<nfm_file_system::walker::PublishedSnapshot>) {
+        let mut found = self.0.lock().unwrap();
+        let found = &mut *found;
+        // Only what the scan has found since it last said. A root is an
+        // entry too, with no directory it is in, and is not listed.
+        let mut folders = Vec::new();
+        for index in found.read..snapshot.len() {
+            if let Some((_, directory)) = snapshot.name_and_directory(index)
+                && !directory.is_empty()
+                && snapshot.is_dir(index)
+                && let Some(path) = snapshot.item(index)
+            {
+                folders.push(path);
+            }
+        }
+        found.read = found.read.max(snapshot.len());
+        if folders.is_empty() {
+            return;
+        }
+        // Rows that match what is typed equally well are found in the
+        // order they were added: the shorter path first, of these.
+        folders.sort_by_key(String::len);
+        if let Some((rows, store)) = &mut found.rows {
+            for folder in &folders {
+                Self::add(rows, folder);
+            }
+            store.publish(rows.snapshot());
+        }
+        found.folders.append(&mut folders);
+    }
+    fn complete(&self, _status: nfm_file_system::walker::ScanStatus) {
+        let mut found = self.0.lock().unwrap();
+        found.done = true;
+        if let Some((_, store)) = &found.rows {
+            store.complete();
         }
     }
 }
@@ -574,8 +678,40 @@ impl PickerSource {
         if entries.iter().map(shown).eq(rows.iter().map(shown)) {
             return false;
         }
-        runtime.session = Self::rows(&rows, *workspaces);
+        if let Session::Folders { store, groups, found, .. } = &mut runtime.session {
+            // The folders found so far follow the new rows as they did the
+            // old, and those still to be found follow them.
+            (*store, *groups) = found.begin(&rows);
+        } else {
+            runtime.session = Self::rows(&rows, *workspaces);
+        }
         *entries = rows;
+        true
+    }
+    /// Have a picker of workspaces list, after its rows, the folders inside
+    /// `roots` to `depth` levels, each as it is found. Whoever shows the
+    /// rows has then to be given the provider again. Returns whether it is
+    /// such a picker and there are roots.
+    pub(super) fn list_folders(&mut self, roots: &[std::path::PathBuf], depth: i32) -> bool {
+        use nfm_file_system::walker::{ScanOptions, start_scan};
+        let Self::CommandPalette { runtime, entries, workspaces: true } = self else {
+            return false;
+        };
+        if roots.is_empty() {
+            return false;
+        }
+        let found = Arc::new(FolderRows::default());
+        let (store, groups) = found.begin(entries);
+        let options = ScanOptions {
+            roots: roots.to_vec(),
+            max_depth: depth,
+            directories_only: true,
+            files_only: false,
+            relative: false,
+        };
+        let scan = start_scan(options, found.clone());
+        runtime.session.stop();
+        runtime.session = Session::Folders { store, groups, found, scan };
         true
     }
     pub(super) fn provider(&self) -> Arc<Provider> {
@@ -585,7 +721,10 @@ impl PickerSource {
             Session::Structured { snapshot, groups } => {
                 Provider::Structured(snapshot.clone(), groups.clone())
             }
-            Session::StructuredCommand { store } => Provider::StructuredStream(store.clone()),
+            Session::StructuredCommand { store } => Provider::StructuredStream(store.clone(), None),
+            Session::Folders { store, groups, .. } => {
+                Provider::StructuredStream(store.clone(), groups.clone())
+            }
             Session::FileSystem { store, layout, .. } => {
                 Provider::FileSystem(store.clone(), *layout)
             }
@@ -594,6 +733,14 @@ impl PickerSource {
     /// The rows of a command palette, or of a picker of workspaces or of
     /// sessions, which have a column for each of a row's cells.
     fn rows(entries: &[crate::actions::Entry], workspaces: bool) -> Session {
+        let (mut structured, groups) = Self::structured(entries, workspaces);
+        Session::Structured { snapshot: structured.snapshot(), groups }
+    }
+    /// Those rows, to be added to, and the group each is in.
+    fn structured(
+        entries: &[crate::actions::Entry],
+        workspaces: bool,
+    ) -> (StructuredStreamingStore, Option<Arc<[u8]>>) {
         let columns: &[&str] = if workspaces {
             &["#", "Workspace", "State", "Layout", "Panes", "Running"]
         } else {
@@ -627,20 +774,29 @@ impl PickerSource {
             };
             entries.iter().map(group).collect()
         });
-        Session::Structured { snapshot: structured.snapshot(), groups }
+        (structured, groups)
     }
     /// The row a result is of, in a picker whose rows run actions.
-    pub(super) fn entry(&self, result: &SearchResult) -> Option<&crate::actions::Entry> {
-        match self {
-            Self::CommandPalette { entries, .. } => entries.get(result.node_index as usize),
-            _ => None,
-        }
+    pub(super) fn entry(
+        &self,
+        result: &SearchResult,
+    ) -> Option<std::borrow::Cow<'_, crate::actions::Entry>> {
+        use std::borrow::Cow;
+        let Self::CommandPalette { entries, .. } = self else { return None };
+        let row = entries.get(result.node_index).map(Cow::Borrowed);
+        row.or_else(|| self.folder(result.node_index).map(FolderRows::entry).map(Cow::Owned))
+    }
+    /// The folder a row after the rows it was given is of, in a picker of
+    /// workspaces that lists folders.
+    fn folder(&self, index: usize) -> Option<String> {
+        let Self::CommandPalette { runtime, entries, .. } = self else { return None };
+        let Session::Folders { found, .. } = &runtime.session else { return None };
+        let found = found.0.lock().unwrap();
+        found.folders.get(index.checked_sub(entries.len())?).cloned()
     }
     pub(super) fn accepted_value(&self, result: &SearchResult) -> String {
         let value = match self {
-            Self::CommandPalette { entries, .. } => entries
-                .get(result.node_index as usize)
-                .map(|entry| entry.id.clone()),
+            Self::CommandPalette { .. } => self.entry(result).map(|entry| entry.id.clone()),
             Self::Items { values, .. } => values.get(result.node_index as usize).cloned(),
             Self::Command {
                 values: Some(values),
@@ -686,13 +842,7 @@ impl PickerSource {
         &self,
         result: &SearchResult,
     ) -> Option<crate::actions::AppAction> {
-        if let Self::CommandPalette { entries, .. } = self {
-            entries
-                .get(result.node_index as usize)
-                .map(|entry| entry.action.clone())
-        } else {
-            None
-        }
+        self.entry(result).map(|entry| entry.action.clone())
     }
     /// What else the selected row can be asked to do, in a picker with
     /// rows for workspaces or sessions; see `RowCommand`.
@@ -1099,7 +1249,8 @@ pub(super) enum Provider {
     Streaming(Arc<SnapshotStore<Items>>),
     Document(Arc<SnapshotStore<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>>),
     Structured(Arc<StructuredStreamingSnapshot>, Option<Arc<[u8]>>),
-    StructuredStream(Arc<SnapshotStore<StructuredStreamingSnapshot>>),
+    /// Rows that go on being found, with the group each of the first is in.
+    StructuredStream(Arc<SnapshotStore<StructuredStreamingSnapshot>>, Option<Arc<[u8]>>),
     FileSystem(
         Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>,
         config::FileLayout,
@@ -1235,8 +1386,8 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Structured(s, groups) => {
                 Some(Arc::new(Snapshot::Structured(s.clone(), groups.clone())))
             }
-            Self::StructuredStream(s) => {
-                s.snapshot().map(|s| Arc::new(Snapshot::Structured(s, None)))
+            Self::StructuredStream(s, groups) => {
+                s.snapshot().map(|s| Arc::new(Snapshot::Structured(s, groups.clone())))
             }
             Self::FileSystem(s, layout) => s
                 .snapshot()
@@ -1248,7 +1399,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Streaming(s) => s.snapshot_version(),
             Self::Document(s) => s.snapshot_version(),
             Self::Structured(s, _) => s.version(),
-            Self::StructuredStream(s) => s.snapshot_version(),
+            Self::StructuredStream(s, _) => s.snapshot_version(),
             Self::FileSystem(s, _) => s.snapshot_version(),
         }
     }
@@ -1257,20 +1408,20 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
             Self::Streaming(s) => s.is_done(),
             Self::Document(s) => s.is_done(),
             Self::Structured(..) => true,
-            Self::StructuredStream(s) => s.is_done(),
+            Self::StructuredStream(s, _) => s.is_done(),
             Self::FileSystem(s, _) => s.is_done(),
         }
     }
     fn is_append_only(&self) -> bool {
         // Structured rows realign as column widths grow, so re-search them.
-        !matches!(self, Self::Structured(..) | Self::StructuredStream(_))
+        !matches!(self, Self::Structured(..) | Self::StructuredStream(..))
     }
     fn subscribe_updates(&self, wake: crossbeam_channel::Sender<()>) -> bool {
         match self {
             Self::Streaming(s) => s.subscribe_updates(wake),
             Self::Document(s) => s.subscribe_updates(wake),
             Self::Structured(..) => true,
-            Self::StructuredStream(s) => s.subscribe_updates(wake),
+            Self::StructuredStream(s, _) => s.subscribe_updates(wake),
             Self::FileSystem(s, _) => s.subscribe_updates(wake),
         }
     }
@@ -1279,6 +1430,65 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
 mod grouped_rows_tests {
     use super::*;
     use crate::actions::{AppAction, Entry};
+    #[test]
+    fn a_picker_of_workspaces_lists_the_folders_found_after_its_rows() {
+        use nfm_file_system::walker::{ScanOptions, start_scan};
+        let root = std::env::temp_dir().join(format!("nterm-folder-rows-{}", std::process::id()));
+        for folder in ["one/zeta", "one/beta/inner/deep", "two/gamma"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        std::fs::write(root.join("one/file.txt"), "").unwrap();
+        let entry = |action| Entry {
+            id: String::new(),
+            label: String::new(),
+            shortcut: None,
+            cells: vec!["mine".into()],
+            action,
+        };
+        let found = Arc::new(FolderRows::default());
+        let (store, groups) = found.begin(&[entry(AppAction::SelectWorkspaceId(1))]);
+        assert_eq!(groups.as_deref(), Some(&[0][..]));
+        // The row it was given is there before any folder is.
+        assert_eq!(store.snapshot().unwrap().len(), 1);
+        let options = ScanOptions {
+            roots: vec![root.join("one"), root.join("missing"), root.join("two")],
+            max_depth: 2,
+            directories_only: true,
+            files_only: false,
+            relative: false,
+        };
+        let _scan = start_scan(options, found.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !store.is_done() {
+            assert!(std::time::Instant::now() < deadline, "the scan ends");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // To two levels, and neither files nor the roots.
+        let inside = |folders: &[String]| -> Vec<String> {
+            let inside = |path: &String| {
+                let path = std::path::Path::new(path).strip_prefix(&root).unwrap();
+                path.to_str().unwrap().replace(std::path::MAIN_SEPARATOR, "/")
+            };
+            let mut inside: Vec<_> = folders.iter().map(inside).collect();
+            inside.sort();
+            inside
+        };
+        let folders = found.0.lock().unwrap().folders.clone();
+        assert_eq!(inside(&folders), ["one/beta", "one/beta/inner", "one/zeta", "two/gamma"]);
+        // A row each, after the one given, that says where it is.
+        let rows = store.snapshot().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.fields(1)["Running"], folders[0]);
+        assert_eq!(rows.fields(1)["State"], "new");
+        // Given other rows, the folders found follow those.
+        let two = [entry(AppAction::SelectWorkspaceId(1)), entry(AppAction::SelectWorkspaceId(2))];
+        let (store, _) = found.begin(&two);
+        let rows = store.snapshot().unwrap();
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.fields(2)["Running"], folders[0]);
+        assert!(store.is_done());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn a_windows_workspaces_are_found_before_sessions_and_those_before_folders() {
         let row = |cells: [&str; 2], action| Entry {

@@ -4,7 +4,6 @@ use crate::graphics as glow;
 use ghostty_app::GhosttyApp;
 
 mod empty;
-mod folders;
 pub(crate) mod floating;
 pub(crate) mod ghostty_app;
 mod layout;
