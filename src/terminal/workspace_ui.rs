@@ -853,7 +853,23 @@ impl TerminalView {
             self.closed_panes.push(pane);
         }
     }
+    /// Workspaces whose last tiled pane has gone go too, unless they have a
+    /// float: its panes are then the workspace's tiled ones, laid out as
+    /// they were, and the workspace stays. The float that is showing is the
+    /// one taken, or else the first; any others stay floats.
     pub(super) fn prune_workspaces(&mut self) {
+        for at in 0..self.workspaces.len() {
+            let workspace = &self.workspaces[at];
+            if !workspace.panes.is_empty() {
+                continue;
+            }
+            let float = workspace.floats.visible().or(workspace.floats.ids().first().copied());
+            let Some(float) = float else { continue };
+            self.workspaces[at].floats.remove(float);
+            if let Some(group) = self.floating.remove(float) {
+                self.workspaces[at].group = group;
+            }
+        }
         let orphaned =
             workspace::prune_empty(&mut self.workspaces, &mut self.current, &mut self.previous);
         self.close_floats(orphaned);
