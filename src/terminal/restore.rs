@@ -189,18 +189,16 @@ impl TerminalView {
         self.offered.is_some() && now.is_some() && now != self.offered
     }
 
-    /// Every frame: the open workspace picker is given its rows again when
-    /// the daemon has given another list. It stays open, with what is typed
-    /// in it, and is left alone if the rows are what it has.
+    /// Every frame: the open picker of workspaces and sessions is given its
+    /// rows again when the daemon has given another list. It stays open,
+    /// with what is typed in it, and is left alone if the rows are what it
+    /// has.
     pub(super) fn follow_sessions(&mut self) {
-        if self.offered.is_none() || self.empty.is_some() {
+        if self.offered.is_none() {
             return;
         }
-        let open = self
-            .active_pane()
-            .and_then(|pane| self.pane_mut(pane))
-            .is_some_and(|pane| pane.workspace_picker_active());
-        if !open {
+        if self.sessions_picker_mut().is_none() {
+            // The picker has closed.
             self.offered = None;
             return;
         }
@@ -209,11 +207,7 @@ impl TerminalView {
         }
         let rows = self.workspace_picker_rows();
         let ctx = self.context.clone();
-        if let Some(picker) = self
-            .active_pane()
-            .and_then(|pane| self.pane_mut(pane))
-            .and_then(|pane| pane.workspace_picker_mut())
-        {
+        if let Some(picker) = self.sessions_picker_mut() {
             picker.set_entries(&ctx, rows);
         }
     }

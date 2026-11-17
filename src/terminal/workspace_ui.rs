@@ -497,15 +497,44 @@ pub(crate) fn install_lua_helpers(lua: &mlua::Lua, nterm: &mlua::Table) -> mlua:
     )
 }
 impl TerminalView {
-    /// The rows of the workspace picker: this window's workspaces, and the
-    /// sessions no window shows, which can be taken from it too.
+    /// The rows of the picker of workspaces and sessions: this window's
+    /// workspaces, then the sessions no window shows. A window with no
+    /// terminal has no workspaces to show, and offers a new session after
+    /// those that wait; with none waiting it has no rows, and nothing to
+    /// ask.
     pub(super) fn workspace_picker_rows(&mut self) -> Vec<crate::actions::Entry> {
+        let window = self.has_panes();
+        let waiting = self.offer_waiting();
+        if !window && waiting.is_empty() {
+            self.offered = None;
+            return waiting;
+        }
         let options = workspace_picker_options(&self.workspaces, self.current, None);
-        let crate::picker::config::Source::Workspaces(mut entries) = options.source else {
-            return Vec::new();
+        let mut entries = match options.source {
+            crate::picker::config::Source::Workspaces(entries) if window => entries,
+            _ => Vec::new(),
         };
-        entries.extend(self.offer_waiting());
+        entries.extend(waiting);
+        if !window {
+            entries.push(crate::actions::Entry {
+                id: "session.new".into(),
+                label: "New session".into(),
+                shortcut: None,
+                action: AppAction::NewSession,
+            });
+        }
         entries
+    }
+
+    /// The open picker of workspaces and sessions: in the active pane, or
+    /// the window's own while it has no terminal.
+    pub(super) fn sessions_picker_mut(&mut self) -> Option<&mut crate::picker::Picker> {
+        if matches!(self.empty, Some(super::empty::Empty::Choose(_))) {
+            let Some(super::empty::Empty::Choose(picker)) = &mut self.empty else { return None };
+            return Some(picker);
+        }
+        let pane = self.active_pane()?;
+        self.pane_mut(pane)?.workspace_picker_mut()
     }
 
     fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
@@ -516,7 +545,7 @@ impl TerminalView {
         let mut options = workspace_picker_options(&self.workspaces, self.current, pane);
         self.offered = None;
         if !moving {
-            options.source = crate::picker::config::Source::Workspaces(self.workspace_picker_rows());
+            options = entry_picker(self.workspace_picker_rows());
         }
         let bindings = self.picker_bindings.clone();
         let palette = self.palette_context();

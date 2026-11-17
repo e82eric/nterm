@@ -6,13 +6,14 @@
 //! cannot be reached and offers to try again.
 
 use super::{TerminalView, pane::PaneStatus, workspace::Request};
-use crate::{actions::AppAction, graphics as glow, session::Status};
+use crate::{graphics as glow, session::Status};
 
 pub(super) enum Empty {
     /// The session daemon is being reached.
     Connecting,
     /// Sessions wait in the daemon: which to show, or a new one. The picker
-    /// is the window's own, as there is no pane to hold it.
+    /// is the one a pane shows for workspaces; the window holds it, as
+    /// there is no pane to.
     Choose(Box<crate::picker::Picker>),
     /// The daemon could not be reached, or was and has gone.
     Unavailable { lost: bool, reason: String },
@@ -110,25 +111,19 @@ impl TerminalView {
                 self.offered = None;
                 Some(Empty::Connecting)
             }
-            // Another window took a session, or left one: the choice is
-            // given what waits now, and stays as it is otherwise.
-            Empty::Choose(mut picker) if self.sessions_changed() => {
-                let rows = self.chooser_rows();
-                if rows.is_empty() {
-                    picker.surrender_focus();
-                    drop(picker);
-                    self.first_shell(gl)
-                } else {
-                    picker.set_entries(&ctx, rows);
-                    Some(Empty::Choose(picker))
-                }
+            // Other windows took every session that waited, so there is
+            // nothing left to ask: see `workspace_picker_rows`.
+            Empty::Choose(picker) if self.offered.is_none() => {
+                picker.surrender_focus();
+                drop(picker);
+                self.first_shell(gl)
             }
             Empty::Choose(mut picker) => match picker.show_scoped(&ctx, content, None, true) {
                 None => Some(Empty::Choose(picker)),
                 Some(action) => {
                     picker.surrender_focus();
                     drop(picker);
-                    self.chosen(action, gl)
+                    self.chosen(action, &ctx, gl)
                 }
             },
             // Another window asked again, and it is under way or done.
@@ -163,27 +158,10 @@ impl TerminalView {
         self.toasts.show(&ctx, content, egui::Id::new("window-toasts"), None, 0.0);
     }
 
-    /// The rows of the choice at launch: the waiting sessions, and a new
-    /// one. None when no session waits.
-    fn chooser_rows(&mut self) -> Vec<crate::actions::Entry> {
-        let mut entries = self.offer_waiting();
-        if entries.is_empty() {
-            self.offered = None;
-            return entries;
-        }
-        entries.push(crate::actions::Entry {
-            id: "session.new".into(),
-            label: "New session".into(),
-            shortcut: None,
-            action: AppAction::NewSession,
-        });
-        entries
-    }
-
-    /// The picker that asks which waiting session to show. `None` when
-    /// none waits.
+    /// The picker of workspaces and sessions, for a window with no pane to
+    /// hold it. `None` when no session waits.
     fn chooser(&mut self, ctx: &egui::Context) -> Option<Box<crate::picker::Picker>> {
-        let entries = self.chooser_rows();
+        let entries = self.workspace_picker_rows();
         if entries.is_empty() {
             return None;
         }
@@ -201,20 +179,21 @@ impl TerminalView {
         )))
     }
 
-    /// The choice was made: a session, or, by its row or by Escape, a new
-    /// shell.
-    fn chosen(&mut self, action: crate::picker::Action, gl: &glow::Context) -> Option<Empty> {
-        let crate::picker::Action::Execute(AppAction::AttachSession(id)) = action else {
-            self.offered = None;
-            return self.first_shell(gl);
-        };
-        match self.attach_session(&id, gl) {
-            Ok(()) => None,
-            Err(error) => {
-                self.show_error("Session could not be shown", error);
-                self.first_shell(gl)
-            }
+    /// The picker has gone. What was chosen is done as it is from a pane's
+    /// picker; a window still without a terminal after that, by the row for
+    /// a new session, by Escape, or because the session could not be shown,
+    /// starts a shell.
+    fn chosen(
+        &mut self,
+        action: crate::picker::Action,
+        ctx: &egui::Context,
+        gl: &glow::Context,
+    ) -> Option<Empty> {
+        self.offered = None;
+        if let crate::picker::Action::Execute(action) = action {
+            self.execute_action(action, false, ctx, gl);
         }
+        if self.has_panes() { None } else { self.first_shell(gl) }
     }
 
     /// The window's first terminal, on a new shell. On failure the window
