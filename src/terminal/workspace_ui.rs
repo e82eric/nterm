@@ -26,8 +26,8 @@ pub(crate) fn workspace_picker_options(
                 .map(|w| crate::actions::Entry {
                     id: format!("workspace.{}", w.id),
                     label: format!(
-                        "Workspace {}{}",
-                        w.index,
+                        "{}{}",
+                        w.title(),
                         if w.id == current { " [current]" } else { "" }
                     ),
                     shortcut: Some(format!("{} / {} panes", w.layout.tag(), w.panes.len())),
@@ -56,6 +56,8 @@ pub(super) fn entry_picker(entries: Vec<crate::actions::Entry>) -> crate::picker
 pub(crate) enum WorkspaceAction {
     CreateWorkspace,
     RemoveWorkspace,
+    /// Ask for a name for the workspace.
+    RenameWorkspace,
     /// Take the workspace out of the window; its shells stay in the daemon.
     DetachWorkspace,
     /// End every shell in the workspace.
@@ -117,6 +119,7 @@ impl WorkspaceAction {
     pub(crate) const ALL: &[Self] = &[
         Self::CreateWorkspace,
         Self::RemoveWorkspace,
+        Self::RenameWorkspace,
         Self::DetachWorkspace,
         Self::EndWorkspace,
         Self::WorkspacePicker,
@@ -186,6 +189,7 @@ impl WorkspaceAction {
             MoveToWorkspace(index) => format!("MoveToWorkspace:{index}").into(),
             CreateWorkspace => "CreateWorkspace".into(),
             RemoveWorkspace => "RemoveWorkspace".into(),
+            RenameWorkspace => "RenameWorkspace".into(),
             DetachWorkspace => "DetachWorkspace".into(),
             EndWorkspace => "EndWorkspace".into(),
             WorkspacePicker => "WorkspacePicker".into(),
@@ -302,6 +306,7 @@ impl WorkspaceAction {
             | ResizeFarUp | ResizeFarDown => true,
             CreateWorkspace
             | RemoveWorkspace
+            | RenameWorkspace
             | DetachWorkspace
             | EndWorkspace
             | WorkspacePicker
@@ -576,6 +581,39 @@ impl TerminalView {
         }
         self.close_window_picker();
         Some(action)
+    }
+    /// Ask what to call a workspace, starting from what it is called now.
+    /// Nothing typed takes its name away.
+    pub(super) fn rename_workspace_prompt(&mut self, id: u64, ctx: &egui::Context) {
+        use crate::picker::config::{PickerEntry, PromptAction, PromptOptions, Scope};
+        let Some(workspace) = self.workspaces.iter().find(|w| w.id == id) else {
+            return;
+        };
+        let options = PromptOptions {
+            scope: Scope::Workspace,
+            position: Default::default(),
+            action: PromptAction::App(std::rc::Rc::new(move |name| {
+                AppAction::RenameWorkspace { id, name }
+            })),
+            params: workspace
+                .name
+                .iter()
+                .map(|name| ("query".to_owned(), name.clone()))
+                .collect(),
+            prompt: Some(format!("Name for workspace {}:", workspace.index)),
+            placeholder: Some("nothing, for no name".into()),
+        };
+        let bindings = self.picker_bindings.clone();
+        let palette = self.palette_context();
+        if let Some(pane) = self.active_pane().and_then(|p| self.pane_mut(p)) {
+            pane.open_picker(ctx, PickerEntry::Prompt(options), None, &bindings, &palette);
+        }
+    }
+    pub(super) fn rename_workspace(&mut self, id: u64, name: &str) {
+        if let Some(workspace) = self.workspaces.iter_mut().find(|w| w.id == id) {
+            workspace.name = workspace::named(name);
+            self.context.request_repaint();
+        }
     }
     pub(super) fn workspace(&self) -> &Workspace {
         self.workspaces
@@ -1116,6 +1154,7 @@ impl TerminalView {
                 RemoveWorkspace => {
                     self.workspace_request(Request::Remove(self.current), gl)?;
                 }
+                RenameWorkspace => self.rename_workspace_prompt(self.current, ctx),
                 DetachWorkspace => self.detach_workspace()?,
                 EndWorkspace => self.end_workspace(),
                 NextWorkspace | PreviousWorkspace => {
@@ -1379,7 +1418,10 @@ impl TerminalView {
             }
             response.on_hover_text(format!(
                 "{} · {} · {} panes",
-                w.index,
+                w.name.as_deref().map_or_else(
+                    || w.index.to_string(),
+                    |name| format!("{}: {name}", w.index)
+                ),
                 w.layout.tag(),
                 w.panes.len()
             ));

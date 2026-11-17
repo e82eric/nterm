@@ -611,7 +611,7 @@ impl Definition {
                 return Ok(PickerEntry::Prompt(PromptOptions {
                     scope,
                     position,
-                    callback,
+                    action: PromptAction::Lua(callback),
                     params,
                     prompt,
                     placeholder,
@@ -1216,13 +1216,22 @@ pub(crate) struct Options {
     pub(crate) label: Option<&'static str>,
 }
 
+/// What a prompt does with the text typed.
+#[derive(Clone)]
+pub(crate) enum PromptAction {
+    /// A Lua action, run with the text as its item. The prompt stays unless
+    /// the action closes it.
+    Lua(std::rc::Rc<crate::lua_callbacks::Callback>),
+    /// An action of the app's, made from the text. The prompt closes.
+    App(std::rc::Rc<dyn Fn(String) -> crate::actions::AppAction>),
+}
+
 /// What an `Argument` definition opens: a prompt for a line of text.
 #[derive(Clone)]
 pub(crate) struct PromptOptions {
     pub(crate) scope: Scope,
     pub(crate) position: Position,
-    /// Runs with the text typed as its item.
-    pub(crate) callback: std::rc::Rc<crate::lua_callbacks::Callback>,
+    pub(crate) action: PromptAction,
     /// Handed to the action. `query` is the text the prompt opens with.
     pub(crate) params: BTreeMap<String, String>,
     /// Shown before the text in place of `>`.

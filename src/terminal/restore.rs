@@ -34,6 +34,8 @@ struct Saved {
     appearance: Option<Appearance>,
     floats: Vec<Float>,
     visible_float: Option<u32>,
+    /// What the user called the workspace.
+    name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -86,6 +88,21 @@ fn takeable(session: &SessionInfo) -> Vec<&PaneInfo> {
     }
 }
 
+/// What the user called a session's workspace. It is kept in the layout,
+/// which is all this reads of it: a layout this build cannot lay out may
+/// still say the name. The shells in no session have none.
+fn session_name(session: &SessionInfo) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Named {
+        name: Option<String>,
+    }
+    if session.id.is_empty() {
+        return None;
+    }
+    let named: Named = serde_json::from_str(&session.layout).ok()?;
+    named.name.as_deref().and_then(workspace::named)
+}
+
 /// A picker's rows for the sessions the daemon holds that nothing is
 /// showing: what runs in each, how many panes and where.
 pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::actions::Entry> {
@@ -110,17 +127,21 @@ pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::acti
             count => format!("{count} panes"),
         };
         let kind = if session.id.is_empty() { "Shells in no session: " } else { "Session: " };
+        let names = names.join(", ");
+        let place = panes
+            .iter()
+            .find_map(|pane| pane.pwd.as_deref().map(place))
+            .filter(|place| !place.is_empty());
+        // A session with a name is called by it, and what it runs moves
+        // over beside how many panes it has.
+        let (label, detail) = match session_name(session) {
+            Some(name) => (name, [Some(count), Some(names), place]),
+            None => (names, [Some(count), None, place]),
+        };
         Some(crate::actions::Entry {
             id: format!("session.{}", session.id),
-            label: format!("{kind}{}", names.join(", ")),
-            shortcut: Some(match panes
-                .iter()
-                .find_map(|pane| pane.pwd.as_deref().map(place))
-                .filter(|place| !place.is_empty())
-            {
-                Some(place) => format!("{count} / {place}"),
-                None => count,
-            }),
+            label: format!("{kind}{label}"),
+            shortcut: Some(detail.into_iter().flatten().collect::<Vec<_>>().join(" / ")),
             action: AppAction::AttachSession(session.id.clone()),
         })
     };
@@ -209,6 +230,7 @@ impl TerminalView {
         workspace.pane_weights = weights;
         workspace.appearance =
             saved.appearance.clone().filter(|appearance| appearance.validate().is_ok());
+        workspace.name = saved.name.as_deref().and_then(workspace::named);
         match visible {
             Some(id) => workspace.floats.show(id),
             None => workspace.floats.hide(),
@@ -300,6 +322,7 @@ impl TerminalView {
                 .map(|(pane, name)| Float { pane, name })
                 .collect(),
             visible_float: workspace.floats.visible().and_then(|id| float(&id)).map(|(pane, _)| pane),
+            name: workspace.name.clone(),
             panes,
         })
     }
@@ -464,6 +487,22 @@ mod tests {
         let other = format!(r#"{{"version":{},"panes":[4]}}"#, VERSION + 1);
         assert_eq!(labels(vec![session("a", other, &[pane(4, false, None)])]), ["Session: cmd.exe"]);
         assert_eq!(labels(vec![session("a", "nonsense".into(), &[pane(4, false, None)])]).len(), 1);
+    }
+
+    #[test]
+    fn a_named_session_is_called_by_its_name_and_says_what_runs_beside_it() {
+        let named = format!(r#"{{"version":{VERSION},"panes":[1],"name":"build"}}"#);
+        let listing = crate::session::Listing::of(vec![session("a", named, &[pane(1, false, None)])]);
+        let rows = session_rows(&listing);
+        assert_eq!(rows[0].label, "Session: build");
+        assert_eq!(rows[0].shortcut.as_deref(), Some("1 pane / cmd.exe"));
+        // A name is read from a layout this build cannot lay out.
+        let other = format!(r#"{{"version":{},"name":"later"}}"#, VERSION + 1);
+        let listing = crate::session::Listing::of(vec![session("a", other, &[pane(1, false, None)])]);
+        assert_eq!(session_rows(&listing)[0].label, "Session: later");
+        // What is typed is trimmed and kept to a line; nothing is no name.
+        assert_eq!(workspace::named("  api\tserver\n "), Some("apiserver".into()));
+        assert_eq!(workspace::named("   "), None);
     }
 
     #[test]

@@ -558,6 +558,7 @@ impl TerminalView {
                     self.show_error("Workspace action failed", error);
                 }
             }
+            AppAction::RenameWorkspace { id, name } => self.rename_workspace(id, &name),
             AppAction::AttachSession(id) => {
                 if let Err(error) = self.attach_session(&id, gl) {
                     self.show_error("Session could not be shown", error);

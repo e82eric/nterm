@@ -174,6 +174,8 @@ pub(crate) struct Workspace {
     /// weighs 1.0. Kept per layout because layouts group panes differently.
     pub pane_weights: BTreeMap<Layout, BTreeMap<u64, f32>>,
     pub appearance: Option<Appearance>,
+    /// What the user called it. It names the session its shells are too.
+    pub name: Option<String>,
     #[serde(flatten)]
     pub floats: super::floating::Floats,
     /// What the workspace is in the session daemon, once it has told the
@@ -181,7 +183,27 @@ pub(crate) struct Workspace {
     #[serde(skip)]
     pub session: Option<Session>,
 }
+/// The longest name a workspace keeps.
+const NAME_LENGTH: usize = 64;
+/// A workspace's name from what was typed: trimmed, on one line and no
+/// longer than `NAME_LENGTH`. `None` for nothing, which takes a name away.
+pub(crate) fn named(text: &str) -> Option<String> {
+    let name: String = text
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(NAME_LENGTH)
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
 impl Workspace {
+    /// What the pickers call it: its number, and its name when it has one.
+    pub fn title(&self) -> String {
+        match &self.name {
+            Some(name) => format!("Workspace {}: {name}", self.index),
+            None => format!("Workspace {}", self.index),
+        }
+    }
     pub fn new(id: u64, index: usize) -> Self {
         Self {
             id,
@@ -192,6 +214,7 @@ impl Workspace {
             main_ratio: 0.5,
             pane_weights: Default::default(),
             appearance: None,
+            name: None,
             floats: Default::default(),
             session: None,
         }

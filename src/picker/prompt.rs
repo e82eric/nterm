@@ -11,8 +11,8 @@ pub(crate) struct Prompt {
     pub(crate) cursor_row: Option<u32>,
     pub(crate) from_copy: bool,
     pub(crate) typography: font::Typography,
-    /// Runs with the text typed as its item.
-    callback: std::rc::Rc<crate::lua_callbacks::Callback>,
+    /// What Enter does with the text typed.
+    action:config::PromptAction,
     request_params: std::collections::BTreeMap<String, String>,
 }
 
@@ -46,7 +46,7 @@ impl Prompt {
             cursor_row: None,
             from_copy,
             typography: font::Typography::default(),
-            callback: options.callback,
+            action: options.action,
             request_params: options.params,
         }
     }
@@ -96,17 +96,20 @@ impl Prompt {
         {
             Some(nfm_egui::PromptEvent::Cancelled) => Some(Action::Cancel),
             // The text typed is the item.
-            Some(nfm_egui::PromptEvent::Submitted(text)) => Some(Action::Custom(CustomAction {
-                callback: self.callback.clone(),
-                text: text.clone(),
-                filesystem: false,
-                range: None,
-                value: text,
-                params: self.request_params.clone(),
-                // Text is not a result: the prompt stays unless the action
-                // closes it.
-                accepted: false,
-            })),
+            Some(nfm_egui::PromptEvent::Submitted(text)) => Some(match &self.action {
+                config::PromptAction::Lua(callback) => Action::Custom(CustomAction {
+                    callback: callback.clone(),
+                    text: text.clone(),
+                    filesystem: false,
+                    range: None,
+                    value: text,
+                    params: self.request_params.clone(),
+                    // Text is not a result: the prompt stays unless the
+                    // action closes it.
+                    accepted: false,
+                }),
+                config::PromptAction::App(action) => Action::Execute(action(text)),
+            }),
             None => None,
         }
     }
@@ -167,7 +170,7 @@ mod tests {
         config::PromptOptions {
             scope: Default::default(),
             position: Default::default(),
-            callback,
+            action: config::PromptAction::Lua(callback),
             params,
             prompt: Some("Grep:".into()),
             placeholder: None,

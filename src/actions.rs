@@ -6,6 +6,8 @@ pub(crate) enum AppAction {
     Workspace(WorkspaceAction),
     /// Picker results that refer to window-local IDs, not config indexes.
     SelectWorkspaceId(u64),
+    /// Call a workspace of this window `name`; nothing takes its name away.
+    RenameWorkspace { id: u64, name: String },
     /// Show a session waiting in the session daemon as a workspace. The
     /// name is the daemon's; empty for the shells no session describes.
     AttachSession(String),
@@ -80,6 +82,7 @@ impl AppAction {
             self,
             Self::Workspace(_)
                 | Self::SelectWorkspaceId(_)
+                | Self::RenameWorkspace { .. }
                 | Self::AttachSession(_)
                 | Self::NewSession
                 | Self::NewWindow
