@@ -603,6 +603,9 @@ impl PickerSource {
         }
         Session::Structured { snapshot: structured.snapshot() }
     }
+    pub(super) fn lists_workspaces(&self) -> bool {
+        matches!(self, Self::CommandPalette { workspaces: true, .. })
+    }
     /// Give a picker of workspaces or sessions its rows again. Whoever
     /// shows them has then to be given the provider again too. Returns
     /// whether they differ from the rows it had.

@@ -145,6 +145,10 @@ impl Picker {
         }
         Ok(())
     }
+    /// Whether its rows are workspaces and sessions.
+    pub(crate) fn lists_workspaces(&self) -> bool {
+        self.source.lists_workspaces()
+    }
     /// Give a picker of workspaces or sessions its rows again, keeping what
     /// is typed in it. Rows that are what it has are left alone, with the
     /// selection; returns whether they were not.

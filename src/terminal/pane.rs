@@ -1014,12 +1014,10 @@ impl TerminalPane {
             .top()
             .is_some_and(|p| p.scope() == crate::picker::config::Scope::Workspace)
     }
-    /// The workspace picker, when it is open.
+    /// The picker of workspaces and sessions, when it is the one open.
+    /// Other pickers are shown across the workspace too.
     pub(super) fn workspace_picker_mut(&mut self) -> Option<&mut crate::picker::Picker> {
-        let page = self.pages.top_mut()?;
-        (page.scope() == crate::picker::config::Scope::Workspace)
-            .then(|| page.picker_mut())
-            .flatten()
+        self.pages.top_mut()?.picker_mut().filter(|picker| picker.lists_workspaces())
     }
     pub(super) fn cancel_workspace_picker(&mut self) {
         if !self.workspace_picker_active() {
