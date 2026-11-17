@@ -109,7 +109,7 @@ impl Listing {
 
 /// Whether a pane's shell is running with nothing showing it.
 pub(crate) fn waiting(pane: &PaneInfo) -> bool {
-    pane.exited.is_none() && pane.attached == 0
+    pane.exited.is_none() && !pane.attached
 }
 
 
@@ -846,7 +846,7 @@ impl Link {
         }
         // Registered before the attach is sent, so its screen finds us.
         self.daemon.panes.lock().unwrap().insert(pane, self.clone());
-        self.ask(|request| Control::Attach { request, pane, size, exclusive: true });
+        self.ask(|request| Control::Attach { request, pane, size });
     }
 
     /// The daemon has started the shell this link asked for.

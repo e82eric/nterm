@@ -393,7 +393,7 @@ mod tests {
     use super::*;
     use nterm_session::protocol::{SessionInfo, Size};
 
-    fn pane(number: u32, attached: u32, title: Option<&str>) -> PaneInfo {
+    fn pane(number: u32, attached: bool, title: Option<&str>) -> PaneInfo {
         PaneInfo {
             pane: number,
             pid: 1,
@@ -437,13 +437,13 @@ mod tests {
     #[test]
     fn waiting_sessions_are_offered_and_shown_ones_are_not() {
         let sessions = vec![
-            session("a", layout(&[1, 2], &[]), &[pane(1, 0, Some("build")), pane(2, 0, None)]),
+            session("a", layout(&[1, 2], &[]), &[pane(1, false, Some("build")), pane(2, false, None)]),
             // Another window is showing it.
-            session("b", layout(&[3], &[]), &[pane(3, 1, None)]),
+            session("b", layout(&[3], &[]), &[pane(3, true, None)]),
             // A window shows one of its shells: it is taken whole or not.
-            session("c", layout(&[6, 7], &[]), &[pane(6, 1, None), pane(7, 0, None)]),
+            session("c", layout(&[6, 7], &[]), &[pane(6, true, None), pane(7, false, None)]),
             // In no session: the one that waits is offered.
-            session("", String::new(), &[pane(5, 0, Some("stray")), pane(8, 1, None)]),
+            session("", String::new(), &[pane(5, false, Some("stray")), pane(8, true, None)]),
         ];
         let rows = session_rows(&crate::session::Listing::of(sessions));
         let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
@@ -458,13 +458,13 @@ mod tests {
         // Listing reads no layout: one this build cannot read is a session
         // all the same.
         let other = format!(r#"{{"version":{},"panes":[4]}}"#, VERSION + 1);
-        assert_eq!(labels(vec![session("a", other, &[pane(4, 0, None)])]), ["Session: cmd.exe"]);
-        assert_eq!(labels(vec![session("a", "nonsense".into(), &[pane(4, 0, None)])]).len(), 1);
+        assert_eq!(labels(vec![session("a", other, &[pane(4, false, None)])]), ["Session: cmd.exe"]);
+        assert_eq!(labels(vec![session("a", "nonsense".into(), &[pane(4, false, None)])]).len(), 1);
     }
 
     #[test]
     fn a_session_is_taken_as_it_was_laid_out_with_every_shell_it_has() {
-        let panes = [pane(1, 0, None), pane(2, 0, None), pane(3, 0, None)];
+        let panes = [pane(1, false, None), pane(2, false, None), pane(3, false, None)];
         // Its float is still a float; a shell the layout leaves out is tiled.
         let saved = arrangement(&session("a", layout(&[2], &[1]), &panes)).unwrap();
         assert_eq!(saved.panes, [2, 3]);
@@ -480,6 +480,6 @@ mod tests {
         let other = format!(r#"{{"version":{},"panes":[2,1]}}"#, VERSION + 1);
         assert_eq!(arrangement(&session("a", other, &panes[..2])).unwrap().panes, [1, 2]);
         // One a window is showing cannot be taken.
-        assert!(arrangement(&session("a", layout(&[1], &[]), &[pane(1, 1, None)])).is_none());
+        assert!(arrangement(&session("a", layout(&[1], &[]), &[pane(1, true, None)])).is_none());
     }
 }

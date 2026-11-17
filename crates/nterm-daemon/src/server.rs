@@ -96,8 +96,9 @@ struct State {
     /// Gone once the shell has ended.
     console: Option<conpty::Console>,
     size: Size,
-    /// The UIs that get this pane's output.
-    subscribers: Vec<(u64, Outbox)>,
+    /// The UI that shows this pane and gets its output. A pane is shown by
+    /// one UI at a time.
+    shown: Option<(u64, Outbox)>,
     exited: Option<u32>,
     /// Forget the pane as soon as its shell has ended.
     closing: bool,
@@ -119,12 +120,18 @@ impl Pane {
             command: self.command.clone(),
             size: state.size,
             exited: state.exited,
-            attached: state.subscribers.len() as u32,
+            attached: state.shown.is_some(),
         }
     }
 }
 
 impl State {
+    /// Send a frame to the UI that shows the pane. One that cannot be sent
+    /// to has gone, and no longer shows it.
+    fn send(&mut self, frame: Vec<u8>) {
+        self.shown.take_if(|(_, outbox)| outbox.send(frame).is_err());
+    }
+
     /// Reflow the terminal, then tell the pseudoconsole, as the UI's own
     /// terminal did when it owned the shell.
     fn resize(&mut self, pane: &Pane, size: Size) {
@@ -260,7 +267,7 @@ impl Session {
                 terminal,
                 console: Some(console),
                 size,
-                subscribers: Vec::new(),
+                shown: None,
                 exited: None,
                 closing: false,
             }),
@@ -303,9 +310,8 @@ impl Session {
                         if !replies.is_empty() {
                             let _ = pane.input.send(replies);
                         }
-                        if !state.subscribers.is_empty() {
-                            let frame = Frame::encode_output(pane.id, bytes);
-                            state.subscribers.retain(|(_, outbox)| outbox.send(frame.clone()).is_ok());
+                        if state.shown.is_some() {
+                            state.send(Frame::encode_output(pane.id, bytes));
                         }
                     }
                 })
@@ -478,7 +484,7 @@ fn serve(session: &Arc<Session>, connection: Connection) {
     let panes: Vec<_> = session.panes.lock().unwrap().values().cloned().collect();
     for pane in panes {
         let mut state = pane.state.lock().unwrap();
-        state.subscribers.retain(|(client, _)| *client != id);
+        state.shown.take_if(|(client, _)| *client == id);
         // The last UI has gone: an ended shell it left has nobody to close
         // it. Running ones wait for the next UI.
         if last && state.exited.is_some() {
@@ -585,17 +591,17 @@ fn converse(
                     Err(message) => fail(Some(request), message),
                 }
             }
-            Control::Attach { request, pane: pane_id, size, exclusive } => {
+            Control::Attach { request, pane: pane_id, size } => {
                 let Some(pane) = session.pane(pane_id) else {
                     missing(Some(request), pane_id);
                     continue;
                 };
                 // The check, the resize, the screen and the subscription
-                // under one lock: of two UIs that ask for a pane to
-                // themselves one is refused, and the output that follows
-                // starts exactly where the screen ends.
+                // under one lock: of two UIs that ask for a pane one is
+                // refused, and the output that follows starts exactly
+                // where the screen ends.
                 let mut state = pane.state.lock().unwrap();
-                if exclusive && state.subscribers.iter().any(|(client, _)| *client != id) {
+                if state.shown.as_ref().is_some_and(|(client, _)| *client != id) {
                     drop(state);
                     fail(Some(request), format!("pane {pane_id} is already shown"));
                     continue;
@@ -605,13 +611,11 @@ fn converse(
                     size.cols, size.rows, state.size.cols, state.size.rows
                 ));
                 state.resize(&pane, size);
-                state.subscribers.retain(|(client, _)| *client != id);
                 let mut info = pane.info_of(&mut state);
-                info.attached += 1;
+                info.attached = true;
                 send(Control::Attached { request, info });
-                if state.send_screen(pane_id, outbox) {
-                    state.subscribers.push((id, outbox.clone()));
-                }
+                state.shown =
+                    state.send_screen(pane_id, outbox).then(|| (id, outbox.clone()));
                 if let Some(code) = state.exited {
                     send(Control::Exited { pane: pane_id, code });
                 }
@@ -619,7 +623,7 @@ fn converse(
             }
             Control::Detach { pane: pane_id } => {
                 if let Some(pane) = session.pane(pane_id) {
-                    pane.state.lock().unwrap().subscribers.retain(|(client, _)| *client != id);
+                    pane.state.lock().unwrap().shown.take_if(|(client, _)| *client == id);
                 }
                 // After it has left the pane, so no program finds it there.
                 session.end_channels(|_, c| c.pane == pane_id && c.ui == id, false);
@@ -659,7 +663,7 @@ fn converse(
                 // this one came from; the daemon's copy replaces it.
                 let frame =
                     Frame::Screen { pane: pane_id, bytes: state.terminal.screen() }.encode();
-                state.subscribers.retain(|(_, outbox)| outbox.send(frame.clone()).is_ok());
+                state.send(frame);
             }
             Control::Snapshot { request, pane: pane_id } => {
                 let Some(pane) = session.pane(pane_id) else {
@@ -722,7 +726,7 @@ fn relay(
         // Under the pane's lock, as leaving a pane is: a UI that leaves
         // either is not found here or finds the channel to end.
         let state = pane.state.lock().unwrap();
-        let Some((ui, ui_outbox)) = state.subscribers.last().cloned() else {
+        let Some((ui, ui_outbox)) = state.shown.clone() else {
             drop(state);
             return refuse("no window is showing this pane".into());
         };

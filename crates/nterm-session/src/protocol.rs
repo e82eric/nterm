@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -88,9 +88,9 @@ pub struct PaneInfo {
     pub size: Size,
     /// The exit code once the shell has ended.
     pub exited: Option<u32>,
-    /// How many UIs are attached to it.
+    /// Whether a UI shows it. A pane is shown by one UI at a time.
     #[serde(default)]
-    pub attached: u32,
+    pub attached: bool,
     /// The title the shell last set, for a UI that was not there to hear it.
     #[serde(default)]
     pub title: Option<String>,
@@ -129,14 +129,11 @@ pub enum Control {
     /// Resize the pane to `size`, send its screen, then its output.
     /// Answered with `Attached` before the screen. Answered with `Error`,
     /// and the pane left as it was, when there is no such pane, or when
-    /// the attach is `exclusive` and a UI is already attached.
+    /// another UI shows it: a pane is shown by one UI at a time.
     Attach {
         request: u32,
         pane: PaneId,
         size: Size,
-        /// The pane is to be this UI's alone: refuse if another has it.
-        #[serde(default)]
-        exclusive: bool,
     },
     Detach { pane: PaneId },
     /// The daemon resizes and sends the pane's screen again.
@@ -177,8 +174,8 @@ pub enum Control {
         session: String,
     },
     Spawned { request: u32, info: PaneInfo },
-    /// The attach asked for by `request` was done. `info.attached` counts
-    /// the asker.
+    /// The attach asked for by `request` was done. `info.attached` is true:
+    /// the asker shows it.
     Attached { request: u32, info: PaneInfo },
     Exited { pane: PaneId, code: u32 },
     Panes { request: u32, panes: Vec<PaneInfo> },
