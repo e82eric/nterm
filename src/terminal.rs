@@ -469,11 +469,11 @@ impl TerminalView {
         // Targets resolve among the current workspace's floats; no target
         // means its most recently focused float.
         let target_id =
-            |view: &Self, target: Option<floating::Target>| -> Result<Option<u64>, String> {
+            |view: &Self, target: Option<u64>| -> Result<Option<u64>, String> {
                 match target {
                     Some(target) => view
                         .floating
-                        .resolve(&target, view.floats())
+                        .resolve(target, view.floats())
                         .map(Some)
                         .ok_or_else(|| "floating pane does not exist".into()),
                     None => Ok(view.floats().last()),
@@ -486,11 +486,11 @@ impl TerminalView {
         };
         let result = match request {
             Request::Create(options) => {
-                self.floating.validate_create(&options, self.floats())?;
+                self.floating.validate_create(&options)?;
                 let pane = self.create_pane(gl, &self.beside_active(options.spawn()))?;
                 let id = self
                     .floating
-                    .insert(options.name, FloatingTerminal { pane });
+                    .insert(FloatingTerminal { pane });
                 self.floats_mut().add(id);
                 serde_json::to_value(describe(self, self.current, Some(id))).unwrap()
             }
@@ -518,7 +518,7 @@ impl TerminalView {
                     .ok_or("workspace does not exist")?
                     .floats;
                 let id = match target {
-                    Some(target) => self.floating.resolve(&target, floats),
+                    Some(target) => self.floating.resolve(target, floats),
                     None => floats.last(),
                 };
                 serde_json::to_value(describe(self, workspace, id)).unwrap()
@@ -993,12 +993,12 @@ impl TerminalView {
         painter.galley(label_rect.center() - label.size() / 2.0, label, chip_text);
         // The floating panes chip has a fixed width, even at 0 or while a float
         // is shown, so the controls to its left keep their place. A visible
-        // float fills it; its name is in the tooltip.
+        // float fills it; its number is in the tooltip.
         {
             let count = self.floats().ids().len();
             let visible = self
                 .visible_float()
-                .map(|p| p.name.clone().unwrap_or_else(|| p.id.to_string()));
+                .map(|p| p.id.to_string());
             let (fill, content) = match (&visible, count) {
                 (Some(_), _) => (palette.warning, palette.background),
                 (None, 0) => (egui::Color32::from_white_alpha(14), palette.muted_text),

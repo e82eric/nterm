@@ -332,7 +332,7 @@ workspace and of workspaces created without an explicit `layout`, including
 | `app:move_float_to_new_window(id)` | Move a floating pane into a new window as its tiled pane |
 | `app:close_pane(id)` | Close terminal; remove empty workspace, or close window if it was the final pane |
 | `app:float_pane(id)` | Turn a tiled pane into a floating pane in its workspace; returns the float's description |
-| `app:tile_floating_pane(id_or_name?)` | Turn the current workspace's float (default: last focused) into a tiled pane after the focused pane; returns `{id,workspace}` |
+| `app:tile_floating_pane(id?)` | Turn the current workspace's float (default: last focused) into a tiled pane after the focused pane; returns `{id,workspace}` |
 
 Workspace descriptions include `id`, `index`, ordered `panes`, `focused`, `layout`,
 `main_ratio`, optional `appearance`, ordered `floats`, and `visible_float`. IDs are window-local and valid for
@@ -396,18 +396,21 @@ unchanged. A shell exiting removes its pane in the same way.
 Named actions and picker selection callbacks support:
 
 ```lua
+-- A float has only its ID, so a script that wants the same one again keeps
+-- the ID. It lasts as long as the configuration is loaded.
+local tools
+
 actions = {
   ToolsPane = {
     label = "Tools pane",
     action = function(app)
-      local pane = app:get_floating_pane("tools")
+      local pane = tools and app:get_floating_pane(tools)
       if pane then
         app:restore_floating_pane(pane.id)
       else
-        pane = app:create_floating_pane({
-          name = "tools", command = "pwsh.exe", cwd = "C:\\src",
-        })
-        app:show_toast("Floating pane", "Created " .. pane.name .. " (" .. pane.id .. ")")
+        pane = app:create_floating_pane({ command = "pwsh.exe", cwd = "C:\src" })
+        tools = pane.id
+        app:show_toast("Floating pane", "Created " .. pane.id)
       end
     end,
   },
@@ -417,13 +420,13 @@ keys = {
 },
 ```
 
-`app:create_floating_pane(options)` returns `{id, name, workspace, visible, focused}` after
+`app:create_floating_pane(options)` returns `{id, workspace, visible, focused}` after
 native creation succeeds. All options are optional; omitted command and working
 directory use the normal terminal defaults. `command` is a Ghostty command
-string. Names must be nonempty and unique among the workspace's floating panes.
+string.
 IDs are stable, monotonically increasing within a window, and never reused.
 
-`app:get_floating_pane(id_or_name, workspace_id?)` returns a description or
+`app:get_floating_pane(id, workspace_id?)` returns a description or
 `nil`; with no target it returns the last focused floating pane. It searches the
 current workspace unless given a workspace ID; to search every workspace, loop
 over `app:get_workspaces()`. `app:get_floating_panes(workspace_id?)` returns a
@@ -431,8 +434,8 @@ workspace's descriptions in creation order. Descriptions are snapshots; `focused
 means the pane is the window's terminal input target, even if the OS window
 itself is unfocused.
 
-`app:restore_floating_pane(id_or_name)`, `app:toggle_floating_pane()`, and
-`app:close_floating_pane(id_or_name)` change pane state immediately and act on
+`app:restore_floating_pane(id)`, `app:toggle_floating_pane()`, and
+`app:close_floating_pane(id)` change pane state immediately and act on
 the current workspace's floats. `app:tile_floating_pane` and `app:float_pane`
 move terminals between floating and tiled; see
 [Lua automation and appearance](#lua-automation-and-appearance).

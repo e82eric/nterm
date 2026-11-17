@@ -368,8 +368,8 @@ mod tests {
     }
 
     #[test]
-    fn floating_api_returns_live_ids_supports_names_and_expires_with_action() {
-        use crate::terminal::floating::{Floats, Panes, Request, Target};
+    fn floating_api_returns_live_ids_and_expires_with_action() {
+        use crate::terminal::floating::{Floats, Panes, Request};
         // A one-workspace host: workspace 1 owns every float.
         let mut panes = Panes::default();
         let mut floats = Floats::default();
@@ -377,23 +377,23 @@ mod tests {
             r#"local saved; return function(app)
             if saved then saved:get_floating_panes(); return end
             saved=app
-            assert(app:get_floating_pane('missing') == nil)
-            local a=app:create_floating_pane({name='tools',command='pwsh.exe',cwd='C:\\src'})
+            assert(app:get_floating_pane(99) == nil)
+            local a=app:create_floating_pane({command='pwsh.exe',cwd='C:\\src'})
             local b=app:create_floating_pane()
-            assert(a.id == 1 and a.name == 'tools' and a.workspace == 1 and a.visible and a.focused)
+            assert(a.id == 1 and a.workspace == 1 and a.visible and a.focused)
             assert(b.id == 2)
             assert(#app:get_floating_panes() == 2)
             assert(#app:get_floating_panes(1) == 2)
-            assert(app:get_floating_pane('tools').id == a.id)
-            assert(app:get_floating_pane('tools', 1).id == a.id)
-            assert(app:get_floating_pane('tools', 2) == nil)
+            assert(app:get_floating_pane(a.id).id == a.id)
+            assert(app:get_floating_pane(a.id, 1).id == a.id)
+            assert(app:get_floating_pane(a.id, 2) == nil)
             app:restore_floating_pane(a.id)
             assert(app:get_floating_pane().id == a.id)
             app:toggle_floating_pane()
             assert(not app:get_floating_pane().visible)
             app:toggle_floating_pane()
-            app:close_floating_pane('tools')
-            assert(app:get_floating_pane('tools') == nil)
+            app:close_floating_pane(a.id)
+            assert(app:get_floating_pane(a.id) == nil)
             assert(app:get_floating_pane().id == b.id)
             local tiled=app:tile_floating_pane()
             assert(tiled.id == 50 and tiled.workspace == 1)
@@ -404,15 +404,15 @@ mod tests {
         end"#,
         );
         let mut dispatch = |request| {
-            let resolve = |panes: &Panes<()>, floats: &Floats, target: Option<Target>| match target
+            let resolve = |panes: &Panes<()>, floats: &Floats, target: Option<u64>| match target
             {
-                Some(target) => panes.resolve(&target, floats),
+                Some(target) => panes.resolve(target, floats),
                 None => floats.last(),
             };
             let result = match request {
                 Request::Create(options) => {
-                    panes.validate_create(&options, &floats)?;
-                    let id = panes.insert(options.name, ());
+                    panes.validate_create(&options)?;
+                    let id = panes.insert(());
                     floats.add(id);
                     serde_json::to_value(panes.description(id, 1, &floats, true)).unwrap()
                 }
@@ -455,7 +455,7 @@ mod tests {
                 }
                 Request::Float(pane) => {
                     assert_eq!(pane, 50);
-                    let id = panes.insert(None, ());
+                    let id = panes.insert(());
                     floats.add(id);
                     serde_json::to_value(panes.description(id, 1, &floats, true)).unwrap()
                 }
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn floating_creation_errors_are_synchronous_and_options_are_strict() {
         let failing = callback(
-            "return function(app) local ok,err=pcall(function() app:create_floating_pane({name='bad'}) end); assert(not ok and string.find(tostring(err),'spawn failed')); app:show_toast('Error handled','yes') end",
+            "return function(app) local ok,err=pcall(function() app:create_floating_pane({command='bad'}) end); assert(not ok and string.find(tostring(err),'spawn failed')); app:show_toast('Error handled','yes') end",
         );
         let commands = failing
             .with_floating(&mut |_| Err("spawn failed".into()), || {
@@ -798,7 +798,7 @@ impl UserData for App {
                 handler.call::<_, mlua::Value>(lua.to_value(&parsed)?)
             });
         }
-        use crate::terminal::floating::{CreateOptions, Request, Target};
+        use crate::terminal::floating::{CreateOptions, Request};
         methods.add_method(
             "create_floating_pane",
             |lua, app, options: Option<mlua::Value>| {
@@ -814,7 +814,7 @@ impl UserData for App {
             app.floating(lua, Request::Toggle)
         });
         methods.add_method("restore_floating_pane", |lua, app, target: mlua::Value| {
-            app.floating(lua, Request::Restore(lua.from_value::<Target>(target)?))
+            app.floating(lua, Request::Restore(lua.from_value::<u64>(target)?))
         });
         methods.add_method(
             "get_floating_pane",
@@ -822,7 +822,7 @@ impl UserData for App {
                 app.floating(
                     lua,
                     Request::Get {
-                        target: target.map(|v| lua.from_value::<Target>(v)).transpose()?,
+                        target: target.map(|v| lua.from_value::<u64>(v)).transpose()?,
                         workspace,
                     },
                 )
@@ -839,7 +839,7 @@ impl UserData for App {
             |lua, app, target: Option<mlua::Value>| {
                 app.floating(
                     lua,
-                    Request::Tile(target.map(|v| lua.from_value::<Target>(v)).transpose()?),
+                    Request::Tile(target.map(|v| lua.from_value::<u64>(v)).transpose()?),
                 )
             },
         );
@@ -848,7 +848,7 @@ impl UserData for App {
             |lua, app, target: Option<mlua::Value>| {
                 app.floating(
                     lua,
-                    Request::Close(target.map(|v| lua.from_value::<Target>(v)).transpose()?),
+                    Request::Close(target.map(|v| lua.from_value::<u64>(v)).transpose()?),
                 )
             },
         );

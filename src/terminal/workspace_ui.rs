@@ -713,7 +713,6 @@ impl TerminalView {
             .map(|p| {
                 crate::actions::floating_pane_entry(
                     p.id,
-                    p.name.as_deref(),
                     &p.title(),
                     floats.visible() == Some(p.id),
                 )
@@ -775,7 +774,7 @@ impl TerminalView {
             .position(|(i, _)| *i == id)
             .ok_or("pane does not exist")?;
         let (_, pane) = self.tiled.remove(at);
-        let float = self.floating.insert(None, super::FloatingTerminal { pane });
+        let float = self.floating.insert(super::FloatingTerminal { pane });
         let w = self
             .workspaces
             .iter_mut()

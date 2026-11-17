@@ -1,27 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub(crate) enum Target {
-    Id(u64),
-    Name(String),
-}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateOptions {
-    pub name: Option<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
 }
 impl CreateOptions {
     pub fn validate(&self) -> Result<(), String> {
-        if self
-            .name
-            .as_ref()
-            .is_some_and(|v| v.is_empty() || v.contains('\0'))
-        {
-            return Err("floating pane name must be nonempty and contain no NUL".into());
-        }
         self.spawn().validate()
     }
     pub fn spawn(&self) -> super::pane::SpawnOptions {
@@ -39,32 +25,29 @@ impl CreateOptions {
 pub(crate) enum Request {
     Create(CreateOptions),
     Toggle,
-    Restore(Target),
+    Restore(u64),
     Get {
-        target: Option<Target>,
+        target: Option<u64>,
         workspace: Option<u64>,
     },
     List {
         workspace: Option<u64>,
     },
-    Close(Option<Target>),
+    Close(Option<u64>),
     /// Turns a tiled pane into a float in its workspace.
     Float(u64),
     /// Turns a float into a tiled pane after the focused pane.
-    Tile(Option<Target>),
+    Tile(Option<u64>),
 }
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Description {
     pub id: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
     pub workspace: u64,
     pub visible: bool,
     pub focused: bool,
 }
 pub(crate) struct Entry<T> {
     pub id: u64,
-    pub name: Option<String>,
     pub value: T,
 }
 impl<T> std::ops::Deref for Entry<T> {
@@ -182,32 +165,21 @@ impl<T> Panes<T> {
     pub fn get_mut(&mut self, id: u64) -> Option<&mut Entry<T>> {
         self.entries.iter_mut().find(|e| e.id == id)
     }
-    /// Finds a float by ID or name among one workspace's floats.
-    pub fn resolve(&self, target: &Target, floats: &Floats) -> Option<u64> {
-        floats.ids().iter().copied().find(|id| match target {
-            Target::Id(target) => id == target,
-            Target::Name(name) => self.get(*id).and_then(|e| e.name.as_ref()) == Some(name),
-        })
+    /// A float by its ID, among one workspace's floats.
+    pub fn resolve(&self, target: u64, floats: &Floats) -> Option<u64> {
+        floats.contains(target).then_some(target)
     }
-    /// Names are unique within a workspace.
-    pub fn validate_create(&self, options: &CreateOptions, floats: &Floats) -> Result<(), String> {
+    pub fn validate_create(&self, options: &CreateOptions) -> Result<(), String> {
         options.validate()?;
-        if options
-            .name
-            .as_ref()
-            .is_some_and(|n| self.resolve(&Target::Name(n.clone()), floats).is_some())
-        {
-            return Err("floating pane name already exists in this workspace".into());
-        }
         if self.next_id > i64::MAX as u64 {
             return Err("floating pane IDs exhausted".into());
         }
         Ok(())
     }
-    pub fn insert(&mut self, name: Option<String>, value: T) -> u64 {
+    pub fn insert(&mut self, value: T) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.entries.push(Entry { id, name, value });
+        self.entries.push(Entry { id, value });
         id
     }
     pub fn remove(&mut self, id: u64) -> Option<T> {
@@ -233,11 +205,10 @@ impl<T> Panes<T> {
         if !floats.contains(id) {
             return None;
         }
-        let entry = self.get(id)?;
+        self.get(id)?;
         let visible = floats.visible() == Some(id);
         Some(Description {
             id,
-            name: entry.name.clone(),
             workspace,
             visible,
             focused: visible && current,
@@ -248,31 +219,19 @@ impl<T> Panes<T> {
 mod tests {
     use super::*;
     #[test]
-    fn each_workspace_keeps_its_own_floats_visibility_and_names() {
+    fn each_workspace_keeps_its_own_floats_and_visibility() {
         let mut panes = Panes::default();
         let (mut first, mut second) = (Floats::default(), Floats::default());
-        let a = panes.insert(Some("tools".into()), ());
+        let a = panes.insert(());
         first.add(a);
-        let b = panes.insert(Some("tools".into()), ());
+        let b = panes.insert(());
         second.add(b);
         second.hide();
         assert_eq!(first.visible(), Some(a));
         assert_eq!(second.visible(), None);
-        assert_eq!(
-            panes.resolve(&Target::Name("tools".into()), &first),
-            Some(a)
-        );
-        assert_eq!(
-            panes.resolve(&Target::Name("tools".into()), &second),
-            Some(b)
-        );
-        assert_eq!(panes.resolve(&Target::Id(b), &first), None);
-        let tools = CreateOptions {
-            name: Some("tools".into()),
-            ..Default::default()
-        };
-        assert!(panes.validate_create(&tools, &first).is_err());
-        assert!(panes.validate_create(&tools, &Floats::default()).is_ok());
+        assert_eq!(panes.resolve(a, &first), Some(a));
+        // A float is found only among its own workspace's.
+        assert_eq!(panes.resolve(b, &first), None);
         let described = panes.descriptions(2, &second, false);
         assert_eq!(described.len(), 1);
         assert_eq!((described[0].id, described[0].workspace), (b, 2));
@@ -288,7 +247,7 @@ mod tests {
         let mut panes = Panes::default();
         let mut floats = Floats::default();
         let mut other = Floats::default();
-        let [a, b, c] = [(); 3].map(|_| panes.insert(None, ()));
+        let [a, b, c] = [(); 3].map(|_| panes.insert(()));
         floats.add(a);
         other.add(b);
         floats.add(c);
@@ -332,9 +291,9 @@ mod tests {
     #[test]
     fn ids_stay_unique_across_removal() {
         let mut panes = Panes::default();
-        let a = panes.insert(None, ());
+        let a = panes.insert(());
         assert!(panes.remove(a).is_some());
         assert!(panes.remove(a).is_none());
-        assert_eq!(panes.insert(None, ()), a + 1);
+        assert_eq!(panes.insert(()), a + 1);
     }
 }

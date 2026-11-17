@@ -1355,8 +1355,8 @@ fn floating_palette_selection_returns_id_instead_of_display_label() {
         ctx.clone(),
         config::Options {
             source: config::Source::CommandPalette(vec![
-                crate::actions::floating_pane_entry(7, Some("tools"), "PowerShell", false),
-                crate::actions::floating_pane_entry(12, None, "nvim", true),
+                crate::actions::floating_pane_entry(7, "tools", false),
+                crate::actions::floating_pane_entry(12, "nvim", true),
             ]),
             params: [("query".into(), "tools".into())].into(),
             ..Default::default()

@@ -42,7 +42,6 @@ struct Saved {
 #[serde(default)]
 struct Float {
     pane: u32,
-    name: Option<String>,
 }
 
 impl Saved {
@@ -289,7 +288,7 @@ impl TerminalView {
         }
         for float in &saved.floats {
             let Some(pane) = self.adopt(float.pane, &listing, gl) else { continue };
-            let id = self.floating.insert(float.name.clone(), FloatingTerminal { pane });
+            let id = self.floating.insert(FloatingTerminal { pane });
             floating.insert(float.pane, id);
             self.workspace_by_id(workspace_id).floats.add(id);
         }
@@ -377,8 +376,7 @@ impl TerminalView {
             return None;
         }
         let float = |id: &u64| {
-            let entry = self.floating.get(*id)?;
-            Some((entry.value.pane.session_pane()?, entry.name.clone()))
+            self.floating.get(*id)?.value.pane.session_pane()
         };
         let weights = workspace
             .pane_weights
@@ -403,9 +401,9 @@ impl TerminalView {
                 .ids()
                 .iter()
                 .filter_map(float)
-                .map(|(pane, name)| Float { pane, name })
+                .map(|pane| Float { pane })
                 .collect(),
-            visible_float: workspace.floats.visible().and_then(|id| float(&id)).map(|(pane, _)| pane),
+            visible_float: workspace.floats.visible().and_then(|id| float(&id)),
             name: workspace.name.clone(),
             panes,
         })
@@ -570,7 +568,7 @@ mod tests {
         let saved = Saved {
             version: VERSION,
             panes: panes.to_vec(),
-            floats: floats.iter().map(|pane| Float { pane: *pane, name: None }).collect(),
+            floats: floats.iter().map(|pane| Float { pane: *pane }).collect(),
             ..Saved::default()
         };
         serde_json::to_string(&saved).unwrap()

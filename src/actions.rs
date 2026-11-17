@@ -250,8 +250,8 @@ pub(crate) struct Entry {
     pub(crate) action: AppAction,
 }
 
-pub(crate) fn floating_pane_entry(id: u64, name: Option<&str>, title: &str, active: bool) -> Entry {
-    let label = name.filter(|name| !name.trim().is_empty()).unwrap_or(title);
+pub(crate) fn floating_pane_entry(id: u64, title: &str, active: bool) -> Entry {
+    let label = title;
     // Titles may contain controls; keep each palette item on one display line.
     let label: String = label
         .chars()
@@ -424,21 +424,21 @@ pub(crate) struct LuaAction {
 mod tests {
     use super::*;
     #[test]
-    fn floating_entries_use_stable_ids_name_then_title_and_mark_active() {
-        let named = floating_pane_entry(7, Some("tools"), "PowerShell", true);
+    fn floating_entries_use_stable_ids_and_titles_and_mark_active() {
+        let named = floating_pane_entry(7, "tools", true);
         assert_eq!(named.id, "floating.restore.7");
         assert_eq!(named.label, "Restore floating pane 7 — tools (active)");
         assert_eq!(named.action, AppAction::RestoreFloatingPane(7));
         assert_eq!(
-            floating_pane_entry(8, None, "nvim README.md", false).label,
+            floating_pane_entry(8, "nvim README.md", false).label,
             "Restore floating pane 8 — nvim README.md"
         );
         assert_eq!(
-            floating_pane_entry(9, None, "", false).label,
+            floating_pane_entry(9, "", false).label,
             "Restore floating pane 9"
         );
         assert!(
-            !floating_pane_entry(10, None, "title\nnext\tline", false)
+            !floating_pane_entry(10, "title\nnext\tline", false)
                 .label
                 .contains('\n')
         );
