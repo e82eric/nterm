@@ -51,7 +51,6 @@ struct Session {
     next_client: AtomicU64,
     /// What the UI last sent; new panes start from it.
     settings: Mutex<TerminalSettings>,
-    blobs: Mutex<HashMap<String, String>>,
     /// The UIs' sessions, by the names the UIs gave them.
     sessions: Mutex<BTreeMap<String, Saved>>,
     /// Sent to when the sessions, or anything a UI is told of them, may have
@@ -379,7 +378,6 @@ pub fn run(options: Options) -> io::Result<()> {
         next_pane: AtomicU32::new(1),
         next_client: AtomicU64::new(1),
         settings: Mutex::default(),
-        blobs: Mutex::default(),
         clients: Mutex::default(),
         channels: Mutex::default(),
         next_channel: AtomicU32::new(1),
@@ -698,28 +696,6 @@ fn converse(
                 panes.sort_by_key(|pane| pane.id);
                 let panes = panes.iter().map(|pane| pane.info()).collect();
                 send(Control::Panes { request, panes });
-            }
-            Control::BlobSet { key, value } => {
-                session.blobs.lock().unwrap().insert(key, value);
-            }
-            Control::BlobGet { request, key } => {
-                let value = session.blobs.lock().unwrap().get(&key).cloned();
-                send(Control::Blob { request, key, value });
-            }
-            Control::BlobList { request, prefix } => {
-                let mut blobs: Vec<(String, String)> = session
-                    .blobs
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(key, _)| key.starts_with(&prefix))
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                blobs.sort();
-                send(Control::Blobs { request, blobs });
-            }
-            Control::BlobRemove { key } => {
-                session.blobs.lock().unwrap().remove(&key);
             }
             Control::ShellClosed { channel } => {
                 session.end_channels(|number, c| number == channel && c.ui == id, false);

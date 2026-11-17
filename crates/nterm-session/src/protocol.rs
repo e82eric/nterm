@@ -146,12 +146,6 @@ pub enum Control {
     /// End the shell if it is running and forget the pane.
     Close { pane: PaneId },
     List { request: u32 },
-    /// Opaque state the UI keeps in the daemon, such as its layout.
-    BlobSet { key: String, value: String },
-    BlobGet { request: u32, key: String },
-    /// Every blob whose key starts with `prefix`.
-    BlobList { request: u32, prefix: String },
-    BlobRemove { key: String },
     /// One workspace of a UI, so that it can be shown again when nothing
     /// shows it: the panes it holds, and how the UI lays them out, which
     /// only UIs read. Sent whenever either changes. A pane is in one session,
@@ -188,13 +182,6 @@ pub enum Control {
     Attached { request: u32, info: PaneInfo },
     Exited { pane: PaneId, code: u32 },
     Panes { request: u32, panes: Vec<PaneInfo> },
-    Blob {
-        request: u32,
-        key: String,
-        value: Option<String>,
-    },
-    /// Keys and values, in key order.
-    Blobs { request: u32, blobs: Vec<(String, String)> },
     /// Every session, to every UI: once after `Welcome`, and again whenever
     /// one changes.
     Sessions { sessions: Vec<SessionInfo> },
