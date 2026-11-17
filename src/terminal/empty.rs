@@ -60,8 +60,9 @@ impl TerminalView {
             _ => return,
         };
         // Nothing of what the window knew of the daemon holds any more.
-        self.sessions.clear();
-        self.sessions_sent.clear();
+        for workspace in &mut self.workspaces {
+            workspace.session = None;
+        }
         self.close_window_picker();
         self.key_table = None;
         self.empty = Some(Empty::Unavailable { lost, reason });

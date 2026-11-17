@@ -16,7 +16,7 @@ use super::{
 use crate::{actions::AppAction, graphics as glow};
 use nterm_session::protocol::{PaneInfo, SessionInfo};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// Bumped when a description stops meaning what it did.
 const VERSION: u32 = 1;
@@ -201,7 +201,8 @@ impl TerminalView {
             workspace.focus(id);
         }
         if !id.is_empty() {
-            self.sessions.insert(workspace_id, id.to_owned());
+            let session = workspace::Session { id: id.to_owned(), sent: String::new() };
+            workspace.session = Some(session);
         }
         self.select_workspace(workspace_id)?;
         // A window that had no terminal had a workspace with nothing in it.
@@ -287,38 +288,24 @@ impl TerminalView {
         })
     }
 
-    /// Keep the daemon's copy of each workspace up to date, and drop the
-    /// sessions whose workspaces have gone because their panes were closed.
-    /// Called every frame; the daemon hears only of changes.
+    /// Keep the daemon's copy of each workspace up to date. Called every
+    /// frame; the daemon hears only of changes. A workspace that goes is
+    /// not taken from the daemon: when its shells end, or another
+    /// workspace takes them, the daemon forgets it, and one that was
+    /// detached is meant to stay.
     pub(super) fn save_sessions(&mut self) {
-        let mut current = HashSet::new();
-        for workspace in &self.workspaces {
-            let described = self.describe(workspace).and_then(|saved| {
-                Some((saved.members(), serde_json::to_string(&saved).ok()?))
-            });
-            let Some((members, text)) = described
-            else {
-                // Nothing the daemon has numbered yet; what was sent stands.
-                if let Some(id) = self.sessions.get(&workspace.id) {
-                    current.insert(id.clone());
-                }
-                continue;
-            };
-            let id = self.sessions.entry(workspace.id).or_insert_with(new_id).clone();
-            if self.sessions_sent.get(&id) != Some(&text) {
-                crate::session::set_session(id.clone(), members, text.clone());
-                self.sessions_sent.insert(id.clone(), text);
+        for at in 0..self.workspaces.len() {
+            // `None` while the daemon has numbered none of its panes.
+            let Some(saved) = self.describe(&self.workspaces[at]) else { continue };
+            let Ok(text) = serde_json::to_string(&saved) else { continue };
+            let session = self.workspaces[at]
+                .session
+                .get_or_insert_with(|| workspace::Session { id: new_id(), sent: String::new() });
+            if session.sent != text {
+                crate::session::set_session(session.id.clone(), saved.members(), text.clone());
+                session.sent = text;
             }
-            current.insert(id);
         }
-        self.sessions.retain(|workspace, _| self.workspaces.iter().any(|w| w.id == *workspace));
-        self.sessions_sent.retain(|id, _| {
-            let kept = current.contains(id);
-            if !kept {
-                crate::session::remove_session(id.clone());
-            }
-            kept
-        });
     }
 
     /// Take the current workspace out of this window and leave its session
@@ -336,20 +323,19 @@ impl TerminalView {
                 .ids()
                 .iter()
                 .all(|float| kept(self.floating.get(*float).map(|entry| &entry.value.pane)));
-        let session = self.sessions.get(&id).filter(|id| self.sessions_sent.contains_key(*id));
-        let Some(session) = session.cloned().filter(|_| all_kept) else {
+        // One the daemon has not been told of could not be shown again.
+        let told = workspace.session.as_ref().is_some_and(|session| !session.sent.is_empty());
+        if !(told && all_kept) {
             return Err("This workspace's shells are not in the session daemon, \
                         so they cannot be left running."
                 .into());
-        };
+        }
         if self.workspaces.len() == 1 {
             // Closing a window detaches what it shows.
             self.close_requested = true;
             return Ok(());
         }
-        // Forgotten here without being removed from the daemon.
-        self.sessions.remove(&id);
-        self.sessions_sent.remove(&session);
+        // Gone from here and left in the daemon.
         let at = self.workspaces.iter().position(|w| w.id == id).expect("current workspace");
         let workspace = self.workspaces.remove(at);
         for pane in &workspace.panes {

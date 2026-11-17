@@ -54,10 +54,6 @@ pub(crate) struct TerminalView {
     /// The resize or move key pressed this frame was held with the key
     /// table's `nudge` modifier, for a small step.
     nudge_step: bool,
-    /// The session each workspace is, by workspace id, once it has one.
-    sessions: std::collections::HashMap<u64, String>,
-    /// What the session daemon was last told of each session, by session.
-    sessions_sent: std::collections::HashMap<String, String>,
     /// Why the window has no terminal, while it has none and is to stay.
     empty: Option<empty::Empty>,
     /// The picker of workspaces and sessions, while it is open. It is the
@@ -290,8 +286,6 @@ impl TerminalView {
             pane_drag: None,
             key_table: None,
             nudge_step: false,
-            sessions: Default::default(),
-            sessions_sent: Default::default(),
             empty: None,
             window_picker: None,
             picker_bindings,

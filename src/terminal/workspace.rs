@@ -154,6 +154,14 @@ impl Appearance {
         Ok(())
     }
 }
+/// A workspace as the session daemon knows it: its shells are kept there
+/// under this name, with how they are laid out, to be shown again.
+#[derive(Clone, Debug)]
+pub(crate) struct Session {
+    pub id: String,
+    /// The layout the daemon was last told, to tell it only of changes.
+    pub sent: String,
+}
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Workspace {
     pub id: u64,
@@ -168,6 +176,10 @@ pub(crate) struct Workspace {
     pub appearance: Option<Appearance>,
     #[serde(flatten)]
     pub floats: super::floating::Floats,
+    /// What the workspace is in the session daemon, once it has told the
+    /// daemon of itself.
+    #[serde(skip)]
+    pub session: Option<Session>,
 }
 impl Workspace {
     pub fn new(id: u64, index: usize) -> Self {
@@ -181,6 +193,7 @@ impl Workspace {
             pane_weights: Default::default(),
             appearance: None,
             floats: Default::default(),
+            session: None,
         }
     }
     pub fn focus(&mut self, id: u64) {

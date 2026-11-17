@@ -118,12 +118,6 @@ pub(crate) fn set_session(id: String, panes: Vec<PaneId>, layout: String) {
     }
 }
 
-pub(crate) fn remove_session(id: String) {
-    if let Some(daemon) = daemon() {
-        daemon.control(Control::SessionRemove { id });
-    }
-}
-
 /// The sessions the daemon holds, as it last gave them. `None` without a
 /// connection.
 pub(crate) fn sessions() -> Option<Arc<Listing>> {
@@ -1180,8 +1174,12 @@ mod tests {
             sessions().filter(|held| held.sessions.iter().any(|session| session.id == "one"))
         });
         assert_eq!(listed.sessions[0].layout, "a layout");
-        remove_session("one".into());
-        until("its removal", || sessions().filter(|held| held.sessions[0].id.is_empty()));
+        // The shell is in the session that named it last; the other is gone.
+        set_session("two".into(), vec![pane], "another".into());
+        let listed = until("the other session", || {
+            sessions().filter(|held| held.sessions.iter().any(|session| session.id == "two"))
+        });
+        assert_eq!(listed.sessions.len(), 1);
 
         // The daemon goes away: the connection is lost, and nothing is
         // known of its sessions.

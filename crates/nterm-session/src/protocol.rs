@@ -149,10 +149,10 @@ pub enum Control {
     /// One workspace of a UI, so that it can be shown again when nothing
     /// shows it: the panes it holds, and how the UI lays them out, which
     /// only UIs read. Sent whenever either changes. A pane is in one session,
-    /// the one that named it last.
+    /// the one that named it last, and a session is forgotten when none of
+    /// its panes is running or another has taken them all: there is nothing
+    /// to say to end one.
     SessionSet { id: String, panes: Vec<PaneId>, layout: String },
-    /// The workspace is gone. Its shells are not ended by this.
-    SessionRemove { id: String },
     /// The first message of a program running in pane `pane`'s shell, in
     /// place of `Hello`. What it sends from then on, in `Frame::Shell`, is
     /// passed to the UI attached to the pane, and what that UI answers is

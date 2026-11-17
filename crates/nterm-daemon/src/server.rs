@@ -638,10 +638,6 @@ fn converse(
                 drop(sessions);
                 session.sessions_changed();
             }
-            Control::SessionRemove { id: name } => {
-                session.sessions.lock().unwrap().remove(&name);
-                session.sessions_changed();
-            }
             Control::Resize { pane: pane_id, size } => {
                 let Some(pane) = session.pane(pane_id) else {
                     missing(None, pane_id);
