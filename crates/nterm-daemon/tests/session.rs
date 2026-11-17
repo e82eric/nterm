@@ -838,3 +838,54 @@ fn ordered_resizes(name: &str) {
     ui.shutdown();
     assert!(failures.is_empty(), "{name}:\n{}", failures.join("\n"));
 }
+
+/// What the daemon's log says of the session, once it says what is wanted.
+fn logged(session: &str, what: &str, wanted: impl Fn(&str) -> bool) -> String {
+    let path = nterm_daemon::log::directory().join(format!("daemon-{session}.log"));
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let log = std::fs::read_to_string(&path).unwrap_or_default();
+        if wanted(&log) {
+            return log;
+        }
+        assert!(Instant::now() < deadline, "the log never said {what}:\n{log}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_pseudoconsole_that_goes_on_its_own_is_logged() {
+    each_conpty("console-gone", |session| {
+        let mut ui = Ui::connect(session);
+        let pane = ui.shell();
+        ui.input(pane, "echo ready\r");
+        ui.until_text("the shell's echo", |text| text.contains("\nready"));
+        // What runs a pseudoconsole is a process the daemon started.
+        let ended = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(
+                "$hosts = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId={} and \
+                 (Name='OpenConsole.exe' or Name='conhost.exe')\"); \
+                 $hosts | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}; $hosts.Count",
+                daemon_pid(&ui)
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&ended.stdout).trim(), "1", "{ended:?}");
+        // Its output ends before the shell is known to have, and is said to.
+        let ended = format!("pane {pane}: output ended (error ");
+        let log = logged(session, "that the output ended", |log| log.contains(&ended));
+        assert!(log.contains("with its shell still running"), "{log}");
+        // Nothing more is taken for the shell, which is said as well. The
+        // first bytes after may still be taken, so more than one are sent.
+        let refused = format!("pane {pane}: input not taken (error ");
+        let deadline = Instant::now() + WAIT;
+        while !logged(session, "anything", |_| true).contains(&refused) {
+            assert!(Instant::now() < deadline, "input was never refused");
+            ui.input(pane, "echo more\r");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("{session}:\n{}", logged(session, "anything", |_| true));
+        ui.shutdown();
+    });
+}

@@ -100,6 +100,9 @@ struct State {
     /// one UI at a time.
     shown: Option<(u64, Outbox)>,
     exited: Option<u32>,
+    /// The shell's output has ended. That it has before the shell did is
+    /// what is left when the pseudoconsole goes on its own.
+    silent: bool,
     /// Forget the pane as soon as its shell has ended.
     closing: bool,
 }
@@ -271,6 +274,7 @@ impl Session {
                 size,
                 shown: None,
                 exited: None,
+                silent: false,
                 closing: false,
             }),
         });
@@ -286,7 +290,11 @@ impl Session {
             .spawn(move || {
                 for bytes in input_rx {
                     trace(id, "<", &bytes);
-                    if !input.write(&bytes) {
+                    if let Err(code) = input.write(&bytes) {
+                        // Nothing more can be given to the shell. Said, for
+                        // this is how a pseudoconsole that went on its own
+                        // is first met.
+                        log(format_args!("pane {id}: input not taken (error {code})"));
                         break;
                     }
                 }
@@ -299,10 +307,24 @@ impl Session {
                 .spawn(move || {
                     let mut buffer = vec![0u8; 65536];
                     loop {
-                        let count = output.read(&mut buffer);
-                        if count == 0 {
-                            break;
-                        }
+                        let count = match output.read(&mut buffer) {
+                            Ok(count) if count > 0 => count,
+                            end => {
+                                let mut state = pane.state.lock().unwrap();
+                                state.silent = true;
+                                // The pseudoconsole is closed here once the
+                                // shell has ended. Output that ends while it
+                                // is still open ended some other way.
+                                if state.console.is_some() {
+                                    log(format_args!(
+                                        "pane {}: output ended (error {}) with its shell still running",
+                                        pane.id,
+                                        end.err().unwrap_or(0)
+                                    ));
+                                }
+                                break;
+                            }
+                        };
                         let bytes = &buffer[..count];
                         trace(pane.id, ">", bytes);
                         let mut state = pane.state.lock().unwrap();
@@ -329,7 +351,10 @@ impl Session {
                 // Closing the pseudoconsole flushes what the shell last
                 // wrote and ends the reader. Not under the lock: it blocks
                 // until the reader, which takes the lock, has drained it.
-                let console = pane.state.lock().unwrap().console.take();
+                let (console, silent) = {
+                    let mut state = pane.state.lock().unwrap();
+                    (state.console.take(), state.silent)
+                };
                 drop(console);
                 let _ = reader.join();
                 let closing = {
@@ -337,7 +362,11 @@ impl Session {
                     state.exited = Some(code);
                     state.closing
                 };
-                log(format_args!("pane {}: exited with {code}", pane.id));
+                log(format_args!(
+                    "pane {}: exited with {code}{}",
+                    pane.id,
+                    if silent { ", after its output had ended" } else { "" }
+                ));
                 // With no UI connected there is nobody to close it, and it
                 // would keep the daemon from ever being idle.
                 if closing || session.clients.lock().unwrap().is_empty() {

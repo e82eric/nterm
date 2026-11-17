@@ -116,13 +116,14 @@ impl Drop for Console {
 pub struct Output(Handle);
 
 impl Output {
-    /// Blocks. Zero is the end: the pseudoconsole was closed.
-    pub fn read(&self, buffer: &mut [u8]) -> usize {
+    /// Blocks. An error is the end, and is the system's code for why: the
+    /// pseudoconsole was closed, or whatever ran it is gone.
+    pub fn read(&self, buffer: &mut [u8]) -> Result<usize, u32> {
         let mut count = 0u32;
         let ok = unsafe {
             ReadFile(self.0.0, buffer.as_mut_ptr(), buffer.len() as u32, &mut count, null_mut())
         };
-        if ok == 0 { 0 } else { count as usize }
+        if ok == 0 { Err(unsafe { GetLastError() }) } else { Ok(count as usize) }
     }
 }
 
@@ -130,17 +131,18 @@ impl Output {
 pub struct Input(Handle);
 
 impl Input {
-    /// Blocks while the pseudoconsole is not reading. False once it is gone.
-    pub fn write(&self, mut bytes: &[u8]) -> bool {
+    /// Blocks while the pseudoconsole is not reading. An error once it is
+    /// gone: the system's code for why.
+    pub fn write(&self, mut bytes: &[u8]) -> Result<(), u32> {
         while !bytes.is_empty() {
             let mut count = 0u32;
             let len = bytes.len().min(1 << 20) as u32;
             if unsafe { WriteFile(self.0.0, bytes.as_ptr(), len, &mut count, null_mut()) } == 0 {
-                return false;
+                return Err(unsafe { GetLastError() });
             }
             bytes = &bytes[count as usize..];
         }
-        true
+        Ok(())
     }
 }
 
