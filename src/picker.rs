@@ -53,6 +53,8 @@ pub(crate) struct Picker {
     callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
     request_params: std::collections::BTreeMap<String, String>,
     enter_action: config::EnterAction,
+    /// See `config::Options::accept`.
+    app_accept: Option<config::AppAccept>,
     source: PickerSource,
     split_parent: Option<(PickerSource, String)>,
     split_parent_presentation: Option<(
@@ -394,10 +396,27 @@ impl Picker {
                 ),
             );
         }
+        if let Some(config::Preview::Directory { .. }) = &options.preview {
+            let value = source.preview_value_resolver();
+            shared.set_preview_provider(
+                &ctx,
+                Arc::new(
+                    move |request: nfm_egui::PreviewRequest<source::Candidate>, _| {
+                        crate::preview_worker::directory_listing(std::path::Path::new(
+                            &value(&request.selection),
+                        ))
+                        .map(nfm_egui::Preview::Text)
+                    },
+                ),
+            );
+        }
         shared.set_external_preview(
             options.preview.is_some()
                 && !nfm_preview
-                && !matches!(options.preview, Some(config::Preview::Text { .. })),
+                && !matches!(
+                    options.preview,
+                    Some(config::Preview::Text { .. } | config::Preview::Directory { .. })
+                ),
         );
         let resolved_preview = match &options.preview {
             Some(source @ config::Preview::Dynamic { .. }) => {
@@ -434,6 +453,7 @@ impl Picker {
             accept_on_click,
             request_params: options.params,
             enter_action: options.enter_action,
+            app_accept: options.accept,
             source,
             split_parent: None,
             split_parent_presentation: None,
@@ -801,6 +821,7 @@ impl Picker {
         }))
     }
     fn accept(&self, selection: nfm_egui::Selection<source::Candidate>) -> Option<Action> {
+        let unmoved = selection.index == 0;
         if let Some(session) = &self.pipe_session {
             let index = selection.item.node_index;
             let value = self
@@ -831,6 +852,12 @@ impl Picker {
             return Some(Action::Execute(action));
         }
         let value = self.source.accepted_value(&result);
+        if let Some(make) = &self.app_accept {
+            // Enter before anything is typed or selected takes what is
+            // offered, which is no row.
+            let offered = unmoved && self.shared.query().is_empty();
+            return Some(Action::Execute(make((!offered).then_some(value))));
+        }
         let needs_position =
             self.callback.is_some() || matches!(self.enter_action, config::EnterAction::Navigate);
         let range = if needs_position {

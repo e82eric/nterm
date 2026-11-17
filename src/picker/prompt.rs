@@ -12,7 +12,7 @@ pub(crate) struct Prompt {
     pub(crate) from_copy: bool,
     pub(crate) typography: font::Typography,
     /// What Enter does with the text typed.
-    action:config::PromptAction,
+    action: config::PromptAction,
     request_params: std::collections::BTreeMap<String, String>,
 }
 

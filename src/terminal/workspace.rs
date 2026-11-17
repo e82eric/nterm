@@ -37,6 +37,10 @@ impl Layout {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Config {
     pub default_layout: Layout,
+    /// The directories whose folders are offered when a workspace is made,
+    /// for its first shell to start in. With none a new workspace starts
+    /// where the active pane is, without asking.
+    pub new_roots: Vec<std::path::PathBuf>,
     pub appearance: Appearance,
 }
 // Not `#[serde(flatten)]`: it disables `deny_unknown_fields`, and typos in
@@ -49,9 +53,22 @@ impl<'de> Deserialize<'de> for Config {
             Some(layout) => serde_json::from_value(layout).map_err(D::Error::custom)?,
             None => Layout::default(),
         };
+        let new_roots: Vec<String> = match fields.remove("new_roots") {
+            Some(roots) => serde_json::from_value(roots).map_err(D::Error::custom)?,
+            None => Vec::new(),
+        };
+        if new_roots
+            .iter()
+            .any(|root| root.trim().is_empty() || root.contains('\0'))
+        {
+            return Err(D::Error::custom(
+                "workspaces.new_roots must contain nonempty paths",
+            ));
+        }
         let appearance = serde_json::from_value(fields.into()).map_err(D::Error::custom)?;
         Ok(Self {
             default_layout,
+            new_roots: new_roots.into_iter().map(Into::into).collect(),
             appearance,
         })
     }
@@ -216,6 +233,19 @@ pub(crate) fn named(text: &str) -> Option<String> {
         .take(NAME_LENGTH)
         .collect();
     (!name.is_empty()).then_some(name)
+}
+/// What to call a workspace started in the directory `cwd`: the directory's
+/// own name, and from the second workspace so called a number after it, the
+/// lowest that none of `others` has. `None` for a path that names nothing.
+pub(crate) fn named_after(cwd: &str, others: &[Workspace]) -> Option<String> {
+    let base = named(cwd.rsplit(['\\', '/']).find(|part| !part.trim().is_empty())?)?;
+    let taken = |name: &str| others.iter().any(|w| w.name.as_deref() == Some(name));
+    if !taken(&base) {
+        return Some(base);
+    }
+    // Room for the number in a name as long as one may be.
+    let base: String = base.chars().take(NAME_LENGTH - 4).collect();
+    (2..).map(|count| format!("{base} {count}")).find(|name| !taken(name))
 }
 impl Workspace {
     pub fn new(id: u64, index: usize) -> Self {
@@ -420,6 +450,8 @@ pub(crate) struct CreateOptions {
     pub index: Option<usize>,
     /// `None` uses the configured `workspaces.default_layout`.
     pub layout: Option<Layout>,
+    /// Where the first shell starts. `None` is where the active pane is.
+    pub cwd: Option<String>,
 }
 /// `app:create_pane` options: the destination workspace (current by default)
 /// and how to start the shell. Tiled panes have no names.
@@ -533,6 +565,23 @@ pub(crate) enum Request {
 mod tests {
     use super::*;
     use crate::terminal::layout::Deck;
+    #[test]
+    fn a_workspace_is_called_after_its_directory_and_counted_from_the_second() {
+        let mut others = Vec::new();
+        for (id, expected) in [(1, "nterm"), (2, "nterm 2"), (3, "nterm 3")] {
+            let name = named_after(r"C:\src\nterm", &others);
+            assert_eq!(name.as_deref(), Some(expected));
+            let mut w = Workspace::new(id, id as usize);
+            w.name = name;
+            others.push(w);
+        }
+        // A number given up is used again.
+        others.remove(1);
+        assert_eq!(named_after("C:/src/nterm/", &others).as_deref(), Some("nterm 2"));
+        assert_eq!(named_after("/home/me/notes", &others).as_deref(), Some("notes"));
+        assert_eq!(named_after(r"C:\", &others).as_deref(), Some("C:"));
+        assert_eq!(named_after("/", &others), None);
+    }
     fn panes(layout: Layout, focused: u64) -> Workspace {
         let mut w = Workspace::new(1, 1);
         w.layout = layout;

@@ -17,6 +17,9 @@ pub(crate) enum AppAction {
     EndSession(String),
     /// Call a workspace of this window `name`; nothing takes its name away.
     RenameWorkspace { id: u64, name: String },
+    /// Make a workspace whose first shell starts in a directory, and go to
+    /// it. `None` is where the active pane is.
+    CreateWorkspaceIn(Option<String>),
     /// Show a session waiting in the session daemon as a workspace. The
     /// name is the daemon's; empty for the shells no session describes.
     AttachSession(String),
@@ -137,6 +140,7 @@ impl AppAction {
             Self::Workspace(_)
                 | Self::SelectWorkspaceId(_)
                 | Self::RenameWorkspace { .. }
+                | Self::CreateWorkspaceIn(_)
                 | Self::RenameWorkspacePrompt(_)
                 | Self::DetachWorkspaceId(_)
                 | Self::EndWorkspaceId(_)

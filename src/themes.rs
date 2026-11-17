@@ -59,6 +59,7 @@ pub(crate) fn picker_options(names: Vec<String>) -> crate::picker::config::Optio
     use crate::picker::config::*;
     Options {
         height: None,
+        accept: None,
         scope: Scope::Pane,
         result_rows: Options::default().result_rows,
         position: Position::Center,

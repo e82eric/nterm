@@ -556,6 +556,11 @@ impl TerminalView {
                 }
             }
             AppAction::RenameWorkspace { id, name } => self.rename_workspace(id, &name),
+            AppAction::CreateWorkspaceIn(cwd) => {
+                if let Err(error) = self.create_workspace_in(cwd, gl) {
+                    self.show_error("Workspace action failed", error);
+                }
+            }
             AppAction::RenameWorkspacePrompt(id) => self.rename_workspace_prompt(id, ctx),
             AppAction::DetachWorkspaceId(id) => {
                 if let Err(error) = self.detach_workspace(id) {

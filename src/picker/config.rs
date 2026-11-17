@@ -182,6 +182,12 @@ pub(crate) enum Preview {
         #[serde(default)]
         max_scrollback_lines: Option<usize>,
     },
+    /// What is in the directory a row names. For pickers made here: a
+    /// configuration lists a directory with a Dynamic preview.
+    #[serde(skip)]
+    Directory {
+        line_numbers: Option<LineNumbers>,
+    },
 }
 
 fn default_preview_rows() -> usize {
@@ -206,6 +212,7 @@ impl Preview {
             | Self::Ansi { line_numbers, .. }
             | Self::Dynamic { line_numbers, .. }
             | Self::Scrollback { line_numbers, .. }
+            | Self::Directory { line_numbers }
             | Self::Command { line_numbers, .. } => *line_numbers,
             Self::Host => None,
         }
@@ -218,6 +225,7 @@ impl Preview {
             | Self::Ansi { line_numbers, .. }
             | Self::Dynamic { line_numbers, .. }
             | Self::Scrollback { line_numbers, .. }
+            | Self::Directory { line_numbers }
             | Self::Command { line_numbers, .. } => Some(line_numbers),
             Self::Host => None,
         }
@@ -876,6 +884,7 @@ impl Definition {
         let label = matches!(source, Source::TextFile(_)).then_some("FILE PICKER");
         let mut options = Options {
             height: None,
+            accept: None,
             scope,
             position,
             result_rows,
@@ -1225,7 +1234,15 @@ pub(crate) struct Options {
     /// what the results leave. Without it the preview has a set number of
     /// rows.
     pub(crate) height: Option<f32>,
+    /// An action of the app's made from the value accepted, in place of
+    /// the Enter action. See `AppAccept`.
+    pub(crate) accept: Option<AppAccept>,
 }
+
+/// Makes the action a picker runs when Enter accepts a row, from the row's
+/// value. It is given `None` when Enter is pressed with nothing typed and the
+/// selection where it started: taking what is offered, not choosing a row.
+pub(crate) type AppAccept = std::rc::Rc<dyn Fn(Option<String>) -> crate::actions::AppAction>;
 
 /// What a prompt does with the text typed.
 #[derive(Clone)]
@@ -1413,6 +1430,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             height: None,
+            accept: None,
             scope: Scope::Pane,
             result_rows: default_result_rows(),
             position: Position::Bottom,
@@ -1480,6 +1498,9 @@ impl PickerEntry {
 pub(crate) struct Bindings {
     pub(crate) workspace_appearance: crate::terminal::workspace::Appearance,
     pub(crate) default_layout: crate::terminal::workspace::Layout,
+    /// `workspaces.new_roots`: where a new workspace's directory is picked
+    /// from. Empty for no picking.
+    pub(crate) new_workspace_roots: Vec<std::path::PathBuf>,
     pub(crate) pipe_policy: super::pipe::Policy,
     pub(crate) builtin_pickers: BuiltinPickers,
     pub(crate) cursor_scroll_padding: u32,
@@ -1498,6 +1519,7 @@ impl Bindings {
         workspaces.appearance.validate()?;
         self.workspace_appearance = workspaces.appearance;
         self.default_layout = workspaces.default_layout;
+        self.new_workspace_roots = workspaces.new_roots;
         Ok(self)
     }
 
@@ -1744,6 +1766,7 @@ impl Bindings {
             key_tables,
             workspace_appearance: Default::default(),
             default_layout: Default::default(),
+            new_workspace_roots: Vec::new(),
             pipe_policy: super::pipe::Policy::default(),
             model,
             builtin_pickers: BuiltinPickers::default(),

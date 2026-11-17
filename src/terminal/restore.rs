@@ -174,7 +174,7 @@ pub(super) fn called(
     let names = names.join(", ");
     let place = place.map(|pwd| self::place(pwd)).filter(|place| !place.is_empty());
     let (name, running) = match name {
-        Some(name) => (name, [Some(names), place]),
+        Some(name) => (name, [Some(names).filter(|names| !names.is_empty()), place]),
         None => (names, [None, place]),
     };
     (name, running.into_iter().flatten().collect::<Vec<_>>().join(" / "))
@@ -748,6 +748,9 @@ mod tests {
         assert_eq!(called(None, &titles, Some(&place)), ("cargo.exe, vim".into(), "C:/src".into()));
         let named = called(Some("api".into()), &titles, Some(&place));
         assert_eq!(named, ("api".into(), "cargo.exe, vim / C:/src".into()));
+        // Nothing running that has said what it is leaves the place alone.
+        let quiet = called(Some("api".into()), &[String::new()], Some(&place));
+        assert_eq!(quiet, ("api".into(), "C:/src".into()));
         assert_eq!(called(None, &[], None), (String::new(), String::new()));
         // Three tiled and two floating.
         assert_eq!((counted(3, [1, 2]), counted(1, [])), ("3 + 1 + 2".into(), "1".into()));

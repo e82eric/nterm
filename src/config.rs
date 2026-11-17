@@ -1066,6 +1066,18 @@ mod tests {
             crate::terminal::workspace::Layout::HorizontalGrid
         );
         assert_eq!(config.workspaces.appearance.inner_gap, 3.0);
+        // Where a new workspace's directory is picked from: nowhere, unless
+        // roots are given.
+        assert!(config.workspaces.new_roots.is_empty());
+        let config =
+            parse("return {workspaces={new_roots={'C:/src','G:/src'},inner_gap=3}}").unwrap();
+        assert_eq!(
+            config.workspaces.new_roots,
+            ["C:/src", "G:/src"].map(std::path::PathBuf::from)
+        );
+        assert_eq!(config.workspaces.appearance.inner_gap, 3.0);
+        assert!(parse("return {workspaces={new_roots={''}}}").is_err());
+        assert!(parse("return {workspaces={new_roots='C:/src'}}").is_err());
         // There was once a `startup` function; it is refused like any unknown key.
         assert!(parse("return {startup=function() end}").is_err());
     }
