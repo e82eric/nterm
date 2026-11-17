@@ -34,6 +34,9 @@ struct Saved {
     appearance: Option<Appearance>,
     floats: Vec<Float>,
     visible_float: Option<u32>,
+    /// Where floats are shown, when they were moved or resized: the top,
+    /// bottom, left and right of `FloatingPadding`.
+    float_size: Option<[f32; 4]>,
     /// What the user called the workspace.
     name: Option<String>,
 }
@@ -253,6 +256,15 @@ pub(super) struct Waiting {
     /// The float that was showing: how its panes are laid out, their ids
     /// the daemon's pane numbers too.
     pub(super) float: Option<workspace::Group>,
+    /// Where its floats are shown, if they were moved or resized.
+    pub(super) float_size: Option<crate::config::FloatingPadding>,
+}
+
+/// Where a saved workspace shows its floats, if that is a size at all.
+fn float_size(saved: &Saved) -> Option<crate::config::FloatingPadding> {
+    let [top, bottom, left, right] = saved.float_size?;
+    let size = crate::config::FloatingPadding { top, bottom, left, right };
+    [top, bottom, left, right].iter().all(|side| side.is_finite()).then_some(size)
 }
 
 /// A session waiting in the daemon, as the daemon last described it. `None`
@@ -296,7 +308,7 @@ pub(super) fn waiting_workspace(id: &str) -> Option<Waiting> {
         group(layout, float.main_ratio, &inside, Some(float.pane), &float.weights)
     });
     let shells = saved.panes.iter().chain(&inside).filter_map(|pane| listing.adopt(*pane)).collect();
-    Some(Waiting { workspace: shown, shells, float })
+    Some(Waiting { workspace: shown, shells, float, float_size: float_size(&saved) })
 }
 
 impl TerminalView {
@@ -382,6 +394,9 @@ impl TerminalView {
         workspace.pane_weights = weights;
         workspace.appearance =
             saved.appearance.clone().filter(|appearance| appearance.validate().is_ok());
+        if let Some(size) = float_size(&saved) {
+            workspace.floats.set_size(Some(size));
+        }
         workspace.name = saved.name.as_deref().and_then(workspace::named);
         match visible {
             Some(id) => workspace.floats.show(id),
@@ -486,6 +501,7 @@ impl TerminalView {
             appearance: workspace.appearance.clone(),
             floats: workspace.floats.ids().iter().filter_map(float).collect(),
             visible_float: workspace.floats.visible().and_then(|id| float(&id)).map(|float| float.pane),
+            float_size: workspace.floats.size().map(|size| [size.top, size.bottom, size.left, size.right]),
             name: workspace.name.clone(),
             panes,
         })
@@ -820,5 +836,15 @@ mod tests {
         let saved = taken(&saved, &[2, 3]);
         assert_eq!(saved.panes, [2, 3]);
         assert!(saved.floats.is_empty());
+    }
+
+    #[test]
+    fn where_floats_are_shown_is_kept_unless_it_is_no_size() {
+        let kept = Saved { float_size: Some([0.1, 0.2, 0.3, 0.4]), ..Saved::default() };
+        let size = float_size(&kept).unwrap();
+        assert_eq!([size.top, size.bottom, size.left, size.right], [0.1, 0.2, 0.3, 0.4]);
+        let bad = Saved { float_size: Some([0.1, f32::NAN, 0.3, 0.4]), ..Saved::default() };
+        assert!(float_size(&bad).is_none());
+        assert!(float_size(&Saved::default()).is_none());
     }
 }

@@ -41,6 +41,8 @@ pub(super) struct Peek {
     /// The float that was showing, its panes among `panes`. Its pane ids
     /// are the daemon's pane numbers too.
     float: Option<Group>,
+    /// Where the session shows its floats, if they were moved or resized.
+    float_size: Option<crate::config::FloatingPadding>,
     asked: Instant,
 }
 
@@ -188,7 +190,7 @@ impl TerminalView {
                     outline(rect, peek.float.is_none() && peek.workspace.focused == Some(pane));
                 }
                 if let Some(group) = &peek.float {
-                    float(self.floating_padding, group, &|pane, rect| {
+                    float(peek.float_size.or(self.floating_padding), group, &|pane, rect| {
                         if let Some(looking) = looking(pane) {
                             draw(Some(&looking.pane), rect, wanted(looking));
                         }
@@ -208,11 +210,13 @@ impl TerminalView {
             workspace: Workspace::new(0, 0),
             panes: Vec::new(),
             float: None,
+            float_size: None,
             asked: Instant::now(),
         };
         let Some(waiting) = super::restore::waiting_workspace(id) else { return peek };
         peek.workspace = waiting.workspace;
         peek.float = waiting.float;
+        peek.float_size = waiting.float_size;
         for shell in waiting.shells {
             let number = shell.info.pane;
             let grid = [shell.info.size.cols, shell.info.size.rows];
