@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -99,6 +99,16 @@ pub struct PaneInfo {
     pub pwd: Option<String>,
 }
 
+/// A session and the shells of it that are running. One with no running
+/// shell is forgotten. The shells in no session are given as one more, with
+/// an empty `id` and no layout, last.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub panes: Vec<PaneInfo>,
+    pub layout: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
@@ -142,6 +152,13 @@ pub enum Control {
     /// Every blob whose key starts with `prefix`.
     BlobList { request: u32, prefix: String },
     BlobRemove { key: String },
+    /// One workspace of a UI, so that it can be shown again when nothing
+    /// shows it: the panes it holds, and how the UI lays them out, which
+    /// only UIs read. Sent whenever either changes. A pane is in one session,
+    /// the one that named it last.
+    SessionSet { id: String, panes: Vec<PaneId>, layout: String },
+    /// The workspace is gone. Its shells are not ended by this.
+    SessionRemove { id: String },
     /// The first message of a program running in pane `pane`'s shell, in
     /// place of `Hello`. What it sends from then on, in `Frame::Shell`, is
     /// passed to the UI attached to the pane, and what that UI answers is
@@ -178,6 +195,9 @@ pub enum Control {
     },
     /// Keys and values, in key order.
     Blobs { request: u32, blobs: Vec<(String, String)> },
+    /// Every session, to every UI: once after `Welcome`, and again whenever
+    /// one changes.
+    Sessions { sessions: Vec<SessionInfo> },
     Error {
         #[serde(default)]
         request: Option<u32>,

@@ -5,7 +5,9 @@ use nterm_daemon::vt::Terminal;
 use nterm_session::{
     GHOSTTY_REVISION,
     pipe::{self, Connection, Writer},
-    protocol::{Control, Frame, PROTOCOL_VERSION, PaneId, PaneInfo, Size, TerminalSettings},
+    protocol::{
+        Control, Frame, PROTOCOL_VERSION, PaneId, PaneInfo, SessionInfo, Size, TerminalSettings,
+    },
 };
 use std::{
     io::Write,
@@ -77,6 +79,8 @@ struct Ui {
     welcome: Control,
     /// What this UI's copy of a pane has been sent, in order.
     mirror: Option<Terminal>,
+    /// The sessions as the daemon last gave them.
+    sessions: Option<Vec<SessionInfo>>,
 }
 
 impl Ui {
@@ -98,6 +102,7 @@ impl Ui {
             frames,
             welcome: Control::Unknown,
             mirror: None,
+            sessions: None,
         };
         ui.send(Control::Hello { protocol: PROTOCOL_VERSION, ghostty: GHOSTTY_REVISION.into() });
         ui.welcome = ui.control(|control| matches!(control, Control::Welcome { .. }));
@@ -121,6 +126,9 @@ impl Ui {
             Frame::Output { bytes, .. } => {
                 // A UI's terminal is silent: its replies are dropped.
                 let _ = self.mirror.as_mut().expect("screen before output").feed(bytes);
+            }
+            Frame::Control(Control::Sessions { sessions }) => {
+                self.sessions = Some(sessions.clone());
             }
             _ => {}
         }
@@ -159,6 +167,21 @@ impl Ui {
             match self.frames.recv_timeout(left) {
                 Ok(frame) => self.absorb(&frame),
                 Err(_) => panic!("never saw {what}; the screen is:\n{text}"),
+            }
+        }
+    }
+
+    /// The sessions, once the daemon has given them as `wanted` has them.
+    fn sessions(&mut self, what: &str, wanted: impl Fn(&[SessionInfo]) -> bool) -> Vec<SessionInfo> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(sessions) = self.sessions.as_ref().filter(|sessions| wanted(sessions)) {
+                return sessions.clone();
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.frames.recv_timeout(left) {
+                Ok(frame) => self.absorb(&frame),
+                Err(_) => panic!("never told of {what}; the sessions are {:#?}", self.sessions),
             }
         }
     }
@@ -646,5 +669,58 @@ fn a_program_is_refused_for_no_pane_or_with_no_ui() {
         assert!(Instant::now() < deadline, "the program was not refused");
         std::thread::sleep(Duration::from_millis(50));
     }
+    ui.shutdown();
+}
+
+#[test]
+fn uis_are_told_of_the_sessions_as_they_change() {
+    let session = session("sessions");
+    let mut ui = Ui::connect(&session);
+    assert!(ui.sessions("none at first", |_| true).is_empty());
+
+    // Shells in no session are given as one with no name.
+    let shell = "cmd.exe /d /q /k prompt $G$S";
+    let (a, b) = (ui.spawn(shell, size(80, 24)).pane, ui.spawn(shell, size(80, 24)).pane);
+    let told = ui.sessions("two strays", |told| told.len() == 1 && told[0].panes.len() == 2);
+    assert_eq!((told[0].id.as_str(), told[0].layout.as_str()), ("", ""));
+
+    let set = |id: &str, panes: &[PaneId], layout: &str| Control::SessionSet {
+        id: id.into(),
+        panes: panes.to_vec(),
+        layout: layout.into(),
+    };
+    let panes = |told: &SessionInfo| told.panes.iter().map(|pane| pane.pane).collect::<Vec<_>>();
+    ui.send(set("one", &[a], "first layout"));
+    let told = ui.sessions("a session and a stray", |told| told.len() == 2);
+    assert_eq!((told[0].id.as_str(), told[0].layout.as_str()), ("one", "first layout"));
+    assert_eq!((panes(&told[0]), panes(&told[1])), (vec![a], vec![b]));
+    assert_eq!(told[1].id, "");
+
+    // A pane is in the session that named it last, and one left with no
+    // pane is forgotten. The panes come in the order the session gave.
+    ui.send(set("two", &[b, a], "second layout"));
+    let told = ui.sessions("one session", |told| told.len() == 1 && told[0].id == "two");
+    assert_eq!((panes(&told[0]), told[0].layout.as_str()), (vec![b, a], "second layout"));
+
+    // Another UI starts from what there is, and hears of what this one does.
+    let mut other = Ui::connect(&session);
+    let told = other.sessions("what there is", |told| told.len() == 1);
+    assert!(told[0].panes.iter().all(|pane| pane.attached == 0));
+    ui.send(Control::Attach { request: 0, pane: a, size: size(80, 24), exclusive: true });
+    other.sessions("the attach", |told| {
+        told.len() == 1 && told[0].panes.iter().any(|pane| pane.pane == a && pane.attached == 1)
+    });
+    ui.send(Control::Detach { pane: a });
+    other.sessions("the detach", |told| {
+        told.len() == 1 && told[0].panes.iter().all(|pane| pane.attached == 0)
+    });
+
+    // A session is told without its shells that have ended, and with none
+    // left it is forgotten.
+    ui.send(Control::Close { pane: a });
+    let told = other.sessions("one shell", |told| told.len() == 1 && told[0].panes.len() == 1);
+    assert_eq!((told[0].id.as_str(), panes(&told[0])), ("two", vec![b]));
+    ui.send(Control::Close { pane: b });
+    other.sessions("none", |told| told.is_empty());
     ui.shutdown();
 }

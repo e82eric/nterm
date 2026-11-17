@@ -497,30 +497,32 @@ pub(crate) fn install_lua_helpers(lua: &mlua::Lua, nterm: &mlua::Table) -> mlua:
     )
 }
 impl TerminalView {
-    /// The sessions no window shows can be taken from the workspace
-    /// picker too. The daemon is asked for them, and the picker opens when
-    /// it has answered: see `poll_waiting`.
+    /// The sessions no window shows can be taken from the workspace picker
+    /// too.
     fn open_workspace_picker(&mut self, ctx: &egui::Context, moving: bool) {
-        if moving || !self.ask_waiting() {
-            self.show_workspace_picker(ctx, moving, None);
-        }
+        self.show_workspace_picker(ctx, moving, None);
     }
 
+    /// `query` is what the picker starts with typed into it.
     pub(super) fn show_workspace_picker(
         &mut self,
         ctx: &egui::Context,
         moving: bool,
-        waiting: Option<crate::session::Listing>,
+        query: Option<String>,
     ) {
         let pane = if moving { self.active_pane() } else { None };
         if moving && pane.is_none() {
             return;
         }
         let mut options = workspace_picker_options(&self.workspaces, self.current, pane);
-        if let (Some(listing), crate::picker::config::Source::Workspaces(entries)) =
-            (waiting, &mut options.source)
+        self.offered = None;
+        if let (false, crate::picker::config::Source::Workspaces(entries)) =
+            (moving, &mut options.source)
         {
-            entries.extend(self.offer_waiting(listing));
+            entries.extend(self.offer_waiting());
+        }
+        if let Some(query) = query {
+            options.params.insert("query".into(), query);
         }
         let bindings = self.picker_bindings.clone();
         let palette = self.palette_context();
@@ -1392,7 +1394,7 @@ impl TerminalView {
         for mut p in self.closed_panes.drain(..) {
             p.destroy();
         }
-        self.poll_waiting();
+        self.follow_sessions();
         self.save_sessions();
         let exited: Vec<_> = self
             .workspaces

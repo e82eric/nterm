@@ -16,10 +16,12 @@ use nterm_session::{
     GHOSTTY_REVISION,
     pipe::{Connection, Listener},
     shell::{DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE},
-    protocol::{Control, Frame, PROTOCOL_VERSION, PaneId, PaneInfo, Size, TerminalSettings},
+    protocol::{
+        Control, Frame, PROTOCOL_VERSION, PaneId, PaneInfo, SessionInfo, Size, TerminalSettings,
+    },
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{self, BufReader, Write},
     sync::{
         Arc, Mutex,
@@ -50,6 +52,11 @@ struct Session {
     /// What the UI last sent; new panes start from it.
     settings: Mutex<TerminalSettings>,
     blobs: Mutex<HashMap<String, String>>,
+    /// The UIs' sessions, by the names the UIs gave them.
+    sessions: Mutex<BTreeMap<String, Saved>>,
+    /// Sent to when the sessions, or anything a UI is told of them, may have
+    /// changed: see `tell_sessions`.
+    sessions_changed: Sender<()>,
     clients: Mutex<HashMap<u64, Outbox>>,
     /// The conversations under way between programs in shells and UIs.
     channels: Mutex<HashMap<u32, Channel>>,
@@ -68,6 +75,12 @@ struct Channel {
     shell: Outbox,
 }
 
+/// One workspace of a UI: the panes in it, and the UI's own account of how
+/// they are laid out, which the daemon keeps and does not read.
+struct Saved {
+    panes: Vec<PaneId>,
+    layout: String,
+}
 
 struct Pane {
     id: PaneId,
@@ -148,6 +161,41 @@ impl Session {
         }
     }
 
+    /// The sessions may have changed; the UIs are told if they have. Nothing
+    /// is worked out here, so this is safe under any lock.
+    fn sessions_changed(&self) {
+        let _ = self.sessions_changed.send(());
+    }
+
+    /// Every session with the shells of it that are running, and last the
+    /// running shells in none. A session with no running shell is forgotten
+    /// here: nothing could show it again.
+    fn sessions(&self) -> Vec<SessionInfo> {
+        let mut panes: Vec<Arc<Pane>> = self.panes.lock().unwrap().values().cloned().collect();
+        panes.sort_by_key(|pane| pane.id);
+        let mut running: BTreeMap<PaneId, PaneInfo> = panes
+            .iter()
+            .map(|pane| (pane.id, pane.info()))
+            .filter(|(_, info)| info.exited.is_none())
+            .collect();
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut listed = Vec::new();
+        sessions.retain(|id, saved| {
+            let panes: Vec<PaneInfo> =
+                saved.panes.iter().filter_map(|pane| running.remove(pane)).collect();
+            let kept = !panes.is_empty();
+            if kept {
+                listed.push(SessionInfo { id: id.clone(), panes, layout: saved.layout.clone() });
+            }
+            kept
+        });
+        if !running.is_empty() {
+            let panes = running.into_values().collect();
+            listed.push(SessionInfo { id: String::new(), panes, layout: String::new() });
+        }
+        listed
+    }
+
     /// End the conversations `which` picks. Each program is told and its
     /// connection closed; the UI is told too unless it is the one that has
     /// gone.
@@ -219,6 +267,7 @@ impl Session {
             }),
         });
         self.panes.lock().unwrap().insert(id, pane.clone());
+        self.sessions_changed();
         log(format_args!(
             "pane {id}: pid {} {}x{} {:?}",
             pane.process.pid, size.cols, size.rows, pane.command
@@ -289,6 +338,7 @@ impl Session {
                 }
                 session.end_channels(|_, channel| channel.pane == pane.id, true);
                 session.broadcast(Control::Exited { pane: pane.id, code });
+                session.sessions_changed();
             })
             .map_err(|error| error.to_string())?;
         Ok(pane)
@@ -306,7 +356,10 @@ impl Session {
 /// Serve the session until told to shut down or left idle.
 pub fn run(options: Options) -> io::Result<()> {
     let mut listener = Listener::bind(&options.session)?;
+    let (sessions_changed, changes) = mpsc::channel();
     let session = Arc::new(Session {
+        sessions: Mutex::default(),
+        sessions_changed,
         name: options.session,
         panes: Mutex::default(),
         next_pane: AtomicU32::new(1),
@@ -341,6 +394,36 @@ pub fn run(options: Options) -> io::Result<()> {
                 }
             }
         });
+    }
+
+    {
+        // One thread tells the UIs of the sessions, so that what they are
+        // told is in order and a burst of changes is one message.
+        let session = session.clone();
+        std::thread::Builder::new().name("sessions".into()).spawn(move || {
+            let mut told = Vec::new();
+            loop {
+                // A shell changes its title or its directory without anything
+                // being asked of the daemon, so look now and then as well.
+                if let Err(mpsc::RecvTimeoutError::Disconnected) =
+                    changes.recv_timeout(Duration::from_secs(1))
+                {
+                    return;
+                }
+                while changes.try_recv().is_ok() {}
+                if session.clients.lock().unwrap().is_empty() {
+                    continue;
+                }
+                let sessions = session.sessions();
+                let frame = Frame::Control(Control::Sessions { sessions }).encode();
+                if frame != told {
+                    for outbox in session.clients.lock().unwrap().values() {
+                        let _ = outbox.send(frame.clone());
+                    }
+                    told = frame;
+                }
+            }
+        })?;
     }
 
     loop {
@@ -407,6 +490,8 @@ fn serve(session: &Arc<Session>, connection: Connection) {
     }
     // After it has left every pane, so no program finds it there.
     session.end_channels(|_, channel| channel.ui == id, false);
+    // What it showed is waiting now.
+    session.sessions_changed();
     // With every sender gone the writer sends what is queued and ends.
     drop(outbox);
     let _ = writer.join();
@@ -455,6 +540,8 @@ fn converse(
         connection.peer_pid()
     ));
     session.clients.lock().unwrap().insert(id, outbox.clone());
+    // A UI starts from what there is, and hears of changes from then on.
+    send(Control::Sessions { sessions: session.sessions() });
 
     loop {
         let frame = match Frame::read(&mut reader) {
@@ -526,6 +613,7 @@ fn converse(
                 if let Some(code) = state.exited {
                     send(Control::Exited { pane: pane_id, code });
                 }
+                session.sessions_changed();
             }
             Control::Detach { pane: pane_id } => {
                 if let Some(pane) = session.pane(pane_id) {
@@ -533,6 +621,28 @@ fn converse(
                 }
                 // After it has left the pane, so no program finds it there.
                 session.end_channels(|_, c| c.pane == pane_id && c.ui == id, false);
+                session.sessions_changed();
+            }
+            Control::SessionSet { id: name, panes, layout } => {
+                if name.is_empty() {
+                    continue;
+                }
+                let mut sessions = session.sessions.lock().unwrap();
+                // A pane is in the session that named it last: the UI that
+                // shows it knows where it is.
+                for (other, saved) in sessions.iter_mut() {
+                    if *other != name {
+                        saved.panes.retain(|pane| !panes.contains(pane));
+                    }
+                }
+                sessions.retain(|_, saved| !saved.panes.is_empty());
+                sessions.insert(name, Saved { panes, layout });
+                drop(sessions);
+                session.sessions_changed();
+            }
+            Control::SessionRemove { id: name } => {
+                session.sessions.lock().unwrap().remove(&name);
+                session.sessions_changed();
             }
             Control::Resize { pane: pane_id, size } => {
                 let Some(pane) = session.pane(pane_id) else {

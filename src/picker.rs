@@ -145,6 +145,10 @@ impl Picker {
         }
         Ok(())
     }
+    /// What has been typed into it.
+    pub(crate) fn query(&self) -> String {
+        self.shared.query().to_owned()
+    }
     pub(crate) fn bind_pipe_search_wake(
         &self,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<crate::app::UserEvent>,

@@ -62,10 +62,7 @@ impl TerminalView {
         // Nothing of what the window knew of the daemon holds any more.
         self.sessions.clear();
         self.sessions_sent.clear();
-        self.waiting = None;
-        if let Some((asked, _)) = self.listing_asked.take() {
-            crate::session::forget_listing(asked);
-        }
+        self.offered = None;
         self.key_table = None;
         self.empty = Some(Empty::Unavailable { lost, reason });
         self.context.request_repaint();
@@ -100,8 +97,7 @@ impl TerminalView {
                 Status::Lost => Some(Empty::Unavailable { lost: true, reason: String::new() }),
                 Status::Off => self.first_shell(gl),
                 Status::Connected => {
-                    let waiting = crate::session::take_first_listing()
-                        .and_then(|listing| self.chooser(&ctx, listing));
+                    let waiting = self.chooser(&ctx, None);
                     match waiting {
                         Some(picker) => Some(Empty::Choose(picker)),
                         None => self.first_shell(gl),
@@ -111,8 +107,20 @@ impl TerminalView {
             // The daemon went while the choice was open: say so next frame.
             Empty::Choose(picker) if now != Status::Connected => {
                 picker.surrender_focus();
-                self.waiting = None;
+                self.offered = None;
                 Some(Empty::Connecting)
+            }
+            // Another window took a session, or left one: the choice is
+            // made again from what waits now, with what was typed into it.
+            Empty::Choose(picker) if self.sessions_changed() => {
+                let query = picker.query();
+                picker.surrender_focus();
+                drop(picker);
+                ctx.request_repaint();
+                match self.chooser(&ctx, Some(query)) {
+                    Some(picker) => Some(Empty::Choose(picker)),
+                    None => self.first_shell(gl),
+                }
             }
             Empty::Choose(mut picker) => match picker.show_scoped(&ctx, content, None, true) {
                 None => Some(Empty::Choose(picker)),
@@ -154,16 +162,17 @@ impl TerminalView {
         self.toasts.show(&ctx, content, egui::Id::new("window-toasts"), None, 0.0);
     }
 
-    /// The picker that asks which waiting session to show. `None` when
+    /// The picker that asks which waiting session to show, with `query`
+    /// typed into it. `None` when
     /// none waits.
     fn chooser(
         &mut self,
         ctx: &egui::Context,
-        listing: crate::session::Listing,
+        query: Option<String>,
     ) -> Option<Box<crate::picker::Picker>> {
-        let mut entries = self.offer_waiting(listing);
+        let mut entries = self.offer_waiting();
         if entries.is_empty() {
-            self.waiting = None;
+            self.offered = None;
             return None;
         }
         entries.push(crate::actions::Entry {
@@ -172,6 +181,10 @@ impl TerminalView {
             shortcut: None,
             action: AppAction::NewSession,
         });
+        let mut options = super::workspace_ui::entry_picker(entries);
+        if let Some(query) = query {
+            options.params.insert("query".into(), query);
+        }
         // Its rows are given to it, so it reads no terminal.
         Some(Box::new(crate::picker::Picker::start_replacing(
             std::ptr::null_mut(),
@@ -179,7 +192,7 @@ impl TerminalView {
             false,
             0,
             ctx.clone(),
-            super::workspace_ui::entry_picker(entries),
+            options,
             &self.picker_bindings.prompt_patterns,
             None,
         )))
@@ -189,7 +202,7 @@ impl TerminalView {
     /// shell.
     fn chosen(&mut self, action: crate::picker::Action, gl: &glow::Context) -> Option<Empty> {
         let crate::picker::Action::Execute(AppAction::AttachSession(id)) = action else {
-            self.waiting = None;
+            self.offered = None;
             return self.first_shell(gl);
         };
         match self.attach_session(&id, gl) {
