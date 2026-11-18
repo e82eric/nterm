@@ -473,6 +473,17 @@ pub(crate) struct CreateOptions {
     #[serde(skip)]
     pub place: Option<crate::session::Place>,
 }
+impl CreateOptions {
+    /// One whose first shell starts in `cwd`, a folder the user chose from
+    /// those the window lists. They are this machine's folders, so its
+    /// shells run here, whatever place the current workspace is in: a
+    /// folder of this machine is no folder of a remote. With no folder it
+    /// is made where the current workspace is.
+    pub(crate) fn in_folder(cwd: Option<String>) -> Self {
+        let place = cwd.is_some().then_some(crate::session::Place::Here);
+        Self { cwd, place, ..Default::default() }
+    }
+}
 /// `app:create_pane` options: the destination workspace (current by default)
 /// and how to start the shell. Tiled panes have no names.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -585,6 +596,16 @@ pub(crate) enum Request {
 mod tests {
     use super::*;
     use crate::terminal::layout::Deck;
+    #[test]
+    fn a_workspace_started_in_a_chosen_folder_is_of_this_machine() {
+        use crate::session::Place;
+        // The folders listed are this machine's, whatever place the
+        // current workspace is in.
+        let chosen = CreateOptions::in_folder(Some("C:/src/project".into()));
+        assert_eq!((chosen.cwd.as_deref(), chosen.place), (Some("C:/src/project"), Some(Place::Here)));
+        // With none chosen it is made where the current one is.
+        assert_eq!(CreateOptions::in_folder(None).place, None);
+    }
     #[test]
     fn a_workspace_is_called_after_its_directory_and_counted_from_the_second() {
         let mut others = Vec::new();

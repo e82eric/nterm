@@ -762,10 +762,8 @@ impl TerminalView {
         gl: &glow::Context,
     ) -> Result<(), String> {
         let name = cwd.as_deref().and_then(|cwd| workspace::named_after(cwd, &self.workspaces));
-        let options = workspace::CreateOptions {
-            cwd,
-            ..Default::default()
-        };
+        // A folder chosen is this machine's, and so is the workspace.
+        let options = workspace::CreateOptions::in_folder(cwd);
         let w = self.workspace_request(Request::Create(options), gl)?;
         let id = w["id"].as_u64().unwrap();
         if let Some(workspace) = self.workspaces.iter_mut().find(|w| w.id == id) {
