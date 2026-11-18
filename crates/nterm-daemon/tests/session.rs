@@ -1597,3 +1597,139 @@ fn a_ui_asks_for_a_picker_for_itself_and_is_told_what_the_row_it_chose_is() {
     }
     ui.shutdown();
 }
+
+#[test]
+fn the_pickers_of_the_machines_file_are_opened_by_name_as_the_daemons_own_are() {
+    let session = session("pick-file");
+    let tree = Tree::new("file");
+    let cwd = tree.path();
+    let file = tree.0.join("nterm-daemon.lua");
+    let write = |text: &str| {
+        // A file's time changes by no less than some of a second.
+        let before = std::fs::metadata(&file).and_then(|file| file.modified()).ok();
+        loop {
+            std::fs::write(&file, text).unwrap();
+            if std::fs::metadata(&file).and_then(|file| file.modified()).ok() != before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    write(
+        r#"return { pickers = {
+          Said = { type = "Command", args = { "cmd.exe", "/c", "echo", "{word}" }, sort = "SourceOrder" },
+          Typed = { type = "File", path = "{history}", reverse = true, unique = true },
+          Fixed = { type = "Items", position = "Cursor", initial_query = "t",
+                    items = { { text = "One", value = "1" }, { text = "Two", value = "2" } },
+                    action = function(app, item) app:send_text(item.value) end },
+          Here = { type = "FileSystem", files_only = true, relative = true, preview_visible = false },
+          files = { type = "Items" },
+        } }"#,
+    );
+    let mut command = std::process::Command::new(DAEMON);
+    command.args(["--session", &session, "--lua-config"]).arg(&file).env_remove("NTERM_CONPTY_DLL");
+    let mut daemon = command.spawn().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while let Err(error) = pipe::connect(&session) {
+        assert!(Instant::now() < deadline, "the daemon never served: {error}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    let params = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    };
+    let mut asks = 0;
+    let mut ask = |ui: &mut Ui, name: &str, given: std::collections::BTreeMap<String, String>| {
+        asks += 1;
+        ui.send(Control::PickerAsk { ask: asks, pane, picker: name.into(), params: given });
+        let answered = |c: &Control| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. });
+        ui.control(answered)
+    };
+
+    // A program the file names, run with what the picker is opened with as
+    // one argument, whatever is in it.
+    let opened = ask(&mut ui, "Said", params(&[("cwd", &cwd), ("word", "one & echo two")]));
+    let Control::PickerOpen { picker, label, preview, at_cursor, .. } = opened else { panic!("{opened:?}") };
+    assert_eq!((label.as_str(), preview, at_cursor), ("Said", None, false));
+    let said = ui.query(picker, 0, "");
+    assert_eq!(said.texts().len(), 1, "{:?}", said.texts());
+    assert!(said.texts()[0].contains("one & echo two"), "{:?}", said.texts());
+    ui.send(Control::PickerAccept { picker, serial: said.serial, row: said.rows[0].0 });
+    let Control::PickerChosen { value, .. } = ui.control(|c| matches!(c, Control::PickerChosen { .. })) else {
+        unreachable!()
+    };
+    assert!(value.contains("one & echo two"));
+
+    // The lines of a file, the last first.
+    std::fs::write(tree.0.join("typed.txt"), "first\nsecond\nfirst\n").unwrap();
+    let opened = ask(&mut ui, "Typed", params(&[("cwd", &cwd), ("history", "typed.txt")]));
+    let Control::PickerOpen { picker, .. } = opened else { panic!("{opened:?}") };
+    assert_eq!(ui.query(picker, 0, "").texts(), ["first", "second"]);
+    ui.send(Control::PickerClose { picker, refused: None });
+
+    // Rows written in the file, shown where the file says and with what it
+    // says is typed already. What the row chosen is, is its value.
+    let opened = ask(&mut ui, "Fixed", params(&[]));
+    let Control::PickerOpen { picker, query, at_cursor, .. } = opened else { panic!("{opened:?}") };
+    assert_eq!((query.as_str(), at_cursor), ("t", true));
+    let found = ui.query(picker, 0, "t");
+    assert_eq!(found.texts(), ["Two"]);
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
+    let Control::PickerChosen { text, value, .. } = ui.control(|c| matches!(c, Control::PickerChosen { .. })) else {
+        unreachable!()
+    };
+    assert_eq!((text.as_str(), value.as_str()), ("Two", "2"));
+
+    // Files under where it is opened, with the previews files have.
+    let opened = ask(&mut ui, "Here", params(&[("cwd", &cwd)]));
+    let Control::PickerOpen { picker, preview, .. } = opened else { panic!("{opened:?}") };
+    assert_eq!(preview, Some(false));
+    let found = ui.query(picker, 0, "gam");
+    assert_eq!(found.texts().len(), 1);
+    let shown = ui.preview(picker, 1, found.serial, found.rows[0].0);
+    let Control::PickerPreviewed { text, .. } = shown else { unreachable!() };
+    assert_eq!(text, "b/gamma.rs");
+    ui.send(Control::PickerClose { picker, refused: None });
+
+    // A program in the shell opens them as it does the daemon's own.
+    let (asker, picker) = ui.picker(&session, pane, "Fixed", serde_json::json!({}));
+    let found = ui.query(picker, 0, "one");
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
+    let (status, result) = asker.result();
+    assert_eq!((status.as_str(), &result["selected"][0]["value"]), ("accepted", &serde_json::json!("1")));
+
+    // Refused, saying why: what it was not opened with, one there is not,
+    // and the daemon's own are not the file's to say.
+    for (name, given, why) in [
+        ("Said", params(&[("cwd", &cwd)]), "not opened with word"),
+        ("Typed", params(&[("history", "typed.txt")]), "not a whole path"),
+        ("Here", params(&[]), "no cwd"),
+        ("Other", params(&[]), "no picker named Other"),
+    ] {
+        let refused = ask(&mut ui, name, given);
+        let Control::PickerRefused { message, .. } = refused else { panic!("{name}: {refused:?}") };
+        assert!(message.contains(why), "{name}: {message}");
+    }
+    let Control::PickerOpen { picker, label, .. } = ask(&mut ui, "files", params(&[("cwd", &cwd)])) else {
+        panic!("the daemon's own files picker did not open")
+    };
+    assert_eq!(label, "Files");
+    ui.send(Control::PickerClose { picker, refused: None });
+
+    // The file is read again once it has changed: no restart.
+    write(r#"return { pickers = { Fixed = { type = "Items", items = { { text = "Three", value = "3" } } } } }"#);
+    let Control::PickerOpen { picker, .. } = ask(&mut ui, "Fixed", params(&[])) else { panic!("did not open") };
+    assert_eq!(ui.query(picker, 0, "").texts(), ["Three"]);
+    ui.send(Control::PickerClose { picker, refused: None });
+    let Control::PickerRefused { message, .. } = ask(&mut ui, "Said", params(&[("word", "x")])) else {
+        panic!("a picker the file no longer has opened")
+    };
+    assert!(message.contains("no picker named Said"), "{message}");
+    // One that cannot be read says so, and the daemon goes on.
+    write("return {");
+    let Control::PickerRefused { message, .. } = ask(&mut ui, "Fixed", params(&[])) else { panic!("opened") };
+    assert!(message.contains("could not be read"), "{message}");
+    ui.shutdown();
+    assert!(daemon.wait().unwrap().success());
+}

@@ -8,6 +8,8 @@ mod conpty;
 #[cfg(windows)]
 pub mod log;
 #[cfg(windows)]
+mod configured;
+#[cfg(windows)]
 mod picker;
 #[cfg(windows)]
 pub mod relay;

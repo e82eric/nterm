@@ -158,6 +158,66 @@ Ctrl+Shift+O and Ctrl+Shift+T (under the current directory) and to Alt+Shift+O
 and Alt+Shift+T (under the roots), history to Alt+Shift+R, and PowerShell's
 completions, through `items`, to Ctrl+Shift+Space.
 
+### Pickers of your own: `nterm-daemon.lua`
+
+The daemon also runs the pickers of a file on its own machine,
+`nterm-daemon.lua`. It looks for `~/nterm-daemon.lua`, then for
+`nterm-daemon.lua` beside `nterm-daemon.exe`, and uses the first there is
+(`nterm-daemon --lua-config FILE` names one in their place). The file is read
+when a picker of it is first asked for and again whenever it has changed, so
+there is nothing to restart. `nterm-daemon.example.lua` is one to start from.
+
+A picker there is written as one in `nterm.lua` is, under `pickers`, and is
+opened by its name as the daemon's own are:
+
+```lua
+-- nterm-daemon.lua, on the machine the shell is on
+return { pickers = {
+  Commits = { type = "Command", sort = "SourceOrder",
+              args = { "git", "log", "--oneline", "-n", "500" } },
+} }
+```
+
+```lua
+-- nterm.lua, on the machine the window is on
+Commits = { type = "Daemon", picker = "Commits",
+            action = function(app, item) app:send_text("git show " .. item.value:match("^%x+")) end },
+```
+
+```powershell
+Invoke-NtermPicker -DaemonPicker Commits -Parameters @{ cwd = $PWD.Path }
+```
+
+So far it runs these types, with the fields they have in `nterm.lua`:
+
+| Type | Fields |
+| --- | --- |
+| `Command` | `args`, `cwd`, `success_exit_codes`, `line_continuation`, `unique` |
+| `File` | `path`, `reverse`, `line_continuation`, `unique` |
+| `Items` | `items`, a list of `{ text, value }` |
+| `FileSystem` | `roots`, `max_depth`, `files_only`, `directories_only`, `relative` |
+
+and of the fields every picker has: `position` (`Cursor` shows it at the
+cursor), `sort`, `initial_query` and `preview_visible`.
+
+What the picker is opened with fills in the rest. An argument of `args`, or
+`path`, written as `"{name}"` is the text given under that name, as one
+argument whole whatever is in it; the picker is refused if it was not given.
+`cwd` is where a `Command` runs and what a relative `path` and a `FileSystem`
+with no `roots` are under; a window gives the directory the shell reported.
+The program a `Command` runs is always the one the file names: `args[1]`
+cannot be `"{name}"`. Nothing a window or a program in a shell sends can make
+the daemon run a program the file does not name.
+
+Not yet: `action`, `preview` and `keys` may be written and are not run by the
+daemon (Enter gives the row's value to whoever opened the picker, and only
+`FileSystem` rows have previews, those of the daemon's `files` picker); a
+picker that is a function, `items` that is a function, and `columns`, are
+refused. A picker that cannot be one is refused when it is opened, saying
+why, and the file's other pickers still open. The names `files`,
+`directories`, `history`, `ripgrep` and `items` are the daemon's own and
+cannot be given to a picker of the file.
+
 ## npick
 
 With `picker_pipe` enabled as above, `npick` opens pickers from the shell

@@ -14,10 +14,15 @@ fn main() {
     let mut session = nterm_session::DEFAULT_SESSION.to_owned();
     let mut idle = Duration::from_secs(10);
     let mut relay = false;
+    let mut pickers = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--relay" => relay = true,
+            "--lua-config" => match args.next() {
+                Some(value) => pickers = Some(std::path::PathBuf::from(value)),
+                None => usage(),
+            },
             "--session" => match args.next() {
                 Some(value) => session = value,
                 None => usage(),
@@ -44,7 +49,7 @@ fn main() {
     // would be held open for as long as the daemon runs.
     let _ = std::env::set_current_dir(log::directory());
 
-    match server::run(server::Options { session, idle }) {
+    match server::run(server::Options { session, idle, pickers }) {
         Ok(()) => {}
         // Another daemon serves the session; the UI connects to that one.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -58,7 +63,7 @@ fn main() {
 #[cfg(windows)]
 fn usage() -> ! {
     eprintln!(
-        "usage: nterm-daemon [--session NAME] [--idle-seconds N]\n       \
+        "usage: nterm-daemon [--session NAME] [--idle-seconds N] [--lua-config FILE]\n       \
          nterm-daemon --relay [--session NAME]"
     );
     std::process::exit(2);

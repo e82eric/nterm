@@ -36,6 +36,9 @@ pub struct Options {
     pub session: String,
     /// How long to stay with no panes and no UI before exiting.
     pub idle: Duration,
+    /// The file of the pickers of this machine, in place of looking for
+    /// it: see `configured`.
+    pub pickers: Option<std::path::PathBuf>,
 }
 
 /// Encoded frames on their way to one UI, or to one program in a shell.
@@ -411,7 +414,7 @@ pub fn run(options: Options) -> io::Result<()> {
         clients: Mutex::default(),
         channels: Mutex::default(),
         next_channel: AtomicU32::new(1),
-        pickers: Pickers::default(),
+        pickers: Pickers::new(options.pickers.clone()),
     });
     log(format_args!(
         "serving session {:?}, pid {}, ghostty {GHOSTTY_REVISION}, conpty {}",

@@ -20,6 +20,7 @@
 //!   `accepted` with `selected` and `query`, `cancelled`, or `error` with
 //!   `code` and `message`.
 
+use crate::configured::{Configured, Defined};
 use crate::log::log;
 use nfm_file_system::{
     walker::{FileWalkerScan, PublishedSnapshot, ScanOptions, start_scan},
@@ -155,10 +156,12 @@ struct Definition {
 enum Lists {
     /// The files or the folders a walk finds.
     Walk(ScanOptions),
-    /// The lines of a file of what was typed at a shell, the newest first.
-    History(PathBuf),
+    /// The lines of a file: of what was typed at a shell, the newest first.
+    File(FileSourceOptions),
     /// The lines a command prints, as a search of files does.
-    Command(CommandSpec),
+    Command(CommandSourceOptions),
+    /// Rows that are written in the file of the pickers.
+    Fixed(Vec<crate::configured::Item>),
     /// What the program that asked gives, as `items`.
     Given,
 }
@@ -403,7 +406,11 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
             // As they are in the file, not the best match first: the last
             // typed of what matches is the one most likely wanted.
             sort = SearchSortMode::SourceOrder;
-            Lists::History(path)
+            let mut options = FileSourceOptions::new(path);
+            options.reverse = true;
+            options.unique = true;
+            options.line_continuation = Some("`".to_owned());
+            Lists::File(options)
         }
         "ripgrep" => {
             label.push_str("Ripgrep");
@@ -425,7 +432,7 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
             // Of what it says went wrong, which is all that is kept of it.
             command.output_limit = 16 * 1024;
             preview = Some(params.get("preview").is_some_and(|preview| preview == "true"));
-            Lists::Command(command)
+            Lists::Command(CommandSourceOptions::new(command))
         }
         "items" => {
             let given = params.get("label").map(|label| label.trim()).filter(|label| !label.is_empty());
@@ -441,6 +448,117 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
         sort,
         preview,
         at_cursor: params.get("position").is_some_and(|position| position == "cursor"),
+    })
+}
+
+/// The names of the pickers the daemon has of its own. The file of the
+/// machine's pickers has none of these names: see `configured`.
+pub(crate) const BUILT_IN: [&str; 5] = ["files", "directories", "history", "ripgrep", "items"];
+
+/// What is given for `{name}`, where `text` is that and no more.
+fn given<'a>(text: &'a str, params: &'a BTreeMap<String, String>) -> Result<&'a str, String> {
+    match text.strip_prefix('{').and_then(|text| text.strip_suffix('}')) {
+        Some(name) => {
+            params.get(name).map(String::as_str).ok_or_else(|| format!("it was not opened with {name}"))
+        }
+        None => Ok(text),
+    }
+}
+
+/// A picker of the machine's file, opened with `params`. They fill what
+/// the file leaves to be given, as `{name}`, and say where: they are never
+/// which program is run, and each is one argument whole, whatever is in it.
+fn configured(name: &str, defined: Defined, params: &BTreeMap<String, String>) -> Result<Definition, String> {
+    use crate::configured::{Lists as Of, Position, Sort};
+    let cwd = params.get("cwd").map(PathBuf::from);
+    if let Some(cwd) = cwd.as_ref().filter(|cwd| cwd.is_relative() || !cwd.is_dir()) {
+        return Err(format!("{} is not a folder", cwd.display()));
+    }
+    let Defined { presentation, lists } = defined;
+    let mut preview = None;
+    let lists = match lists {
+        Of::Command { args, cwd: folder, line_continuation, success_exit_codes, unique, .. } => {
+            let mut filled = Vec::with_capacity(args.len());
+            for argument in &args {
+                let argument = given(argument, params)?;
+                if argument.contains('\0') {
+                    return Err("an argument has a NUL in it".into());
+                }
+                filled.push(argument.to_owned());
+            }
+            let mut command = CommandSpec::new(filled.remove(0));
+            command.arguments = filled;
+            // Where it was opened, or where the file says, in that order.
+            command.working_directory = cwd.or(folder.map(PathBuf::from));
+            if let Some(folder) = command.working_directory.as_ref().filter(|folder| !folder.is_dir()) {
+                return Err(format!("{} is not a folder", folder.display()));
+            }
+            command.output_limit = 16 * 1024;
+            let mut options = CommandSourceOptions::new(command);
+            options.line_continuation = line_continuation;
+            options.unique = unique.unwrap_or(false);
+            if let Some(codes) = success_exit_codes {
+                options.success_exit_codes = codes;
+            }
+            Lists::Command(options)
+        }
+        Of::File { path, reverse, line_continuation, unique, .. } => {
+            let mut path = PathBuf::from(given(&path, params)?);
+            if path.is_relative() {
+                path = cwd.ok_or_else(|| format!("{} is not a whole path", path.display()))?.join(path);
+            }
+            if !path.is_file() {
+                return Err(format!("{} is not a file", path.display()));
+            }
+            let mut options = FileSourceOptions::new(path);
+            options.reverse = reverse;
+            options.line_continuation = line_continuation;
+            options.unique = unique.unwrap_or(false);
+            Lists::File(options)
+        }
+        Of::Items { items, .. } => Lists::Fixed(items),
+        Of::FileSystem { roots, max_depth, files_only, directories_only, relative, .. } => {
+            let mut roots: Vec<PathBuf> = match params.get("roots") {
+                Some(roots) => serde_json::from_str::<Vec<String>>(roots)
+                    .map_err(|error| format!("roots is not a list of folders: {error}"))?
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+                None => roots.into_iter().map(PathBuf::from).collect(),
+            };
+            if roots.is_empty() {
+                roots.push(cwd.ok_or("it has no roots, and was opened with no cwd")?);
+            }
+            if let Some(root) = roots.iter().find(|root| root.is_relative() || !root.is_dir()) {
+                return Err(format!("{} is not a folder", root.display()));
+            }
+            if max_depth.is_some_and(|depth| depth < 0) {
+                return Err("max_depth is less than nothing".into());
+            }
+            // Its rows are files and folders: they show as those of the
+            // daemon's own pickers of them do.
+            let shown = params.get("preview").map(|preview| preview == "true");
+            preview = Some(shown.unwrap_or(presentation.preview_visible));
+            Lists::Walk(ScanOptions {
+                roots,
+                max_depth: max_depth.unwrap_or(i32::MAX),
+                directories_only,
+                files_only,
+                relative,
+            })
+        }
+    };
+    Ok(Definition {
+        label: name.chars().take(MOST_LABEL).collect(),
+        lists,
+        query: params.get("query").cloned().or(presentation.initial_query).unwrap_or_default(),
+        sort: match presentation.sort {
+            Sort::Score => SearchSortMode::Score,
+            Sort::SourceOrder => SearchSortMode::SourceOrder,
+        },
+        preview,
+        at_cursor: presentation.position == Position::Cursor
+            || params.get("position").is_some_and(|position| position == "cursor"),
     })
 }
 
@@ -724,10 +842,11 @@ enum Outcome {
 }
 
 /// The pickers under way.
-#[derive(Default)]
 pub(crate) struct Pickers {
     next: AtomicU32,
     open: Arc<Mutex<HashMap<u32, Arc<Picker>>>>,
+    /// The pickers of the file of the machine the daemon is on.
+    configured: Configured,
 }
 
 /// Where a program's picker is to be shown.
@@ -750,6 +869,22 @@ fn result(to: &Outbox, request_id: &Value, status: &str, extra: Value) {
 }
 
 impl Pickers {
+    pub(crate) fn new(file: Option<PathBuf>) -> Self {
+        Self { next: AtomicU32::default(), open: Arc::default(), configured: Configured::new(file) }
+    }
+
+    /// The picker called `name`, opened with `params`: one of the daemon's
+    /// own, or one of the machine's file.
+    fn define(&self, name: &str, params: &BTreeMap<String, String>) -> Result<Definition, String> {
+        if BUILT_IN.contains(&name) {
+            return define(name, params);
+        }
+        match self.configured.picker(name)? {
+            Some(defined) => configured(name, defined, params).map_err(|why| format!("{name}: {why}")),
+            None => Err(format!("no picker named {name}")),
+        }
+    }
+
     /// A program's message. `mine` is the picker it has open, if it has.
     /// Returns false when the conversation is over.
     pub(crate) fn said(&self, bytes: &[u8], mine: &mut Option<u32>, showing: impl FnOnce() -> Result<Showing, String>, program: &Outbox) -> bool {
@@ -761,7 +896,7 @@ impl Pickers {
                     result(program, &request_id, "error", json!({"code": code, "message": message}));
                     false
                 };
-                let definition = match define(&picker, &params) {
+                let definition = match self.define(&picker, &params) {
                     Ok(definition) => definition,
                     Err(message) => return refuse("bad_request", message),
                 };
@@ -808,20 +943,21 @@ impl Pickers {
         let number = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let of = match &definition.lists {
             Lists::Walk(scan) => format!("under {:?}", scan.roots),
-            Lists::History(path) => format!("of {}", path.display()),
+            Lists::File(file) => format!("of {}", file.path.display()),
             Lists::Command(command) => format!(
                 "of what {} prints in {}",
-                command.program.display(),
-                command.working_directory.as_deref().unwrap_or(Path::new(".")).display()
+                command.command.program.display(),
+                command.command.working_directory.as_deref().unwrap_or(Path::new(".")).display()
             ),
             Lists::Given => "of what its program gives".to_owned(),
+            Lists::Fixed(rows) => format!("of {} rows", rows.len()),
         };
         log(format_args!("picker {number}: {} {of} for pane {}", definition.label, pane));
         // What reads a file or runs a command, begun once the picker is one
         // of those open: it may fail at once, and that ends the picker.
         let mut begin: Option<Box<dyn FnOnce()>> = None;
         let found_in = match &definition.lists {
-            Lists::Command(command) => command.working_directory.clone(),
+            Lists::Command(command) => command.command.working_directory.clone(),
             _ => None,
         };
         let source = match definition.lists {
@@ -830,13 +966,9 @@ impl Pickers {
                 let scan = start_scan(scan, store.clone());
                 Source::Walk { store, scan }
             }
-            Lists::History(path) => {
+            Lists::File(options) => {
                 let (source, sink, control) = self.read(number);
                 begin = Some(Box::new(move || {
-                    let mut options = FileSourceOptions::new(path);
-                    options.reverse = true;
-                    options.unique = true;
-                    options.line_continuation = Some("`".to_owned());
                     let failed = control.failed.clone();
                     if let Err(message) = file::start(options, sink, control) {
                         failed(&message);
@@ -848,11 +980,26 @@ impl Pickers {
                 let (source, sink, control) = self.read(number);
                 begin = Some(Box::new(move || {
                     let failed = control.failed.clone();
-                    if let Err(message) = command::start(CommandSourceOptions::new(command), sink, control) {
+                    if let Err(message) = command::start(command, sink, control) {
                         failed(&message);
                     }
                 }));
                 source
+            }
+            Lists::Fixed(items) => {
+                let store = Arc::new(SnapshotStore::new_append_only());
+                let mut adding = PublishingStreamingItemStoreWithPayload::new(store.clone());
+                let mut rows = Vec::with_capacity(items.len());
+                for item in items {
+                    // A row is one line, whatever is in what it shows.
+                    let shows: String =
+                        item.text.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
+                    adding.add_item(shows.as_bytes(), ());
+                    rows.push((rows.len().to_string(), Value::String(item.value)));
+                }
+                adding.publish();
+                adding.complete();
+                Source::Given { store, given: Mutex::new(Given { adding: None, rows }) }
             }
             Lists::Given => {
                 let store = Arc::new(SnapshotStore::new_append_only());
@@ -940,7 +1087,7 @@ impl Pickers {
         params: &BTreeMap<String, String>,
         shows: bool,
     ) {
-        let definition = if shows { define(name, params) } else { Err(format!("pane {pane} is not shown here")) };
+        let definition = if shows { self.define(name, params) } else { Err(format!("pane {pane} is not shown here")) };
         let definition = match definition {
             // It has no program to give it rows.
             Ok(Definition { lists: Lists::Given, .. }) => Err(format!("{name} is a picker for a program")),
@@ -1453,7 +1600,7 @@ mod tests {
         std::fs::write(&file, "one\n").unwrap();
         let path = file.to_string_lossy().into_owned();
         let history = define("history", &params(&[("path", &path), ("query", "git"), ("position", "cursor")])).unwrap();
-        assert!(matches!(&history.lists, Lists::History(read) if *read == file));
+        assert!(matches!(&history.lists, Lists::File(read) if read.path == file && read.reverse));
         // In the order of the file, with no previews, where the cursor is.
         assert!(matches!(history.sort, SearchSortMode::SourceOrder) && history.at_cursor);
         assert_eq!((history.label.as_str(), history.query.as_str(), history.preview), ("History", "git", None));
@@ -1461,7 +1608,7 @@ mod tests {
         let name = file.file_name().unwrap().to_string_lossy().into_owned();
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let beside = define("history", &params(&[("path", &name), ("cwd", &cwd)])).unwrap();
-        assert!(matches!(&beside.lists, Lists::History(read) if *read == file));
+        assert!(matches!(&beside.lists, Lists::File(read) if read.path == file && read.reverse));
         std::fs::remove_file(&file).unwrap();
         for given in [params(&[]), params(&[("path", &path)]), params(&[("path", &name)]), params(&[("path", &cwd)])] {
             assert!(define("history", &given).is_err(), "history with {given:?} was taken");
@@ -1480,7 +1627,7 @@ mod tests {
         let here = std::env::temp_dir();
         let cwd = here.to_string_lossy().into_owned();
         let found = define("ripgrep", &params(&[("cwd", &cwd), ("pattern", "-e fn main")])).unwrap();
-        let Lists::Command(command) = &found.lists else { panic!("not a command") };
+        let Lists::Command(CommandSourceOptions { command, .. }) = &found.lists else { panic!("not a command") };
         assert_eq!(command.program, Path::new("rg"));
         assert_eq!(command.working_directory.as_deref(), Some(here.as_path()));
         // The pattern is the last, after `--`, however it begins.
