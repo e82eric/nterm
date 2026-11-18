@@ -1734,6 +1734,52 @@ impl TerminalPane {
             drop(picker);
             self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
         }
+        // What a picker the daemon runs says is done to this pane: its own
+        // machine's file ran what is done with a row. It is text for the
+        // pane's shell, which is that daemon's, and notes to show.
+        let steps = self.pages.top().and_then(crate::picker::Page::fed).map(|fed| fed.steps()).unwrap_or_default();
+        for step in steps {
+            use nterm_session::protocol::PickerStep;
+            match step {
+                PickerStep::SendText { text } => Self::send_picker_text(self.host, &text),
+                PickerStep::Paste { text } => unsafe {
+                    ghostty_ffi::nterm_host_text(self.host, text.as_ptr().cast(), text.len());
+                },
+                PickerStep::ReplacePrompt { text, before, after } => {
+                    Self::replace_picker_prompt(self.host, &text, before.min(4096), after.min(4096));
+                }
+                PickerStep::Toast { title, message, duration_ms } => {
+                    let shown = duration_ms.unwrap_or(2000).clamp(1, 60_000);
+                    self.toasts.push(title.unwrap_or_default(), message, shown);
+                }
+                PickerStep::Picker { name, mut params } => {
+                    // The daemon is asked for it, as it is for one of the
+                    // window's `type = "Daemon"`. It is placed when the
+                    // daemon says it is open, the first being over by then.
+                    if let Some(pwd) = self.pwd() {
+                        params.entry("cwd".into()).or_insert(pwd);
+                    }
+                    let given = params.clone();
+                    match self.session.as_ref().and_then(|session| session.ask_picker(name, params)) {
+                        Some(ask) => {
+                            self.asked = Some(Asked {
+                                ask,
+                                accept: crate::picker::Accept { callback: None, params: given },
+                                direct: true,
+                                replace: false,
+                                cwd: true,
+                            });
+                        }
+                        None => self.show_error(
+                            "Could not open picker",
+                            "The pane's shell is not one a session daemon runs".into(),
+                        ),
+                    }
+                }
+                PickerStep::Unknown => {}
+            }
+            ctx.request_repaint();
+        }
         // A picker the daemon runs, which the daemon ended: its program
         // went, or the daemon did.
         if let Some(ended) = self.pages.top().and_then(crate::picker::Page::fed).and_then(|fed| fed.closed()) {

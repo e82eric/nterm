@@ -228,8 +228,26 @@ closes, is stopped, and so is the program it waits for. One row may take 12
 seconds and show 10 MiB. `nterm.json_parse` and `nterm.json_encode_pretty`
 are there as in `nterm.lua`.
 
-Not yet: `action` and `keys` may be written and are not run by the daemon
-(Enter gives the row's value to whoever opened the picker); previews of types
+What is done with the row chosen is the file's to say too: `action =
+function(app, item, params) ... end`. When a window opened the picker, the
+daemon runs `action` on its own machine at Enter, so it may read that
+machine's files and run its programs with `preview.run`. What it asks of
+`app` is done to the pane the picker is over, in the order asked, once the
+function has returned: `app:send_text(text)`, `app:paste(text)`,
+`app:replace_prompt(text, before, after)`, `app:show_toast(title, message,
+duration_ms)` or `app:show_toast { header, message, duration_ms }`, and
+`app:push_picker(name, params)` (or `app:replace_picker`), which opens another
+of the daemon's pickers in place of this one. The picker is over when a row
+is chosen, so `app:close_picker()` changes nothing. Anything else a window's
+`app` has is refused, saying so. An `action` that fails does nothing to the
+pane, and the window says why. A window entry `type = "Daemon"` whose picker
+has an `action` in the daemon's file needs none of its own: the window's is
+not run.
+
+A program in a shell that opens such a picker is given the row, as of any
+picker, and the `action` is not run: what is done with it is the program's.
+
+Not yet: `keys` may be written and are not run by the daemon; previews of types
 other than `Dynamic`, a picker that is a function, `items` that is a
 function, and `columns`, are refused. A picker that cannot be one is refused
 when it is opened, saying why, and the file's other pickers still open. The

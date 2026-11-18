@@ -1620,8 +1620,7 @@ fn the_pickers_of_the_machines_file_are_opened_by_name_as_the_daemons_own_are() 
           Said = { type = "Command", args = { "cmd.exe", "/c", "echo", "{word}" }, sort = "SourceOrder" },
           Typed = { type = "File", path = "{history}", reverse = true, unique = true },
           Fixed = { type = "Items", position = "Cursor", initial_query = "t",
-                    items = { { text = "One", value = "1" }, { text = "Two", value = "2" } },
-                    action = function(app, item) app:send_text(item.value) end },
+                    items = { { text = "One", value = "1" }, { text = "Two", value = "2" } } },
           Here = { type = "FileSystem", files_only = true, relative = true, preview_visible = false },
           files = { type = "Items" },
         } }"#,
@@ -1868,4 +1867,91 @@ fn a_function_of_the_machines_file_says_what_shows_for_a_row() {
     ui.shutdown();
     assert!(daemon.wait().unwrap().success());
     assert!(began.elapsed() < Duration::from_secs(20), "the daemon waited for a stopped program");
+}
+
+#[test]
+fn the_machines_file_says_what_is_done_with_the_row_a_ui_chose() {
+    let session = session("pick-action");
+    let tree = Tree::new("action");
+    let cwd = tree.path();
+    let file = tree.0.join("nterm-daemon.lua");
+    std::fs::write(
+        &file,
+        r#"local rows = { { text = "Types", value = "types" }, { text = "Fails", value = "fails" } }
+        return { pickers = {
+          Acts = { type = "Items", items = rows, action = function(app, item, params)
+            if item.value == "fails" then error("no such branch", 0) end
+            app:send_text("echo " .. item.value .. " " .. params.word)
+            app:show_toast("Done", item.text)
+          end },
+          Shows = { type = "Items", items = rows },
+        } }"#,
+    )
+    .unwrap();
+    let mut command = std::process::Command::new(DAEMON);
+    command.args(["--session", &session, "--lua-config"]).arg(&file).env_remove("NTERM_CONPTY_DLL");
+    let mut daemon = command.spawn().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while let Err(error) = pipe::connect(&session) {
+        assert!(Instant::now() < deadline, "the daemon never served: {error}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    let mut open = |ui: &mut Ui, ask: u64, name: &str| -> u32 {
+        let given = [("cwd".to_owned(), cwd.clone()), ("word".to_owned(), "given".to_owned())].into_iter().collect();
+        ui.send(Control::PickerAsk { ask, pane, picker: name.into(), params: given });
+        let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. }));
+        let Control::PickerOpen { picker, .. } = opened else { panic!("{name}: {opened:?}") };
+        picker
+    };
+    use nterm_session::protocol::PickerStep;
+
+    // The row a UI chose is acted on where the file is: the UI is told what
+    // to do to the pane, and that the picker is over. It is not told what
+    // the row is, to act on itself.
+    let picker = open(&mut ui, 1, "Acts");
+    let found = ui.query(picker, 0, "types");
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
+    let told = ui.control(|c| {
+        matches!(c, Control::PickerActed { .. } | Control::PickerChosen { .. } | Control::PickerClosed { .. })
+    });
+    let Control::PickerActed { picker: of, steps } = told else { panic!("{told:?}") };
+    assert_eq!(of, picker);
+    assert_eq!(
+        steps,
+        [
+            PickerStep::SendText { text: "echo types given".into() },
+            PickerStep::Toast { title: Some("Done".into()), message: "Types".into(), duration_ms: None },
+        ]
+    );
+    let closed = ui.control(|c| matches!(c, Control::PickerChosen { .. } | Control::PickerClosed { .. }));
+    assert_eq!(closed, Control::PickerClosed { picker, message: None });
+
+    // An action that goes wrong ends the picker saying why, with nothing
+    // done to the pane.
+    let picker = open(&mut ui, 2, "Acts");
+    let found = ui.query(picker, 0, "fails");
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
+    let told = ui.control(|c| matches!(c, Control::PickerActed { .. } | Control::PickerClosed { .. }));
+    let Control::PickerClosed { message, .. } = told else { panic!("{told:?}") };
+    assert!(message.is_some_and(|message| message.contains("no such branch")));
+
+    // With no action in the file the UI is told what the row is, as it is
+    // of the daemon's own pickers.
+    let picker = open(&mut ui, 3, "Shows");
+    let found = ui.query(picker, 0, "types");
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
+    let told = ui.control(|c| matches!(c, Control::PickerActed { .. } | Control::PickerChosen { .. }));
+    assert!(matches!(told, Control::PickerChosen { value, .. } if value == "types"));
+
+    // A program that asked is given the row: what is done with it is the
+    // program's to say.
+    let (asker, picker) = ui.picker(&session, pane, "Acts", serde_json::json!({"word": "w"}));
+    let found = ui.query(picker, 0, "types");
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
+    let (status, result) = asker.result();
+    assert_eq!((status.as_str(), &result["selected"][0]["value"]), ("accepted", &serde_json::json!("types")));
+    ui.shutdown();
+    assert!(daemon.wait().unwrap().success());
 }

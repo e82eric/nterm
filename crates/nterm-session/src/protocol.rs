@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -107,6 +107,37 @@ pub struct SessionInfo {
     pub id: String,
     pub panes: Vec<PaneInfo>,
     pub layout: String,
+}
+
+/// One thing a UI does to a pane for a picker: see `Control::PickerActed`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum PickerStep {
+    /// Text typed at the shell, a line end in it being Enter.
+    SendText { text: String },
+    /// Text pasted at the shell.
+    Paste { text: String },
+    /// Text in place of what is at the shell's cursor: so many characters
+    /// before it and after it are taken away first.
+    ReplacePrompt { text: String, before: u32, after: u32 },
+    /// A note shown for a while.
+    Toast {
+        #[serde(default)]
+        title: Option<String>,
+        message: String,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+    },
+    /// Another picker of the daemon's, by its name, opened for the pane
+    /// once this one is over.
+    Picker {
+        name: String,
+        #[serde(default)]
+        params: std::collections::BTreeMap<String, String>,
+    },
+    /// A step from a newer version.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One row a picker shows.
@@ -268,6 +299,11 @@ pub enum Control {
     /// row shows, what it is, and the query it was found with. The picker
     /// is over.
     PickerChosen { picker: u32, text: String, value: String, query: String },
+    /// To a UI: what the picker's own machine says is done with a row, for
+    /// the UI to do to the pane the picker is over, in order. It is all a
+    /// UI does for a picker beyond drawing it: text for the pane's shell,
+    /// which is the daemon's own, and a note to show.
+    PickerActed { picker: u32, steps: Vec<PickerStep> },
     /// What was found for the query with this revision. There can be
     /// several for one revision while the picker's source is still being
     /// added to, each in place of the one before.

@@ -843,6 +843,8 @@ struct Showing {
     previews: u64,
     /// Who waits for the last preview asked for.
     previewing: Option<(u64, mpsc::Sender<Result<Previewed, String>>)>,
+    /// What the picker's own machine says is done to the pane, yet to be.
+    steps: Vec<nterm_session::protocol::PickerStep>,
     /// A row was chosen, and the daemon has yet to say what it is.
     awaiting: bool,
     /// What it said: what the row shows, and its value.
@@ -988,6 +990,17 @@ impl Shown {
         state.chosen = Some((text, value));
         drop(state);
         (self.wake)();
+    }
+
+    /// The daemon says what is done to the pane the picker is over.
+    pub(crate) fn acted(&self, steps: Vec<nterm_session::protocol::PickerStep>) {
+        self.state.lock().unwrap().steps.extend(steps);
+        (self.wake)();
+    }
+
+    /// What is to be done to the pane, once only.
+    pub(crate) fn steps(&self) -> Vec<nterm_session::protocol::PickerStep> {
+        std::mem::take(&mut self.state.lock().unwrap().steps)
     }
 
     /// What the row chosen is, once the daemon has said, and once only.
@@ -1212,6 +1225,12 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                             }),
                         },
                     );
+                }
+            }
+            Frame::Control(Control::PickerActed { picker, steps }) => {
+                let shown = daemon.pickers.lock().unwrap().get(&picker).cloned();
+                if let Some(shown) = shown {
+                    shown.acted(steps);
                 }
             }
             Frame::Control(Control::PickerChosen { picker, text, value, .. }) => {

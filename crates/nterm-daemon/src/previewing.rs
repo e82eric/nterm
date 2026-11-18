@@ -12,6 +12,7 @@
 
 use crate::configured::short;
 use mlua::{Lua, LuaSerdeExt};
+use nterm_session::protocol::PickerStep;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -64,6 +65,124 @@ impl Asked {
     }
 }
 
+/// What a function of the file asked of `app`, for the picker's UI to do.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Acted {
+    pub(crate) steps: Vec<PickerStep>,
+    /// Whether it asked for the picker to close.
+    pub(crate) close: bool,
+}
+/// The most steps one function asks for, and the most text in one.
+const MOST_STEPS: usize = 256;
+const MOST_TEXT: usize = 1024 * 1024;
+
+/// `app`, as a function of the file is given it: what a window's has that
+/// is done to the pane the picker is over. Each is kept as a step, and
+/// anything else a window's has says that the daemon has not got it.
+fn app(lua: &Lua) -> mlua::Result<mlua::Table<'_>> {
+    fn step(lua: &Lua, step: PickerStep) -> mlua::Result<()> {
+        let mut acted = lua
+            .app_data_mut::<Acted>()
+            .ok_or_else(|| mlua::Error::RuntimeError("app is for use in a picker's action".into()))?;
+        if acted.steps.len() == MOST_STEPS {
+            return Err(mlua::Error::RuntimeError(format!("more than {MOST_STEPS} things were asked of app")));
+        }
+        acted.steps.push(step);
+        Ok(())
+    }
+    fn text(text: String) -> mlua::Result<String> {
+        if text.len() > MOST_TEXT || text.contains('\0') {
+            return Err(mlua::Error::RuntimeError("the text is too long, or has a NUL in it".into()));
+        }
+        Ok(text)
+    }
+    let app = lua.create_table()?;
+    app.set(
+        "send_text",
+        lua.create_function(|lua, (_, given): (mlua::Value, String)| step(lua, PickerStep::SendText { text: text(given)? }))?,
+    )?;
+    app.set(
+        "paste",
+        lua.create_function(|lua, (_, given): (mlua::Value, String)| step(lua, PickerStep::Paste { text: text(given)? }))?,
+    )?;
+    app.set(
+        "replace_prompt",
+        lua.create_function(|lua, (_, given, before, after): (mlua::Value, String, u32, u32)| {
+            if before > 4096 || after > 4096 {
+                return Err(mlua::Error::RuntimeError("that is more of the prompt than is replaced".into()));
+            }
+            step(lua, PickerStep::ReplacePrompt { text: text(given)?, before, after })
+        })?,
+    )?;
+    app.set(
+        "show_toast",
+        lua.create_function(|lua, (_, first, second, third): (mlua::Value, mlua::Value, Option<String>, Option<u64>)| {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Options {
+                #[serde(default)]
+                header: Option<String>,
+                message: String,
+                #[serde(default)]
+                duration_ms: Option<u64>,
+            }
+            // A table of what to show, or a title and a message.
+            let (title, message, duration_ms) = match (first, second) {
+                (options @ mlua::Value::Table(_), None) => {
+                    let options: Options = lua.from_value(options)?;
+                    (options.header, options.message, options.duration_ms)
+                }
+                (mlua::Value::String(title), Some(message)) => {
+                    (Some(title.to_string_lossy().into_owned()), message, third)
+                }
+                _ => {
+                    return Err(mlua::Error::RuntimeError(
+                        "show_toast takes a table, or a title, a message and how long".into(),
+                    ));
+                }
+            };
+            if duration_ms.is_some_and(|duration| !(1..=60_000).contains(&duration)) {
+                return Err(mlua::Error::RuntimeError("a toast shows for 1 to 60000 milliseconds".into()));
+            }
+            step(lua, PickerStep::Toast { title, message: text(message)?, duration_ms })
+        })?,
+    )?;
+    app.set(
+        "close_picker",
+        lua.create_function(|lua, _: mlua::Value| {
+            let mut acted = lua
+                .app_data_mut::<Acted>()
+                .ok_or_else(|| mlua::Error::RuntimeError("app is for use in a picker's action".into()))?;
+            acted.close = true;
+            Ok(())
+        })?,
+    )?;
+    // Another picker of this machine, in place of this one. A window's
+    // `push_picker` keeps the first under the second; here the first is over.
+    for method in ["push_picker", "replace_picker"] {
+        app.set(
+            method,
+            lua.create_function(|lua, (_, name, params): (mlua::Value, String, Option<BTreeMap<String, String>>)| {
+                let params = params.unwrap_or_default();
+                let long = params.iter().map(|(key, value)| key.len() + value.len()).sum::<usize>() > MOST_TEXT;
+                if name.is_empty() || name.len() > 256 || long {
+                    return Err(mlua::Error::RuntimeError("that is not a picker's name and what it is opened with".into()));
+                }
+                step(lua, PickerStep::Picker { name, params })
+            })?,
+        )?;
+    }
+    let meta = lua.create_table()?;
+    meta.set(
+        "__index",
+        lua.create_function(|_, (_, name): (mlua::Value, String)| -> mlua::Result<mlua::Value> {
+            Err(mlua::Error::RuntimeError(format!("app:{name} is not something the daemon has")))
+        })?,
+    )?;
+    app.set_metatable(Some(meta));
+    Ok(app)
+}
+
 /// The Lua of one open picker's previews.
 pub(crate) struct Previewer {
     lua: Lua,
@@ -87,12 +206,68 @@ impl Previewer {
         {
             let pickers: Option<mlua::Table> = lua.named_registry_value("pickers").map_err(|error| short(&error))?;
             let picker: Option<mlua::Table> = pickers.and_then(|pickers| pickers.get(name).ok());
-            let preview: Option<mlua::Table> = picker.and_then(|picker| picker.get("preview").ok());
+            let picker = picker.ok_or("the file no longer has this picker")?;
+            let preview: Option<mlua::Table> = picker.get("preview").ok();
             let resolve: Option<mlua::Function> = preview.and_then(|preview| preview.get("resolve").ok());
-            let resolve = resolve.ok_or("the file no longer has a preview for this picker")?;
             lua.set_named_registry_value("resolve", resolve).map_err(|error| short(&error))?;
+            let action: Option<mlua::Function> = picker.get("action").ok();
+            lua.set_named_registry_value("action", action).map_err(|error| short(&error))?;
+            lua.set_named_registry_value("app", app(&lua).map_err(|error| short(&error))?)
+                .map_err(|error| short(&error))?;
         }
         Ok(Self { lua, params, files, wanted })
+    }
+
+    /// Run what the file says is done with the row that shows as `text` and
+    /// is `value`: its `action`. What it asks of `app` is not done here: it
+    /// is given back, as the steps for the picker's UI to do in order, with
+    /// whether the picker is to close.
+    pub(crate) fn act(&self, text: &str, value: &str) -> Result<Acted, String> {
+        let lua = &self.lua;
+        let failed = |error: mlua::Error| short(&error);
+        // Nothing stops it but how long it takes.
+        let asked = Asked { request: 0, wanted: Arc::default(), until: Instant::now() + MOST_TIME };
+        lua.set_app_data(asked.clone());
+        lua.set_app_data(Acted::default());
+        let stop = asked.clone();
+        lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), move |_, _| {
+            if stop.over() {
+                return Err(mlua::Error::RuntimeError("it took too long".into()));
+            }
+            Ok(())
+        });
+        let ran = (|| -> Result<(), String> {
+            let action: Option<mlua::Function> = lua.named_registry_value("action").map_err(failed)?;
+            let action = action.ok_or("the file no longer says what is done with a row of this picker")?;
+            let app: mlua::Table = lua.named_registry_value("app").map_err(failed)?;
+            action.call::<_, ()>((app, self.item(text, value)?, self.given()?)).map_err(failed)
+        })();
+        lua.remove_hook();
+        lua.remove_app_data::<Asked>();
+        let acted = lua.remove_app_data::<Acted>().unwrap_or_default();
+        ran.map(|()| acted)
+    }
+
+    /// The row, as a function of the file is given it.
+    fn item(&self, text: &str, value: &str) -> Result<mlua::Table<'_>, String> {
+        let failed = |error: mlua::Error| short(&error);
+        let item = self.lua.create_table().map_err(failed)?;
+        item.set("text", text).map_err(failed)?;
+        item.set("value", value).map_err(failed)?;
+        if self.files {
+            item.set("path", value).map_err(failed)?;
+        }
+        Ok(item)
+    }
+
+    /// What the picker was opened with, as a function of the file is given it.
+    fn given(&self) -> Result<mlua::Table<'_>, String> {
+        let failed = |error: mlua::Error| short(&error);
+        let params = self.lua.create_table().map_err(failed)?;
+        for (name, value) in &self.params {
+            params.set(name.as_str(), value.as_str()).map_err(failed)?;
+        }
+        Ok(params)
     }
 
     /// What shows for the row that shows as `text` and is `value`, asked
@@ -122,7 +297,8 @@ impl Previewer {
     fn run(&self, asked: &Asked, text: &str, value: &str) -> Result<Shows, String> {
         let lua = &self.lua;
         let failed = |error: mlua::Error| short(&error);
-        let resolve: mlua::Function = lua.named_registry_value("resolve").map_err(failed)?;
+        let resolve: Option<mlua::Function> = lua.named_registry_value("resolve").map_err(failed)?;
+        let resolve = resolve.ok_or("the file no longer has a preview for this picker")?;
         let item = lua.create_table().map_err(failed)?;
         item.set("text", text).map_err(failed)?;
         item.set("value", value).map_err(failed)?;
@@ -553,8 +729,95 @@ mod tests {
         let early: mlua::Table = pickers.get("Early").unwrap();
         let items: Vec<mlua::Table> = early.get("items").unwrap();
         assert_eq!(items[0].get::<_, String>("text").unwrap(), "false");
-        let made = Previewer::new(&path, "None", BTreeMap::new(), false, Arc::default());
+        let none = Previewer::new(&path, "None", BTreeMap::new(), false, Arc::default()).unwrap();
+        let made = none.resolve(0, "t", "v").unwrap();
         assert!(made.is_err_and(|error| error.contains("no longer has a preview")));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod acting_tests {
+    use super::*;
+
+    fn previewer(test: &str, text: &str) -> (Previewer, PathBuf) {
+        let folder = std::env::temp_dir().join(format!("nterm-acting-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(crate::configured::FILE);
+        std::fs::write(&path, text).unwrap();
+        let params = [("cwd".to_owned(), folder.to_string_lossy().into_owned())].into_iter().collect();
+        (Previewer::new(&path, "P", params, false, Arc::default()).unwrap(), folder)
+    }
+
+    #[test]
+    fn what_an_action_asks_of_app_is_kept_as_steps_in_order() {
+        let (previewer, folder) = previewer(
+            "steps",
+            r#"return { pickers = { P = { type = "Items", action = function(app, item, params)
+              if item.value == "all" then
+                app:send_text("cd " .. params.cwd .. "\r")
+                app:paste(item.text)
+                app:replace_prompt("git switch " .. item.value, 3, 0)
+                app:show_toast("Title", "Message", 500)
+                app:show_toast({ message = "Only a message" })
+                app:close_picker()
+              elseif item.value == "ran" then
+                local printed = preview.run { args = { "cmd.exe", "/c", "echo", "from a program" } }
+                app:send_text(printed.stdout)
+              elseif item.value == "next" then
+                app:push_picker("Other", { pattern = item.text })
+              elseif item.value == "window" then
+                app:navigate(item)
+              elseif item.value == "wrong" then
+                app:send_text("typed before it went wrong")
+                error("it went wrong", 0)
+              elseif item.value == "loop" then
+                while true do end
+              elseif item.value == "long" then
+                app:show_toast("T", "M", 99999999)
+              end
+            end } } }"#,
+        );
+        let acted = previewer.act("the text", "all").unwrap();
+        let cwd = folder.to_string_lossy().into_owned();
+        assert_eq!(
+            acted.steps,
+            [
+                PickerStep::SendText { text: format!("cd {cwd}\r") },
+                PickerStep::Paste { text: "the text".into() },
+                PickerStep::ReplacePrompt { text: "git switch all".into(), before: 3, after: 0 },
+                PickerStep::Toast { title: Some("Title".into()), message: "Message".into(), duration_ms: Some(500) },
+                PickerStep::Toast { title: None, message: "Only a message".into(), duration_ms: None },
+            ]
+        );
+        assert!(acted.close);
+        // It may run a program of this machine, as a preview may.
+        let acted = previewer.act("t", "ran").unwrap();
+        assert!(matches!(&acted.steps[..], [PickerStep::SendText { text }] if text.contains("from a program")));
+        assert!(!acted.close);
+        let acted = previewer.act("found", "next").unwrap();
+        let with = [("pattern".to_owned(), "found".to_owned())].into_iter().collect();
+        assert_eq!(acted.steps, [PickerStep::Picker { name: "Other".into(), params: with }]);
+        // What only a window has says so, and nothing is done.
+        assert!(previewer.act("t", "window").unwrap_err().contains("app:navigate is not something the daemon has"));
+        // Of an action that goes wrong, nothing it asked for is done.
+        assert!(previewer.act("t", "wrong").unwrap_err().contains("it went wrong"));
+        assert!(previewer.act("t", "long").unwrap_err().contains("60000"));
+        // One row's steps are not the next's.
+        assert_eq!(previewer.act("t", "none").unwrap(), Acted::default());
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn a_picker_with_no_action_has_none_to_run_and_app_is_for_actions() {
+        let (previewer, folder) = previewer(
+            "none",
+            r#"return { pickers = { P = { type = "Items", preview = { type = "Dynamic", resolve = function(item)
+              return { type = "Text", text = item.value }
+            end } } } }"#,
+        );
+        assert!(previewer.act("t", "v").unwrap_err().contains("no longer says what is done"));
+        let _ = std::fs::remove_dir_all(folder);
     }
 }

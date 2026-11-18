@@ -81,6 +81,10 @@ impl Fed {
     pub(crate) fn label(&self) -> &str {
         &self.label
     }
+    /// What the daemon says is done to the pane the picker is over, once.
+    pub(crate) fn steps(&self) -> Vec<nterm_session::protocol::PickerStep> {
+        self.shown.steps()
+    }
     /// Whether the daemon ended it, and with what message if it gave one.
     pub(crate) fn closed(&self) -> Option<Option<String>> {
         self.shown.closed()

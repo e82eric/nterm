@@ -17,11 +17,11 @@
 -- opened with fills the arguments written as "{name}", each as one argument
 -- whole, and is never which program is run.
 --
--- So far: types Command, File, Items and FileSystem, and previews of type
--- Dynamic, whose function runs here: it reads this machine's files and runs
--- its programs. `action` and `keys` are read and not yet run: Enter gives the
--- row's value to whoever opened the picker. The names files, directories,
--- history, ripgrep and items are the daemon's own.
+-- So far: types Command, File, Items and FileSystem; previews of type
+-- Dynamic, whose function runs here; and `action`, run here when a window
+-- opened the picker, what it asks of `app` being done to the pane. `keys`
+-- are read and not yet run. The names files, directories, history, ripgrep
+-- and items are the daemon's own.
 return {
   pickers = {
     -- The commits of the repository the shell is in.
@@ -42,6 +42,12 @@ return {
     Search = {
       type = "Command", success_exit_codes = { 0, 1 },
       args = { "rg.exe", "--crlf", "--no-messages", "--color=never", "-i", "--vimgrep", "--", "{pattern}" },
+      -- Enter, from a window: the line is opened in an editor in the shell.
+      action = function(app, item)
+        local path, line = item.value:match("^(.*):(%d+):%d+:")
+        if not path then return end
+        app:send_text("nvim +" .. line .. " '" .. path:gsub("'", "''") .. "'\r")
+      end,
     },
     -- What was typed at a shell, the last first. Opened with the file's
     -- path as `history`.

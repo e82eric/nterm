@@ -142,6 +142,8 @@ pub(crate) struct Defined {
     pub(crate) lists: Lists,
     /// Whether the file says what shows for a row of it: see `previewing`.
     pub(crate) preview: bool,
+    /// Whether it says what is done with the row chosen: its `action`.
+    pub(crate) action: bool,
 }
 
 /// The fields of a picker that are for every kind.
@@ -335,6 +337,12 @@ fn define(lua: &Lua, value: mlua::Value) -> Result<Defined, String> {
         }
         _ => return Err("preview is not a table".into()),
     };
+    // What is done with the row chosen is a function's to say too.
+    let action = match table.raw_get::<_, mlua::Value>("action").map_err(|error| short(&error))? {
+        mlua::Value::Nil => false,
+        mlua::Value::Function(_) => true,
+        _ => return Err("action is not a function".into()),
+    };
     // A copy without what the daemon does not run yet: the file's own
     // table is left as it was written.
     let copy = lua.create_table().map_err(|error| short(&error))?;
@@ -389,7 +397,7 @@ fn define(lua: &Lua, value: mlua::Value) -> Result<Defined, String> {
         }
         _ => {}
     }
-    Ok(Defined { presentation, lists, preview })
+    Ok(Defined { presentation, lists, preview, action })
 }
 
 #[cfg(test)]
