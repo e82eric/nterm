@@ -255,6 +255,14 @@ impl Listener {
                         return Err(io::Error::new(io::ErrorKind::PermissionDenied, error));
                     }
                 }
+                // A client that came and went before it was waited for. The
+                // instance is spent as above: waited on again it would say
+                // the same for ever, with every client told the pipe is busy.
+                ERROR_NO_DATA => {
+                    let error = io::Error::from_raw_os_error(ERROR_NO_DATA as i32);
+                    self.next = instance(&self.name, &self.identity, false)?;
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, error));
+                }
                 code => return Err(io::Error::from_raw_os_error(code as i32)),
             }
         }
