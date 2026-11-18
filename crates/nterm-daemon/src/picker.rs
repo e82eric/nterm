@@ -8,7 +8,7 @@
 //! and is answered, is JSON in `Frame::Shell`:
 //!
 //! - `{"type":"open","request_id":ID,"picker":NAME,"params":{...}}` asks
-//!   for a picker, and is answered `{"type":"opened"}` once a UI has been
+//!   for a picker, and is answered `{"type":"opened","request_id":ID}` once a UI has been
 //!   asked to show it;
 //! - `{"type":"cancel"}`, or leaving, ends it;
 //! - `{"type":"result","request_id":ID,"status":...}` is how it ended:
@@ -352,8 +352,9 @@ impl Pickers {
                     Ok(showing) => showing,
                     Err(message) => return refuse("no_window", message),
                 };
+                let opened = json!({"type": "opened", "request_id": request_id});
                 *mine = Some(self.open(definition, request_id, showing));
-                reply(program, json!({"type": "opened"}));
+                reply(program, opened);
                 true
             }
             Some(Said::Cancel) => {
@@ -371,7 +372,7 @@ impl Pickers {
     fn open(&self, definition: Definition, request_id: Value, showing: Showing) -> u32 {
         limit_search_threads();
         let number = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let store = Arc::new(FileSystemSearchStore::new());
+        let store = Arc::new(FileSystemSearchStore::new_append_only());
         log(format_args!(
             "picker {number}: {} under {:?} for pane {}",
             definition.label, definition.scan.roots, showing.pane
@@ -580,6 +581,7 @@ impl Picker {
             skipped: self.store.skipped_items() as u64,
             done: update.source_done,
             version: update.source_version,
+            append_only: true,
         });
     }
 

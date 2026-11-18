@@ -2,13 +2,14 @@
 //! or what a program prints. The pane keeps them in a stack and treats them alike for where they
 //! were opened and what they report; what only a picker does is asked of the
 //! picker.
-use super::{Action, Output, Picker, Prompt, font};
+use super::{Action, Fed, Output, Picker, Prompt, font};
 
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Page {
     Picker(Picker),
     Prompt(Prompt),
     Output(Output),
+    Fed(Fed),
 }
 impl From<Picker> for Page {
     fn from(picker: Picker) -> Self {
@@ -25,24 +26,36 @@ impl From<Output> for Page {
         Self::Output(output)
     }
 }
+impl From<Fed> for Page {
+    fn from(fed: Fed) -> Self {
+        Self::Fed(fed)
+    }
+}
 
 impl Page {
     pub(crate) fn picker(&self) -> Option<&Picker> {
         match self {
             Self::Picker(picker) => Some(picker),
-            Self::Prompt(_) | Self::Output(_) => None,
+            Self::Prompt(_) | Self::Output(_) | Self::Fed(_) => None,
         }
     }
     pub(crate) fn picker_mut(&mut self) -> Option<&mut Picker> {
         match self {
             Self::Picker(picker) => Some(picker),
-            Self::Prompt(_) | Self::Output(_) => None,
+            Self::Prompt(_) | Self::Output(_) | Self::Fed(_) => None,
+        }
+    }
+    /// The page, if it is a picker the session daemon runs.
+    pub(crate) fn fed(&self) -> Option<&Fed> {
+        match self {
+            Self::Fed(fed) => Some(fed),
+            _ => None,
         }
     }
     pub(crate) fn into_picker(self) -> Option<Picker> {
         match self {
             Self::Picker(picker) => Some(picker),
-            Self::Prompt(_) | Self::Output(_) => None,
+            Self::Prompt(_) | Self::Output(_) | Self::Fed(_) => None,
         }
     }
     /// The terminal snapshot the page reads, if it reads one.
@@ -55,13 +68,15 @@ impl Page {
             Self::Picker(picker) => picker.from_copy,
             Self::Prompt(prompt) => prompt.from_copy,
             Self::Output(output) => output.from_copy,
+            Self::Fed(_) => false,
         }
     }
-    pub(crate) fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &str {
         match self {
             Self::Picker(picker) => picker.label(),
             Self::Prompt(prompt) => prompt.label(),
             Self::Output(output) => output.label(),
+            Self::Fed(fed) => fed.label(),
         }
     }
     pub(crate) fn set_typography(&mut self, typography: font::Typography) {
@@ -69,6 +84,7 @@ impl Page {
             Self::Picker(picker) => picker.typography = typography,
             Self::Prompt(prompt) => prompt.typography = typography,
             Self::Output(output) => output.typography = typography,
+            Self::Fed(fed) => fed.typography = typography,
         }
     }
     /// The terminal row a `Cursor` position opens beneath.
@@ -77,6 +93,7 @@ impl Page {
             Self::Picker(picker) => picker.cursor_row = row,
             Self::Prompt(prompt) => prompt.cursor_row = row,
             Self::Output(output) => output.cursor_row = row,
+            Self::Fed(fed) => fed.cursor_row = row,
         }
     }
     pub(crate) fn surrender_focus(&self) {
@@ -84,6 +101,7 @@ impl Page {
             Self::Picker(picker) => picker.surrender_focus(),
             Self::Prompt(prompt) => prompt.surrender_focus(),
             Self::Output(output) => output.surrender_focus(),
+            Self::Fed(fed) => fed.surrender_focus(),
         }
     }
     pub(crate) fn show_scoped(
@@ -97,6 +115,7 @@ impl Page {
             Self::Picker(picker) => picker.show_scoped(ctx, pane, workspace, interactive),
             Self::Prompt(prompt) => prompt.show_scoped(ctx, pane, workspace, interactive),
             Self::Output(output) => output.show_scoped(ctx, pane, workspace, interactive),
+            Self::Fed(fed) => fed.show_scoped(ctx, pane, workspace, interactive),
         }
     }
 }

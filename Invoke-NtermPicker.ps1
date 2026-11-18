@@ -6,6 +6,10 @@
 # request to the window showing the pane. There is no secret to keep and no
 # connection to hold: one connection is one request.
 #
+# With -DaemonPicker the daemon runs the picker itself: it lists and searches on
+# the machine this shell is on, and the window only draws the rows. That works
+# the same when the window is on another machine.
+#
 # Both switches are accepted for profiles that pass them. Nothing is compiled,
 # so there is nothing to prepare in the background.
 param([switch]$BackgroundInitialize, [switch]$FreshConnection)
@@ -20,7 +24,9 @@ function Invoke-NtermPicker {
     [CmdletBinding(DefaultParameterSetName='Stream')]
     param(
         [Parameter(Mandatory, ParameterSetName='Named')][string] $Name,
-        [Parameter(ParameterSetName='Named')][hashtable] $Parameters = @{},
+        # One of the pickers the daemon has: files, directories.
+        [Parameter(Mandatory, ParameterSetName='Daemon')][string] $DaemonPicker,
+        [Parameter(ParameterSetName='Named')][Parameter(ParameterSetName='Daemon')][hashtable] $Parameters = @{},
         [Parameter(ValueFromPipeline, ParameterSetName='Stream')]
         [Parameter(ValueFromPipeline, ParameterSetName='Named')][AllowNull()][object] $InputObject,
         [Parameter(ParameterSetName='Stream')][hashtable] $Options = @{},
@@ -43,8 +49,9 @@ function Invoke-NtermPicker {
         $originals = [System.Collections.Generic.Dictionary[string,object]]::new()
         $requestId = [guid]::NewGuid().ToString('N')
         # Piping into -Name streams the items of a configured Items picker.
-        $streaming = $PSCmdlet.ParameterSetName -eq 'Stream' -or $MyInvocation.ExpectingInput -or
-            $PSBoundParameters.ContainsKey('InputObject')
+        $daemonRuns = $PSCmdlet.ParameterSetName -eq 'Daemon'
+        $streaming = -not $daemonRuns -and ($PSCmdlet.ParameterSetName -eq 'Stream' -or
+            $MyInvocation.ExpectingInput -or $PSBoundParameters.ContainsKey('InputObject'))
         $pane = [uint32]0
         if (-not $env:NTERM_DAEMON_PIPE -or -not [uint32]::TryParse($env:NTERM_PANE, [ref]$pane)) {
             throw 'Run this function inside an nterm pane whose shell the session daemon runs.'
@@ -158,8 +165,15 @@ function Invoke-NtermPicker {
                 [System.IO.HandleInheritability]::None)
             try { $pipe.Connect(5000) }
             catch [System.TimeoutException] { throw 'The nterm session daemon is not running.' }
-            Send-PickerFrame 0 ('{"type":"shell","pane":' + $pane + '}')
+            # `shell` is passed through to the window; `pick` is for the daemon.
+            $first = if ($daemonRuns) { 'pick' } else { 'shell' }
+            Send-PickerFrame 0 ('{"type":"' + $first + '","pane":' + $pane + '}')
             $request = switch ($PSCmdlet.ParameterSetName) {
+                Daemon {
+                    $strings = @{}
+                    foreach ($key in $Parameters.Keys) { $strings[[string]$key] = [string]$Parameters[$key] }
+                    $strings
+                }
                 Named {
                     $strings = @{}
                     foreach ($key in $Parameters.Keys) { $strings[[string]$key] = [string]$Parameters[$key] }
@@ -176,7 +190,11 @@ function Invoke-NtermPicker {
                     @{ kind='stream'; options=$streamOptions }
                 }
             }
-            Send-PickerMessage @{ type='open'; request_id=$requestId; request=$request }
+            if ($daemonRuns) {
+                Send-PickerMessage @{ type='open'; request_id=$requestId; picker=$DaemonPicker; params=$request }
+            } else {
+                Send-PickerMessage @{ type='open'; request_id=$requestId; request=$request }
+            }
             $reply = Receive-PickerMessage 15
             if ($reply.type -eq 'result') { $result = $reply }
             elseif ($reply.type -ne 'opened') { throw 'Unexpected picker open response.' }

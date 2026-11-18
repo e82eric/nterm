@@ -260,6 +260,10 @@ pub enum Control {
         /// The source's version: rows sent with the same one are the same
         /// rows under the same numbers.
         version: u64,
+        /// Whether a row keeps its number and what it says while the source
+        /// is added to, whatever the version.
+        #[serde(default)]
+        append_only: bool,
     },
     /// To a UI: the picker is over, and not by the UI's doing. With what
     /// went wrong, if something did.

@@ -22,6 +22,7 @@ use crate::{
     },
 };
 use crossbeam_channel::{Receiver, Sender};
+use nfm_egui::fed::{Asked, Feed, Found, Page, Row, Rows};
 use nterm_session::{
     DEFAULT_SESSION, GHOSTTY_REVISION,
     pipe::{self, Connection},
@@ -31,7 +32,7 @@ use nterm_session::{
     },
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::{CStr, c_void},
     io,
     sync::{
@@ -540,6 +541,9 @@ struct Daemon {
     programs: Mutex<HashMap<u32, Program>>,
     /// Who waits for each snapshot asked for, by request.
     snapshots: Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>,
+    /// The pickers the daemon runs that are shown here, by its number for
+    /// each.
+    pickers: Mutex<HashMap<u32, Arc<Shown>>>,
     /// The sessions the daemon holds, as it last gave them.
     sessions: Mutex<Arc<Listing>>,
     next_request: AtomicU32,
@@ -667,6 +671,7 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             starting: Mutex::default(),
             programs: Mutex::default(),
             snapshots: Mutex::default(),
+            pickers: Mutex::default(),
             sessions: Mutex::new(Arc::new(Listing { sessions, daemon: number, place: client.place.clone() })),
             next_request: AtomicU32::new(1),
             settings: Mutex::default(),
@@ -769,6 +774,135 @@ fn answer(daemon: Arc<Daemon>, channel: u32, replies: Receiver<serde_json::Value
     let _ = std::thread::Builder::new().name("picker replies".into()).spawn(pass);
 }
 
+/// How many of the answers a picker was last given are kept, to say which
+/// one a row was chosen from.
+const KEPT_ANSWERS: usize = 8;
+
+/// A picker the daemon runs for a program in a pane, shown here: the way
+/// between the daemon, which finds the rows, and the page that draws them.
+pub(crate) struct Shown {
+    /// Says something to the daemon.
+    tell: Box<dyn Fn(Control) + Send + Sync>,
+    /// Has the pane drawn again.
+    wake: Box<dyn Fn() + Send + Sync>,
+    picker: u32,
+    /// What it is a picker of, as the daemon names it.
+    pub(crate) label: String,
+    /// The query it starts with.
+    pub(crate) query: String,
+    state: Mutex<Showing>,
+}
+
+#[derive(Default)]
+struct Showing {
+    /// Where the page is told what was found, once there is a page.
+    feed: Option<Feed<Rows>>,
+    /// Found before there was.
+    early: Option<Found<Rows>>,
+    /// The last answers, each with the daemon's number for it.
+    answers: VecDeque<(Arc<Rows>, u64)>,
+    /// Ended, from either side.
+    over: bool,
+    /// Ended by the daemon, with what went wrong if something did.
+    closed: Option<Option<String>>,
+}
+
+impl Shown {
+    /// `tell` says something to the daemon, and `wake` has the pane drawn
+    /// again; both are called from any thread.
+    pub(crate) fn new(
+        picker: u32,
+        label: String,
+        query: String,
+        tell: impl Fn(Control) + Send + Sync + 'static,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self { tell: Box::new(tell), wake: Box::new(wake), picker, label, query, state: Mutex::default() }
+    }
+
+    /// The page wants this found.
+    pub(crate) fn ask(&self, asked: Asked) {
+        if self.state.lock().unwrap().over {
+            return;
+        }
+        (self.tell)(Control::PickerQuery {
+            picker: self.picker,
+            revision: asked.revision,
+            query: asked.query,
+            rows: asked.rows.min(u32::MAX as usize) as u32,
+        });
+    }
+
+    /// Where the page is told what was found.
+    pub(crate) fn feed(&self, feed: Feed<Rows>) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(found) = state.early.take() {
+            feed.found(found);
+        }
+        state.feed = Some(feed);
+    }
+
+    pub(crate) fn found(&self, serial: u64, found: Found<Rows>) {
+        let mut state = self.state.lock().unwrap();
+        if state.over {
+            return;
+        }
+        state.answers.push_back((found.source.clone(), serial));
+        while state.answers.len() > KEPT_ANSWERS {
+            state.answers.pop_front();
+        }
+        match &state.feed {
+            Some(feed) => feed.found(found),
+            None => state.early = Some(found),
+        }
+        drop(state);
+        (self.wake)();
+    }
+
+    /// A row was chosen: `row` of the answer `rows`. The daemon is told
+    /// which, and gives the program what the row is. False when the answer
+    /// is not one of the last given, and nothing was chosen.
+    pub(crate) fn accept(&self, rows: &Arc<Rows>, row: usize) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.over {
+            return false;
+        }
+        let serial = state.answers.iter().find(|(answer, _)| Arc::ptr_eq(answer, rows));
+        let Some(serial) = serial.map(|(_, serial)| *serial) else {
+            return false;
+        };
+        state.over = true;
+        drop(state);
+        (self.tell)(Control::PickerAccept { picker: self.picker, serial, row: row as u64 });
+        true
+    }
+
+    /// The picker is closed here with nothing chosen, or, with `refused`,
+    /// is not shown at all.
+    pub(crate) fn close(&self, refused: Option<String>) {
+        if std::mem::replace(&mut self.state.lock().unwrap().over, true) {
+            return;
+        }
+        (self.tell)(Control::PickerClose { picker: self.picker, refused });
+    }
+
+    /// The daemon ended it: its program went, or the daemon did.
+    pub(crate) fn ended(&self, message: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        if std::mem::replace(&mut state.over, true) {
+            return;
+        }
+        state.closed = Some(message);
+        drop(state);
+        (self.wake)();
+    }
+
+    /// Whether the daemon ended it, and with what message if it gave one.
+    pub(crate) fn closed(&self) -> Option<Option<String>> {
+        self.state.lock().unwrap().closed.clone()
+    }
+}
+
 /// The reader thread.
 fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
     let error = loop {
@@ -844,11 +978,78 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 None => daemon.control(Control::ShellClosed { channel }),
             },
             // The daemon runs a picker for a program in a pane and asks for
-            // it to be shown, which this window does not do yet: the
-            // program is told so, not left waiting.
-            Frame::Control(Control::PickerOpen { picker, .. }) => {
-                let refused = Some("this window does not show the daemon's pickers yet".to_owned());
-                daemon.control(Control::PickerClose { picker, refused });
+            // it to be shown. The daemon finds the rows, where the program
+            // is; only what it sends is drawn here, so this is the same for
+            // a daemon on another machine.
+            Frame::Control(Control::PickerOpen { picker, pane, label, query }) => match daemon.pane(pane) {
+                Some(link) => {
+                    let (to, woken) = (daemon.clone(), link.clone());
+                    let tell = move |control: Control| {
+                        // Either ends it here: the daemon says no more of it.
+                        if matches!(control, Control::PickerAccept { .. } | Control::PickerClose { .. }) {
+                            to.pickers.lock().unwrap().remove(&picker);
+                        }
+                        to.control(control);
+                    };
+                    let shown = Arc::new(Shown::new(picker, label, query, tell, move || woken.wake_pane()));
+                    daemon.pickers.lock().unwrap().insert(picker, shown.clone());
+                    let _ = link.requests.0.send(Event::Shown(shown));
+                    link.wake_pane();
+                }
+                // The pane went as the program asked.
+                None => {
+                    let refused = Some("the pane is not shown".to_owned());
+                    daemon.control(Control::PickerClose { picker, refused });
+                }
+            },
+            Frame::Control(Control::PickerRows {
+                picker,
+                serial,
+                revision,
+                query,
+                matched_against,
+                header,
+                rows,
+                matched,
+                total,
+                skipped,
+                done,
+                version,
+                append_only,
+            }) => {
+                let shown = daemon.pickers.lock().unwrap().get(&picker).cloned();
+                if let Some(shown) = shown {
+                    // Said as it is taken, so that the daemon sends the next
+                    // no faster than they arrive.
+                    daemon.control(Control::PickerSeen { picker, serial });
+                    let rows = rows
+                        .into_iter()
+                        .map(|row| Row { index: row.index as usize, text: row.text, fields: None })
+                        .collect();
+                    let page = Page { version, rows, matched_against, header, template: None };
+                    let (source, results) = page.into_rows();
+                    shown.found(
+                        serial,
+                        Found {
+                            revision,
+                            query,
+                            source: Arc::new(source),
+                            epoch: 0,
+                            append_only,
+                            results,
+                            matched: matched as usize,
+                            total: total as usize,
+                            skipped: skipped as usize,
+                            done,
+                        },
+                    );
+                }
+            }
+            Frame::Control(Control::PickerClosed { picker, message }) => {
+                let shown = daemon.pickers.lock().unwrap().remove(&picker);
+                if let Some(shown) = shown {
+                    shown.ended(message);
+                }
             }
             Frame::Shell { channel, bytes } => said(daemon, channel, &bytes),
             Frame::Control(Control::ShellClosed { channel }) => daemon.end_program(channel, false),
@@ -881,6 +1082,11 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
     let programs: Vec<u32> = daemon.programs.lock().unwrap().keys().copied().collect();
     for channel in programs {
         daemon.end_program(channel, false);
+    }
+    let pickers: Vec<Arc<Shown>> =
+        daemon.pickers.lock().unwrap().drain().map(|(_, shown)| shown).collect();
+    for shown in pickers {
+        shown.ended(None);
     }
     let mut links: Vec<Arc<Link>> = daemon.panes.lock().unwrap().drain().map(|(_, l)| l).collect();
     links.extend(daemon.starting.lock().unwrap().drain().map(|(_, link)| link));

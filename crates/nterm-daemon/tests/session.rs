@@ -1086,7 +1086,8 @@ impl Ui {
             unreachable!()
         };
         assert_eq!(over, pane);
-        assert_eq!(asker.told()["type"], "opened");
+        let opened = asker.told();
+        assert_eq!((&opened["type"], &opened["request_id"]), (&"opened".into(), &"r1".into()));
         (asker, picker)
     }
 

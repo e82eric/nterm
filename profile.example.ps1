@@ -14,17 +14,25 @@ if (-not (Get-Command Invoke-NtermPicker -CommandType Function -ErrorAction Sile
 $script:NtermProfilePickerRoots = $PickerRoots
 
 function Invoke-ProfilePathPicker {
-    param([string[]]$Roots = $script:NtermProfilePickerRoots, [switch]$Directories)
-    $name = if ($Directories) { 'ProfileDirectories' } else { 'ProfileFiles' }
-    Invoke-NtermPicker -Name $name -Parameters @{
+    # With -Daemon the session daemon lists and searches, on the machine this
+    # shell is on, and the window only draws: the one that works when the
+    # window is on another machine.
+    param([string[]]$Roots = $script:NtermProfilePickerRoots, [switch]$Directories, [switch]$Daemon)
+    $parameters = @{
         roots = (ConvertTo-Json -InputObject @($Roots) -Compress)
         cwd = $PWD.Path
     }
+    if ($Daemon) {
+        $name = if ($Directories) { 'directories' } else { 'files' }
+        return Invoke-NtermPicker -DaemonPicker $name -Parameters $parameters
+    }
+    $name = if ($Directories) { 'ProfileDirectories' } else { 'ProfileFiles' }
+    Invoke-NtermPicker -Name $name -Parameters $parameters
 }
 
 function Insert-FilePickerResult {
-    param([string[]]$Roots = $script:NtermProfilePickerRoots)
-    $result = Invoke-ProfilePathPicker -Roots $Roots
+    param([string[]]$Roots = $script:NtermProfilePickerRoots, [switch]$Daemon)
+    $result = Invoke-ProfilePathPicker -Roots $Roots -Daemon:$Daemon
     if ($null -ne $result) {
         # Quote paths containing spaces or apostrophes for PowerShell.
         $quoted = "'" + ([string]$result).Replace("'", "''") + "'"
@@ -33,8 +41,8 @@ function Insert-FilePickerResult {
 }
 
 function Set-LocationFromPicker {
-    param([string[]]$Roots = $script:NtermProfilePickerRoots)
-    $result = Invoke-ProfilePathPicker -Roots $Roots -Directories
+    param([string[]]$Roots = $script:NtermProfilePickerRoots, [switch]$Daemon)
+    $result = Invoke-ProfilePathPicker -Roots $Roots -Directories -Daemon:$Daemon
     if ($null -ne $result) {
         $quoted = "'" + ([string]$result).Replace("'", "''") + "'"
         [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
@@ -49,6 +57,12 @@ Set-PSReadLineKeyHandler -Chord Ctrl+o -ScriptBlock { Set-LocationFromPicker -Ro
 Set-PSReadLineKeyHandler -Chord Alt+o -ScriptBlock { Set-LocationFromPicker }
 Set-PSReadLineKeyHandler -Chord Ctrl+t -ScriptBlock { Insert-FilePickerResult -Roots @($PWD.Path) }
 Set-PSReadLineKeyHandler -Chord Alt+t -ScriptBlock { Insert-FilePickerResult }
+# The same, with the session daemon running the picker. Not on Ctrl+Shift+o
+# and Ctrl+Shift+t: the terminal keeps those two and the shell never sees them.
+# A capital letter is the key with Shift: PSReadLine reads Alt+Shift+o as Alt+o.
+Set-PSReadLineKeyHandler -Chord Ctrl+Alt+o -ScriptBlock { Set-LocationFromPicker -Roots @($PWD.Path) -Daemon }
+Set-PSReadLineKeyHandler -Chord Alt+O -ScriptBlock { Set-LocationFromPicker -Daemon }
+Set-PSReadLineKeyHandler -Chord Alt+T -ScriptBlock { Insert-FilePickerResult -Daemon }
 
 Set-PSReadLineKeyHandler -Chord Alt+r -ScriptBlock {
     $line = ''; $cursor = 0

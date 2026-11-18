@@ -1,5 +1,6 @@
 pub(crate) mod command;
 pub(crate) mod config;
+mod fed;
 pub(crate) mod files;
 pub(crate) mod font;
 mod output;
@@ -14,6 +15,7 @@ pub(crate) mod wire;
 
 use crate::ghostty_ffi::{self, Host, SnapshotCell, SnapshotCellRange};
 use nfm_search_core::search::SearchResult;
+pub(crate) use fed::Fed;
 pub(crate) use output::Output;
 pub(crate) use page::Page;
 pub(crate) use prompt::Prompt;

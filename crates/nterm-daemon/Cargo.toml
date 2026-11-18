@@ -16,8 +16,8 @@ path = "src/main.rs"
 [dependencies]
 nterm-session = { path = "../nterm-session" }
 # What a picker the daemon runs lists and is searched with; see `picker`.
-nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "c8818258d9923761bd5bb9e6c3830df545dc192d" }
-nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "c8818258d9923761bd5bb9e6c3830df545dc192d" }
+nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "95ee4f7c2aab659fee9c1b0bdf677a01105e3a90" }
+nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "95ee4f7c2aab659fee9c1b0bdf677a01105e3a90" }
 crossbeam-channel = "0.5.15"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

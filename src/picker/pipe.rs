@@ -134,6 +134,9 @@ pub(crate) enum Event {
     End {
         session: Arc<Session>,
     },
+    /// The session daemon runs a picker for a program in the pane's shell,
+    /// and asks for it to be shown.
+    Shown(Arc<crate::session::Shown>),
 }
 
 pub(crate) struct Session {

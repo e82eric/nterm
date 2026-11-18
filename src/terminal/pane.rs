@@ -1687,6 +1687,17 @@ impl TerminalPane {
             drop(picker);
             self.handle_picker_action(crate::picker::Action::Cancel, generation, from_copy);
         }
+        // A picker the daemon runs, which the daemon ended: its program
+        // went, or the daemon did.
+        if let Some(ended) = self.pages.top().and_then(crate::picker::Page::fed).and_then(|fed| fed.closed()) {
+            if let Some(page) = self.take_pages() {
+                page.surrender_focus();
+            }
+            if let Some(message) = ended {
+                self.show_error("The picker ended", message);
+            }
+            ctx.request_repaint();
+        }
         // A producer can refill the queue as batches are acknowledged. Yield to
         // input and preview painting instead of draining it indefinitely.
         let pipe_deadline = std::time::Instant::now() + std::time::Duration::from_millis(4);
@@ -1740,6 +1751,29 @@ impl TerminalPane {
                         continue;
                     }
                     self.open_pipe_picker(ctx, bindings, request, session);
+                }
+                // The daemon finds the rows and this pane draws them. It is
+                // refused where a program's own request for a picker is.
+                Event::Shown(shown) => {
+                    let refused = if !bindings.pipe_policy.enabled {
+                        Some("picker pipe is disabled in Lua configuration")
+                    } else if !interactive
+                        || !self.pages.is_empty()
+                        || self.search.active
+                        || self.quick_select.is_some()
+                    {
+                        Some("another overlay is active")
+                    } else {
+                        None
+                    };
+                    match refused {
+                        Some(why) => shown.close(Some(why.into())),
+                        None => {
+                            let page = crate::picker::Fed::start(ctx.clone(), shown);
+                            self.place_page(true, page);
+                            ctx.request_repaint();
+                        }
+                    }
                 }
                 other => {
                     if let Some(picker) = self

@@ -83,6 +83,31 @@ requests. Another active overlay, or another request already open in the pane,
 returns `busy`; requests are not queued. Returned paths are not automatically
 shell-quoted.
 
+## Have the session daemon run the picker
+
+With `-DaemonPicker` the session daemon that runs the shell lists and searches,
+on the machine the shell is on, and the window only draws the rows it is sent
+and says what was typed and which row was chosen. It is the kind that works in
+a window on another machine (`--remote`), where the pickers above are refused:
+they would list that window's own files.
+
+```powershell
+# A file under the current directory; returns its full path.
+Invoke-NtermPicker -DaemonPicker files -Parameters @{ cwd = $PWD.Path }
+
+# A folder under any of several roots.
+Invoke-NtermPicker -DaemonPicker directories -Parameters @{
+    roots = (ConvertTo-Json -InputObject @('C:\src', 'D:\work') -Compress)
+}
+```
+
+The daemon has two pickers, `files` and `directories`. `roots` is a JSON list
+of folders; without it `cwd` is the one root. `query` is the text the picker
+opens with. With one root the rows are paths from it; the value returned is
+always the whole path. The window needs `picker_pipe.enabled`, and nothing in
+`named`. There are no previews yet. `profile.example.ps1` binds these to
+Ctrl+Alt+O, Alt+Shift+O and Alt+Shift+T.
+
 ## npick
 
 With `picker_pipe` enabled as above, `npick` opens pickers from the shell
