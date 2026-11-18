@@ -182,12 +182,6 @@ pub(crate) enum Preview {
         #[serde(default)]
         max_scrollback_lines: Option<usize>,
     },
-    /// What is in the directory a row names. For pickers made here: a
-    /// configuration lists a directory with a Dynamic preview.
-    #[serde(skip)]
-    Directory {
-        line_numbers: Option<LineNumbers>,
-    },
 }
 
 fn default_preview_rows() -> usize {
@@ -212,7 +206,6 @@ impl Preview {
             | Self::Ansi { line_numbers, .. }
             | Self::Dynamic { line_numbers, .. }
             | Self::Scrollback { line_numbers, .. }
-            | Self::Directory { line_numbers }
             | Self::Command { line_numbers, .. } => *line_numbers,
             Self::Host => None,
         }
@@ -225,7 +218,6 @@ impl Preview {
             | Self::Ansi { line_numbers, .. }
             | Self::Dynamic { line_numbers, .. }
             | Self::Scrollback { line_numbers, .. }
-            | Self::Directory { line_numbers }
             | Self::Command { line_numbers, .. } => Some(line_numbers),
             Self::Host => None,
         }

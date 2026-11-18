@@ -423,26 +423,12 @@ impl Picker {
                 ),
             );
         }
-        if let Some(config::Preview::Directory { .. }) = &options.preview {
-            let value = source.preview_value_resolver();
-            shared.set_preview_provider(
-                &ctx,
-                Arc::new(
-                    move |request: nfm_egui::PreviewRequest<source::Candidate>, _| {
-                        crate::preview_worker::directory_listing(std::path::Path::new(
-                            &value(&request.selection),
-                        ))
-                        .map(nfm_egui::Preview::Text)
-                    },
-                ),
-            );
-        }
         shared.set_external_preview(
             options.preview.is_some()
                 && !nfm_preview
                 && !matches!(
                     options.preview,
-                    Some(config::Preview::Text { .. } | config::Preview::Directory { .. })
+                    Some(config::Preview::Text { .. })
                 ),
         );
         let resolved_preview = match &options.preview {

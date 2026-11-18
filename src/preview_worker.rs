@@ -73,20 +73,6 @@ pub(crate) struct DirectoryItem {
     is_directory: bool,
 }
 
-/// A directory as text: a name to a line, folders ending in a slash.
-pub(crate) fn directory_listing(path: &std::path::Path) -> Result<String, String> {
-    let items = directory_items(path, 1 << 20, || false)?.ok_or("Not a directory")?;
-    if items.is_empty() {
-        return Ok("[Empty directory]".into());
-    }
-    let lines: Vec<String> = items
-        .into_iter()
-        .map(|item| if item.is_directory { item.name + "/" } else { item.name })
-        .collect();
-    Ok(lines.join("
-"))
-}
-
 pub(crate) fn directory_items(
     path: &std::path::Path,
     limit: usize,

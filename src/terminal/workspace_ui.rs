@@ -720,40 +720,6 @@ impl TerminalView {
         self.close_window_picker();
         Some(action)
     }
-    /// Ask which directory a new workspace's first shell starts in: the
-    /// folders of `workspaces.new_roots`. Enter before anything is typed or
-    /// selected is where the active pane is.
-    pub(super) fn new_workspace_picker(&mut self, ctx: &egui::Context) {
-        use crate::picker::config::{
-            EnterAction, FileOptions, Options, PickerEntry, Position, Preview, Scope, Source,
-        };
-        let options = Options {
-            scope: Scope::Workspace,
-            position: Position::Bottom,
-            source: Source::FileSystem(FileOptions {
-                roots: self.picker_bindings.new_workspace_roots.clone(),
-                // As many levels of folders as the picker of workspaces lists.
-                max_depth: self.picker_bindings.new_workspace_depth,
-                files_only: false,
-                directories_only: true,
-                relative: false,
-                layout: Default::default(),
-            }),
-            enter_action: EnterAction::SendInput,
-            // As tall as a picker of workspaces, and what the folder holds
-            // where that draws the workspace.
-            preview: Some(Preview::Directory { line_numbers: None }),
-            height: Some(PICKER_HEIGHT),
-            label: Some("NEW WORKSPACE IN"),
-            accept: Some(std::rc::Rc::new(AppAction::CreateWorkspaceIn)),
-            ..Options::default()
-        };
-        let bindings = self.picker_bindings.clone();
-        let palette = self.palette_context();
-        if let Some(pane) = self.active_pane().and_then(|p| self.pane_mut(p)) {
-            pane.open_picker(ctx, PickerEntry::Static(options), None, &bindings, &palette);
-        }
-    }
     /// Make a workspace whose first shell starts in `cwd`, and go to it.
     /// One started in a chosen directory is called after it.
     pub(super) fn create_workspace_in(
@@ -1566,12 +1532,9 @@ impl TerminalView {
                     }
                 }
                 CreateWorkspace => {
-                    // With roots to pick from, the directory is asked for first.
-                    if self.picker_bindings.new_workspace_roots.is_empty() {
-                        self.create_workspace_in(None, gl)?;
-                    } else {
-                        self.new_workspace_picker(ctx);
-                    }
+                    // Where the current one is. One in a folder is started
+                    // from the picker of workspaces.
+                    self.create_workspace_in(None, gl)?;
                 }
                 MovePaneToNewWorkspace => {
                     if let Some(pane) = self.active_pane() {
