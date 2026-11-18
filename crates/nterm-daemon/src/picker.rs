@@ -26,6 +26,7 @@ use nfm_file_system::{
     walker_search_store::FileSystemSearchStore,
 };
 use nfm_picker_sources::{
+    command::{self, CommandSourceOptions, CommandSpec},
     file::{self, FileSourceOptions},
     records::{StreamControl, StreamSink, StreamValues},
 };
@@ -64,6 +65,20 @@ const MAX_REQUEST: usize = 1 << 20;
 const MOST_GIVEN: usize = 100_000;
 /// The most characters of the name a program gives a picker of its rows.
 const MOST_LABEL: usize = 64;
+/// What `rg` is run with, before the pattern.
+const RIPGREP: [&str; 9] = [
+    "--crlf",
+    "--max-columns=500",
+    "--max-columns-preview",
+    "--no-messages",
+    "--hidden",
+    "--color=never",
+    "-i",
+    "--vimgrep",
+    "--",
+];
+/// The most lines a picker reads of a file or of what a command prints.
+const MOST_LINES: usize = 1_000_000;
 
 /// A search runs on as many threads as it is let, and the daemon's first
 /// work is its shells: searches are left all the processors but two, so
@@ -142,6 +157,8 @@ enum Lists {
     Walk(ScanOptions),
     /// The lines of a file of what was typed at a shell, the newest first.
     History(PathBuf),
+    /// The lines a command prints, as a search of files does.
+    Command(CommandSpec),
     /// What the program that asked gives, as `items`.
     Given,
 }
@@ -223,6 +240,9 @@ impl Shown {
 /// - `history` lists the lines of the file `path` names, the last first and
 ///   each once, with lines that end in a backtick joined to the next: the
 ///   file PSReadLine keeps of what was typed.
+/// - `ripgrep` lists the lines of the files under `cwd` that `pattern`, a
+///   regular expression, is found in: what `rg` prints, which is run once
+///   and not again as the query changes.
 /// - `items` lists what the program gives after it, and is called `label`.
 fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, String> {
     let cwd = params.get("cwd").map(PathBuf::from);
@@ -279,6 +299,27 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
             // typed of what matches is the one most likely wanted.
             sort = SearchSortMode::SourceOrder;
             Lists::History(path)
+        }
+        "ripgrep" => {
+            label.push_str("Ripgrep");
+            let pattern = params.get("pattern").filter(|pattern| !pattern.is_empty()).ok_or("no pattern was given")?;
+            if pattern.contains('\0') {
+                return Err("the pattern has a NUL in it".into());
+            }
+            let folder = cwd.clone().ok_or("no cwd was given")?;
+            if folder.is_relative() || !folder.is_dir() {
+                return Err(format!("{} is not a folder", folder.display()));
+            }
+            // One line for each place the pattern is found, as
+            // `path:line:column:text`, whatever the case of its letters.
+            // The pattern is after `--`: it is never read as an option.
+            let mut command = CommandSpec::new("rg");
+            command.arguments = RIPGREP.iter().map(|argument| (*argument).to_owned()).collect();
+            command.arguments.push(pattern.clone());
+            command.working_directory = Some(folder);
+            // Of what it says went wrong, which is all that is kept of it.
+            command.output_limit = 16 * 1024;
+            Lists::Command(command)
         }
         "items" => {
             let given = params.get("label").map(|label| label.trim()).filter(|label| !label.is_empty());
@@ -487,10 +528,11 @@ struct Answer {
 /// What a picker lists, and how that is added to and stopped.
 enum Source {
     Walk { store: Arc<FileSystemSearchStore>, scan: FileWalkerScan },
-    /// The lines of a file, read on a thread that stops when `cancelled`.
+    /// Lines read as they come, of a file or of what a command prints, on
+    /// a thread that stops when `cancelled`.
     /// `whole` has, by row, what a row is where that is not what it shows:
     /// a command of several lines, which shows as one.
-    File { store: Arc<SnapshotStore<Lines>>, cancelled: Arc<AtomicBool>, whole: StreamValues },
+    Read { store: Arc<SnapshotStore<Lines>>, cancelled: Arc<AtomicBool>, whole: StreamValues },
     /// What the program gives.
     Given { store: Arc<SnapshotStore<Lines>>, given: Mutex<Given> },
 }
@@ -505,7 +547,7 @@ impl Source {
     fn found(&self) -> Found {
         match self {
             Self::Walk { store, .. } => Found::Walk(store.clone()),
-            Self::File { store, .. } | Self::Given { store, .. } => Found::Lines(store.clone()),
+            Self::Read { store, .. } | Self::Given { store, .. } => Found::Lines(store.clone()),
         }
     }
     fn skipped(&self) -> usize {
@@ -514,7 +556,7 @@ impl Source {
     fn stop(&self) {
         match self {
             Self::Walk { scan, .. } => scan.cancel(),
-            Self::File { cancelled, .. } => cancelled.store(true, Ordering::Release),
+            Self::Read { cancelled, .. } => cancelled.store(true, Ordering::Release),
             Self::Given { given, .. } => given.lock().unwrap().adding = None,
         }
     }
@@ -568,7 +610,7 @@ enum Outcome {
 #[derive(Default)]
 pub(crate) struct Pickers {
     next: AtomicU32,
-    open: Mutex<HashMap<u32, Arc<Picker>>>,
+    open: Arc<Mutex<HashMap<u32, Arc<Picker>>>>,
 }
 
 /// Where a program's picker is to be shown.
@@ -649,9 +691,17 @@ impl Pickers {
         let of = match &definition.lists {
             Lists::Walk(scan) => format!("under {:?}", scan.roots),
             Lists::History(path) => format!("of {}", path.display()),
+            Lists::Command(command) => format!(
+                "of what {} prints in {}",
+                command.program.display(),
+                command.working_directory.as_deref().unwrap_or(Path::new(".")).display()
+            ),
             Lists::Given => "of what its program gives".to_owned(),
         };
         log(format_args!("picker {number}: {} {of} for pane {}", definition.label, showing.pane));
+        // What reads a file or runs a command, begun once the picker is one
+        // of those open: it may fail at once, and that ends the picker.
+        let mut begin: Option<Box<dyn FnOnce()>> = None;
         let source = match definition.lists {
             Lists::Walk(scan) => {
                 let store = Arc::new(FileSystemSearchStore::new_append_only());
@@ -659,31 +709,28 @@ impl Pickers {
                 Source::Walk { store, scan }
             }
             Lists::History(path) => {
-                let store = Arc::new(SnapshotStore::new_append_only());
-                let cancelled = Arc::new(AtomicBool::new(false));
-                let whole = StreamValues::default();
-                let mut options = FileSourceOptions::new(path);
-                options.reverse = true;
-                options.unique = true;
-                options.line_continuation = Some("`".to_owned());
-                let sink = StreamSink {
-                    store: store.clone(),
-                    payload: (),
-                    values: Some(whole.clone()),
-                    error: Arc::default(),
-                };
-                let failed = move |message: &str| log(format_args!("picker {number}: its file was not read: {message}"));
-                let control = StreamControl {
-                    cancelled: cancelled.clone(),
-                    changed: Arc::new(|| {}),
-                    failed: Arc::new(failed),
-                };
-                if let Err(message) = file::start(options, sink, control) {
-                    // Nothing reads it: it lists nothing, and says so.
-                    failed(&message);
-                    PublishingStreamingItemStoreWithPayload::new(store.clone()).complete();
-                }
-                Source::File { store, cancelled, whole }
+                let (source, sink, control) = self.read(number);
+                begin = Some(Box::new(move || {
+                    let mut options = FileSourceOptions::new(path);
+                    options.reverse = true;
+                    options.unique = true;
+                    options.line_continuation = Some("`".to_owned());
+                    let failed = control.failed.clone();
+                    if let Err(message) = file::start(options, sink, control) {
+                        failed(&message);
+                    }
+                }));
+                source
+            }
+            Lists::Command(command) => {
+                let (source, sink, control) = self.read(number);
+                begin = Some(Box::new(move || {
+                    let failed = control.failed.clone();
+                    if let Err(message) = command::start(CommandSourceOptions::new(command), sink, control) {
+                        failed(&message);
+                    }
+                }));
+                source
             }
             Lists::Given => {
                 let store = Arc::new(SnapshotStore::new_append_only());
@@ -712,7 +759,48 @@ impl Pickers {
             preview: definition.preview,
             at_cursor: definition.at_cursor,
         });
+        if let Some(begin) = begin {
+            begin();
+        }
         number
+    }
+
+    /// A picker of lines that are read as they come, of a file or of what a
+    /// command prints: what it lists, where the lines are put, and how the
+    /// reading is stopped and says it failed.
+    fn read(&self, number: u32) -> (Source, StreamSink<()>, StreamControl) {
+        let store = Arc::new(SnapshotStore::new_append_only());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let whole = StreamValues::default();
+        let sink = StreamSink {
+            store: store.clone(),
+            payload: (),
+            values: Some(whole.clone()),
+            error: Arc::default(),
+        };
+        let (open, listed) = (self.open.clone(), store.clone());
+        let failed = move |message: &str| {
+            log(format_args!("picker {number}: what it lists was not read: {message}"));
+            // With rows it goes on with those it has: a search that could
+            // not read one file has still found what is in the rest. With
+            // none there is nothing to choose, and it ends saying why.
+            if listed.snapshot().is_none_or(|rows| rows.is_empty()) {
+                let outcome = Outcome::Error { code: "source_failed", message: message.to_owned() };
+                end(&open, number, outcome, true);
+            }
+        };
+        let (most, stop) = (store.clone(), cancelled.clone());
+        let changed = move || {
+            if most.snapshot().is_some_and(|rows| rows.len() >= MOST_LINES) {
+                stop.store(true, Ordering::Release);
+            }
+        };
+        let control = StreamControl {
+            cancelled: cancelled.clone(),
+            changed: Arc::new(changed),
+            failed: Arc::new(failed),
+        };
+        (Source::Read { store, cancelled, whole }, sink, control)
     }
 
     /// The program that asked for `number` gives it rows. They are not
@@ -812,50 +900,56 @@ impl Pickers {
     }
 
     fn end(&self, number: u32, outcome: Outcome, tell_ui: bool) {
-        let Some(picker) = self.open.lock().unwrap().remove(&number) else { return };
-        picker.source.stop();
-        let query = {
-            let mut state = picker.state.lock().unwrap();
-            if let Some(search) = state.search.take() {
-                search.stop();
-            }
-            state.flow = None;
-            state.last = None;
-            state.sent.clear();
-            std::mem::take(&mut state.query)
-        };
-        let how = match &outcome {
-            Outcome::Accepted(_) => "accepted".to_owned(),
-            Outcome::Cancelled(reason) => format!("cancelled ({reason})"),
-            Outcome::Error { message, .. } => format!("failed: {message}"),
-        };
-        log(format_args!("picker {number}: {how}"));
-        let message = match &outcome {
-            Outcome::Error { message, .. } => Some(message.clone()),
-            _ => None,
-        };
-        match outcome {
-            Outcome::Accepted(row) => result(
-                &picker.program,
-                &picker.request_id,
-                "accepted",
-                json!({"selected": [{"id": row.id, "text": row.text, "value": row.value}], "query": query}),
-            ),
-            Outcome::Cancelled(reason) => {
-                result(&picker.program, &picker.request_id, "cancelled", json!({"reason": reason}))
-            }
-            Outcome::Error { code, message } => result(
-                &picker.program,
-                &picker.request_id,
-                "error",
-                json!({"code": code, "message": message}),
-            ),
+        end(&self.open, number, outcome, tell_ui);
+    }
+}
+
+/// End picker `number` of those `open`, if it is still one of them: its
+/// program is told how, and its UI unless that is what ended it.
+fn end(open: &Mutex<HashMap<u32, Arc<Picker>>>, number: u32, outcome: Outcome, tell_ui: bool) {
+    let Some(picker) = open.lock().unwrap().remove(&number) else { return };
+    picker.source.stop();
+    let query = {
+        let mut state = picker.state.lock().unwrap();
+        if let Some(search) = state.search.take() {
+            search.stop();
         }
-        // Write what was queued for the program, then close its connection.
-        let _ = picker.program.send(Vec::new());
-        if tell_ui {
-            picker.tell_ui(Control::PickerClosed { picker: number, message });
+        state.flow = None;
+        state.last = None;
+        state.sent.clear();
+        std::mem::take(&mut state.query)
+    };
+    let how = match &outcome {
+        Outcome::Accepted(_) => "accepted".to_owned(),
+        Outcome::Cancelled(reason) => format!("cancelled ({reason})"),
+        Outcome::Error { message, .. } => format!("failed: {message}"),
+    };
+    log(format_args!("picker {number}: {how}"));
+    let message = match &outcome {
+        Outcome::Error { message, .. } => Some(message.clone()),
+        _ => None,
+    };
+    match outcome {
+        Outcome::Accepted(row) => result(
+            &picker.program,
+            &picker.request_id,
+            "accepted",
+            json!({"selected": [{"id": row.id, "text": row.text, "value": row.value}], "query": query}),
+        ),
+        Outcome::Cancelled(reason) => {
+            result(&picker.program, &picker.request_id, "cancelled", json!({"reason": reason}))
         }
+        Outcome::Error { code, message } => result(
+            &picker.program,
+            &picker.request_id,
+            "error",
+            json!({"code": code, "message": message}),
+        ),
+    }
+    // Write what was queued for the program, then close its connection.
+    let _ = picker.program.send(Vec::new());
+    if tell_ui {
+        picker.tell_ui(Control::PickerClosed { picker: number, message });
     }
 }
 
@@ -971,7 +1065,7 @@ impl Picker {
         };
         Some(match &self.source {
             Source::Walk { .. } => Row { id: row.to_string(), text, value: Value::String(shown) },
-            Source::File { whole, .. } => {
+            Source::Read { whole, .. } => {
                 let whole = whole.lock().unwrap().get(&index).cloned();
                 Row { id: row.to_string(), text, value: Value::String(whole.unwrap_or(shown)) }
             }
@@ -1145,6 +1239,30 @@ mod tests {
         let long = "x".repeat(MOST_LABEL + 10);
         assert_eq!(define("items", &params(&[("label", " Completions ")])).unwrap().label, "Completions");
         assert_eq!(define("items", &params(&[("label", &long)])).unwrap().label.len(), MOST_LABEL);
+    }
+
+    #[test]
+    fn a_picker_is_of_the_lines_a_search_of_a_folder_prints() {
+        let here = std::env::temp_dir();
+        let cwd = here.to_string_lossy().into_owned();
+        let found = define("ripgrep", &params(&[("cwd", &cwd), ("pattern", "-e fn main")])).unwrap();
+        let Lists::Command(command) = &found.lists else { panic!("not a command") };
+        assert_eq!(command.program, Path::new("rg"));
+        assert_eq!(command.working_directory.as_deref(), Some(here.as_path()));
+        // The pattern is the last, after `--`, however it begins.
+        let last = &command.arguments[command.arguments.len() - 2..];
+        assert_eq!(last, ["--", "-e fn main"]);
+        assert_eq!((found.label.as_str(), found.preview), ("Ripgrep", None));
+        for given in [
+            params(&[("cwd", &cwd)]),
+            params(&[("cwd", &cwd), ("pattern", "")]),
+            params(&[("cwd", &cwd), ("pattern", "a\0b")]),
+            params(&[("pattern", "a")]),
+            params(&[("cwd", "relative"), ("pattern", "a")]),
+            params(&[("cwd", "Z:\\no\\such\\folder\\anywhere"), ("pattern", "a")]),
+        ] {
+            assert!(define("ripgrep", &given).is_err(), "ripgrep with {given:?} was taken");
+        }
     }
 
     #[test]

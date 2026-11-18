@@ -24,7 +24,7 @@ function Invoke-NtermPicker {
     [CmdletBinding(DefaultParameterSetName='Stream')]
     param(
         [Parameter(Mandatory, ParameterSetName='Named')][string] $Name,
-        # One of the pickers the daemon has: files, directories, history, and
+        # One of the pickers the daemon has: files, directories, history, ripgrep, and
         # items, whose rows are what is piped in.
         [Parameter(Mandatory, ParameterSetName='Daemon')][string] $DaemonPicker,
         [Parameter(ParameterSetName='Named')][Parameter(ParameterSetName='Daemon')][hashtable] $Parameters = @{},

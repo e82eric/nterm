@@ -101,7 +101,7 @@ Invoke-NtermPicker -DaemonPicker directories -Parameters @{
 }
 ```
 
-The daemon has four pickers. For all of them `query` is the text the picker
+The daemon has five pickers. For all of them `query` is the text the picker
 opens with, and `position = "cursor"` shows it at the pane's cursor instead of
 in the middle of the pane. The window needs `picker_pipe.enabled`, and nothing
 in `named`.
@@ -130,7 +130,17 @@ Get-Process | Invoke-NtermPicker -DaemonPicker items -DisplayProperty Name `
     -Parameters @{ label = 'Processes' }
 ```
 
-`history` and `items` have no previews.
+`ripgrep` runs `rg` once in `cwd` for `pattern`, a regular expression, and
+lists each place it is found as `path:line:column:text`. What is typed in the
+picker narrows those lines; it does not search again. `rg` has to be on the
+`PATH` the daemon was started with. If it cannot be run, or fails having found
+nothing (a pattern it cannot read, say), the picker ends with what it said.
+
+```powershell
+Invoke-NtermPicker -DaemonPicker ripgrep -Parameters @{ cwd = $PWD.Path; pattern = 'fn main' }
+```
+
+`history`, `ripgrep` and `items` have no previews.
 
 Each row of `files` and `directories` has a preview, hidden until Ctrl+P shows it; with `preview = "true"`
 in the parameters it opens shown. A file shows its first 256 KB as text,

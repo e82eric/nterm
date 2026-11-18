@@ -1462,3 +1462,56 @@ fn a_picker_of_rows_its_program_gives_and_what_the_program_is_told_of_one() {
     assert_eq!(asker.result().0, "cancelled");
     ui.shutdown();
 }
+
+#[test]
+fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
+    let session = session("pick-ripgrep");
+    let tree = Tree::new("ripgrep");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+
+    // A search that cannot be run, or that ends saying it failed with
+    // nothing found, ends the picker, and both are told why.
+    let asker = Asker::ask(&session, pane, "ripgrep", serde_json::json!({"cwd": tree.path(), "pattern": "("}));
+    let Control::PickerOpen { picker, label, preview, .. } = ui.control(|c| matches!(c, Control::PickerOpen { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!((label.as_str(), preview), ("Ripgrep", None));
+    let closed = ui.control(|c| matches!(c, Control::PickerClosed { picker: of, .. } if *of == picker));
+    let Control::PickerClosed { message, .. } = closed else { unreachable!() };
+    assert!(message.is_some());
+    // It may have ended before the program was told it had opened.
+    let mut told = asker.told();
+    if told["type"] == "opened" {
+        told = asker.told();
+    }
+    assert_eq!((&told["type"], &told["status"], &told["code"]), (&"result".into(), &"error".into(), &"source_failed".into()));
+
+    // The rest is of what `rg` finds, where there is one to run.
+    if std::process::Command::new("rg").arg("--version").output().is_err() {
+        eprintln!("rg is not installed: what a search finds was not tested");
+        ui.shutdown();
+        return;
+    }
+    // The tree's files hold their own names. Whatever the case of a letter.
+    let params = serde_json::json!({"cwd": tree.path(), "pattern": "ALPHA|gamma"});
+    let (asker, picker) = ui.picker(&session, pane, "ripgrep", params);
+    let all = ui.query(picker, 0, "");
+    assert_eq!(all.texts(), ["a\\alpha.txt:1:3:a/alpha.txt", "b\\gamma.rs:1:3:b/gamma.rs"]);
+    // What is typed narrows what was found: the search is not run again.
+    let some = ui.query(picker, 1, "rs");
+    assert_eq!(some.texts(), ["b\\gamma.rs:1:3:b/gamma.rs"]);
+    ui.send(Control::PickerAccept { picker, serial: some.serial, row: some.rows[0].0 });
+    let (status, result) = asker.result();
+    assert_eq!(status, "accepted");
+    assert_eq!(result["selected"][0]["value"], "b\\gamma.rs:1:3:b/gamma.rs");
+
+    // Nothing found is a picker of nothing, not one that failed.
+    let params = serde_json::json!({"cwd": tree.path(), "pattern": "nowhere in any of them"});
+    let (asker, picker) = ui.picker(&session, pane, "ripgrep", params);
+    assert_eq!(ui.query(picker, 0, "").matched, 0);
+    ui.send(Control::PickerClose { picker, refused: None });
+    assert_eq!(asker.result().0, "cancelled");
+    ui.shutdown();
+}
