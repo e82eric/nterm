@@ -324,7 +324,7 @@ The session daemon runs the pane's shell and sets in its environment:
 ```
 NTERM_DAEMON=<the daemon's name>
 NTERM_PANE=<the daemon's number for the pane>
-NTERM_DAEMON_PIPE=\\.\pipe\nterm-session-<logon session>-<name>
+NTERM_DAEMON_PIPE=\\.\pipe\nterm-session-<account>-<name>
 ```
 
 These are not persisted or set globally. Shell descendants inherit them. None
@@ -538,12 +538,13 @@ exits 0 with the value on stdout, 130 when cancelled, and 2 on errors.
 On Windows a picker request is admitted by the session daemon's pipe, as a
 window is, and by the Lua policy.
 
-- The pipe's access list grants read and write to the current logon session
-  alone, and its integrity label denies reads and writes from lower-integrity
-  clients. Remote clients are refused (`PIPE_REJECT_REMOTE_CLIENTS`).
+- The pipe's access list grants read and write to the account alone, from
+  any of its sign-ins, and its integrity label denies reads and writes from
+  lower-integrity clients. Remote clients are refused
+  (`PIPE_REJECT_REMOTE_CLIENTS`).
 - For every connection the daemon uses `ImpersonateNamedPipeClient` and
   compares what the client is acting as, and what its process is, with the
-  daemon's own security context. A client of another user, or at another
+  daemon's own account and elevation. A client of another user, or at another
   elevation, is closed before anything it sent is read. Identification level
   is enough, and is what the supplied clients ask for.
 - The clients check the other end before sending, since a request can hold the

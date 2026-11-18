@@ -1,6 +1,16 @@
 //! Who a process is, for deciding whether the other end of the pipe may be
-//! talked to. The comparison is the one the picker pipe makes: both ends must
-//! run with the same token in every respect that grants access.
+//! talked to: both ends must run as the same account at the same elevation.
+//!
+//! Not as the same sign-in. A user who signs in twice, at the desktop and
+//! over SSH say, is one user with one set of sessions, and a relay started
+//! from one sign-in must reach the daemon of another. So what differs between
+//! two sign-ins of an account is not compared: the logon session, the
+//! desktop session, and the groups that say how the user signed in.
+//!
+//! What this gives up: a program started as the same account with some of
+//! its groups switched off, but at the same integrity level, was refused
+//! when groups were compared and is not now. Restricted and AppContainer
+//! tokens, which are how programs are usually confined, are still refused.
 use std::{io, ptr::null_mut};
 use windows_sys::Win32::{
     Foundation::*,
@@ -77,14 +87,12 @@ fn sid_string(sid: PSID) -> io::Result<String> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
-    user: String,
-    logon: (u32, i32),
-    session: u32,
+    /// The account's SID.
+    pub user: String,
+    /// The integrity level: 0x2000 for an ordinary program, 0x3000 for an
+    /// elevated one.
     pub integrity: u32,
     elevated: bool,
-    elevation_type: u32,
-    groups: Vec<(String, u32)>,
-    privileges: Vec<(u32, i32, u32)>,
 }
 
 pub(crate) fn identity(token: HANDLE) -> io::Result<Identity> {
@@ -96,36 +104,7 @@ pub(crate) fn identity(token: HANDLE) -> io::Result<Identity> {
     }
     let user = token_data(token, TokenUser)?;
     let user = sid_string(unsafe { (*(user.0.as_ptr().cast::<TOKEN_USER>())).User.Sid })?;
-    let stats = token_data(token, TokenStatistics)?;
-    let stats = unsafe { &*stats.0.as_ptr().cast::<TOKEN_STATISTICS>() };
-    let session = token_data(token, TokenSessionId)?.0[0] as u32;
     let elevated = token_data(token, TokenElevation)?.0[0] as u32 != 0;
-    let elevation_type = token_data(token, TokenElevationType)?.0[0] as u32;
-    let group_data = token_data(token, TokenGroups)?;
-    let group_data = unsafe { &*group_data.0.as_ptr().cast::<TOKEN_GROUPS>() };
-    let group_entries = unsafe {
-        std::slice::from_raw_parts(group_data.Groups.as_ptr(), group_data.GroupCount as usize)
-    };
-    let mut groups = group_entries
-        .iter()
-        .map(|g| sid_string(g.Sid).map(|sid| (sid, g.Attributes)))
-        .collect::<io::Result<Vec<_>>>()?;
-    groups.sort_unstable();
-    let privilege_data = token_data(token, TokenPrivileges)?;
-    let privilege_data = unsafe { &*privilege_data.0.as_ptr().cast::<TOKEN_PRIVILEGES>() };
-    let entries = unsafe {
-        std::slice::from_raw_parts(
-            privilege_data.Privileges.as_ptr(),
-            privilege_data.PrivilegeCount as usize,
-        )
-    };
-    // Which privileges are held, not whether they are enabled: a process may
-    // toggle the ones it holds, so only SE_PRIVILEGE_REMOVED (0x4) matters.
-    let mut privileges: Vec<_> = entries
-        .iter()
-        .map(|p| (p.Luid.LowPart, p.Luid.HighPart, p.Attributes & 0x4))
-        .collect();
-    privileges.sort_unstable();
     let label = token_data(token, TokenIntegrityLevel)?;
     let sid = unsafe { (*(label.0.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())).Label.Sid };
     let count = unsafe { *GetSidSubAuthorityCount(sid) };
@@ -133,16 +112,7 @@ pub(crate) fn identity(token: HANDLE) -> io::Result<Identity> {
         return Err(denied("invalid integrity SID"));
     }
     let integrity = unsafe { *GetSidSubAuthority(sid, count as u32 - 1) };
-    Ok(Identity {
-        user,
-        logon: (stats.AuthenticationId.LowPart, stats.AuthenticationId.HighPart),
-        session,
-        integrity,
-        elevated,
-        elevation_type,
-        groups,
-        privileges,
-    })
+    Ok(Identity { user, integrity, elevated })
 }
 
 pub(crate) fn process_token(process: HANDLE) -> io::Result<Handle> {
@@ -168,19 +138,6 @@ pub(crate) fn process_identity(pid: u32) -> io::Result<Identity> {
     identity(process_token(process.0)?.0)
 }
 
-/// The SID of this logon session, which names and guards the pipe.
-pub(crate) fn logon_sid() -> io::Result<String> {
-    let token = process_token(unsafe { GetCurrentProcess() })?;
-    let data = token_data(token.0, TokenGroups)?;
-    let groups = unsafe { &*data.0.as_ptr().cast::<TOKEN_GROUPS>() };
-    let entries =
-        unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
-    entries
-        .iter()
-        .find(|g| g.Attributes & 0xC0000000 == 0xC0000000)
-        .ok_or_else(|| denied("missing logon SID"))
-        .and_then(|g| sid_string(g.Sid))
-}
 
 /// The identity a pipe client is acting with, taken by impersonating it.
 pub(crate) fn impersonated(
@@ -206,4 +163,28 @@ pub(crate) fn impersonated(
         std::process::abort();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_process_is_its_account_and_its_elevation() {
+        let own = own_identity().unwrap();
+        // An account of this machine or its domain, not a sign-in ("S-1-5-5-").
+        assert!(own.user.starts_with("S-1-5-21-"), "{own:?}");
+        assert!(own.integrity >= 0x2000, "{own:?}");
+        assert_eq!(own.elevated, own.integrity >= 0x3000, "{own:?}");
+        assert_eq!(process_identity(std::process::id()).unwrap(), own);
+    }
+
+    #[test]
+    fn another_account_or_elevation_is_another_identity() {
+        let own = own_identity().unwrap();
+        let other = Identity { user: "S-1-5-21-1-2-3-1001".into(), ..own.clone() };
+        assert_ne!(own, other);
+        let raised = Identity { integrity: 0x3000, elevated: true, ..own.clone() };
+        assert_eq!(own == raised, own.elevated);
+    }
 }

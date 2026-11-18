@@ -1,9 +1,11 @@
 //! The named pipe between a UI and the daemon.
 //!
-//! The pipe is named after the logon session and only that logon session may
-//! open it. Each end then checks that the other runs with the same token:
-//! the daemon by impersonating the client, the client by looking at the
-//! process that serves the pipe. Handles are never inherited.
+//! The pipe is named after the account and only that account may open it,
+//! from any of its sign-ins: at the desktop, over SSH, from a scheduled
+//! task. Each end then checks that the other runs as the same account at the
+//! same elevation (see `identity`): the daemon by impersonating the client,
+//! the client by looking at the process that serves the pipe. Handles are
+//! never inherited.
 //!
 //! A connection is one duplex byte stream. One thread may read while another
 //! writes; `close` wakes both.
@@ -30,7 +32,7 @@ use windows_sys::Win32::{
 /// the pipe itself.
 const CLIENT_ACCESS: u32 = 0x0012_0083;
 
-/// The pipe of a session, for this logon session and elevation.
+/// The pipe of a session, for this account and elevation.
 pub fn name(session: &str) -> io::Result<String> {
     if session.is_empty()
         || !session.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -40,10 +42,10 @@ pub fn name(session: &str) -> io::Result<String> {
             "a session name is letters, digits, '-' and '_'",
         ));
     }
-    let logon = identity::logon_sid()?;
+    let own = identity::own_identity()?;
     // An elevated UI gets its own daemon; the two could not talk anyway.
-    let high = if identity::own_identity()?.integrity >= 0x3000 { "-hi" } else { "" };
-    Ok(format!(r"\\.\pipe\nterm-session-{logon}-{session}{high}"))
+    let high = if own.integrity >= 0x3000 { "-hi" } else { "" };
+    Ok(format!(r"\\.\pipe\nterm-session-{}-{session}{high}", own.user))
 }
 
 struct Pipe {
@@ -292,13 +294,13 @@ impl Listener {
 }
 
 fn instance(name: &[u16], identity: &Identity, first: bool) -> io::Result<Handle> {
-    let logon = identity::logon_sid()?;
-    // The logon session gets generic read and write, which includes creating
+    let account = &identity.user;
+    // The account gets generic read and write, which includes creating
     // instances: the daemon is checked against this list for every instance
     // after the first and has no SID of its own to hold more. So a client
     // does not trust the pipe's name; it checks who serves it.
     let label = if identity.integrity >= 0x3000 { "HI" } else { "ME" };
-    let sddl = wide(&format!("D:P(A;;0x0012019F;;;{logon})S:(ML;;NWNR;;;{label})"));
+    let sddl = wide(&format!("D:P(A;;0x0012019F;;;{account})S:(ML;;NWNR;;;{label})"));
     let mut descriptor = null_mut();
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
