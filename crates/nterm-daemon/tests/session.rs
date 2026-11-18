@@ -5,6 +5,7 @@ use nterm_daemon::vt::Terminal;
 use nterm_session::{
     GHOSTTY_REVISION,
     pipe::{self, Connection, Writer},
+    relay,
     protocol::{
         Control, Frame, PROTOCOL_VERSION, PaneId, PaneInfo, SessionInfo, Size, TerminalSettings,
     },
@@ -21,6 +22,13 @@ const WAIT: Duration = Duration::from_secs(20);
 
 fn size(cols: u16, rows: u16) -> Size {
     Size { cols, rows, cell_width: 9, cell_height: 18 }
+}
+
+/// With `NTERM_TEST_RELAY=1`, every UI in every test here reaches its daemon
+/// through a relay, so the whole suite says whether a relay carries all that
+/// the pipe does. Without it, one test does (`a_ui_through_a_relay`).
+fn relayed() -> bool {
+    std::env::var_os("NTERM_TEST_RELAY").is_some_and(|value| value == "1")
 }
 
 /// A session name no other test or run uses.
@@ -85,8 +93,23 @@ struct Ui {
 
 impl Ui {
     /// Connect as nterm does: the daemon is started if the session has none.
+    /// Through a relay when every test is asked to (see `relayed`).
     fn connect(session: &str) -> Self {
-        let connection = pipe::connect_or_start(session, Path::new(DAEMON)).expect("connect");
+        if relayed() {
+            return Self::through_relay(session);
+        }
+        Self::over(pipe::connect_or_start(session, Path::new(DAEMON)).expect("connect"))
+    }
+
+    /// Connect as a UI on another machine does: through `nterm-daemon
+    /// --relay`, whose input and output stand for the pipe.
+    fn through_relay(session: &str) -> Self {
+        let mut relay = std::process::Command::new(DAEMON);
+        relay.args(["--relay", "--session", session]);
+        Self::over(relay::connect(&mut relay).expect("connect through a relay"))
+    }
+
+    fn over(connection: Connection) -> Self {
         let mut reader = connection.reader().unwrap();
         let (tx, frames) = mpsc::channel();
         std::thread::spawn(move || {
@@ -281,7 +304,8 @@ fn lifecycle(session: &str) {
         panic!("no welcome");
     };
     assert_eq!((protocol, ghostty.as_str(), named.as_str()), (PROTOCOL_VERSION, GHOSTTY_REVISION, session.as_str()));
-    assert_eq!(pid, ui.connection.peer_pid());
+    // Through a relay the peer is the relay, which is not the daemon.
+    assert_eq!(pid == ui.connection.peer_pid(), !ui.connection.relayed());
 
     ui.send(Control::Settings {
         settings: TerminalSettings { scrollback_bytes: Some(1 << 26), ..Default::default() },
@@ -349,6 +373,61 @@ fn lifecycle(session: &str) {
     ui.send(Control::Close { pane: pane.pane });
     assert!(ui.panes().is_empty());
     ui.shutdown();
+}
+
+#[test]
+fn a_ui_through_a_relay() {
+    let session = session("ui-relay");
+    // The relay starts the daemon, as a UI at the pipe would.
+    let mut ui = Ui::through_relay(&session);
+    assert!(ui.connection.relayed());
+    let pid = daemon_pid(&ui);
+    assert_ne!(pid, ui.connection.peer_pid(), "the peer is the relay");
+
+    let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+    ui.send(Control::Attach { request: 0, pane: pane.pane, size: size(80, 24) });
+    ui.frame(|frame| matches!(frame, Frame::Screen { .. }));
+    ui.input(pane.pane, "echo through-the-relay\r");
+    ui.until_text("the echoed line", |text| text.contains("\nthrough-the-relay"));
+    // The whole terminal, as one large frame.
+    assert!(ui.snapshot(pane.pane).text().contains("through-the-relay"));
+
+    // The UI goes: the relay goes with it, and the daemon and shell stay.
+    let relay = ui.connection.peer_pid();
+    ui.connection.close();
+    drop(ui);
+    let deadline = Instant::now() + WAIT;
+    while running(relay) {
+        assert!(Instant::now() < deadline, "the relay outlived its UI");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // At the pipe, the same daemon still has the pane.
+    let mut ui = Ui::over(pipe::connect(&session).expect("the daemon is still there"));
+    assert_eq!(daemon_pid(&ui), pid, "the same daemon");
+    let panes = ui.panes();
+    assert_eq!(panes.len(), 1);
+    assert_eq!((panes[0].pid, panes[0].exited), (pane.pid, None));
+    ui.shutdown();
+}
+
+/// Whether a process is still running.
+fn running(pid: u32) -> bool {
+    let list = std::process::Command::new("tasklist")
+        .args(["/fi", &format!("PID eq {pid}"), "/fo", "csv", "/nh"])
+        .output()
+        .expect("tasklist");
+    String::from_utf8_lossy(&list.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// A relay to a daemon that cannot be started says why and ends.
+#[test]
+fn a_relay_that_cannot_reach_a_daemon_says_so() {
+    let mut relay = std::process::Command::new(DAEMON);
+    relay.args(["--relay", "--session", "not a name"]);
+    let error = relay::connect(&mut relay).err().expect("no connection").to_string();
+    assert!(error.contains("ended before it was ready"), "{error}");
+    assert!(error.contains("a session name is letters"), "{error}");
 }
 
 #[test]

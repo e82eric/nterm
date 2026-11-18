@@ -11,6 +11,8 @@ mod identity;
 #[cfg(windows)]
 pub mod pipe;
 #[cfg(windows)]
+pub mod relay;
+#[cfg(windows)]
 pub mod shell;
 
 /// The ghostty revision this build was made from.

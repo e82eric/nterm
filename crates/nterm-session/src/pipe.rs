@@ -9,6 +9,7 @@
 //! writes; `close` wakes both.
 
 use crate::identity::{self, Handle, Identity, owned, wide};
+use crate::relay;
 use std::{
     io::{self, Read, Write},
     mem::{size_of, zeroed},
@@ -45,54 +46,83 @@ pub fn name(session: &str) -> io::Result<String> {
     Ok(format!(r"\\.\pipe\nterm-session-{logon}-{session}{high}"))
 }
 
-struct Inner {
+struct Pipe {
     pipe: Handle,
     /// Signalled to end pending and future reads and writes.
     closed: Handle,
     peer: u32,
 }
 
-/// One end of a connection.
+/// One end of a connection: a pipe, or a relay to one (see `relay`).
 #[derive(Clone)]
-pub struct Connection(Arc<Inner>);
+pub struct Connection(Link);
+
+#[derive(Clone)]
+enum Link {
+    Pipe(Arc<Pipe>),
+    Relay(Arc<relay::Child>),
+}
 
 impl Connection {
     fn new(pipe: Handle, peer: u32) -> io::Result<Self> {
         let closed = owned(unsafe { CreateEventW(null(), 1, 0, null()) })?;
-        Ok(Self(Arc::new(Inner { pipe, closed, peer })))
+        Ok(Self(Link::Pipe(Arc::new(Pipe { pipe, closed, peer }))))
     }
 
-    /// The process at the other end.
+    pub(crate) fn through(relay: Arc<relay::Child>) -> Self {
+        Self(Link::Relay(relay))
+    }
+
+    /// The process at the other end: the daemon, or the relay to it.
     pub fn peer_pid(&self) -> u32 {
-        self.0.peer
+        match &self.0 {
+            Link::Pipe(pipe) => pipe.peer,
+            Link::Relay(relay) => relay.pid(),
+        }
     }
 
+    /// Whether the other end is reached through a relay, and so was not
+    /// checked to be this user's daemon on this machine.
+    pub fn relayed(&self) -> bool {
+        matches!(self.0, Link::Relay(_))
+    }
+
+    /// A relay has one reader and one writer; a pipe as many as are asked for.
     pub fn reader(&self) -> io::Result<Reader> {
-        Ok(Reader(Half::new(self)?))
+        Ok(Reader(match &self.0 {
+            Link::Pipe(pipe) => ReadEnd::Pipe(Half::new(pipe)?),
+            Link::Relay(relay) => ReadEnd::Relay(relay.reader()?),
+        }))
     }
 
     pub fn writer(&self) -> io::Result<Writer> {
-        Ok(Writer(Half::new(self)?))
+        Ok(Writer(match &self.0 {
+            Link::Pipe(pipe) => WriteEnd::Pipe(Half::new(pipe)?),
+            Link::Relay(relay) => WriteEnd::Relay(relay.writer()?),
+        }))
     }
 
     /// End reads and writes on every clone, now and from now on.
     pub fn close(&self) {
-        unsafe {
-            SetEvent(self.0.closed.0);
+        match &self.0 {
+            Link::Pipe(pipe) => unsafe {
+                SetEvent(pipe.closed.0);
+            },
+            Link::Relay(relay) => relay.close(),
         }
     }
 }
 
 struct Half {
-    inner: Arc<Inner>,
+    inner: Arc<Pipe>,
     /// Signalled when this half's operation completes.
     done: Handle,
 }
 
 impl Half {
-    fn new(connection: &Connection) -> io::Result<Self> {
+    fn new(pipe: &Arc<Pipe>) -> io::Result<Self> {
         Ok(Self {
-            inner: connection.0.clone(),
+            inner: pipe.clone(),
             done: owned(unsafe { CreateEventW(null(), 1, 0, null()) })?,
         })
     }
@@ -142,27 +172,46 @@ impl Half {
     }
 }
 
-pub struct Reader(Half);
+enum ReadEnd {
+    Pipe(Half),
+    Relay(relay::ChildReader),
+}
+
+pub struct Reader(ReadEnd);
 impl Read for Reader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
-        self.0.transfer(buffer.as_mut_ptr(), buffer.len(), false)
+        match &mut self.0 {
+            ReadEnd::Pipe(half) => half.transfer(buffer.as_mut_ptr(), buffer.len(), false),
+            ReadEnd::Relay(relay) => relay.read(buffer),
+        }
     }
 }
 
-pub struct Writer(Half);
+enum WriteEnd {
+    Pipe(Half),
+    Relay(relay::ChildWriter),
+}
+
+pub struct Writer(WriteEnd);
 impl Write for Writer {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
-        // The kernel only reads through the pointer on a write.
-        self.0.transfer(buffer.as_ptr().cast_mut(), buffer.len(), true)
+        match &mut self.0 {
+            // The kernel only reads through the pointer on a write.
+            WriteEnd::Pipe(half) => half.transfer(buffer.as_ptr().cast_mut(), buffer.len(), true),
+            WriteEnd::Relay(relay) => relay.write(buffer),
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        match &mut self.0 {
+            WriteEnd::Pipe(_) => Ok(()),
+            WriteEnd::Relay(relay) => relay.flush(),
+        }
     }
 }
 
