@@ -7,10 +7,20 @@ use crate::session::Shown;
 use nfm_egui::fed::Rows;
 use std::sync::Arc;
 
+/// What is done with the row chosen of a picker the pane asked the daemon
+/// for: the Lua action of its definition, run with what it was opened with,
+/// or with none the row's value is typed into the pane.
+pub(crate) struct Accept {
+    pub(crate) callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
+    pub(crate) params: std::collections::BTreeMap<String, String>,
+}
+
 pub(crate) struct Fed {
     context: egui::Context,
     shared: nfm_egui::Picker<Rows>,
     shown: Arc<Shown>,
+    /// What is done with the row chosen, of a picker the pane asked for.
+    accept: Option<Accept>,
     label: String,
     anchor_bounds: Option<egui::Rect>,
     pub(crate) cursor_row: Option<u32>,
@@ -18,6 +28,13 @@ pub(crate) struct Fed {
 }
 
 impl Fed {
+    /// A picker the pane asked the daemon for itself: no program is given
+    /// the row chosen, and `accept` says what is done with it here.
+    pub(crate) fn start_asked(ctx: egui::Context, shown: Arc<Shown>, accept: Accept) -> Self {
+        let mut page = Self::start(ctx, shown);
+        page.accept = Some(accept);
+        page
+    }
     pub(crate) fn start(ctx: egui::Context, shown: Arc<Shown>) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -54,6 +71,7 @@ impl Fed {
             context: ctx,
             shared,
             shown,
+            accept: None,
             label,
             anchor_bounds: None,
             cursor_row: None,
@@ -90,6 +108,21 @@ impl Fed {
         interactive: bool,
     ) -> Option<Action> {
         self.anchor_bounds = Some(pane);
+        // The daemon has said what the row chosen is.
+        if let Some((text, value)) = self.shown.chosen() {
+            return Some(match &self.accept {
+                Some(Accept { callback: Some(callback), params }) => Action::Custom(super::CustomAction {
+                    callback: callback.clone(),
+                    text,
+                    filesystem: false,
+                    range: None,
+                    value,
+                    params: params.clone(),
+                    accepted: true,
+                }),
+                _ => Action::SendInput(value),
+            });
+        }
         let appearance = super::appearance(&self.typography, ctx);
         let placement = super::placement(
             if self.shown.at_cursor { config::Position::Cursor } else { config::Position::default() },
@@ -105,7 +138,10 @@ impl Fed {
             }
             Some(nfm_egui::PickerEvent::Accepted(selection)) => {
                 let rows = selection.source_snapshot::<Rows>()?;
-                self.shown.accept(&rows, selection.item).then_some(Action::Close)
+                // A picker the pane asked for stays until the daemon says
+                // what the row is: see above.
+                let waits = self.shown.asked.is_some();
+                (self.shown.accept(&rows, selection.item) && !waits).then_some(Action::Close)
             }
             _ => None,
         }
@@ -144,6 +180,117 @@ impl Drop for Fed {
     /// However the page goes, the program is not left waiting.
     fn drop(&mut self) {
         self.shown.close(None);
+    }
+}
+
+#[cfg(test)]
+mod asked_tests {
+    use super::*;
+    use nfm_egui::fed::{Found, Page, Row};
+    use nterm_session::protocol::Control;
+    use std::sync::mpsc;
+
+    /// A picker the pane asked the daemon for, with what the page tells
+    /// the daemon.
+    fn asked() -> (Arc<Shown>, mpsc::Receiver<Control>) {
+        let (tell, told) = mpsc::channel();
+        let tell = std::sync::Mutex::new(tell);
+        let mut shown = Shown::new(
+            9,
+            "Ripgrep".into(),
+            String::new(),
+            move |control| {
+                let _ = tell.lock().unwrap().send(control);
+            },
+            || {},
+        );
+        shown.asked = Some(4);
+        (Arc::new(shown), told)
+    }
+    fn found(shown: &Shown, text: &str) {
+        let rows = vec![Row { index: 5, text: text.into(), fields: None }];
+        let page = Page { version: 1, rows, matched_against: String::new(), header: None, template: None };
+        let (source, results) = page.into_rows();
+        shown.found(
+            1,
+            Found {
+                revision: 0,
+                query: String::new(),
+                source: Arc::new(source),
+                epoch: 0,
+                append_only: true,
+                results,
+                matched: 1,
+                total: 1,
+                skipped: 0,
+                done: true,
+            },
+        );
+    }
+    fn frame(ctx: &egui::Context, fed: &mut Fed, events: Vec<egui::Event>) -> Option<Action> {
+        let mut action = None;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let mut output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(screen), events, ..Default::default() },
+            |ui| {
+                let shown = fed.show_scoped(ui.ctx(), ui.ctx().content_rect(), None, true);
+                if shown.is_some() {
+                    action = shown;
+                }
+            },
+        );
+        output.textures_delta.clear();
+        action
+    }
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+    fn accept() -> Accept {
+        Accept { callback: None, params: Default::default() }
+    }
+
+    #[test]
+    fn a_picker_the_pane_asked_for_stays_until_it_is_told_what_the_row_chosen_is() {
+        let ctx = egui::Context::default();
+        let (shown, daemon) = asked();
+        let mut fed = Fed::start_asked(ctx.clone(), shown.clone(), accept());
+        found(&shown, "src/main.rs:3:1:fn main() {");
+        frame(&ctx, &mut fed, vec![]);
+        daemon.try_iter().count();
+        // The daemon is told which row, and the page waits for what it is.
+        assert!(frame(&ctx, &mut fed, vec![enter()]).is_none());
+        let told: Vec<Control> = daemon.try_iter().collect();
+        assert_eq!(told, [Control::PickerAccept { picker: 9, serial: 1, row: 5 }]);
+        assert!(frame(&ctx, &mut fed, vec![]).is_none());
+        // With no action of its own, what the row is is typed into the pane.
+        shown.chose("src/main.rs:3:1:fn main() {".into(), "the value".into());
+        let action = frame(&ctx, &mut fed, vec![]);
+        assert!(matches!(action, Some(Action::SendInput(value)) if value == "the value"));
+        // Once: the page is not told it again, and says no more to the daemon.
+        assert!(frame(&ctx, &mut fed, vec![]).is_none());
+        drop(fed);
+        assert_eq!(daemon.try_iter().count(), 0);
+    }
+
+    #[test]
+    fn a_picker_that_ends_before_saying_what_was_chosen_says_so() {
+        let ctx = egui::Context::default();
+        let (shown, _daemon) = asked();
+        let mut fed = Fed::start_asked(ctx.clone(), shown.clone(), accept());
+        found(&shown, "one");
+        frame(&ctx, &mut fed, vec![]);
+        assert!(frame(&ctx, &mut fed, vec![enter()]).is_none());
+        assert_eq!(fed.closed(), None);
+        // The daemon ends it in place of saying what the row is.
+        shown.ended(Some("the row is not one the picker has".into()));
+        assert_eq!(fed.closed(), Some(Some("the row is not one the picker has".into())));
+        assert!(frame(&ctx, &mut fed, vec![]).is_none());
     }
 }
 

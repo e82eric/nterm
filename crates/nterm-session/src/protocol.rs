@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -199,6 +199,18 @@ pub enum Control {
         #[serde(default)]
         refused: Option<String>,
     },
+    /// From a UI: run the picker named `picker` over `pane`, which the UI
+    /// shows, for the UI itself and not for a program: as when its user
+    /// asks for one with a key. `ask` is the UI's own number for this, said
+    /// back in the `PickerOpen` that follows, or in `PickerRefused`. The UI
+    /// is told what a row it accepts is with `PickerChosen`.
+    PickerAsk {
+        ask: u64,
+        pane: PaneId,
+        picker: String,
+        #[serde(default)]
+        params: std::collections::BTreeMap<String, String>,
+    },
     /// From a UI: what would show for row `row` of the rows sent with
     /// `serial`. Answered `PickerPreviewed` with the same `request`; a UI
     /// that has asked again wants only the last.
@@ -246,7 +258,16 @@ pub enum Control {
         /// put there is, and not in the middle of the pane.
         #[serde(default)]
         at_cursor: bool,
+        /// The UI's number for it, when the UI asked with `PickerAsk`.
+        #[serde(default)]
+        ask: Option<u64>,
     },
+    /// To a UI: the picker it asked for with `ask` is not run, and why.
+    PickerRefused { ask: u64, message: String },
+    /// To a UI that asked for the picker and accepted a row of it: what the
+    /// row shows, what it is, and the query it was found with. The picker
+    /// is over.
+    PickerChosen { picker: u32, text: String, value: String, query: String },
     /// What was found for the query with this revision. There can be
     /// several for one revision while the picker's source is still being
     /// added to, each in place of the one before.

@@ -436,6 +436,19 @@ action either shows a page on top with `app:push_picker` or closes it with
 `app:close_picker()`. The sample `Grep` picker asks for text and pushes
 `Ripgrep` with it as `pattern`.
 
+`Daemon` is one of the pickers the session daemon has, named by `picker`:
+`files`, `directories`, `history` or `ripgrep` (see
+[picker-pipe.md](picker-pipe.md) for what each takes). The daemon lists and
+searches where the pane's shell is and the window draws the rows, so it works
+the same in a window on another machine (`--remote`), where the other kinds
+would read that window's own files. The parameters it is opened with are the
+daemon picker's: `app:push_picker("Ripgrep", { pattern = item.value })` gives
+`ripgrep` its pattern, and `cwd` is the shell's working directory when the
+shell reports it. Enter runs the `action` callback with the row as `item`, or
+without one types the row's value into the pane. Of the options every picker
+takes, it uses `position` and `initial_query`; its previews are the daemon's
+own. The sample `Ripgrep` picker is one.
+
 `Output` has nothing to pick from either: it runs the `args` array without a
 shell and shows what the program prints, standard output and standard error
 together with their colors, while it runs. An argument consisting of `{name}`

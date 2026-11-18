@@ -251,6 +251,19 @@ impl SpawnOptions {
     }
 }
 
+/// A picker the pane asked the session daemon to run, by the pane's number
+/// for it, and where it goes once the daemon says it is open.
+struct Asked {
+    ask: u64,
+    accept: crate::picker::Accept,
+    /// Shown alone, and not on the page that asked for it.
+    direct: bool,
+    /// In place of the page that asked for it.
+    replace: bool,
+    /// Whether the directory to run it in was known.
+    cwd: bool,
+}
+
 /// Who opens a picker, which decides where closing it returns to.
 enum PickerOpen {
     /// The user, from the live terminal or from copy mode; closing returns
@@ -340,6 +353,9 @@ pub(super) struct TerminalPane {
     /// the action shows a page or another picker, and a key's action or an
     /// argument's text does not.
     pub(super) pending_callback: Option<PendingCallback>,
+    /// A picker this pane asked the session daemon for, until the daemon
+    /// says it is open or will not be.
+    asked: Option<Asked>,
 }
 
 #[unsafe(no_mangle)]
@@ -450,6 +466,7 @@ impl TerminalPane {
             decorated_viewport: std::cell::Cell::new(None),
             prompt_patterns: Default::default(),
             pending_callback: None,
+            asked: None,
         }
     }
 
@@ -1207,6 +1224,33 @@ impl TerminalPane {
             }
         };
         options.default_cwd(self.pwd());
+        if let crate::picker::config::Source::Daemon(name) = &options.source {
+            // The session daemon runs it, where the pane's shell is, and
+            // the page is placed when the daemon says it is open: see
+            // `handle_pipe_requests`.
+            let name = name.clone();
+            let mut params = options.params.clone();
+            if options.position == crate::picker::config::Position::Cursor {
+                params.entry("position".into()).or_insert_with(|| "cursor".into());
+            }
+            let cwd = params.contains_key("cwd");
+            let Some(ask) = self.session.as_ref().and_then(|session| session.ask_picker(name, params))
+            else {
+                self.show_error(
+                    "Could not open picker",
+                    "The pane's shell is not one a session daemon runs".into(),
+                );
+                return false;
+            };
+            self.asked = Some(Asked {
+                ask,
+                accept: crate::picker::Accept { callback: options.callback.clone(), params: options.params },
+                direct: matches!(open, PickerOpen::Direct),
+                replace: matches!(open, PickerOpen::FromCallback { .. }),
+                cwd,
+            });
+            return true;
+        }
         if matches!(options.source, crate::picker::config::Source::ErrorLog) {
             let messages = crate::error_log::picker_options(&palette.config_issues);
             options.source = messages.source;
@@ -1754,6 +1798,40 @@ impl TerminalPane {
                 }
                 // The daemon finds the rows and this pane draws them. It is
                 // refused where a program's own request for a picker is.
+                // The picker this pane asked the daemon for is open. It goes
+                // where it was asked from, if that is still as it was.
+                Event::Shown(shown) if shown.asked.is_some() => {
+                    let asked = self.asked.take_if(|asked| Some(asked.ask) == shown.asked);
+                    let fits = asked.as_ref().is_some_and(|asked| asked.direct == self.pages.is_empty())
+                        && interactive
+                        && !self.search.active
+                        && self.quick_select.is_none();
+                    match asked {
+                        Some(asked) if fits => {
+                            if asked.replace {
+                                drop(self.pages.apply(Outcome::Back));
+                            }
+                            let at_cursor = shown.at_cursor;
+                            let mut page = crate::picker::Fed::start_asked(ctx.clone(), shown, asked.accept);
+                            if at_cursor {
+                                page.cursor_row = self.picker_cursor_row();
+                            }
+                            self.place_page(asked.direct, page);
+                            ctx.request_repaint();
+                        }
+                        _ => shown.close(None),
+                    }
+                }
+                Event::Refused { ask, message } => {
+                    if let Some(asked) = self.asked.take_if(|asked| asked.ask == ask) {
+                        let why = if asked.cwd {
+                            message
+                        } else {
+                            format!("{message}\nThe shell has not said which directory it is in.")
+                        };
+                        self.show_error("Could not open picker", why);
+                    }
+                }
                 Event::Shown(shown) => {
                     let refused = if !bindings.pipe_policy.enabled {
                         Some("picker pipe is disabled in Lua configuration")

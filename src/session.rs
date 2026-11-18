@@ -544,6 +544,9 @@ struct Daemon {
     /// The pickers the daemon runs that are shown here, by its number for
     /// each.
     pickers: Mutex<HashMap<u32, Arc<Shown>>>,
+    /// The panes that asked the daemon for a picker for themselves and have
+    /// not been answered, by their number for what they asked.
+    asks: Mutex<HashMap<u64, Arc<Link>>>,
     /// The sessions the daemon holds, as it last gave them.
     sessions: Mutex<Arc<Listing>>,
     next_request: AtomicU32,
@@ -672,6 +675,7 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             programs: Mutex::default(),
             snapshots: Mutex::default(),
             pickers: Mutex::default(),
+            asks: Mutex::default(),
             sessions: Mutex::new(Arc::new(Listing { sessions, daemon: number, place: client.place.clone() })),
             next_request: AtomicU32::new(1),
             settings: Mutex::default(),
@@ -795,6 +799,9 @@ pub(crate) struct Shown {
     pub(crate) preview: Option<bool>,
     /// Whether it is shown at the pane's cursor.
     pub(crate) at_cursor: bool,
+    /// The pane's number for it, when the pane asked for it itself and no
+    /// program did.
+    pub(crate) asked: Option<u64>,
     state: Mutex<Showing>,
 }
 
@@ -826,6 +833,10 @@ struct Showing {
     previews: u64,
     /// Who waits for the last preview asked for.
     previewing: Option<(u64, mpsc::Sender<Result<Previewed, String>>)>,
+    /// A row was chosen, and the daemon has yet to say what it is.
+    awaiting: bool,
+    /// What it said: what the row shows, and its value.
+    chosen: Option<(String, String)>,
 }
 
 impl Shown {
@@ -846,6 +857,7 @@ impl Shown {
             query,
             preview: None,
             at_cursor: false,
+            asked: None,
             state: Mutex::default(),
         }
     }
@@ -952,9 +964,25 @@ impl Shown {
             return false;
         };
         state.over = true;
+        // The daemon says what the row is, to a pane that asked for itself.
+        state.awaiting = self.asked.is_some();
         drop(state);
         (self.tell)(Control::PickerAccept { picker: self.picker, serial, row: row as u64 });
         true
+    }
+
+    /// The daemon says what the row chosen is: what it shows, and its value.
+    pub(crate) fn chose(&self, text: String, value: String) {
+        let mut state = self.state.lock().unwrap();
+        state.awaiting = false;
+        state.chosen = Some((text, value));
+        drop(state);
+        (self.wake)();
+    }
+
+    /// What the row chosen is, once the daemon has said, and once only.
+    pub(crate) fn chosen(&self) -> Option<(String, String)> {
+        self.state.lock().unwrap().chosen.take()
     }
 
     /// The picker is closed here with nothing chosen, or, with `refused`,
@@ -969,7 +997,9 @@ impl Shown {
     /// The daemon ended it: its program went, or the daemon did.
     pub(crate) fn ended(&self, message: Option<String>) {
         let mut state = self.state.lock().unwrap();
-        if std::mem::replace(&mut state.over, true) {
+        // One that waits to be told what was chosen is over, and still
+        // hears that it will not be.
+        if std::mem::replace(&mut state.over, true) && !std::mem::take(&mut state.awaiting) {
             return;
         }
         state.closed = Some(message);
@@ -1063,18 +1093,28 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
             // it to be shown. The daemon finds the rows, where the program
             // is; only what it sends is drawn here, so this is the same for
             // a daemon on another machine.
-            Frame::Control(Control::PickerOpen { picker, pane, label, query, preview, at_cursor }) => match daemon.pane(pane) {
+            Frame::Control(Control::PickerOpen { picker, pane, label, query, preview, at_cursor, ask }) => match daemon.pane(pane) {
                 Some(link) => {
                     let (to, woken) = (daemon.clone(), link.clone());
                     let tell = move |control: Control| {
-                        // Either ends it here: the daemon says no more of it.
-                        if matches!(control, Control::PickerAccept { .. } | Control::PickerClose { .. }) {
+                        // Either ends it here: the daemon says no more of it,
+                        // but for what the row chosen is, of one the pane
+                        // asked for itself.
+                        let ends = match control {
+                            Control::PickerAccept { .. } => ask.is_none(),
+                            Control::PickerClose { .. } => true,
+                            _ => false,
+                        };
+                        if ends {
                             to.pickers.lock().unwrap().remove(&picker);
                         }
                         to.control(control);
                     };
                     let shown = Shown::new(picker, label, query, tell, move || woken.wake_pane());
-                    let shown = Arc::new(Shown { preview, at_cursor, ..shown });
+                    let shown = Arc::new(Shown { preview, at_cursor, asked: ask, ..shown });
+                    if let Some(ask) = ask {
+                        daemon.asks.lock().unwrap().remove(&ask);
+                    }
                     daemon.pickers.lock().unwrap().insert(picker, shown.clone());
                     let _ = link.requests.0.send(Event::Shown(shown));
                     link.wake_pane();
@@ -1140,6 +1180,19 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                     );
                 }
             }
+            Frame::Control(Control::PickerChosen { picker, text, value, .. }) => {
+                let shown = daemon.pickers.lock().unwrap().remove(&picker);
+                if let Some(shown) = shown {
+                    shown.chose(text, value);
+                }
+            }
+            Frame::Control(Control::PickerRefused { ask, message }) => {
+                let link = daemon.asks.lock().unwrap().remove(&ask);
+                if let Some(link) = link {
+                    let _ = link.requests.0.send(Event::Refused { ask, message });
+                    link.wake_pane();
+                }
+            }
             Frame::Control(Control::PickerClosed { picker, message }) => {
                 let shown = daemon.pickers.lock().unwrap().remove(&picker);
                 if let Some(shown) = shown {
@@ -1182,6 +1235,11 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
         daemon.pickers.lock().unwrap().drain().map(|(_, shown)| shown).collect();
     for shown in pickers {
         shown.ended(None);
+    }
+    let asks: Vec<(u64, Arc<Link>)> = daemon.asks.lock().unwrap().drain().collect();
+    for (ask, link) in asks {
+        let message = "the session daemon is gone".to_owned();
+        let _ = link.requests.0.send(Event::Refused { ask, message });
     }
     let mut links: Vec<Arc<Link>> = daemon.panes.lock().unwrap().drain().map(|(_, l)| l).collect();
     links.extend(daemon.starting.lock().unwrap().drain().map(|(_, link)| link));
@@ -1607,6 +1665,23 @@ impl Link {
     /// What a program in the shell asks next, if anything.
     pub(crate) fn request(&self) -> Option<Event> {
         self.requests.1.try_recv().ok()
+    }
+
+    /// Ask the daemon to run its picker `picker` over this pane, for the
+    /// pane itself. Returns the number the answer comes with: `Event::Shown`
+    /// of a picker asked for with it, or `Event::Refused`. None before the
+    /// pane has a shell.
+    pub(crate) fn ask_picker(
+        self: &Arc<Self>,
+        picker: String,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Option<u64> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let pane = self.state.lock().unwrap().pane()?;
+        let ask = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.daemon.asks.lock().unwrap().insert(ask, self.clone());
+        self.daemon.control(Control::PickerAsk { ask, pane, picker, params });
+        Some(ask)
     }
 
     /// Whether a program in the shell is talking to the pane.

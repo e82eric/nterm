@@ -575,9 +575,8 @@ struct Picker {
     /// The UI that shows it: its client number and the way to it.
     ui: u64,
     ui_outbox: Outbox,
-    /// The way to the program that asked.
-    program: Outbox,
-    request_id: Value,
+    /// Who asked for it, and is told how it ended.
+    asker: Asker,
     source: Source,
     sort: SearchSortMode,
     /// The way to the thread that reads previews, once one was asked for.
@@ -597,6 +596,15 @@ struct State {
     query: String,
     /// What the search last found for that query.
     last: Option<Answer>,
+}
+
+/// Who asked for a picker.
+enum Asker {
+    /// A program in the pane's shell: the way to it, and its name for what
+    /// it asked.
+    Program { to: Outbox, request_id: Value },
+    /// The UI that shows it, as when its user asked with a key.
+    Ui,
 }
 
 /// How a picker ended.
@@ -653,7 +661,8 @@ impl Pickers {
                     Err(message) => return refuse("no_window", message),
                 };
                 let opened = json!({"type": "opened", "request_id": request_id});
-                *mine = Some(self.open(definition, request_id, showing));
+                let asker = Asker::Program { to: showing.program, request_id };
+                *mine = Some(self.open(definition, asker, None, showing.pane, showing.ui, showing.ui_outbox));
                 reply(program, opened);
                 true
             }
@@ -685,7 +694,7 @@ impl Pickers {
         }
     }
 
-    fn open(&self, definition: Definition, request_id: Value, showing: Showing) -> u32 {
+    fn open(&self, definition: Definition, asker: Asker, ask: Option<u64>, pane: PaneId, ui: u64, ui_outbox: Outbox) -> u32 {
         limit_search_threads();
         let number = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let of = match &definition.lists {
@@ -698,7 +707,7 @@ impl Pickers {
             ),
             Lists::Given => "of what its program gives".to_owned(),
         };
-        log(format_args!("picker {number}: {} {of} for pane {}", definition.label, showing.pane));
+        log(format_args!("picker {number}: {} {of} for pane {}", definition.label, pane));
         // What reads a file or runs a command, begun once the picker is one
         // of those open: it may fail at once, and that ends the picker.
         let mut begin: Option<Box<dyn FnOnce()>> = None;
@@ -740,11 +749,10 @@ impl Pickers {
         };
         let picker = Arc::new(Picker {
             number,
-            pane: showing.pane,
-            ui: showing.ui,
-            ui_outbox: showing.ui_outbox,
-            program: showing.program,
-            request_id,
+            pane,
+            ui,
+            ui_outbox,
+            asker,
             source,
             sort: definition.sort,
             previews: Mutex::default(),
@@ -758,6 +766,7 @@ impl Pickers {
             query: definition.query,
             preview: definition.preview,
             at_cursor: definition.at_cursor,
+            ask,
         });
         if let Some(begin) = begin {
             begin();
@@ -801,6 +810,38 @@ impl Pickers {
             failed: Arc::new(failed),
         };
         (Source::Read { store, cancelled, whole }, sink, control)
+    }
+
+    /// The UI `ui` asks for a picker over `pane` for itself, with its own
+    /// number `ask` for it. `shows` is whether it is the UI that shows the
+    /// pane. It is told the picker is open as the UI of any picker is, with
+    /// its number, or that it is refused.
+    pub(crate) fn asked(
+        &self,
+        ui: u64,
+        ui_outbox: &Outbox,
+        ask: u64,
+        pane: PaneId,
+        name: &str,
+        params: &BTreeMap<String, String>,
+        shows: bool,
+    ) {
+        let definition = if shows { define(name, params) } else { Err(format!("pane {pane} is not shown here")) };
+        let definition = match definition {
+            // It has no program to give it rows.
+            Ok(Definition { lists: Lists::Given, .. }) => Err(format!("{name} is a picker for a program")),
+            other => other,
+        };
+        match definition {
+            Ok(definition) => {
+                self.open(definition, Asker::Ui, Some(ask), pane, ui, ui_outbox.clone());
+            }
+            Err(message) => {
+                log(format_args!("picker {name} refused: {message}"));
+                let refused = Control::PickerRefused { ask, message };
+                let _ = ui_outbox.send(Frame::Control(refused).encode());
+            }
+        }
     }
 
     /// The program that asked for `number` gives it rows. They are not
@@ -929,25 +970,35 @@ fn end(open: &Mutex<HashMap<u32, Arc<Picker>>>, number: u32, outcome: Outcome, t
         Outcome::Error { message, .. } => Some(message.clone()),
         _ => None,
     };
-    match outcome {
-        Outcome::Accepted(row) => result(
-            &picker.program,
-            &picker.request_id,
-            "accepted",
-            json!({"selected": [{"id": row.id, "text": row.text, "value": row.value}], "query": query}),
-        ),
-        Outcome::Cancelled(reason) => {
-            result(&picker.program, &picker.request_id, "cancelled", json!({"reason": reason}))
+    match (&picker.asker, outcome) {
+        // The UI asked for it itself: it is told what the row it chose is,
+        // and knows of any other end as the UI of any picker does.
+        (Asker::Ui, Outcome::Accepted(row)) => {
+            let value = match row.value {
+                Value::String(value) => value,
+                other => other.to_string(),
+            };
+            picker.tell_ui(Control::PickerChosen { picker: number, text: row.text, value, query });
         }
-        Outcome::Error { code, message } => result(
-            &picker.program,
-            &picker.request_id,
-            "error",
-            json!({"code": code, "message": message}),
-        ),
+        (Asker::Ui, _) => {}
+        (Asker::Program { to, request_id }, outcome) => {
+            match outcome {
+                Outcome::Accepted(row) => result(
+                    to,
+                    request_id,
+                    "accepted",
+                    json!({"selected": [{"id": row.id, "text": row.text, "value": row.value}], "query": query}),
+                ),
+                Outcome::Cancelled(reason) => result(to, request_id, "cancelled", json!({"reason": reason})),
+                Outcome::Error { code, message } => {
+                    result(to, request_id, "error", json!({"code": code, "message": message}))
+                }
+            }
+            // Write what was queued for the program, then close its
+            // connection.
+            let _ = to.send(Vec::new());
+        }
     }
-    // Write what was queued for the program, then close its connection.
-    let _ = picker.program.send(Vec::new());
     if tell_ui {
         picker.tell_ui(Control::PickerClosed { picker: number, message });
     }

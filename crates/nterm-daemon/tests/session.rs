@@ -1515,3 +1515,52 @@ fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
     assert_eq!(asker.result().0, "cancelled");
     ui.shutdown();
 }
+
+#[test]
+fn a_ui_asks_for_a_picker_for_itself_and_is_told_what_the_row_it_chose_is() {
+    let session = session("pick-asked");
+    let tree = Tree::new("asked");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    let params = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    };
+    let cwd = tree.path();
+
+    // No program is in it: the UI asks, and is the one told.
+    ui.send(Control::PickerAsk { ask: 41, pane, picker: "files".into(), params: params(&[("cwd", &cwd), ("query", "gam")]) });
+    let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
+    let Control::PickerOpen { picker, pane: over, label, query, ask, .. } = opened else { unreachable!() };
+    assert_eq!((over, label.as_str(), query.as_str(), ask), (pane, "Files", "gam", Some(41)));
+    let found = ui.query(picker, 0, "gam");
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
+    let chosen = ui.control(|c| matches!(c, Control::PickerChosen { .. }));
+    let Control::PickerChosen { picker: of, text, value, query } = chosen else { unreachable!() };
+    let whole = tree.0.join("b").join("gamma.rs").to_string_lossy().into_owned();
+    assert_eq!((of, text.as_str(), value, query.as_str()), (picker, "b/gamma.rs".replace('/', "\u{5c}").as_str(), whole, "gam"));
+
+    // One it closes is over with nothing more said, and the next is another.
+    ui.send(Control::PickerAsk { ask: 42, pane, picker: "directories".into(), params: params(&[("cwd", &cwd)]) });
+    let Control::PickerOpen { picker: second, ask, .. } = ui.control(|c| matches!(c, Control::PickerOpen { .. })) else {
+        unreachable!()
+    };
+    assert_eq!(ask, Some(42));
+    assert_ne!(second, picker);
+    ui.send(Control::PickerClose { picker: second, refused: None });
+
+    // Refused, by its own number: a picker there is not, one that is for a
+    // program, one that cannot be shown, and one over a pane it does not show.
+    for (ask, pane, name, given) in [
+        (43, pane, "themes", params(&[("cwd", &cwd)])),
+        (44, pane, "items", params(&[])),
+        (45, pane, "files", params(&[])),
+        (46, pane + 100, "files", params(&[("cwd", &cwd)])),
+    ] {
+        ui.send(Control::PickerAsk { ask, pane, picker: name.into(), params: given });
+        let refused = ui.control(|c| matches!(c, Control::PickerRefused { .. }));
+        let Control::PickerRefused { ask: of, message } = refused else { unreachable!() };
+        assert_eq!(of, ask, "{message}");
+        assert!(!message.is_empty());
+    }
+    ui.shutdown();
+}

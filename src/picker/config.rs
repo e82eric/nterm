@@ -494,6 +494,16 @@ pub(crate) enum DefinitionSource {
         #[serde(skip)]
         line: Option<std::rc::Rc<crate::lua_callbacks::LineFilter>>,
     },
+    /// One of the pickers the session daemon has, run by the daemon where
+    /// the pane's shell is: `picker` is its name there, and the parameters
+    /// the picker is opened with are the ones it is given.
+    Daemon {
+        picker: String,
+        #[serde(default)]
+        enter_action: Option<EnterAction>,
+        #[serde(skip)]
+        callback: Option<std::rc::Rc<crate::lua_callbacks::Callback>>,
+    },
     FileSystem {
         #[serde(default)]
         roots: Vec<String>,
@@ -839,6 +849,17 @@ impl Definition {
                     EnterAction::SendInput,
                 )
             }
+            DefinitionSource::Daemon { picker, .. } => {
+                if picker.trim().is_empty() {
+                    return Err(format!("pickers.{name}.picker must name a picker of the session daemon"));
+                }
+                if callback.is_none() && matches!(enter_action, Some(EnterAction::Navigate)) {
+                    return Err(format!(
+                        "pickers.{name}: Daemon only supports enter_action SendInput"
+                    ));
+                }
+                (Source::Daemon(picker), EnterAction::SendInput)
+            }
             DefinitionSource::FileSystem {
                 roots,
                 max_depth,
@@ -949,6 +970,7 @@ impl Definition {
             | DefinitionSource::Command { callback, .. }
             | DefinitionSource::File { callback, .. }
             | DefinitionSource::Argument { callback, .. }
+            | DefinitionSource::Daemon { callback, .. }
             | DefinitionSource::Items { callback, .. } => *callback = Some(value),
             DefinitionSource::Factory { .. }
             | DefinitionSource::Output { .. }
@@ -990,6 +1012,11 @@ impl Definition {
                 enter_action,
                 ..
             }
+            | DefinitionSource::Daemon {
+                callback,
+                enter_action,
+                ..
+            }
             | DefinitionSource::FileSystem {
                 callback,
                 enter_action,
@@ -1011,6 +1038,7 @@ impl Definition {
             | DefinitionSource::Command { callback, .. }
             | DefinitionSource::File { callback, .. }
             | DefinitionSource::Argument { callback, .. }
+            | DefinitionSource::Daemon { callback, .. }
             | DefinitionSource::Items { callback, .. } => callback.as_ref(),
             DefinitionSource::Factory { .. }
             | DefinitionSource::Output { .. }
@@ -1330,6 +1358,8 @@ pub(crate) enum Source {
     Items(ItemsOptions),
     Command(CommandOptions),
     TextFile(TextFileOptions),
+    /// A picker the session daemon runs, by its name there.
+    Daemon(String),
 }
 
 #[derive(Clone)]

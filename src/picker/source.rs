@@ -308,7 +308,10 @@ impl PickerSource {
                     store: Arc::new(SnapshotStore::new()),
                 }
             }
-            crate::picker::config::Source::Items(_)
+            // The session daemon runs its own: the pane asks it before any
+            // of this, and one that came here all the same lists nothing.
+            crate::picker::config::Source::Daemon(_)
+            | crate::picker::config::Source::Items(_)
             | crate::picker::config::Source::Command(_)
             | crate::picker::config::Source::TextFile(_) => Session::Streaming,
         };
@@ -527,7 +530,7 @@ impl PickerSource {
             }
             config::Source::FileSystem(_) => Self::FileSystem(runtime),
             config::Source::Scrollback { .. } => Self::Scrollback(runtime),
-            config::Source::Items(_) => Self::Items {
+            config::Source::Items(_) | config::Source::Daemon(_) => Self::Items {
                 runtime,
                 values: item_values,
             },

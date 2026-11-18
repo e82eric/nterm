@@ -376,6 +376,23 @@ return {
       type = "FileSystem", roots = {"."}, directories_only = true,
       max_depth = 0, position = "Cursor", preview_visible = false,
     },
+    -- Grep asks for a pattern and shows Ripgrep on top with what is found.
+    -- The session daemon runs rg where the pane's shell is, so this works
+    -- the same in a window on another machine (--remote). The shell has to
+    -- report its directory (OSC 7; see profile.example.ps1).
+    Grep = {
+      type = "Argument", prompt = "Grep:",
+      action = function(app, item) app:push_picker("Ripgrep", { pattern = item.value }) end,
+    },
+    Ripgrep = {
+      type = "Daemon", picker = "ripgrep",
+      action = function(app, item)
+        local path, line = item.value:match("^(.-):(%d+):%d+:")
+        if not path then return end
+        -- Typed for review; change nvim to your preferred editor.
+        app:send_text("nvim +" .. line .. " '" .. path:gsub("'", "''") .. "'")
+      end,
+    },
     ProfileRipgrep = {
       type = "Command", position = "Cursor", success_exit_codes = {0,1},
       args = {"rg.exe","--crlf","--max-columns=500","--max-columns-preview","--no-messages","--hidden","--color=never","-i","--vimgrep","--","{pattern}"},

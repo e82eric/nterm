@@ -1952,6 +1952,15 @@ mod tests {
         );
         let error = compile("return {pickers={x={type='Argument'}}}").unwrap_err();
         assert!(error.contains("Argument requires an action"), "{error}");
+        // A picker the session daemon runs is named, with or without an
+        // action for the row chosen.
+        assert!(compile("return {pickers={x={type='Daemon', picker='ripgrep'}}}").is_ok());
+        assert!(
+            compile("return {pickers={x={type='Daemon', picker='files', position='Cursor', action=function() end}}}")
+                .is_ok()
+        );
+        let error = compile("return {pickers={x={type='Daemon', picker=' '}}}").unwrap_err();
+        assert!(error.contains("must name a picker of the session daemon"), "{error}");
         assert!(
             compile("return {pickers={x={type='Argument', prompt='a\\nb', action=function() end}}}")
                 .is_err()

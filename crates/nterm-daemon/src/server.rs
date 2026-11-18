@@ -623,6 +623,13 @@ fn converse(
         if session.pickers.from_ui(id, &control) {
             continue;
         }
+        if let Control::PickerAsk { ask, pane, picker, params } = &control {
+            let shows = session.pane(*pane).is_some_and(|pane| {
+                pane.state.lock().unwrap().shown.as_ref().is_some_and(|(shown, _)| *shown == id)
+            });
+            session.pickers.asked(id, outbox, *ask, *pane, picker, params, shows);
+            continue;
+        }
         match control {
             Control::Settings { settings } => {
                 *session.settings.lock().unwrap() = settings.clone();
