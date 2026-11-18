@@ -1955,3 +1955,93 @@ fn the_machines_file_says_what_is_done_with_the_row_a_ui_chose() {
     ui.shutdown();
     assert!(daemon.wait().unwrap().success());
 }
+
+#[test]
+fn a_key_of_the_machines_file_acts_on_a_row_and_leaves_the_picker_open() {
+    let session = session("pick-keys");
+    let tree = Tree::new("keys");
+    let cwd = tree.path();
+    let file = tree.0.join("nterm-daemon.lua");
+    std::fs::write(
+        &file,
+        r#"return { pickers = {
+          Keyed = { type = "Items", items = { { text = "Alpha", value = "a" }, { text = "Beta", value = "b" } },
+            keys = {
+              { key = "d", mods = "CTRL", description = "Note it", action = function(app, item, params)
+                  app:show_toast("Noted", item.value .. " in " .. params.word)
+                end },
+              { key = "y", mods = "CTRL", action = function(app, item)
+                  app:paste(item.value)
+                  app:close_picker()
+                end },
+              { key = "x", mods = "CTRL|SHIFT", action = function() error("not this one", 0) end },
+            } },
+          Bad = { type = "Items", items = {}, keys = { { key = "d", action = "typed" } } },
+        } }"#,
+    )
+    .unwrap();
+    let mut command = std::process::Command::new(DAEMON);
+    command.args(["--session", &session, "--lua-config"]).arg(&file).env_remove("NTERM_CONPTY_DLL");
+    let mut daemon = command.spawn().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while let Err(error) = pipe::connect(&session) {
+        assert!(Instant::now() < deadline, "the daemon never served: {error}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    use nterm_session::protocol::{PickerBinding, PickerStep};
+    let given: std::collections::BTreeMap<String, String> =
+        [("cwd".to_owned(), cwd.clone()), ("word".to_owned(), "given".to_owned())].into_iter().collect();
+
+    // The UI is told the picker's keys when it opens, as the file has them.
+    ui.send(Control::PickerAsk { ask: 1, pane, picker: "Keyed".into(), params: given.clone() });
+    let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. }));
+    let Control::PickerOpen { picker, keys, .. } = opened else { panic!("{opened:?}") };
+    assert_eq!(
+        keys,
+        [
+            PickerBinding { key: "d".into(), mods: "CTRL".into(), description: "Note it".into() },
+            PickerBinding { key: "y".into(), mods: "CTRL".into(), description: String::new() },
+            PickerBinding { key: "x".into(), mods: "CTRL|SHIFT".into(), description: String::new() },
+        ]
+    );
+    let acted = |ui: &mut Ui| {
+        let told = ui.control(|c| matches!(c, Control::PickerActed { .. } | Control::PickerClosed { .. }));
+        let Control::PickerActed { steps, .. } = told else { panic!("{told:?}") };
+        steps
+    };
+
+    // A key runs its function for the row, and the picker goes on: the
+    // same key again, on another row.
+    let found = ui.query(picker, 0, "");
+    let (alpha, beta) = (found.rows[0].0, found.rows[1].0);
+    ui.send(Control::PickerKey { picker, serial: found.serial, row: alpha, key: 0 });
+    let noted = |value: &str| {
+        [PickerStep::Toast { title: Some("Noted".into()), message: format!("{value} in given"), duration_ms: None }]
+    };
+    assert_eq!(acted(&mut ui), noted("a"));
+    ui.send(Control::PickerKey { picker, serial: found.serial, row: beta, key: 0 });
+    assert_eq!(acted(&mut ui), noted("b"));
+    // One that fails says so, and the picker goes on. A key there is not
+    // is nothing.
+    ui.send(Control::PickerKey { picker, serial: found.serial, row: alpha, key: 9 });
+    ui.send(Control::PickerKey { picker, serial: found.serial, row: alpha, key: 2 });
+    let failed = acted(&mut ui);
+    assert!(matches!(&failed[..], [PickerStep::Toast { message, .. }] if message.contains("not this one")));
+    assert_eq!(ui.query(picker, 1, "bet").texts(), ["Beta"]);
+    // One that closes the picker: what it asked for, then that it is over.
+    let found = ui.query(picker, 2, "bet");
+    ui.send(Control::PickerKey { picker, serial: found.serial, row: found.rows[0].0, key: 1 });
+    assert_eq!(acted(&mut ui), [PickerStep::Paste { text: "b".into() }]);
+    let closed = ui.control(|c| matches!(c, Control::PickerActed { .. } | Control::PickerClosed { .. }));
+    assert_eq!(closed, Control::PickerClosed { picker, message: None });
+
+    // Keys that are not written as keys are: the picker is refused.
+    ui.send(Control::PickerAsk { ask: 2, pane, picker: "Bad".into(), params: given });
+    let refused = ui.control(|c| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. }));
+    let Control::PickerRefused { message, .. } = refused else { panic!("{refused:?}") };
+    assert!(message.contains("keys[1].action is not a function"), "{message}");
+    ui.shutdown();
+    assert!(daemon.wait().unwrap().success());
+}

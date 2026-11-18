@@ -8,6 +8,7 @@
 //! it has changed since.
 
 use mlua::{Lua, LuaSerdeExt};
+use nterm_session::protocol::PickerBinding;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -135,6 +136,9 @@ pub(crate) enum Lists {
     },
 }
 
+/// The most keys one picker has.
+const MOST_KEYS: usize = 32;
+
 /// A picker of the file.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Defined {
@@ -144,6 +148,8 @@ pub(crate) struct Defined {
     pub(crate) preview: bool,
     /// Whether it says what is done with the row chosen: its `action`.
     pub(crate) action: bool,
+    /// Its own keys, each with a function of the file to run.
+    pub(crate) keys: Vec<PickerBinding>,
 }
 
 /// The fields of a picker that are for every kind.
@@ -343,6 +349,39 @@ fn define(lua: &Lua, value: mlua::Value) -> Result<Defined, String> {
         mlua::Value::Function(_) => true,
         _ => return Err("action is not a function".into()),
     };
+    // Its own keys: what each is, and that it has a function to run.
+    let keys = match table.raw_get::<_, mlua::Value>("keys").map_err(|error| short(&error))? {
+        mlua::Value::Nil => Vec::new(),
+        mlua::Value::Table(keys) => {
+            let mut read = Vec::new();
+            for (at, key) in keys.sequence_values::<mlua::Table>().enumerate() {
+                let place = format!("keys[{}]", at + 1);
+                let key = key.map_err(|_| format!("{place} is not a table"))?;
+                for pair in key.clone().pairs::<String, mlua::Value>() {
+                    let (field, _) = pair.map_err(|_| format!("{place} has a field that is not named"))?;
+                    if !["key", "mods", "action", "description"].contains(&field.as_str()) {
+                        return Err(format!("{place} has {field}, which a key has not"));
+                    }
+                }
+                if !matches!(key.raw_get::<_, mlua::Value>("action"), Ok(mlua::Value::Function(_))) {
+                    return Err(format!("{place}.action is not a function"));
+                }
+                let named = |field: &str| -> Result<Option<String>, String> {
+                    key.raw_get::<_, Option<String>>(field).map_err(|_| format!("{place}.{field} is not text"))
+                };
+                read.push(PickerBinding {
+                    key: named("key")?.filter(|key| !key.is_empty()).ok_or(format!("{place} has no key"))?,
+                    mods: named("mods")?.unwrap_or_default(),
+                    description: named("description")?.unwrap_or_default(),
+                });
+            }
+            if read.len() > MOST_KEYS {
+                return Err(format!("it has more than {MOST_KEYS} keys"));
+            }
+            read
+        }
+        _ => return Err("keys is not a table".into()),
+    };
     // A copy without what the daemon does not run yet: the file's own
     // table is left as it was written.
     let copy = lua.create_table().map_err(|error| short(&error))?;
@@ -397,7 +436,7 @@ fn define(lua: &Lua, value: mlua::Value) -> Result<Defined, String> {
         }
         _ => {}
     }
-    Ok(Defined { presentation, lists, preview, action })
+    Ok(Defined { presentation, lists, preview, action, keys })
 }
 
 #[cfg(test)]

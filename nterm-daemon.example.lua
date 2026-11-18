@@ -19,8 +19,8 @@
 --
 -- So far: types Command, File, Items and FileSystem; previews of type
 -- Dynamic, whose function runs here; and `action`, run here when a window
--- opened the picker, what it asks of `app` being done to the pane. `keys`
--- are read and not yet run. The names files, directories, history, ripgrep
+-- opened the picker, and `keys`, what they ask of `app` being done to the
+-- pane. The names files, directories, history, ripgrep
 -- and items are the daemon's own.
 return {
   pickers = {
@@ -36,6 +36,15 @@ return {
                  args = { "git", "show", "--stat", "--patch", "--color=always", hash } }
       end },
       preview_visible = false,
+      -- Keys of its own. One leaves the picker open unless its function
+      -- closes it.
+      keys = {
+        { key = "y", mods = "CTRL", description = "Paste the commit's hash",
+          action = function(app, item)
+            app:paste(item.value:match("^(%x+)") or "")
+            app:close_picker()
+          end },
+      },
     },
     -- The lines a pattern is found on, with flags of your own. Opened with
     -- a pattern: app:push_picker("Search", { pattern = item.value }).

@@ -52,6 +52,24 @@ impl Fed {
             move |ask| asked.ask(ask),
         );
         let mut shared = shared;
+        // The picker's own keys, as its machine's file writes them. One is
+        // known to the daemon by its place among them; one this window
+        // cannot read is left unbound.
+        shared.set_bindings(
+            shown
+                .keys
+                .iter()
+                .enumerate()
+                .filter_map(|(at, binding)| {
+                    Some(nfm_egui::PickerBinding {
+                        trigger: nfm_egui::PickerTrigger::Key(crate::config::keybindings::parse_key(&binding.key)?),
+                        modifiers: crate::config::keybindings::parse_modifiers(&binding.mods).ok()?,
+                        action: nfm_egui::PickerAction::Custom(at),
+                        description: Some(binding.description.clone()).filter(|said| !said.is_empty()),
+                    })
+                })
+                .collect(),
+        );
         if shown.preview.is_some() {
             // The daemon says what shows for a row, as text, and it is laid
             // out here: coloured by the name of the file it is of. Nothing
@@ -139,6 +157,12 @@ impl Fed {
             Some(nfm_egui::PickerEvent::Cancelled) => {
                 self.shown.close(None);
                 Some(Action::Cancel)
+            }
+            // One of the picker's own keys: its machine says what is done.
+            Some(nfm_egui::PickerEvent::CustomAction { action, selection }) => {
+                let rows = selection.source_snapshot::<Rows>()?;
+                self.shown.key(&rows, selection.item, action as u32);
+                None
             }
             Some(nfm_egui::PickerEvent::Accepted(selection)) => {
                 let rows = selection.source_snapshot::<Rows>()?;

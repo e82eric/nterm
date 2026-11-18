@@ -802,6 +802,8 @@ pub(crate) struct Shown {
     /// The pane's number for it, when the pane asked for it itself and no
     /// program did.
     pub(crate) asked: Option<u64>,
+    /// The keys the picker's own machine does something for.
+    pub(crate) keys: Vec<nterm_session::protocol::PickerBinding>,
     state: Mutex<Showing>,
 }
 
@@ -870,6 +872,7 @@ impl Shown {
             preview: None,
             at_cursor: false,
             asked: None,
+            keys: Vec::new(),
             state: Mutex::default(),
         }
     }
@@ -981,6 +984,21 @@ impl Shown {
         drop(state);
         (self.tell)(Control::PickerAccept { picker: self.picker, serial, row: row as u64 });
         true
+    }
+
+    /// One of the picker's own keys was pressed on `row` of the answer
+    /// `rows`: the daemon is told which, and says what is to be done. The
+    /// picker stays as it is.
+    pub(crate) fn key(&self, rows: &Arc<Rows>, row: usize, key: u32) {
+        let state = self.state.lock().unwrap();
+        if state.over {
+            return;
+        }
+        let serial = state.answers.iter().find(|(answer, _)| Arc::ptr_eq(answer, rows)).map(|(_, serial)| *serial);
+        drop(state);
+        if let Some(serial) = serial {
+            (self.tell)(Control::PickerKey { picker: self.picker, serial, row: row as u64, key });
+        }
     }
 
     /// The daemon says what the row chosen is: what it shows, and its value.
@@ -1116,7 +1134,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
             // it to be shown. The daemon finds the rows, where the program
             // is; only what it sends is drawn here, so this is the same for
             // a daemon on another machine.
-            Frame::Control(Control::PickerOpen { picker, pane, label, query, preview, at_cursor, ask }) => match daemon.pane(pane) {
+            Frame::Control(Control::PickerOpen { picker, pane, label, query, preview, at_cursor, ask, keys }) => match daemon.pane(pane) {
                 Some(link) => {
                     let (to, woken) = (daemon.clone(), link.clone());
                     let tell = move |control: Control| {
@@ -1134,7 +1152,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                         to.control(control);
                     };
                     let shown = Shown::new(picker, label, query, tell, move || woken.wake_pane());
-                    let shown = Arc::new(Shown { preview, at_cursor, asked: ask, ..shown });
+                    let shown = Arc::new(Shown { preview, at_cursor, asked: ask, keys, ..shown });
                     if let Some(ask) = ask {
                         daemon.asks.lock().unwrap().remove(&ask);
                     }

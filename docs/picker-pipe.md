@@ -247,7 +247,18 @@ not run.
 A program in a shell that opens such a picker is given the row, as of any
 picker, and the `action` is not run: what is done with it is the program's.
 
-Not yet: `keys` may be written and are not run by the daemon; previews of types
+A picker may have keys of its own, written as in `nterm.lua`: `keys = { { key
+= "d", mods = "CTRL", description = "...", action = function(app, item,
+params) ... end } }`. The window is told the keys when the picker opens and
+tells the daemon when one is pressed on a row; the daemon runs that key's
+`action` on its own machine, and what it asks of `app` is done to the pane as
+above. A key leaves the picker open, so it can be pressed on row after row.
+The picker closes only when the function calls `app:close_picker()` or opens
+another picker. A key's function that fails shows why, and the picker stays.
+The rows are not read again after a key. Keys work however the picker was
+opened, by a window or by a program in a shell.
+
+Not yet: previews of types
 other than `Dynamic`, a picker that is a function, `items` that is a
 function, and `columns`, are refused. A picker that cannot be one is refused
 when it is opened, saying why, and the file's other pickers still open. The

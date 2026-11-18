@@ -40,7 +40,7 @@ use nfm_search_core::{
         ItemsSource, PublishingStreamingItemStoreWithPayload, SearchPlan, StreamingItemSnapshotWithPayload,
     },
 };
-use nterm_session::protocol::{Control, Frame, PaneId, PickerRow, PreviewKind};
+use nterm_session::protocol::{Control, Frame, PaneId, PickerBinding, PickerRow, PickerStep, PreviewKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -483,7 +483,7 @@ fn configured(
     if let Some(cwd) = cwd.as_ref().filter(|cwd| cwd.is_relative() || !cwd.is_dir()) {
         return Err(format!("{} is not a folder", cwd.display()));
     }
-    let Defined { presentation, lists, preview: resolved, action: acts } = defined;
+    let Defined { presentation, lists, preview: resolved, action: acts, keys } = defined;
     let mut preview = None;
     let lists = match lists {
         Of::Command { args, cwd: folder, line_continuation, success_exit_codes, unique, .. } => {
@@ -560,12 +560,12 @@ fn configured(
     // Where the file says what shows for a row, every row has a preview,
     // and it is the file's and not the daemon's own.
     let resolves = match file {
-        Some(file) if resolved || acts => {
+        Some(file) if resolved || acts || !keys.is_empty() => {
             if resolved {
                 let shown = params.get("preview").map(|preview| preview == "true");
                 preview = Some(shown.unwrap_or(presentation.preview_visible));
             }
-            Some(Resolves { file, name: name.to_owned(), params: params.clone(), preview: resolved, action: acts })
+            Some(Resolves { file, name: name.to_owned(), params: params.clone(), preview: resolved, action: acts, keys })
         }
         _ => None,
     };
@@ -882,6 +882,8 @@ enum Wanted {
     Row { text: String, value: String },
     /// A row to do what the picker's file says is done with one.
     Act { text: String, value: String },
+    /// A row one of the picker's own keys was pressed on, and which key.
+    Key { key: usize, text: String, value: String },
 }
 
 /// Where the function is that says what shows for a row of a picker of the
@@ -895,6 +897,7 @@ struct Resolves {
     /// the one chosen.
     preview: bool,
     action: bool,
+    keys: Vec<PickerBinding>,
 }
 
 /// To a UI: there is nothing to show for the row, and why.
@@ -1116,6 +1119,7 @@ impl Pickers {
             query: definition.query,
             preview: definition.preview,
             at_cursor: definition.at_cursor,
+            keys: picker.resolves.as_ref().map(|resolves| resolves.keys.clone()).unwrap_or_default(),
             ask,
         });
         if let Some(begin) = begin {
@@ -1259,6 +1263,11 @@ impl Pickers {
                     }
                     let outcome = found.chosen(*serial, *row);
                     self.end(*picker, outcome, false);
+                }
+            }
+            Control::PickerKey { picker, serial, row, key } => {
+                if let Some(picker) = self.shown_by(*picker, ui) {
+                    picker.key(*serial, *row, *key);
                 }
             }
             Control::PickerPreview { picker, request, serial, row } => {
@@ -1563,7 +1572,7 @@ impl Picker {
                     // Of the previews asked for only the last is found. A
                     // row to act on is never passed over.
                     while let Ok(newer) = asking.try_recv() {
-                        if !matches!(waiting.back(), Some((_, Wanted::Act { .. }))) {
+                        if !matches!(waiting.back(), Some((_, Wanted::Act { .. } | Wanted::Key { .. }))) {
                             waiting.pop_back();
                         }
                         waiting.push_back(newer);
@@ -1572,7 +1581,7 @@ impl Picker {
                     let previewed = match (wanted, &resolves) {
                         (Wanted::Act { text, value }, _) => {
                             let acted = match previewer.get_or_insert_with(&make) {
-                                Ok(previewer) => previewer.act(&text, &value),
+                                Ok(previewer) => previewer.act(&text, &value, None),
                                 Err(error) => Err(error.clone()),
                             };
                             // What it asked for is the UI's to do, and the
@@ -1589,6 +1598,32 @@ impl Picker {
                                 end(&open, number, outcome, true);
                             }
                             break;
+                        }
+                        (Wanted::Key { key, text, value }, _) => {
+                            let acted = match previewer.get_or_insert_with(&make) {
+                                Ok(previewer) => previewer.act(&text, &value, Some(key)),
+                                Err(error) => Err(error.clone()),
+                            };
+                            // A key leaves the picker open, unless its
+                            // function closed it or asked for another.
+                            let (steps, ends) = match acted {
+                                Ok(acted) => {
+                                    let another = acted.steps.iter().any(|step| matches!(step, PickerStep::Picker { .. }));
+                                    (acted.steps, acted.close || another)
+                                }
+                                Err(message) => {
+                                    let title = Some("The picker's key failed".to_owned());
+                                    (vec![PickerStep::Toast { title, message, duration_ms: Some(6000) }], false)
+                                }
+                            };
+                            let _ = ui.send(Frame::Control(Control::PickerActed { picker: number, steps }).encode());
+                            if ends {
+                                if let Some(open) = open.upgrade() {
+                                    end(&open, number, Outcome::Cancelled("closed_by_key"), true);
+                                }
+                                break;
+                            }
+                            continue;
                         }
                         (Wanted::Row { text, value }, Some(_)) => {
                             let previewer = previewer.get_or_insert_with(&make);
@@ -1675,6 +1710,18 @@ impl Picker {
         self.wanted.store(u64::MAX, Ordering::Release);
         self.ask(0, Wanted::Act { text, value });
         true
+    }
+
+    /// The UI pressed one of the picker's own keys on a row: the function
+    /// the file has for it is run, on the picker's own thread.
+    fn key(&self, serial: u64, row: u64, key: u32) {
+        let has = self.resolves.as_ref().is_some_and(|resolves| (key as usize) < resolves.keys.len());
+        let Some(Row { text, value, .. }) = self.row(serial, row).filter(|_| has) else { return };
+        let value = match value {
+            Value::String(value) => value,
+            other => other.to_string(),
+        };
+        self.ask(0, Wanted::Key { key: key as usize, text, value });
     }
 
     /// The row the UI chose, of those sent with `serial`.

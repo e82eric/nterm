@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -107,6 +107,17 @@ pub struct SessionInfo {
     pub id: String,
     pub panes: Vec<PaneInfo>,
     pub layout: String,
+}
+
+/// A key a picker's own machine does something for: as it is written in a
+/// Lua file (`key = "d", mods = "CTRL"`), and what it is for.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PickerBinding {
+    pub key: String,
+    #[serde(default)]
+    pub mods: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 /// One thing a UI does to a pane for a picker: see `Control::PickerActed`.
@@ -289,6 +300,10 @@ pub enum Control {
         /// put there is, and not in the middle of the pane.
         #[serde(default)]
         at_cursor: bool,
+        /// The keys the picker's own machine does something for, each
+        /// known by its place here: see `PickerKey`.
+        #[serde(default)]
+        keys: Vec<PickerBinding>,
         /// The UI's number for it, when the UI asked with `PickerAsk`.
         #[serde(default)]
         ask: Option<u64>,
@@ -304,6 +319,11 @@ pub enum Control {
     /// UI does for a picker beyond drawing it: text for the pane's shell,
     /// which is the daemon's own, and a note to show.
     PickerActed { picker: u32, steps: Vec<PickerStep> },
+    /// From a UI: a key of the picker's was pressed on a row, of those
+    /// sent with `serial`. `key` is its place in the keys the picker
+    /// opened with. What is to be done comes back as `PickerActed`; the
+    /// picker stays open unless that is followed by `PickerClosed`.
+    PickerKey { picker: u32, serial: u64, row: u64, key: u32 },
     /// What was found for the query with this revision. There can be
     /// several for one revision while the picker's source is still being
     /// added to, each in place of the one before.

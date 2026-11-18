@@ -212,6 +212,8 @@ impl Previewer {
             lua.set_named_registry_value("resolve", resolve).map_err(|error| short(&error))?;
             let action: Option<mlua::Function> = picker.get("action").ok();
             lua.set_named_registry_value("action", action).map_err(|error| short(&error))?;
+            let keys: Option<mlua::Table> = picker.get("keys").ok();
+            lua.set_named_registry_value("keys", keys).map_err(|error| short(&error))?;
             lua.set_named_registry_value("app", app(&lua).map_err(|error| short(&error))?)
                 .map_err(|error| short(&error))?;
         }
@@ -222,7 +224,9 @@ impl Previewer {
     /// is `value`: its `action`. What it asks of `app` is not done here: it
     /// is given back, as the steps for the picker's UI to do in order, with
     /// whether the picker is to close.
-    pub(crate) fn act(&self, text: &str, value: &str) -> Result<Acted, String> {
+    /// With `key`, it is the function of that one of the picker's `keys`,
+    /// counted from nothing.
+    pub(crate) fn act(&self, text: &str, value: &str, key: Option<usize>) -> Result<Acted, String> {
         let lua = &self.lua;
         let failed = |error: mlua::Error| short(&error);
         // Nothing stops it but how long it takes.
@@ -237,7 +241,14 @@ impl Previewer {
             Ok(())
         });
         let ran = (|| -> Result<(), String> {
-            let action: Option<mlua::Function> = lua.named_registry_value("action").map_err(failed)?;
+            let action: Option<mlua::Function> = match key {
+                None => lua.named_registry_value("action").map_err(failed)?,
+                Some(key) => {
+                    let keys: Option<mlua::Table> = lua.named_registry_value("keys").map_err(failed)?;
+                    let key: Option<mlua::Table> = keys.and_then(|keys| keys.raw_get(key + 1).ok());
+                    key.and_then(|key| key.raw_get("action").ok())
+                }
+            };
             let action = action.ok_or("the file no longer says what is done with a row of this picker")?;
             let app: mlua::Table = lua.named_registry_value("app").map_err(failed)?;
             action.call::<_, ()>((app, self.item(text, value)?, self.given()?)).map_err(failed)
@@ -779,7 +790,7 @@ mod acting_tests {
               end
             end } } }"#,
         );
-        let acted = previewer.act("the text", "all").unwrap();
+        let acted = previewer.act("the text", "all", None).unwrap();
         let cwd = folder.to_string_lossy().into_owned();
         assert_eq!(
             acted.steps,
@@ -793,19 +804,19 @@ mod acting_tests {
         );
         assert!(acted.close);
         // It may run a program of this machine, as a preview may.
-        let acted = previewer.act("t", "ran").unwrap();
+        let acted = previewer.act("t", "ran", None).unwrap();
         assert!(matches!(&acted.steps[..], [PickerStep::SendText { text }] if text.contains("from a program")));
         assert!(!acted.close);
-        let acted = previewer.act("found", "next").unwrap();
+        let acted = previewer.act("found", "next", None).unwrap();
         let with = [("pattern".to_owned(), "found".to_owned())].into_iter().collect();
         assert_eq!(acted.steps, [PickerStep::Picker { name: "Other".into(), params: with }]);
         // What only a window has says so, and nothing is done.
-        assert!(previewer.act("t", "window").unwrap_err().contains("app:navigate is not something the daemon has"));
+        assert!(previewer.act("t", "window", None).unwrap_err().contains("app:navigate is not something the daemon has"));
         // Of an action that goes wrong, nothing it asked for is done.
-        assert!(previewer.act("t", "wrong").unwrap_err().contains("it went wrong"));
-        assert!(previewer.act("t", "long").unwrap_err().contains("60000"));
+        assert!(previewer.act("t", "wrong", None).unwrap_err().contains("it went wrong"));
+        assert!(previewer.act("t", "long", None).unwrap_err().contains("60000"));
         // One row's steps are not the next's.
-        assert_eq!(previewer.act("t", "none").unwrap(), Acted::default());
+        assert_eq!(previewer.act("t", "none", None).unwrap(), Acted::default());
         let _ = std::fs::remove_dir_all(folder);
     }
 
@@ -817,7 +828,7 @@ mod acting_tests {
               return { type = "Text", text = item.value }
             end } } } }"#,
         );
-        assert!(previewer.act("t", "v").unwrap_err().contains("no longer says what is done"));
+        assert!(previewer.act("t", "v", None).unwrap_err().contains("no longer says what is done"));
         let _ = std::fs::remove_dir_all(folder);
     }
 }
