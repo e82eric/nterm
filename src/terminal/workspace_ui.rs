@@ -637,10 +637,12 @@ impl TerminalView {
             &self.picker_bindings.prompt_patterns,
             None,
         )));
-        // After those rows, the folders a new one can be started in.
-        let bindings = &self.picker_bindings;
-        if let Some(picker) = self.window_picker.as_mut() {
-            picker.list_folders(ctx, &bindings.new_workspace_roots, bindings.new_workspace_depth);
+        // After those rows, the folders a new one can be started in, which
+        // this machine's daemon finds: see `show_window_picker`.
+        if !self.picker_bindings.new_workspace_roots.is_empty()
+            && let Some(picker) = self.window_picker.as_mut()
+        {
+            self.window_folders = picker.list_folders(ctx).map(|rows| (rows, None));
         }
         // One opened again as a window empties says what emptied it.
         if let (Some(picker), Some((said, at))) = (self.window_picker.as_mut(), &self.picker_said)
@@ -652,6 +654,7 @@ impl TerminalView {
     }
 
     pub(super) fn close_window_picker(&mut self) {
+        self.window_folders = None;
         if let Some(picker) = self.window_picker.take() {
             picker.surrender_focus();
             self.context.request_repaint();
@@ -680,6 +683,22 @@ impl TerminalView {
         }
         picker.builtin_pickers = builtin;
         picker.set_cursor_scroll_padding(padding);
+        // The folders it lists are found by this machine's daemon, for what
+        // is typed. Asked for once there is a connection, and again over a
+        // new one.
+        if let Some((rows, search)) = &mut self.window_folders {
+            if !search.as_ref().is_some_and(|search| search.live()) {
+                let bindings = &self.picker_bindings;
+                let roots = bindings.new_workspace_roots.iter().map(|root| root.to_string_lossy().into_owned());
+                let to = rows.clone();
+                let found = move |found: Vec<String>, done| to.set(&found, done);
+                let here = crate::session::Place::Here;
+                *search = crate::session::folders(&here, roots.collect(), bindings.new_workspace_depth, found);
+            }
+            if let Some(search) = search {
+                search.typed(picker.typed());
+            }
+        }
         // The daemon says when the sessions change. Rows of what the picker
         // already has rows of are left alone.
         if of != self.window_picker_rows {

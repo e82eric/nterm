@@ -329,6 +329,106 @@ pub(crate) fn sessions(place: &Place) -> Option<Arc<Listing>> {
     Some(daemon(place)?.sessions.lock().unwrap().clone())
 }
 
+/// The numbers this UI gives what it asks a daemon to show or find.
+static NEXT_ASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How many folders a daemon is asked for at a time: the best for what is
+/// typed. Typing finds the rest.
+const FOLDERS_ASKED: u32 = 200;
+
+/// A search of a place's folders that its daemon does for this UI, over no
+/// pane: for the list of where a workspace can be started. The daemon says
+/// what it finds for what is typed, as it finds it, each lot in place of
+/// the last. It ends when this is dropped.
+pub(crate) struct Folders {
+    daemon: Arc<Daemon>,
+    ask: u64,
+    state: Mutex<FolderSearch>,
+    /// Told the folders found, and whether no more are being looked for.
+    found: Box<dyn Fn(Vec<String>, bool) + Send + Sync>,
+}
+
+#[derive(Default)]
+struct FolderSearch {
+    /// The daemon's number for it, once it has said.
+    picker: Option<u32>,
+    /// What was typed last, and its number.
+    query: String,
+    revision: u64,
+}
+
+/// Ask `place`'s daemon for the folders under `roots`, to `depth` levels.
+/// None without a connection, or roots.
+pub(crate) fn folders(
+    place: &Place,
+    roots: Vec<String>,
+    depth: i32,
+    found: impl Fn(Vec<String>, bool) + Send + Sync + 'static,
+) -> Option<Arc<Folders>> {
+    if roots.is_empty() {
+        return None;
+    }
+    let daemon = daemon(place)?;
+    let ask = NEXT_ASK.fetch_add(1, Ordering::Relaxed);
+    let state = Mutex::new(FolderSearch { revision: 1, ..Default::default() });
+    let folders = Arc::new(Folders { daemon: daemon.clone(), ask, state, found: Box::new(found) });
+    daemon.folders.lock().unwrap().insert(ask, Arc::downgrade(&folders));
+    daemon.control(Control::FoldersAsk { ask, roots, depth });
+    Some(folders)
+}
+
+impl Folders {
+    /// This is typed now.
+    pub(crate) fn typed(&self, query: &str) {
+        let mut state = self.state.lock().unwrap();
+        if state.query == query {
+            return;
+        }
+        state.query = query.to_owned();
+        state.revision += 1;
+        self.say(&state);
+    }
+
+    fn say(&self, state: &FolderSearch) {
+        if let Some(picker) = state.picker {
+            let (revision, query) = (state.revision, state.query.clone());
+            self.daemon.control(Control::PickerQuery { picker, revision, query, rows: FOLDERS_ASKED });
+        }
+    }
+
+    /// Whether the connection it was asked over is still the one to the
+    /// place. When not, nothing more comes of it.
+    pub(crate) fn live(&self) -> bool {
+        daemon(&self.daemon.sessions.lock().unwrap().place).is_some_and(|now| Arc::ptr_eq(&now, &self.daemon))
+    }
+
+    /// The daemon has started it, as its picker `picker`.
+    fn opened(&self, picker: u32) {
+        let mut state = self.state.lock().unwrap();
+        state.picker = Some(picker);
+        self.say(&state);
+    }
+
+    /// The daemon found these for what was typed at `revision`.
+    fn rows(&self, revision: u64, rows: Vec<String>, done: bool) {
+        // Those for what is no longer typed are left: the ones for what
+        // is are on their way.
+        if self.state.lock().unwrap().revision == revision {
+            (self.found)(rows, done);
+        }
+    }
+}
+
+impl Drop for Folders {
+    fn drop(&mut self) {
+        self.daemon.folders.lock().unwrap().remove(&self.ask);
+        if let Some(picker) = self.state.lock().unwrap().picker {
+            self.daemon.folder_searches.lock().unwrap().remove(&picker);
+            self.daemon.control(Control::PickerClose { picker, refused: None });
+        }
+    }
+}
+
 /// Called with the configuration before the first pane is made.
 pub(crate) fn configure(enabled: bool) {
     ENABLED.store(enabled, Ordering::Release);
@@ -547,6 +647,11 @@ struct Daemon {
     /// The panes that asked the daemon for a picker for themselves and have
     /// not been answered, by their number for what they asked.
     asks: Mutex<HashMap<u64, Arc<Link>>>,
+    /// The searches of folders asked of the daemon for the UI itself: those
+    /// not yet answered, by the number each was asked with, and those under
+    /// way, by the daemon's number for each.
+    folders: Mutex<HashMap<u64, std::sync::Weak<Folders>>>,
+    folder_searches: Mutex<HashMap<u32, std::sync::Weak<Folders>>>,
     /// The sessions the daemon holds, as it last gave them.
     sessions: Mutex<Arc<Listing>>,
     next_request: AtomicU32,
@@ -676,6 +781,8 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             snapshots: Mutex::default(),
             pickers: Mutex::default(),
             asks: Mutex::default(),
+            folders: Mutex::default(),
+            folder_searches: Mutex::default(),
             sessions: Mutex::new(Arc::new(Listing { sessions, daemon: number, place: client.place.clone() })),
             next_request: AtomicU32::new(1),
             settings: Mutex::default(),
@@ -1160,6 +1267,18 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                     let _ = link.requests.0.send(Event::Shown(shown));
                     link.wake_pane();
                 }
+                // No pane's: a search of folders the UI asked for itself,
+                // if whoever asked still wants it.
+                None if pane.is_none() => {
+                    let asked = ask.and_then(|ask| daemon.folders.lock().unwrap().remove(&ask));
+                    match asked.and_then(|asked| asked.upgrade()) {
+                        Some(search) => {
+                            daemon.folder_searches.lock().unwrap().insert(picker, Arc::downgrade(&search));
+                            search.opened(picker);
+                        }
+                        None => daemon.control(Control::PickerClose { picker, refused: None }),
+                    }
+                }
                 // The pane went as the program asked.
                 None => {
                     let refused = Some("the pane is not shown".to_owned());
@@ -1182,7 +1301,13 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 append_only,
             }) => {
                 let shown = daemon.pickers.lock().unwrap().get(&picker).cloned();
-                if let Some(shown) = shown {
+                let search = daemon.folder_searches.lock().unwrap().get(&picker).and_then(std::sync::Weak::upgrade);
+                if let Some(search) = search {
+                    // A search of folders for the UI itself, not a picker.
+                    daemon.control(Control::PickerSeen { picker, serial });
+                    search.rows(revision, rows.into_iter().map(|row| row.text).collect(), done);
+                    wake_ui();
+                } else if let Some(shown) = shown {
                     // Said as it is taken, so that the daemon sends the next
                     // no faster than they arrive.
                     daemon.control(Control::PickerSeen { picker, serial });
@@ -1252,12 +1377,16 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 }
             }
             Frame::Control(Control::PickerChosen { picker, text, value, .. }) => {
+                daemon.folder_searches.lock().unwrap().remove(&picker);
                 let shown = daemon.pickers.lock().unwrap().remove(&picker);
                 if let Some(shown) = shown {
                     shown.chose(text, value);
                 }
             }
             Frame::Control(Control::PickerRefused { ask, message }) => {
+                if daemon.folders.lock().unwrap().remove(&ask).is_some() {
+                    report("The folders to start a workspace in were not listed", &message);
+                }
                 let link = daemon.asks.lock().unwrap().remove(&ask);
                 if let Some(link) = link {
                     let _ = link.requests.0.send(Event::Refused { ask, message });
@@ -1265,6 +1394,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 }
             }
             Frame::Control(Control::PickerClosed { picker, message }) => {
+                daemon.folder_searches.lock().unwrap().remove(&picker);
                 let shown = daemon.pickers.lock().unwrap().remove(&picker);
                 if let Some(shown) = shown {
                     shown.ended(message);
@@ -1747,9 +1877,8 @@ impl Link {
         picker: String,
         params: std::collections::BTreeMap<String, String>,
     ) -> Option<u64> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let pane = self.state.lock().unwrap().pane()?;
-        let ask = NEXT.fetch_add(1, Ordering::Relaxed);
+        let ask = NEXT_ASK.fetch_add(1, Ordering::Relaxed);
         self.daemon.asks.lock().unwrap().insert(ask, self.clone());
         self.daemon.control(Control::PickerAsk { ask, pane, picker, params });
         Some(ask)

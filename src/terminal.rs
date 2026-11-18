@@ -85,6 +85,9 @@ pub(crate) struct TerminalView {
     /// What the rows `window_picker` was last given are of; see
     /// `workspace_picker_rows`.
     window_picker_rows: String,
+    /// The folders the window's picker lists after its rows, and the search
+    /// for them that a daemon does, once one has been asked.
+    window_folders: Option<(std::sync::Arc<crate::picker::FolderRows>, Option<std::sync::Arc<crate::session::Folders>>)>,
     /// What that picker was last told to say, and when: new rows take it
     /// away, and it is said again while it would still have been showing.
     picker_said: Option<(String, std::time::Instant)>,
@@ -297,6 +300,7 @@ impl TerminalView {
             empty: None,
             window_picker: None,
             window_picker_rows: String::new(),
+            window_folders: None,
             picker_said: None,
             picker_bindings,
             floating_padding,

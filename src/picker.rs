@@ -20,6 +20,7 @@ pub(crate) use output::Output;
 pub(crate) use page::Page;
 pub(crate) use prompt::Prompt;
 use source::PickerSource;
+pub(crate) use source::FolderRows;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -182,20 +183,19 @@ impl Picker {
         self.shared.replace_source(ctx, self.source.provider(), query);
         true
     }
-    /// Have a picker of workspaces list, after its rows, a row for each
-    /// folder inside `roots` to `depth` levels, as each is found.
-    pub(crate) fn list_folders(
-        &mut self,
-        ctx: &egui::Context,
-        roots: &[std::path::PathBuf],
-        depth: i32,
-    ) {
-        if self.source.list_folders(roots, depth)
-            && let Some(members) = self.source.members()
-        {
+    /// Have a picker of workspaces list, after its rows, the folders given
+    /// to what this returns, each lot in place of the last.
+    pub(crate) fn list_folders(&mut self, ctx: &egui::Context) -> Option<Arc<source::FolderRows>> {
+        let folders = self.source.list_folders()?;
+        if let Some(members) = self.source.members() {
             let query = self.shared.query().to_owned();
             self.shared.replace_sources(ctx, members, query);
         }
+        Some(folders)
+    }
+    /// What is typed in it.
+    pub(crate) fn typed(&self) -> &str {
+        self.shared.query()
     }
     pub(crate) fn bind_pipe_search_wake(
         &self,
