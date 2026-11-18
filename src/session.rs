@@ -68,6 +68,102 @@ pub(crate) fn choose(session: String) {
     *CHOSEN.lock().unwrap() = Some(session);
 }
 
+/// A daemon on another machine, which `--remote NAME` asks for. The window
+/// reaches it by running `ssh`, whose input and output are the connection:
+/// see `nterm_session::relay`.
+///
+/// Such a window only shows and types. It starts no daemon here, and `ssh`
+/// is what vouches for the one there. What that daemon sends is drawn and
+/// nothing more: nothing here is run or opened because it asked. And what is
+/// true of this machine only is not sent: its environment, its directories,
+/// the command its shells are started with.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Remote {
+    /// As the command line gave it.
+    pub(crate) name: String,
+    /// What `ssh` is given to find the machine.
+    pub(crate) address: String,
+    /// What a new shell there is started with.
+    pub(crate) command: Option<String>,
+    /// The daemon program there, when it is not found by name.
+    pub(crate) daemon: Option<String>,
+}
+
+/// What a new shell on another machine is started with when its remote
+/// names nothing.
+const REMOTE_COMMAND: &str = "cmd.exe";
+
+impl Remote {
+    /// What is wrong with it, if anything. Each part ends up on a command
+    /// line: `ssh`'s here, and a shell's on the other machine.
+    pub(crate) fn check(&self) -> Result<(), String> {
+        let plain = |text: &str| !text.is_empty() && !text.chars().any(char::is_control);
+        if !plain(&self.address) || self.address.contains(char::is_whitespace) {
+            return Err("address must be one word, as ssh takes it".into());
+        }
+        // Or ssh would read it as one of its options.
+        if self.address.starts_with('-') {
+            return Err("address must not start with '-'".into());
+        }
+        if self.command.as_deref().is_some_and(|command| !plain(command)) {
+            return Err("command must not be empty".into());
+        }
+        if self.daemon.as_deref().is_some_and(|daemon| !plain(daemon) || daemon.contains('"')) {
+            return Err("daemon must be the path of a program, without quotes".into());
+        }
+        Ok(())
+    }
+
+    /// What `ssh` runs on the other machine.
+    fn relay(&self, session: &str) -> String {
+        let daemon = match &self.daemon {
+            Some(daemon) => format!("\"{daemon}\""),
+            None => "nterm-daemon".into(),
+        };
+        format!("{daemon} --relay --session {session}")
+    }
+
+    /// The `ssh` that carries the connection. It asks nothing, as nobody
+    /// would see the question: a machine whose key is not already known is
+    /// refused, and so is one that wants a password. It forwards nothing.
+    fn ssh(&self, session: &str) -> std::process::Command {
+        let mut ssh = std::process::Command::new("ssh");
+        ssh.arg("-T");
+        for option in [
+            "BatchMode=yes",
+            "StrictHostKeyChecking=yes",
+            "ForwardAgent=no",
+            "ForwardX11=no",
+            "ClearAllForwardings=yes",
+        ] {
+            ssh.args(["-o", option]);
+        }
+        // `--`: what follows is the machine, whatever it looks like.
+        ssh.arg("--").arg(&self.address).arg(self.relay(session));
+        ssh
+    }
+}
+
+static REMOTE: Mutex<Option<Remote>> = Mutex::new(None);
+
+/// `--remote NAME`: this window's shells are on that machine.
+pub(crate) fn set_remote(remote: Remote) {
+    *REMOTE.lock().unwrap() = Some(remote);
+}
+
+/// The other machine this window's shells are on, if they are.
+pub(crate) fn remote() -> Option<Remote> {
+    REMOTE.lock().unwrap().clone()
+}
+
+/// What the window is called: a remote one says where its shells are.
+pub(crate) fn window_title() -> String {
+    match remote() {
+        Some(remote) => format!("nterm \u{2014} {}", remote.name),
+        None => "nterm".into(),
+    }
+}
+
 // Defined by the pane, which is what the surface tells of a title or a
 // directory. `userdata` is the pane's `WakeState`.
 unsafe extern "C" {
@@ -154,10 +250,14 @@ pub(crate) fn configure(enabled: bool) {
     ENABLED.store(enabled, Ordering::Release);
 }
 
-/// `NTERM_SESSION_DAEMON=1` or `0` overrides the configuration.
+/// `NTERM_SESSION_DAEMON=1` or `0` overrides the configuration. A remote
+/// window has nowhere else to run a shell.
 fn enabled() -> bool {
     #[cfg(test)]
     if tests::TARGET.lock().unwrap().is_some() {
+        return true;
+    }
+    if remote().is_some() {
         return true;
     }
     match std::env::var("NTERM_SESSION_DAEMON").as_deref() {
@@ -388,8 +488,12 @@ fn open(number: u64) -> io::Result<Arc<Daemon>> {
     // A daemon from another build cannot be trusted to speak the same
     // snapshot format. One with no panes is replaced; one with panes is left
     // alone and not used.
+    let remote = remote();
     for attempt in 0..2 {
-        let connection = pipe::connect_or_start(&session, &program)?;
+        let connection = match &remote {
+            Some(remote) => nterm_session::relay::connect(&mut remote.ssh(&session))?,
+            None => pipe::connect_or_start(&session, &program)?,
+        };
         let mut reader = io::BufReader::with_capacity(1 << 16, connection.reader()?);
         let mut writer = connection.writer()?;
         Frame::Control(Control::Hello {
@@ -411,6 +515,16 @@ fn open(number: u64) -> io::Result<Arc<Daemon>> {
         };
         if protocol != PROTOCOL_VERSION || ghostty != GHOSTTY_REVISION {
             let panes: usize = sessions.iter().map(|session| session.panes.len()).sum();
+            // Another machine's daemon is its own build's, and the one that
+            // took its place would be too.
+            if let Some(remote) = &remote {
+                return Err(other(format!(
+                    "the nterm on {} is another build (protocol {protocol}, ghostty \
+                     {ghostty}; this build has protocol {PROTOCOL_VERSION}, ghostty \
+                     {GHOSTTY_REVISION})",
+                    remote.name
+                )));
+            }
             if panes == 0 && attempt == 0 {
                 Frame::Control(Control::Shutdown).write(&mut writer)?;
                 // Wait for it to go, so the next connect starts a new one.
@@ -596,6 +710,11 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 }
             }
             Frame::Control(Control::ShellOpen { channel, pane }) => match daemon.pane(pane) {
+                // A program on another machine would have a picker run here,
+                // on this machine's files, with this machine's programs.
+                Some(_) if daemon.connection.relayed() => {
+                    daemon.control(Control::ShellClosed { channel });
+                }
                 Some(link) => {
                     link.programs.fetch_add(1, Ordering::AcqRel);
                     link.wake_pane();
@@ -1193,10 +1312,20 @@ extern "C" fn on_spawn(userdata: *mut c_void, spawn: *const HostSpawn) {
         } else {
             unsafe { std::slice::from_raw_parts(spawn.env, spawn.env_len) }
         };
-        let spec = SpawnSpec {
-            command: text(spawn.command),
-            cwd: (!spawn.cwd.is_null()).then(|| text(spawn.cwd)),
-            env: env.iter().map(|var| (text(var.key), text(var.value))).collect(),
+        let spec = match remote() {
+            // The terminal describes a shell for this machine. Another
+            // machine's is its remote's command, in the daemon's own
+            // environment and directory.
+            Some(remote) => SpawnSpec {
+                command: remote.command.unwrap_or_else(|| REMOTE_COMMAND.into()),
+                cwd: None,
+                env: Vec::new(),
+            },
+            None => SpawnSpec {
+                command: text(spawn.command),
+                cwd: (!spawn.cwd.is_null()).then(|| text(spawn.cwd)),
+                env: env.iter().map(|var| (text(var.key), text(var.value))).collect(),
+            },
         };
         // A link that takes a running shell has no use for it.
         if let Phase::Sizing { want: Want::Spawn(wanted), .. } =
@@ -1265,6 +1394,63 @@ mod tests {
     pub(super) static TARGET: Mutex<Option<(String, std::path::PathBuf)>> = Mutex::new(None);
 
     const WAIT: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn a_remote_is_reached_by_an_ssh_that_asks_and_forwards_nothing() {
+        let mut remote = Remote { name: "vm".into(), address: "me@host".into(), ..Remote::default() };
+        let args = |remote: &Remote| -> Vec<String> {
+            let ssh = remote.ssh("work");
+            assert_eq!(ssh.get_program(), "ssh");
+            ssh.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(
+            args(&remote),
+            [
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ForwardX11=no",
+                "-o",
+                "ClearAllForwardings=yes",
+                "--",
+                "me@host",
+                "nterm-daemon --relay --session work",
+            ]
+        );
+        remote.daemon = Some(r"C:\Program Files\nterm\nterm-daemon.exe".into());
+        assert_eq!(
+            args(&remote).last().unwrap(),
+            r#""C:\Program Files\nterm\nterm-daemon.exe" --relay --session work"#
+        );
+    }
+
+    #[test]
+    fn a_remote_that_would_say_more_than_it_seems_to_is_refused() {
+        let remote = |address: &str, command: Option<&str>, daemon: Option<&str>| Remote {
+            name: "x".into(),
+            address: address.into(),
+            command: command.map(str::to_owned),
+            daemon: daemon.map(str::to_owned),
+        };
+        assert!(remote("me@host", Some("pwsh.exe -NoLogo"), Some(r"C:\a b\d.exe")).check().is_ok());
+        for bad in [
+            remote("", None, None),
+            remote("-oProxyCommand=calc", None, None),
+            remote("host -oProxyCommand=calc", None, None),
+            remote("host\n", None, None),
+            remote("host", Some(""), None),
+            remote("host", None, Some("")),
+            remote("host", None, Some("d.exe\" & calc & \"")),
+            remote("host", None, Some("d.exe\ncalc")),
+        ] {
+            assert!(bad.check().is_err(), "{bad:?}");
+        }
+    }
 
     fn until<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
         let deadline = std::time::Instant::now() + WAIT;

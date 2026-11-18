@@ -1521,7 +1521,11 @@ impl Bindings {
         workspaces.appearance.validate()?;
         self.workspace_appearance = workspaces.appearance;
         self.default_layout = workspaces.default_layout;
-        self.new_workspace_roots = workspaces.new_roots;
+        // The folders are this machine's. A remote window's shells are not.
+        self.new_workspace_roots = match crate::session::remote() {
+            Some(_) => Vec::new(),
+            None => workspaces.new_roots,
+        };
         // No `workspaces` table at all leaves it unset.
         self.new_workspace_depth = workspaces.new_depth.max(1);
         Ok(self)

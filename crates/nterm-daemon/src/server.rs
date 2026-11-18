@@ -258,6 +258,10 @@ impl Session {
         }
         env.push((DAEMON_VARIABLE.into(), self.name.clone()));
         env.push((PANE_VARIABLE.into(), id.to_string()));
+        // With none given it is the user's own, not the daemon's, which is
+        // where the daemon keeps its log. A window on another machine gives
+        // none: it knows no directory of this one.
+        let cwd = cwd.or_else(|| std::env::var("USERPROFILE").ok());
         let spawned = conpty::spawn(&command, cwd.as_deref(), &env, size.cols, size.rows)
             .map_err(|error| error.to_string())?;
         let conpty::Spawned { console, output, input, process } = spawned;

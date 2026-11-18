@@ -360,6 +360,8 @@ struct AppConfig {
     colors: ColorConfig,
     theme_colors: std::collections::BTreeMap<String, crate::colors::UiOverrides>,
     floating: FloatingConfig,
+    /// The machines `--remote NAME` knows by name.
+    remotes: std::collections::BTreeMap<String, RemoteConfig>,
     workspaces: crate::terminal::workspace::Config,
     picker_defaults: crate::picker::config::PickerDefaults,
     builtin_pickers: crate::picker::config::BuiltinPickers,
@@ -398,6 +400,33 @@ struct TerminalConfig {
     /// Run shells in the session daemon, so they outlive the UI. Read once,
     /// at startup.
     session_daemon: bool,
+}
+
+/// One of `remotes`: a machine whose nterm daemon a window can use.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RemoteConfig {
+    /// What `ssh` is given. Without it, the remote's name.
+    address: Option<String>,
+    /// What a new shell there is started with.
+    command: Option<String>,
+    /// Where `nterm-daemon` is there, when its `PATH` does not have it.
+    daemon: Option<String>,
+}
+
+impl RemoteConfig {
+    /// The remote `--remote name` asked for. A name `remotes` does not have
+    /// is the machine's address, with nothing else said of it.
+    fn named(self, name: &str) -> Result<crate::session::Remote, String> {
+        let remote = crate::session::Remote {
+            name: name.to_owned(),
+            address: self.address.unwrap_or_else(|| name.to_owned()),
+            command: self.command,
+            daemon: self.daemon,
+        };
+        remote.check().map_err(|error| format!("remotes.{name}: {error}"))?;
+        Ok(remote)
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -881,6 +910,7 @@ pub(crate) fn prepare_with_reload(
     let program = incoming.next().unwrap_or_else(|| "nterm".into());
     let mut remaining = Vec::new();
     let mut explicit = None;
+    let mut remote = None;
     while let Some(arg) = incoming.next() {
         if arg == "-e" || arg == "--" {
             remaining.push(arg);
@@ -898,6 +928,20 @@ pub(crate) fn prepare_with_reload(
                 return Err(format!("--session: {}", nterm_session::SESSION_NAME_RULE));
             }
             crate::session::choose(session);
+            continue;
+        }
+        let named = if arg == "--remote" {
+            Some(incoming.next().ok_or("--remote requires a name or an address")?)
+        } else {
+            arg.strip_prefix("--remote=").map(str::to_owned)
+        };
+        if let Some(named) = named {
+            // Checked now as an address, which is what it is unless the
+            // configuration knows it as a name.
+            RemoteConfig::default().named(&named).map_err(|_| {
+                "--remote requires a name from `remotes`, or an address as ssh takes it"
+            })?;
+            remote = Some(named);
             continue;
         }
         let path = if arg == "--lua-config" {
@@ -930,8 +974,13 @@ pub(crate) fn prepare_with_reload(
         })? {
             reload_path = Some(path.clone());
             let (options, bindings, padding, overrides) = AppConfig::parse(&source, &path)
-                .and_then(|config| {
+                .and_then(|mut config| {
                     crate::session::configure(config.terminal.session_daemon);
+                    // Before the rest is made, which differs for a remote.
+                    if let Some(name) = remote.take() {
+                        let known = config.remotes.remove(&name).unwrap_or_default();
+                        crate::session::set_remote(known.named(&name)?);
+                    }
                     Ok((
                         config.ghostty_args()?,
                         crate::picker::config::Bindings::compile_with_actions(
@@ -975,6 +1024,10 @@ pub(crate) fn prepare_with_reload(
         }
         Ok(None) => {}
         Err(error) => issues.push(format!("Lua configuration was not loaded. Using defaults for Lua settings.\nFix the configuration and restart the app.\n\n{error}")),
+    }
+    // No configuration read it: it is an address.
+    if let Some(name) = remote {
+        crate::session::set_remote(RemoteConfig::default().named(&name)?);
     }
     // Ghostty loads its normal files first, then these arguments. Explicit
     // command-line values come last and override the Lua configuration.
@@ -3912,6 +3965,42 @@ mod tests {
             "return {terminal = {command = ''}}",
         ] {
             assert!(parse(source).unwrap().ghostty_args().is_err());
+        }
+    }
+
+    #[test]
+    fn a_remote_is_a_name_from_the_configuration_or_an_address() {
+        let config = parse(
+            r#"return { remotes = {
+                vm = { address = "me@10.0.0.5", command = "pwsh.exe -NoLogo",
+                       daemon = "C:\\Program Files\\nterm\\nterm-daemon.exe" },
+                bare = {},
+                bad = { address = "-oProxyCommand=calc" },
+            } }"#,
+        );
+        let mut remotes = config.unwrap().remotes;
+        let vm = remotes.remove("vm").unwrap().named("vm").unwrap();
+        assert_eq!((vm.name.as_str(), vm.address.as_str()), ("vm", "me@10.0.0.5"));
+        assert_eq!(vm.command.as_deref(), Some("pwsh.exe -NoLogo"));
+        assert_eq!(vm.daemon.as_deref(), Some(r"C:\Program Files\nterm\nterm-daemon.exe"));
+        // With no address, its name is one.
+        assert_eq!(remotes.remove("bare").unwrap().named("bare").unwrap().address, "bare");
+        // A name the configuration does not have is an address too.
+        let unknown = RemoteConfig::default().named("me@host").unwrap();
+        assert_eq!((unknown.address.as_str(), unknown.command), ("me@host", None));
+        let error = remotes.remove("bad").unwrap().named("bad").unwrap_err();
+        assert!(error.starts_with("remotes.bad: address"), "{error}");
+        assert!(parse("return { remotes = { vm = { adress = 'x' } } }").is_err());
+
+        // On the command line, refused before anything is asked of ssh.
+        for bad in [
+            vec!["app", "--remote"],
+            vec!["app", "--remote="],
+            vec!["app", "--remote=-oProxyCommand=calc"],
+            vec!["app", "--remote", "two words"],
+        ] {
+            let args = bad.iter().map(|arg| arg.to_string()).collect();
+            assert!(prepare_args(args).unwrap_err().contains("--remote"), "{bad:?}");
         }
     }
 

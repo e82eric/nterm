@@ -853,6 +853,65 @@ mod tests {
         assert_eq!(terminal.apply(&short), vec!["palette"]);
     }
 
+    /// A window on another machine is given these bytes by a daemon it has
+    /// only ssh's word for. Whatever they are, decoding them must end: with a
+    /// terminal or with an error, and never by bringing the process down.
+    /// The window's terminal decodes with the same library.
+    #[test]
+    fn damaged_screen_bytes_are_refused_or_read_and_never_crash() {
+        let mut terminal = Terminal::new(size(80, 24), &TerminalSettings::default()).unwrap();
+        for line in 0..300 {
+            let _ = terminal.feed(format!("\x1b[3{}mline {line} \u{e9}\x1b[0m\r\n", line % 8).as_bytes());
+        }
+        let _ = terminal.feed(b"\x1b]2;a title\x07\x1b]7;file://host/C:/src\x07prompt> \x1b[3");
+        let mut next = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut random = move || {
+            next ^= next << 13;
+            next ^= next >> 7;
+            next ^= next << 17;
+            next
+        };
+        let mut refused = 0;
+        let mut attempt = |bytes: &[u8]| {
+            if let Ok(mut decoded) = Terminal::decode(bytes) {
+                // One that was read is one that can be used.
+                let _ = decoded.text();
+                let _ = decoded.feed(b"more\r\n");
+            } else {
+                refused += 1;
+            }
+        };
+        for good in [terminal.screen(false), terminal.snapshot()] {
+            // Cut short, anywhere.
+            for _ in 0..200 {
+                attempt(&good[..random() as usize % good.len()]);
+            }
+            // One byte wrong, then a run of them.
+            for round in 0..600 {
+                let mut bad = good.clone();
+                let at = random() as usize % bad.len();
+                let run = if round % 3 == 0 { 1 + random() as usize % 64 } else { 1 };
+                for byte in bad.iter_mut().skip(at).take(run) {
+                    *byte = random() as u8;
+                }
+                attempt(&bad);
+            }
+            // Lengths and counts that claim far more than is there.
+            for _ in 0..200 {
+                let mut bad = good.clone();
+                let at = random() as usize % bad.len().saturating_sub(8);
+                bad[at..at + 8].copy_from_slice(&[0xff; 8]);
+                attempt(&bad);
+            }
+        }
+        // Nothing of a snapshot at all.
+        for length in [0, 1, 7, 64, 4096] {
+            let noise: Vec<u8> = (0..length).map(|_| random() as u8).collect();
+            attempt(&noise);
+        }
+        assert!(refused > 0, "nothing was refused: the damage did no damage");
+    }
+
     #[test]
     fn a_screen_is_small_and_decodes_to_the_same_screen() {
         let settings =

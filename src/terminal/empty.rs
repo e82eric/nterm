@@ -126,15 +126,21 @@ impl TerminalView {
                 Some(Empty::Connecting)
             }
             Empty::Unavailable { lost, reason } => {
-                let title = match lost {
-                    true => "The session daemon has gone",
-                    false => "The session daemon cannot be reached",
+                // A daemon on this machine is lost only by ending. One on
+                // another is lost with the connection, and may well be there.
+                let remote = crate::session::remote().map(|remote| remote.name);
+                let title = match (&remote, lost) {
+                    (Some(name), true) => format!("The connection to {name} was lost"),
+                    (Some(name), false) => format!("{name} cannot be reached"),
+                    (None, true) => "The session daemon has gone".into(),
+                    (None, false) => "The session daemon cannot be reached".into(),
                 };
-                let detail = match lost {
-                    true => "The shells it was running ended with it.",
-                    false => reason.as_str(),
+                let detail = match (&remote, lost) {
+                    (Some(_), true) => "Its shells run on there, unless it has gone too.",
+                    (None, true) => "The shells it was running ended with it.",
+                    (_, false) => reason.as_str(),
                 };
-                let below = say(ui, content, title, detail);
+                let below = say(ui, content, &title, detail);
                 if retry(ui, content, below) {
                     crate::session::connect();
                     Some(Empty::Connecting)

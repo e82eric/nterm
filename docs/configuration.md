@@ -43,6 +43,49 @@ the base; Lua overrides them, and explicit command-line options override Lua.
 The picker still imports Ghostty's resolved font and tracks its cell dimensions.
 Use the command palette's Reload configuration action to apply supported Lua settings.
 
+## Remotes
+
+`nterm --remote NAME` opens a window whose shells run in the nterm daemon of
+another machine. The window reaches it by running `ssh`, so the other machine
+needs an ssh server and this build of nterm, and nothing else. The shells
+stay there when the window closes or the connection is lost, and the next
+`nterm --remote NAME` shows them again. `--session NAME` picks one of several
+daemons there, as it does here.
+
+`remotes` names the machines:
+
+```lua
+remotes = {
+  vm = {
+    address = "me@192.168.56.10",
+    command = "pwsh.exe -NoLogo",
+    daemon = "C:\\Program Files\\nterm\\nterm-daemon.exe",
+  },
+}
+```
+
+- `address` is what `ssh` is given: `user@host`, or a `Host` of your ssh
+  configuration. Without it, the remote's name is used.
+- `command` is what a new shell there is started with. Without it, `cmd.exe`.
+  `terminal.command` is this machine's and is not used.
+- `daemon` is where `nterm-daemon` is there. Without it, it is found by name,
+  so its folder must be on that account's `PATH`.
+
+A name that `remotes` does not have is taken as an address:
+`nterm --remote me@host`.
+
+The window's `ssh` asks nothing, as there is nowhere to answer. So the machine
+must take a key or an agent, not a password, and its host key must already be
+known: connect once by hand (`ssh me@host`) and accept it. A machine whose key
+has changed is refused. Nothing is forwarded.
+
+A remote window shows and types, and that is all the other machine has of
+this one. A new shell is given the daemon's environment and the home
+directory there, not this machine's. Pickers that a program in the shell asks
+for (`npick`) are refused, as they would run here; your own key bindings'
+pickers still open, and are about this machine. The workspace picker lists
+the sessions there, and not the folders of `workspaces.new_roots`.
+
 ## Prompt patterns
 
 `prompt_patterns` configures prompt detection for copy-mode command navigation,
