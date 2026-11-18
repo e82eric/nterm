@@ -843,6 +843,13 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 // The pane went as the program came.
                 None => daemon.control(Control::ShellClosed { channel }),
             },
+            // The daemon runs a picker for a program in a pane and asks for
+            // it to be shown, which this window does not do yet: the
+            // program is told so, not left waiting.
+            Frame::Control(Control::PickerOpen { picker, .. }) => {
+                let refused = Some("this window does not show the daemon's pickers yet".to_owned());
+                daemon.control(Control::PickerClose { picker, refused });
+            }
             Frame::Shell { channel, bytes } => said(daemon, channel, &bytes),
             Frame::Control(Control::ShellClosed { channel }) => daemon.end_program(channel, false),
             Frame::Control(Control::Exited { pane, .. }) => {

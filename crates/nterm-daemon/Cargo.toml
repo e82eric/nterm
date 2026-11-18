@@ -15,6 +15,13 @@ path = "src/main.rs"
 
 [dependencies]
 nterm-session = { path = "../nterm-session" }
+# What a picker the daemon runs lists and is searched with; see `picker`.
+nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "c8818258d9923761bd5bb9e6c3830df545dc192d" }
+nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "c8818258d9923761bd5bb9e6c3830df545dc192d" }
+crossbeam-channel = "0.5.15"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # The terminal library decodes no PNG itself; see `vt::init`.
 png = "0.18"
 

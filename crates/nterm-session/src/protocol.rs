@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -109,6 +109,15 @@ pub struct SessionInfo {
     pub layout: String,
 }
 
+/// One row a picker shows.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PickerRow {
+    /// The row's number in the picker's source, which it is known by.
+    pub index: u64,
+    /// What the row shows, and what its matches are found in.
+    pub text: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
@@ -166,6 +175,30 @@ pub enum Control {
     /// program. To a UI: the program has gone. To the program, with
     /// channel 0: the UI has finished, or has gone.
     ShellClosed { channel: u32 },
+    /// The first message of a program running in pane `pane`'s shell that
+    /// wants the daemon to run a picker for it, in place of `Hello`. What
+    /// it sends from then on, in `Frame::Shell`, is for the daemon: which
+    /// picker, and with what. The daemon finds the rows, and the UI attached
+    /// to the pane shows them; see `PickerOpen`. Refused with `Error` as
+    /// `Shell` is.
+    Pick { pane: PaneId },
+    /// From a UI showing picker `picker`: find rows for `query`, and answer
+    /// with no more than `rows` of them. `revision` counts the UI's queries
+    /// for this picker from none, and what is found says which it is for.
+    PickerQuery { picker: u32, revision: u64, query: String, rows: u32 },
+    /// From a UI: it has taken the `PickerRows` with this serial. More
+    /// found for a query already answered is sent only after this.
+    PickerSeen { picker: u32, serial: u64 },
+    /// From a UI: row `row` was chosen, of the rows sent with `serial`. The
+    /// picker is over.
+    PickerAccept { picker: u32, serial: u64, row: u64 },
+    /// From a UI: the picker is over with nothing chosen. With a reason
+    /// when the UI would not show it at all.
+    PickerClose {
+        picker: u32,
+        #[serde(default)]
+        refused: Option<String>,
+    },
     /// End every shell and the daemon.
     Shutdown,
 
@@ -189,6 +222,51 @@ pub enum Control {
         #[serde(default)]
         request: Option<u32>,
         message: String,
+    },
+
+    /// To the UI attached to `pane`: show a picker over it, whose rows the
+    /// daemon finds. The UI asks for them with `PickerQuery`, first for
+    /// `query`, and ends the picker with `PickerAccept` or `PickerClose`.
+    PickerOpen {
+        picker: u32,
+        pane: PaneId,
+        /// What the picker is of, to show with it.
+        label: String,
+        /// The query it starts with.
+        query: String,
+    },
+    /// What was found for the query with this revision. There can be
+    /// several for one revision while the picker's source is still being
+    /// added to, each in place of the one before.
+    PickerRows {
+        picker: u32,
+        /// Counts what this picker has been sent, from one.
+        serial: u64,
+        revision: u64,
+        query: String,
+        /// What of the query the rows' text was matched against.
+        matched_against: String,
+        /// A line to show over the rows.
+        #[serde(default)]
+        header: Option<String>,
+        /// The rows to show, the best first.
+        rows: Vec<PickerRow>,
+        matched: u64,
+        total: u64,
+        /// Source records left out, such as overlong lines.
+        skipped: u64,
+        /// Whether the source has all it will have.
+        done: bool,
+        /// The source's version: rows sent with the same one are the same
+        /// rows under the same numbers.
+        version: u64,
+    },
+    /// To a UI: the picker is over, and not by the UI's doing. With what
+    /// went wrong, if something did.
+    PickerClosed {
+        picker: u32,
+        #[serde(default)]
+        message: Option<String>,
     },
 
     /// A message from a newer version.

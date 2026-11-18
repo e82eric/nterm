@@ -10,6 +10,7 @@
 use crate::{
     conpty,
     log::{log, trace},
+    picker::{Pickers, Showing},
     vt::Terminal,
 };
 use nterm_session::{
@@ -60,6 +61,8 @@ struct Session {
     /// The conversations under way between programs in shells and UIs.
     channels: Mutex<HashMap<u32, Channel>>,
     next_channel: AtomicU32,
+    /// The pickers the daemon is running for programs in shells.
+    pickers: Pickers,
 }
 
 /// A program in a pane's shell talking to the UI attached to that pane. The
@@ -377,6 +380,7 @@ impl Session {
                     session.panes.lock().unwrap().remove(&pane.id);
                 }
                 session.end_channels(|_, channel| channel.pane == pane.id, true);
+                session.pickers.end_where(|of, _| of == pane.id, true);
                 session.broadcast(Control::Exited { pane: pane.id, code });
                 session.sessions_changed();
             })
@@ -395,8 +399,7 @@ impl Session {
 
 /// Serve the session until told to shut down or left idle.
 pub fn run(options: Options) -> io::Result<()> {
-    let mut listener = Listener::bind(&options.session)?;
-    let (sessions_changed, changes) = mpsc::channel();
+    let mut listener = Listener::bind(&options.session)?;    let (sessions_changed, changes) = mpsc::channel();
     let session = Arc::new(Session {
         sessions: Mutex::default(),
         sessions_changed,
@@ -408,6 +411,7 @@ pub fn run(options: Options) -> io::Result<()> {
         clients: Mutex::default(),
         channels: Mutex::default(),
         next_channel: AtomicU32::new(1),
+        pickers: Pickers::default(),
     });
     log(format_args!(
         "serving session {:?}, pid {}, ghostty {GHOSTTY_REVISION}, conpty {}",
@@ -529,6 +533,7 @@ fn serve(session: &Arc<Session>, connection: Connection) {
     }
     // After it has left every pane, so no program finds it there.
     session.end_channels(|_, channel| channel.ui == id, false);
+    session.pickers.end_where(|_, ui| ui == id, false);
     // What it showed is waiting now.
     session.sessions_changed();
     // With every sender gone the writer sends what is queued and ends.
@@ -559,6 +564,9 @@ fn converse(
     };
     if let Frame::Control(Control::Shell { pane }) = first {
         return relay(session, connection, &mut reader, pane, outbox);
+    }
+    if let Frame::Control(Control::Pick { pane }) = first {
+        return pick(session, connection, &mut reader, pane, outbox);
     }
     let Frame::Control(Control::Hello { protocol, ghostty }) = first else {
         fail(None, "expected hello".into());
@@ -612,6 +620,9 @@ fn converse(
         let missing = |request: Option<u32>, pane: PaneId| {
             fail(request, format!("no pane {pane}"));
         };
+        if session.pickers.from_ui(id, &control) {
+            continue;
+        }
         match control {
             Control::Settings { settings } => {
                 *session.settings.lock().unwrap() = settings.clone();
@@ -672,6 +683,7 @@ fn converse(
                 }
                 // After it has left the pane, so no program finds it there.
                 session.end_channels(|_, c| c.pane == pane_id && c.ui == id, false);
+                session.pickers.end_where(|pane, ui| pane == pane_id && ui == id, true);
                 session.sessions_changed();
             }
             Control::SessionSet { id: name, panes, layout } => {
@@ -796,6 +808,60 @@ fn relay(
     // Still there: the program went first, and the UI has to be told.
     if session.channels.lock().unwrap().remove(&number).is_some() {
         let _ = ui.send(Frame::Control(Control::ShellClosed { channel: number }).encode());
+    }
+    Ok(())
+}
+
+/// A program in a pane's shell that wants a picker. The daemon runs it, and
+/// the UI showing the pane shows it; see `crate::picker`.
+fn pick(
+    session: &Arc<Session>,
+    connection: &Connection,
+    reader: &mut impl io::Read,
+    pane_id: PaneId,
+    outbox: &Outbox,
+) -> io::Result<()> {
+    let Some(pane) = session.pane(pane_id) else {
+        let message = format!("no pane {pane_id}");
+        log(format_args!("program {} refused for pane {pane_id}: {message}", connection.peer_pid()));
+        let _ = outbox.send(Frame::Control(Control::Error { request: None, message }).encode());
+        return Ok(());
+    };
+    // The UI that shows the pane, if it is the one a picker was opened for.
+    let shown_by = |ui: u64| {
+        pane.state.lock().unwrap().shown.as_ref().is_some_and(|(shown, _)| *shown == ui)
+    };
+    let mut mine = None;
+    loop {
+        let bytes = match Frame::read(reader) {
+            Ok(Frame::Shell { bytes, .. }) => bytes,
+            Ok(_) => continue,
+            Err(_) => break,
+        };
+        let had = mine;
+        let mut ui = None;
+        let showing = || {
+            let (shown, ui_outbox) =
+                pane.state.lock().unwrap().shown.clone().ok_or("no window is showing this pane")?;
+            ui = Some(shown);
+            Ok(Showing { pane: pane_id, ui: shown, ui_outbox, program: outbox.clone() })
+        };
+        let goes_on = session.pickers.said(&bytes, &mut mine, showing, outbox);
+        // A UI that left the pane while the picker was being opened did not
+        // find it to end.
+        if had.is_none()
+            && mine.is_some()
+            && let Some(ui) = ui
+            && !shown_by(ui)
+        {
+            session.pickers.end_where(|of, by| of == pane_id && by == ui, true);
+        }
+        if !goes_on {
+            break;
+        }
+    }
+    if let Some(number) = mine {
+        session.pickers.program_gone(number);
     }
     Ok(())
 }

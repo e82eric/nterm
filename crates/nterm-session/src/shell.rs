@@ -51,9 +51,19 @@ impl Program {
     }
 
     pub fn connect(session: &str, pane: PaneId) -> io::Result<Self> {
+        Self::open(session, Control::Shell { pane })
+    }
+
+    /// As `connect`, for a program that wants the daemon to run a picker:
+    /// what it sends is for the daemon, and so is what it is answered.
+    pub fn pick(session: &str, pane: PaneId) -> io::Result<Self> {
+        Self::open(session, Control::Pick { pane })
+    }
+
+    fn open(session: &str, first: Control) -> io::Result<Self> {
         let connection = pipe::connect(session)?;
         let mut writer = connection.writer()?;
-        Frame::Control(Control::Shell { pane }).write(&mut writer)?;
+        Frame::Control(first).write(&mut writer)?;
         let mut reader = BufReader::new(connection.reader()?);
         let (tx, events) = mpsc::channel();
         std::thread::Builder::new().name("nterm session".into()).spawn(move || {

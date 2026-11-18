@@ -558,6 +558,13 @@ fn an_idle_daemon_exits_and_a_second_one_defers() {
         .spawn()
         .unwrap();
     // Wait for it to serve, then start a rival: it must stand down at once.
+    // Connecting as a UI does would start a daemon if this one were not
+    // serving yet, and that one would have the session.
+    let deadline = Instant::now() + WAIT;
+    while pipe::connect(&session).is_err() {
+        assert!(Instant::now() < deadline, "the daemon never served");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let ui = Ui::connect(&session);
     assert_eq!(daemon_pid(&ui), daemon.id());
     let rival = std::process::Command::new(DAEMON)
@@ -991,4 +998,281 @@ fn a_pseudoconsole_that_goes_on_its_own_is_logged() {
         eprintln!("{session}:\n{}", logged(session, "anything", |_| true));
         ui.shutdown();
     });
+}
+
+/// What a picker the daemon runs said was found.
+struct Rows {
+    serial: u64,
+    query: String,
+    matched_against: String,
+    rows: Vec<(u64, String)>,
+    matched: u64,
+}
+impl Rows {
+    fn texts(&self) -> Vec<&str> {
+        let mut texts: Vec<&str> = self.rows.iter().map(|(_, text)| text.as_str()).collect();
+        texts.sort();
+        texts
+    }
+}
+
+/// A folder of a few files and folders, removed when dropped.
+struct Tree(std::path::PathBuf);
+impl Tree {
+    fn new(test: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("nterm-pick-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for file in ["a/alpha.txt", "a/beta.txt", "b/gamma.rs", "top.md"] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, file).unwrap();
+        }
+        Self(root)
+    }
+    fn path(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+}
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A program that has asked the daemon for a picker.
+struct Asker(nterm_session::shell::Program);
+impl Asker {
+    fn ask(session: &str, pane: PaneId, picker: &str, params: serde_json::Value) -> Self {
+        let mut program = nterm_session::shell::Program::pick(session, pane).expect("connect");
+        let open = serde_json::json!({
+            "type": "open", "request_id": "r1", "picker": picker, "params": params,
+        });
+        // Refused already for a pane there is not, and nothing more is read.
+        let _ = program.send(open.to_string().as_bytes());
+        Self(program)
+    }
+    /// What the daemon says next.
+    fn told(&self) -> serde_json::Value {
+        use nterm_session::shell::Event;
+        match self.0.receive(WAIT).expect("the daemon said nothing") {
+            Event::Message(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            Event::Closed => serde_json::json!({"type": "closed"}),
+            Event::Refused(why) => serde_json::json!({"type": "refused", "message": why}),
+            Event::Lost => serde_json::json!({"type": "lost"}),
+        }
+    }
+    /// How the picker ended: its status, and the rest of the result.
+    fn result(&self) -> (String, serde_json::Value) {
+        let told = self.told();
+        assert_eq!((&told["type"], &told["request_id"]), (&"result".into(), &"r1".into()), "{told}");
+        (told["status"].as_str().unwrap().to_owned(), told)
+    }
+}
+
+impl Ui {
+    /// A program asks for a picker over `pane`, and this UI is asked to
+    /// show it.
+    fn picker(
+        &mut self,
+        session: &str,
+        pane: PaneId,
+        name: &str,
+        params: serde_json::Value,
+    ) -> (Asker, u32) {
+        let asker = Asker::ask(session, pane, name, params);
+        let Control::PickerOpen { picker, pane: over, .. } =
+            self.control(|c| matches!(c, Control::PickerOpen { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(over, pane);
+        assert_eq!(asker.told()["type"], "opened");
+        (asker, picker)
+    }
+
+    /// Ask a picker for `query`, and take what it finds until its source
+    /// has all it will have.
+    fn query(&mut self, picker: u32, revision: u64, query: &str) -> Rows {
+        self.send(Control::PickerQuery { picker, revision, query: query.into(), rows: 200 });
+        loop {
+            let found = self
+                .control(|c| matches!(c, Control::PickerRows { picker: of, .. } if *of == picker));
+            let Control::PickerRows {
+                serial, revision: of, query, matched_against, rows, matched, done, ..
+            } = found
+            else {
+                unreachable!()
+            };
+            self.send(Control::PickerSeen { picker, serial });
+            if of == revision && done {
+                let rows = rows.into_iter().map(|row| (row.index, row.text)).collect();
+                return Rows { serial, query, matched_against, rows, matched };
+            }
+        }
+    }
+}
+
+#[test]
+fn a_program_is_run_a_picker_of_files_and_given_the_one_chosen() {
+    let session = session("pick-files");
+    let tree = Tree::new("files");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    let params = serde_json::json!({"cwd": tree.path()});
+    let (asker, picker) = ui.picker(&session, pane, "files", params);
+
+    // Everything under the folder, said from there, and not the folders.
+    let all = ui.query(picker, 0, "");
+    assert_eq!(all.texts(), ["a\\alpha.txt", "a\\beta.txt", "b\\gamma.rs", "top.md"]);
+    assert_eq!(all.matched, 4);
+
+    let some = ui.query(picker, 1, "gam");
+    assert_eq!((some.query.as_str(), some.matched_against.as_str()), ("gam", "gam"));
+    assert_eq!(some.texts(), ["b\\gamma.rs"]);
+
+    // The UI says only which row; the program is given what it is.
+    let (row, _) = some.rows[0];
+    ui.send(Control::PickerAccept { picker, serial: some.serial, row });
+    let (status, result) = asker.result();
+    assert_eq!(status, "accepted");
+    assert_eq!(result["query"], "gam");
+    assert_eq!(result["selected"][0]["text"], "b\\gamma.rs");
+    let whole = tree.0.join("b").join("gamma.rs");
+    assert_eq!(result["selected"][0]["value"], whole.to_string_lossy().as_ref());
+    // The conversation is over, and the daemon closed it.
+    assert!(matches!(asker.told()["type"].as_str(), Some("closed" | "lost")));
+    // Nothing is said of a picker that is over.
+    ui.send(Control::PickerQuery { picker, revision: 2, query: "a".into(), rows: 200 });
+    ui.panes();
+    ui.shutdown();
+}
+
+#[test]
+fn a_picker_of_folders_and_the_ways_a_ui_ends_one() {
+    let session = session("pick-folders");
+    let tree = Tree::new("folders");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    let params = || {
+        let roots = serde_json::to_string(&[tree.path()]).unwrap();
+        serde_json::json!({"roots": roots, "query": "b"})
+    };
+
+    // It starts with the query it was asked for with.
+    let asker = Asker::ask(&session, pane, "directories", params());
+    let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
+    let Control::PickerOpen { picker, label, query, .. } = opened else { unreachable!() };
+    assert_eq!((label.as_str(), query.as_str()), ("Directories", "b"));
+    assert_eq!(asker.told()["type"], "opened");
+    assert_eq!(ui.query(picker, 0, "b").texts(), ["b"]);
+    assert_eq!(ui.query(picker, 1, "").texts(), ["a", "b"]);
+
+    // Closed with nothing chosen.
+    ui.send(Control::PickerClose { picker, refused: None });
+    assert_eq!(asker.result().0, "cancelled");
+
+    // Not shown at all.
+    let (asker, picker) = ui.picker(&session, pane, "directories", params());
+    ui.send(Control::PickerClose { picker, refused: Some("busy".into()) });
+    let (status, result) = asker.result();
+    assert_eq!(status, "error");
+    assert_eq!((&result["code"], &result["message"]), (&"refused".into(), &"busy".into()));
+
+    // A row it was not sent.
+    let (asker, picker) = ui.picker(&session, pane, "directories", params());
+    let found = ui.query(picker, 0, "");
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: 9999 });
+    let (status, result) = asker.result();
+    assert_eq!((status.as_str(), &result["code"]), ("error", &"no_such_row".into()));
+    ui.shutdown();
+}
+
+#[test]
+fn a_picker_ends_when_its_program_or_its_ui_goes() {
+    let session = session("pick-ends");
+    let tree = Tree::new("ends");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    let params = || serde_json::json!({"cwd": tree.path()});
+    let closed = |ui: &mut Ui, picker: u32| {
+        ui.control(|c| matches!(c, Control::PickerClosed { picker: of, .. } if *of == picker));
+    };
+
+    // The program says it is done with it.
+    let (mut asker, picker) = ui.picker(&session, pane, "files", params());
+    asker.0.send(b"{\"type\":\"cancel\"}").unwrap();
+    closed(&mut ui, picker);
+    assert_eq!(asker.result().0, "cancelled");
+
+    // The program goes.
+    let (asker, picker) = ui.picker(&session, pane, "files", params());
+    drop(asker);
+    closed(&mut ui, picker);
+
+    // The UI lets go of the pane.
+    let (asker, picker) = ui.picker(&session, pane, "files", params());
+    ui.send(Control::Detach { pane });
+    closed(&mut ui, picker);
+    assert_eq!(asker.result().0, "cancelled");
+    ui.show(pane);
+
+    // The shell of the pane ends.
+    let (asker, picker) = ui.picker(&session, pane, "files", params());
+    let mut other = Ui::connect(&session);
+    let second = other.shell();
+    let (theirs, _) = other.picker(&session, second, "files", params());
+    ui.send(Control::Close { pane });
+    closed(&mut ui, picker);
+    assert_eq!(asker.result().0, "cancelled");
+
+    // The UI goes altogether.
+    other.connection.close();
+    drop(other);
+    assert_eq!(theirs.result().0, "cancelled");
+    ui.shutdown();
+}
+
+#[test]
+fn a_picker_is_refused_for_what_cannot_be_shown_or_is_not_one() {
+    let session = session("pick-refuse");
+    let tree = Tree::new("refuse");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(200, 24)).pane;
+    let params = serde_json::json!({"cwd": tree.path()});
+
+    let nowhere = Asker::ask(&session, pane + 100, "files", params.clone());
+    assert_eq!(nowhere.told()["type"], "refused");
+
+    // Nothing shows the pane.
+    let (status, result) = Asker::ask(&session, pane, "files", params.clone()).result();
+    assert_eq!((status.as_str(), &result["code"]), ("error", &"no_window".into()));
+
+    ui.show(pane);
+    let missing = tree.0.join("none").to_string_lossy().into_owned();
+    for (name, params) in [
+        ("themes", params),
+        ("files", serde_json::json!({})),
+        ("files", serde_json::json!({"cwd": missing})),
+    ] {
+        let (status, result) = Asker::ask(&session, pane, name, params).result();
+        assert_eq!((status.as_str(), &result["code"]), ("error", &"bad_request".into()), "{result}");
+    }
+    ui.shutdown();
+}
+
+#[test]
+fn a_client_that_comes_and_goes_before_it_is_waited_for_does_not_stop_the_next() {
+    // The daemon's own listener, held here so that nothing waits on it
+    // while the first client comes and goes.
+    let session = session("came-and-went");
+    let mut listener = pipe::Listener::bind(&session).unwrap();
+    drop(pipe::connect(&session).unwrap());
+    let refused = listener.accept().err().expect("the client that went was not one");
+    assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    let client = std::thread::spawn({
+        let session = session.clone();
+        move || pipe::connect(&session).map(drop)
+    });
+    listener.accept().expect("the next client is taken");
+    client.join().unwrap().unwrap();
 }
