@@ -38,7 +38,7 @@ use nfm_search_core::{
         ItemsSource, PublishingStreamingItemStoreWithPayload, SearchPlan, StreamingItemSnapshotWithPayload,
     },
 };
-use nterm_session::protocol::{Control, Frame, PaneId, PickerRow};
+use nterm_session::protocol::{Control, Frame, PaneId, PickerRow, PreviewKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -168,6 +168,10 @@ enum Lists {
 const MOST_PREVIEW: usize = 256 * 1024;
 /// The most entries of a folder that are.
 const MOST_LISTED: usize = 1000;
+/// The most of a picture that is: one larger is not sent.
+const MOST_PICTURE: u64 = 10 * 1024 * 1024;
+/// The files that are pictures, by how their names end.
+const PICTURES: [&str; 8] = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"];
 
 /// What shows for a row: the start of a file, or what is in a folder.
 #[derive(Debug, Default, PartialEq)]
@@ -179,6 +183,8 @@ struct Shown {
     /// The line of the text, from one, that the row is about.
     line: Option<u64>,
     error: Option<String>,
+    /// The file itself, where it is a picture, in place of `text`.
+    picture: Option<Vec<u8>>,
 }
 impl Shown {
     fn of(path: &Path, line: Option<u64>) -> Self {
@@ -194,6 +200,19 @@ impl Shown {
         use std::io::Read;
         let file = std::fs::File::open(path)?;
         let size = file.metadata()?.len();
+        // A picture is sent as it is, for the UI to draw.
+        let extension = path.extension().map(|extension| extension.to_string_lossy().to_lowercase());
+        if extension.is_some_and(|extension| PICTURES.contains(&extension.as_str())) {
+            if size > MOST_PICTURE {
+                return Ok(Self { text: format!("A picture too large to show: {size} bytes"), ..Default::default() });
+            }
+            let mut bytes = Vec::new();
+            (&file).take(MOST_PICTURE).read_to_end(&mut bytes)?;
+            if !bytes.is_empty() {
+                return Ok(Self { picture: Some(bytes), ..Default::default() });
+            }
+            return Ok(Self { text: "An empty file".into(), ..Default::default() });
+        }
         let mut bytes = Vec::new();
         file.take(MOST_PREVIEW as u64).read_to_end(&mut bytes)?;
         // A file with a zero byte near its start is not one to read as text.
@@ -212,6 +231,7 @@ impl Shown {
             truncated,
             line: None,
             error: None,
+            picture: None,
         })
     }
 
@@ -275,6 +295,7 @@ impl Shown {
             truncated: left_out,
             line: at,
             error: None,
+            picture: None,
         })
     }
 
@@ -1258,16 +1279,21 @@ impl Picker {
                     }
                     let (request, path, line) = last;
                     let shown = Shown::of(&path, line);
-                    let previewed = Control::PickerPreviewed {
-                        picker: number,
-                        request,
-                        text: shown.text,
-                        name: shown.name,
-                        truncated: shown.truncated,
-                        line: shown.line,
-                        error: shown.error,
+                    let previewed = match shown.picture {
+                        Some(bytes) => {
+                            Frame::Previewed { picker: number, request, kind: PreviewKind::Image, bytes }
+                        }
+                        None => Frame::Control(Control::PickerPreviewed {
+                            picker: number,
+                            request,
+                            text: shown.text,
+                            name: shown.name,
+                            truncated: shown.truncated,
+                            line: shown.line,
+                            error: shown.error,
+                        }),
                     };
-                    if ui.send(Frame::Control(previewed).encode()).is_err() {
+                    if ui.send(previewed.encode()).is_err() {
                         break;
                     }
                 }
@@ -1504,6 +1530,18 @@ mod tests {
         assert_eq!((&folder.name, folder.truncated), (&None, false));
         assert_eq!(Shown::of(&root.join("sub"), None).text, "Empty folder");
 
+        // A picture is the file itself, whatever the case of its name, and
+        // one too large to send, or with nothing in it, says so.
+        std::fs::write(root.join("Dot.PNG"), [137u8, 80, 78, 71, 0, 1]).unwrap();
+        let picture = Shown::of(&root.join("Dot.PNG"), None);
+        assert_eq!((picture.picture.as_deref(), picture.text.as_str()), (Some(&[137u8, 80, 78, 71, 0, 1][..]), ""));
+        assert_eq!(Shown::of(&root.join("Dot.PNG"), Some(1)).line, None);
+        let large = std::fs::File::create(root.join("large.jpg")).unwrap();
+        large.set_len(MOST_PICTURE + 1).unwrap();
+        let large = Shown::of(&root.join("large.jpg"), None);
+        assert!(large.picture.is_none() && large.text.starts_with("A picture too large to show"), "{}", large.text);
+        std::fs::write(root.join("none.gif"), []).unwrap();
+        assert_eq!(Shown::of(&root.join("none.gif"), None).text, "An empty file");
         let missing = Shown::of(&root.join("none.txt"), None);
         assert!(missing.error.is_some() && missing.text.is_empty());
         let _ = std::fs::remove_dir_all(&root);

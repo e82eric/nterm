@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -353,6 +353,30 @@ pub enum Frame {
     Resized { pane: PaneId, cols: u16, rows: u16 },
     /// A whole ghostty snapshot, answering `Control::Snapshot`.
     Snapshot { request: u32, bytes: Vec<u8> },
+    /// To a UI: what shows for the row it asked of with `request`, where
+    /// that is not text: see `Control::PickerPreviewed`. It is content,
+    /// and nothing for the UI to open or run.
+    Previewed { picker: u32, request: u64, kind: PreviewKind, bytes: Vec<u8> },
+}
+
+/// What the bytes of a preview are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewKind {
+    /// What a program printed, with the escape sequences that colour it.
+    Ansi,
+    /// A picture, as the file of one: a PNG, a JPEG.
+    Image,
+}
+impl PreviewKind {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Ansi => 1,
+            Self::Image => 2,
+        }
+    }
+    fn of(byte: u8) -> Option<Self> {
+        [Self::Ansi, Self::Image].into_iter().find(|kind| kind.byte() == byte)
+    }
 }
 
 const KIND_CONTROL: u8 = 0;
@@ -362,6 +386,7 @@ const KIND_SCREEN: u8 = 3;
 const KIND_SNAPSHOT: u8 = 4;
 const KIND_RESIZED: u8 = 6;
 const KIND_SHELL: u8 = 5;
+const KIND_PREVIEWED: u8 = 7;
 
 impl Frame {
     /// The frame as it travels, length first.
@@ -381,6 +406,13 @@ impl Frame {
                 [cols.to_le_bytes(), rows.to_le_bytes()].concat().into(),
             ),
             Self::Shell { channel, bytes } => (KIND_SHELL, Some(*channel), bytes.as_slice().into()),
+            Self::Previewed { picker, request, kind, bytes } => {
+                let mut body = Vec::with_capacity(9 + bytes.len());
+                body.extend_from_slice(&request.to_le_bytes());
+                body.push(kind.byte());
+                body.extend_from_slice(bytes);
+                (KIND_PREVIEWED, Some(*picker), body.into())
+            }
             Self::Snapshot { request, bytes } => {
                 (KIND_SNAPSHOT, Some(*request), bytes.as_slice().into())
             }
@@ -433,6 +465,13 @@ impl Frame {
                 _ => Err(invalid("resized frame")),
             },
             KIND_SHELL => Ok(Self::Shell { channel: id, bytes }),
+            KIND_PREVIEWED => {
+                let (request, rest) = bytes.split_first_chunk::<8>().ok_or_else(|| invalid("previewed frame"))?;
+                let (kind, bytes) = rest.split_first().ok_or_else(|| invalid("previewed frame"))?;
+                // A kind from a newer version.
+                let Some(kind) = PreviewKind::of(*kind) else { return Ok(Self::Control(Control::Unknown)) };
+                Ok(Self::Previewed { picker: id, request: u64::from_le_bytes(*request), kind, bytes: bytes.to_vec() })
+            }
             // A frame kind from a newer version.
             _ => Ok(Self::Control(Control::Unknown)),
         }
@@ -478,6 +517,8 @@ mod tests {
         round_trip(Frame::Input { pane: 7, bytes: vec![] });
         round_trip(Frame::Screen { pane: 1, bytes: vec![0, 1, 2] });
         round_trip(Frame::Snapshot { request: 9, bytes: vec![255; 300] });
+        round_trip(Frame::Previewed { picker: 4, request: u64::MAX - 1, kind: PreviewKind::Image, bytes: vec![0, 137, 80] });
+        round_trip(Frame::Previewed { picker: 4, request: 2, kind: PreviewKind::Ansi, bytes: vec![] });
         round_trip(Control::Hello { protocol: PROTOCOL_VERSION, ghostty: "abc".into() }.into());
         round_trip(
             Control::Spawn {

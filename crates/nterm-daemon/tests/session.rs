@@ -1315,6 +1315,26 @@ fn a_ui_is_sent_what_shows_for_a_row_of_a_picker() {
     let Control::PickerPreviewed { error, .. } = shown else { unreachable!() };
     assert!(error.is_some());
     assert_eq!(ui.query(picker, 1, "alp").texts(), ["a\\alpha.txt"]);
+
+    // A picture is sent as the file it is, and not as text. It is made
+    // after the picker opened: what is listed is found again by asking.
+    let picture = [137u8, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 255];
+    std::fs::write(std::path::Path::new(&tree.path()).join("top.md"), picture).unwrap();
+    std::fs::rename(
+        std::path::Path::new(&tree.path()).join("top.md"),
+        std::path::Path::new(&tree.path()).join("Top.PNG"),
+    )
+    .unwrap();
+    ui.send(Control::PickerClose { picker, refused: None });
+    assert_eq!(asker.result().0, "cancelled");
+    let (asker, picker) = ui.picker(&session, pane, "files", serde_json::json!({"cwd": tree.path()}));
+    let found = ui.query(picker, 0, "top");
+    assert_eq!(found.texts(), ["Top.PNG"]);
+    ui.send(Control::PickerPreview { picker, request: 7, serial: found.serial, row: found.rows[0].0 });
+    let sent = ui.frame(|frame| matches!(frame, Frame::Previewed { .. }));
+    let Frame::Previewed { picker: of, request, kind, bytes } = sent else { unreachable!() };
+    assert_eq!((of, request, kind), (picker, 7, nterm_session::protocol::PreviewKind::Image));
+    assert_eq!(bytes, picture);
     ui.send(Control::PickerClose { picker, refused: None });
     assert_eq!(asker.result().0, "cancelled");
 

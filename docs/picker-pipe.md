@@ -149,8 +149,8 @@ first line sent, not the file's first.
 
 Each row of `files` and `directories` has a preview, hidden until Ctrl+P shows it; with `preview = "true"`
 in the parameters it opens shown. A file shows its first 256 KB as text,
-coloured by its name, and a folder shows what is in it. The daemon reads them
-and the window lays them out. Images and the rest of a longer file are not
+coloured by its name, a picture (png, jpg, jpeg, gif, bmp, webp, tif, tiff) of up to 10 MiB shows as the picture, and a folder shows what is in it. The daemon reads them
+and the window lays them out. The rest of a longer file is not
 shown yet.
 
 `profile.example.ps1` binds these pickers to

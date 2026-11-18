@@ -615,6 +615,7 @@ fn converse(
             Frame::Output { .. }
             | Frame::Screen { .. }
             | Frame::Resized { .. }
+            | Frame::Previewed { .. }
             | Frame::Snapshot { .. } => continue,
         };
         let missing = |request: Option<u32>, pane: PaneId| {

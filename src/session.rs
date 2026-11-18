@@ -814,6 +814,9 @@ pub(crate) struct Previewed {
     pub(crate) truncated: bool,
     /// The line of the text, from one, to show in the middle and mark.
     pub(crate) line: Option<usize>,
+    /// What shows where that is not text: what a program printed, or a
+    /// picture.
+    pub(crate) bytes: Option<(nterm_session::protocol::PreviewKind, Vec<u8>)>,
 }
 
 /// How long a preview is waited for.
@@ -1170,6 +1173,14 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                     );
                 }
             }
+            Frame::Previewed { picker, request, kind, bytes } => {
+                let shown = daemon.pickers.lock().unwrap().get(&picker).cloned();
+                if let Some(shown) = shown {
+                    let previewed =
+                        Previewed { text: String::new(), name: None, truncated: false, line: None, bytes: Some((kind, bytes)) };
+                    shown.previewed(request, Ok(previewed));
+                }
+            }
             Frame::Control(Control::PickerPreviewed { picker, request, text, name, truncated, line, error }) => {
                 let shown = daemon.pickers.lock().unwrap().get(&picker).cloned();
                 if let Some(shown) = shown {
@@ -1177,7 +1188,13 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                         request,
                         match error {
                             Some(error) => Err(error),
-                            None => Ok(Previewed { text, name, truncated, line: line.and_then(|line| usize::try_from(line).ok()).filter(|line| *line > 0) }),
+                            None => Ok(Previewed {
+                                text,
+                                name,
+                                truncated,
+                                line: line.and_then(|line| usize::try_from(line).ok()).filter(|line| *line > 0),
+                                bytes: None,
+                            }),
                         },
                     );
                 }
