@@ -92,6 +92,10 @@ pub(crate) struct Remote {
     pub(crate) directory: Option<String>,
     /// Which of the daemons there, as `--session` says which here.
     pub(crate) session: Option<String>,
+    /// The folders there a workspace can be started in, and how many
+    /// levels inside them; this machine's number of levels without it.
+    pub(crate) new_roots: Vec<String>,
+    pub(crate) new_depth: Option<i32>,
 }
 
 /// What a new shell on another machine is started with when its remote
@@ -1554,6 +1558,9 @@ pub(crate) struct Link {
     /// while the surface is fed, so it cannot be destroyed underneath.
     host: Mutex<usize>,
     state: Mutex<State>,
+    /// On a remote, the folder there a shell it starts starts in, as that
+    /// remote's daemon listed it.
+    there: Option<String>,
 }
 
 impl Link {
@@ -1578,11 +1585,13 @@ impl Link {
     /// when the shell to be taken cannot be. A shell of the surface's own
     /// in its place would not outlive the window, and nothing would say so.
     ///
-    /// `place` is where the shell is to run.
+    /// `place` is where the shell is to run, and on a remote `there` is the
+    /// folder there it starts in: see `SpawnSpec`.
     pub(crate) fn prepare(
         wake: *mut c_void,
         start: &Start,
         place: &Place,
+        there: Option<String>,
     ) -> Result<Option<Arc<Link>>, String> {
         let daemon = daemon(place);
         let want = match (start, &daemon) {
@@ -1625,6 +1634,7 @@ impl Link {
                 size: None,
                 queued_input: Vec::new(),
             }),
+            there,
         });
         Ok(Some(link))
     }
@@ -2036,10 +2046,11 @@ extern "C" fn on_spawn(userdata: *mut c_void, spawn: *const HostSpawn) {
         let spec = match link.daemon.remote.clone() {
             // The terminal describes a shell for this machine. Another
             // machine's is its remote's command, in the daemon's own
-            // environment and directory.
+            // environment, and in the remote's directory or a folder of
+            // that machine its daemon listed.
             Some(remote) => SpawnSpec {
                 command: remote.command.unwrap_or_else(|| REMOTE_COMMAND.into()),
-                cwd: remote.directory,
+                cwd: link.there.clone().or(remote.directory),
                 env: Vec::new(),
             },
             None => SpawnSpec {
@@ -2159,6 +2170,7 @@ mod tests {
             daemon: daemon.map(str::to_owned),
             directory: None,
             session: None,
+            ..Remote::default()
         };
         assert!(remote("me@host", Some("pwsh.exe -NoLogo"), Some(r"C:\a b\d.exe")).check().is_ok());
         for bad in [

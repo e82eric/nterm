@@ -236,6 +236,9 @@ pub(crate) struct SpawnOptions {
     /// Where the shell runs. `None` is the current workspace's place, which
     /// the window fills in.
     pub place: Option<crate::session::Place>,
+    /// On a remote, the folder there the shell starts in, as that remote's
+    /// daemon listed it. Without it, the remote's `directory`.
+    pub there: Option<String>,
 }
 impl SpawnOptions {
     pub fn validate(&self) -> Result<(), String> {
@@ -828,7 +831,7 @@ impl TerminalPane {
         let cwd = text(&options.cwd, "pane directory")?;
         let userdata: *mut c_void = (&mut *wake as *mut WakeState).cast();
         let place = options.place.clone().unwrap_or_else(crate::session::home);
-        let session = crate::session::Link::prepare(userdata, &options.start, &place)
+        let session = crate::session::Link::prepare(userdata, &options.start, &place, options.there.clone())
             .map_err(|e| FatalError::new("show a running shell", e))?;
         // A shell of the pane's own is reached by a pipe of the pane's own.
         #[cfg(unix)]

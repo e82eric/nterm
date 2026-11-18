@@ -87,6 +87,10 @@ pub(crate) struct TerminalView {
     window_picker_rows: String,
     /// The folders the window's picker lists after its rows, and the search
     /// for them that a daemon does, once one has been asked.
+    /// The place whose page of the picker of workspaces shows: a remote's,
+    /// or none for the first page, with the window's workspaces and this
+    /// machine's sessions and folders.
+    window_picker_page: Option<crate::session::Place>,
     window_folders: Option<(std::sync::Arc<crate::picker::FolderRows>, Option<std::sync::Arc<crate::session::Folders>>)>,
     /// What that picker was last told to say, and when: new rows take it
     /// away, and it is said again while it would still have been showing.
@@ -300,6 +304,7 @@ impl TerminalView {
             empty: None,
             window_picker: None,
             window_picker_rows: String::new(),
+            window_picker_page: None,
             window_folders: None,
             picker_said: None,
             picker_bindings,
@@ -587,8 +592,8 @@ impl TerminalView {
                 }
             }
             AppAction::RenameWorkspace { id, name } => self.rename_workspace(id, &name),
-            AppAction::CreateWorkspaceIn(cwd) => {
-                if let Err(error) = self.create_workspace_in(cwd, gl) {
+            AppAction::CreateWorkspaceIn(place, cwd) => {
+                if let Err(error) = self.create_workspace_in(Some((place, cwd)), gl) {
                     self.show_error("Workspace action failed", error);
                 }
             }
@@ -617,6 +622,13 @@ impl TerminalView {
             // shown again to choose from that.
             AppAction::Connect(place) => {
                 crate::session::connect(&place);
+                self.open_workspace_picker(ctx);
+            }
+            // The page of what a remote has, which fills in once it is
+            // connected to.
+            AppAction::PlacePage(place) => {
+                crate::session::connect(&place);
+                self.window_picker_page = Some(place);
                 self.open_workspace_picker(ctx);
             }
             AppAction::ReloadConfig => match self.reload_source.reload() {

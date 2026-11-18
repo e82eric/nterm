@@ -416,6 +416,13 @@ struct RemoteConfig {
     directory: Option<String>,
     /// Which of the daemons there. Without it, the one called "default".
     session: Option<String>,
+    /// The folders there a workspace can be started in: each folder inside
+    /// one of these is listed on the remote's page of the picker of
+    /// workspaces, found by its daemon.
+    new_roots: Vec<String>,
+    /// How many levels of folders inside them. Without it,
+    /// `workspaces.new_depth`.
+    new_depth: Option<i32>,
 }
 
 impl RemoteConfig {
@@ -429,7 +436,15 @@ impl RemoteConfig {
             daemon: self.daemon,
             directory: self.directory,
             session: self.session,
+            new_roots: self.new_roots,
+            new_depth: self.new_depth,
         };
+        if remote.new_roots.iter().any(|root| root.trim().is_empty() || root.contains('\0')) {
+            return Err(format!("remotes.{name}.new_roots must contain nonempty paths"));
+        }
+        if remote.new_depth.is_some_and(|depth| depth < 1) {
+            return Err(format!("remotes.{name}.new_depth must be at least 1"));
+        }
         remote.check().map_err(|error| format!("remotes.{name}: {error}"))?;
         Ok(remote)
     }
@@ -4019,6 +4034,21 @@ mod tests {
         let error = remotes.remove("bad").unwrap().named("bad").unwrap_err();
         assert!(error.starts_with("remotes.bad: address"), "{error}");
         assert!(parse("return { remotes = { vm = { adress = 'x' } } }").is_err());
+
+        // The folders there a workspace can be started in, and how deep.
+        let named = |table: &str| {
+            let mut remotes = parse(&format!("return {{ remotes = {{ vm = {table} }} }}")).unwrap().remotes;
+            remotes.remove("vm").unwrap().named("vm")
+        };
+        let vm = named("{ new_roots = { 'C:/src', 'D:/work' }, new_depth = 2 }").unwrap();
+        assert_eq!((vm.new_roots, vm.new_depth), (vec!["C:/src".to_owned(), "D:/work".to_owned()], Some(2)));
+        let vm = named("{}").unwrap();
+        assert_eq!((vm.new_roots.len(), vm.new_depth), (0, None));
+        for bad in ["{ new_roots = { '' } }", "{ new_depth = 0 }"] {
+            let error = named(bad).unwrap_err();
+            assert!(error.starts_with("remotes.vm.new_"), "{bad}: {error}");
+        }
+        assert!(parse("return { remotes = { vm = { new_roots = 'C:/src' } } }").is_err());
 
         // On the command line, refused before anything is asked of ssh.
         for bad in [

@@ -472,16 +472,23 @@ pub(crate) struct CreateOptions {
     /// The place its shells run in. `None` is the current workspace's.
     #[serde(skip)]
     pub place: Option<crate::session::Place>,
+    /// On a remote, the folder there its first shell starts in: one that
+    /// remote's daemon listed. A shell there starts in no folder the window
+    /// names itself, which might be one of this machine's.
+    #[serde(skip)]
+    pub there: Option<String>,
 }
 impl CreateOptions {
-    /// One whose first shell starts in `cwd`, a folder the user chose from
-    /// those the window lists. They are this machine's folders, so its
-    /// shells run here, whatever place the current workspace is in: a
-    /// folder of this machine is no folder of a remote. With no folder it
-    /// is made where the current workspace is.
-    pub(crate) fn in_folder(cwd: Option<String>) -> Self {
-        let place = cwd.is_some().then_some(crate::session::Place::Here);
-        Self { cwd, place, ..Default::default() }
+    /// One whose first shell starts in `folder`, a folder of `place` the
+    /// user chose from those the window lists: the workspace is of that
+    /// place, whatever place the current one is in. A folder of this
+    /// machine is no folder of a remote, nor the other way round.
+    pub(crate) fn in_folder(place: crate::session::Place, folder: String) -> Self {
+        let (cwd, there) = match place {
+            crate::session::Place::Here => (Some(folder), None),
+            crate::session::Place::Remote(_) => (None, Some(folder)),
+        };
+        Self { cwd, there, place: Some(place), ..Default::default() }
     }
 }
 /// `app:create_pane` options: the destination workspace (current by default)
@@ -597,14 +604,19 @@ mod tests {
     use super::*;
     use crate::terminal::layout::Deck;
     #[test]
-    fn a_workspace_started_in_a_chosen_folder_is_of_this_machine() {
+    fn a_workspace_started_in_a_chosen_folder_is_of_its_place() {
         use crate::session::Place;
-        // The folders listed are this machine's, whatever place the
-        // current workspace is in.
-        let chosen = CreateOptions::in_folder(Some("C:/src/project".into()));
-        assert_eq!((chosen.cwd.as_deref(), chosen.place), (Some("C:/src/project"), Some(Place::Here)));
-        // With none chosen it is made where the current one is.
-        assert_eq!(CreateOptions::in_folder(None).place, None);
+        // Of the place whose folder it is, whatever place the current
+        // workspace is in.
+        let chosen = CreateOptions::in_folder(Place::Here, "C:/src/project".into());
+        assert_eq!((chosen.cwd.as_deref(), chosen.there), (Some("C:/src/project"), None));
+        assert_eq!(chosen.place, Some(Place::Here));
+        // A remote's folder is said apart, as the remote's, and not as a
+        // directory of this machine.
+        let vm = Place::Remote("vm".into());
+        let chosen = CreateOptions::in_folder(vm.clone(), "C:/src/project".into());
+        assert_eq!((chosen.cwd, chosen.there.as_deref()), (None, Some("C:/src/project")));
+        assert_eq!(chosen.place, Some(vm));
     }
     #[test]
     fn a_workspace_is_called_after_its_directory_and_counted_from_the_second() {

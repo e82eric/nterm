@@ -73,6 +73,8 @@ const FOLDER_ROWS: usize = 1 << 40;
 /// one before.
 #[derive(Default)]
 pub(crate) struct FolderRows {
+    /// The place they are folders of, where a workspace in one is made.
+    place: crate::session::Place,
     /// The folders, and how many times they have been given.
     rows: std::sync::Mutex<(Option<Arc<Items>>, u64)>,
     done: AtomicBool,
@@ -116,14 +118,14 @@ impl FolderRows {
     }
 }
 
-/// The row of a folder: one that starts a workspace in it.
-fn folder_entry(path: String) -> crate::actions::Entry {
+/// The row of a folder of `place`: one that starts a workspace there, in it.
+fn folder_entry(place: crate::session::Place, path: String) -> crate::actions::Entry {
     crate::actions::Entry {
         id: format!("workspace.in.{path}"),
         label: String::new(),
         shortcut: None,
         cells: Vec::new(),
-        action: crate::actions::AppAction::CreateWorkspaceIn(Some(path)),
+        action: crate::actions::AppAction::CreateWorkspaceIn(place, path),
     }
 }
 
@@ -668,12 +670,12 @@ impl PickerSource {
     /// are given to what this returns, which a daemon finds. Whoever shows
     /// the rows has then to be given the picker's `members`. None when it
     /// is not such a picker.
-    pub(super) fn list_folders(&mut self) -> Option<Arc<FolderRows>> {
+    pub(super) fn list_folders(&mut self, place: crate::session::Place) -> Option<Arc<FolderRows>> {
         let Self::CommandPalette { runtime, workspaces: true, .. } = self else {
             return None;
         };
         let Session::Structured { snapshot, groups } = &runtime.session else { return None };
-        let store = Arc::new(FolderRows::default());
+        let store = Arc::new(FolderRows { place, ..Default::default() });
         let (snapshot, groups) = (snapshot.clone(), groups.clone());
         runtime.session = Session::Folders { snapshot, groups, store: store.clone() };
         Some(store)
@@ -753,7 +755,7 @@ impl PickerSource {
         // those found.
         let Session::Folders { store, .. } = &runtime.session else { return None };
         let folder = store.folder(result.node_index.checked_sub(FOLDER_ROWS)?)?;
-        Some(Cow::Owned(folder_entry(folder)))
+        Some(Cow::Owned(folder_entry(store.place.clone(), folder)))
     }
     pub(super) fn accepted_value(&self, result: &SearchResult) -> String {
         let value = match self {
@@ -1450,7 +1452,7 @@ mod grouped_rows_tests {
         };
         // In the order that how well each matches would give them.
         let entries = [
-            row(["", "pub"], AppAction::CreateWorkspaceIn(Some("pub".into()))),
+            row(["", "pub"], AppAction::CreateWorkspaceIn(crate::session::Place::Here, "pub".into())),
             row(["a pub of sorts", "detached"], AppAction::AttachSession("a".into())),
             row(["the long way to a p u b", ""], AppAction::SelectWorkspaceId(1)),
         ];

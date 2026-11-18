@@ -185,8 +185,12 @@ impl Picker {
     }
     /// Have a picker of workspaces list, after its rows, the folders given
     /// to what this returns, each lot in place of the last.
-    pub(crate) fn list_folders(&mut self, ctx: &egui::Context) -> Option<Arc<source::FolderRows>> {
-        let folders = self.source.list_folders()?;
+    pub(crate) fn list_folders(
+        &mut self,
+        ctx: &egui::Context,
+        place: crate::session::Place,
+    ) -> Option<Arc<source::FolderRows>> {
+        let folders = self.source.list_folders(place)?;
         if let Some(members) = self.source.members() {
             let query = self.shared.query().to_owned();
             self.shared.replace_sources(ctx, members, query);

@@ -545,6 +545,13 @@ impl TerminalView {
             entry.cells[0] = name;
             entry.cells.push(running);
         }
+        // A remote's page has the window's workspaces that are on it.
+        let page = self.window_picker_page.clone();
+        if let Some(page) = &page {
+            let mut on_page = self.workspaces.iter().map(|workspace| workspace.place == *page);
+            entries.retain(|_| on_page.next().unwrap_or(false));
+            of.push_str(&format!("{page:?}"));
+        }
         // Under the names, as it has no number.
         let new = |id: &str, name: &str, action| crate::actions::Entry {
             id: id.into(),
@@ -553,24 +560,30 @@ impl TerminalView {
             cells: vec![name.into()],
             action,
         };
-        // What each place's daemon holds that nothing shows: this machine's,
-        // then each remote's. A place that is not connected has one row,
-        // which connects to it: its sessions take that row's place once it
-        // is. Nothing is connected to until it is asked for.
+        // What the page's place holds that nothing shows: this machine's on
+        // the first page, a remote's on its own. A place that is not
+        // connected has one row, which connects to it: its sessions take
+        // that row's place once it is. Nothing is connected to until it is
+        // asked for.
         use crate::session::{Place, Status};
         let current = self.current_place();
         let mut starts = Vec::new();
-        let remotes = crate::session::remotes().into_iter().map(|remote| Place::Remote(remote.name));
-        for place in std::iter::once(Place::Here).chain(remotes) {
+        let place = page.clone().unwrap_or(Place::Here);
+        {
             let status = crate::session::status(&place);
             let name = place.name().unwrap_or("this machine").to_owned();
             of.push_str(&format!("{name}{status:?}"));
+            // On a remote's page, it stays on that page.
+            let connect = match &page {
+                Some(_) => AppAction::PlacePage(place.clone()),
+                None => AppAction::Connect(place.clone()),
+            };
             let row = |state: &str| crate::actions::Entry {
                 id: format!("place.{name}"),
                 label: String::new(),
                 shortcut: None,
                 cells: vec![name.clone(), state.to_owned()],
-                action: AppAction::Connect(place.clone()),
+                action: connect.clone(),
             };
             match status {
                 Status::Connected => {
@@ -589,19 +602,48 @@ impl TerminalView {
                     starts.push(row(&format!("cannot be reached: {reason}")));
                 }
             }
-            // A new workspace is made where the current one is, by the rows
-            // below. Any other place that can take one has a row of its own.
+            // On the first page a new workspace is made where the current
+            // one is, by the rows below, and this machine has a row of its
+            // own when that is somewhere else. A remote's page has one.
             let takes = matches!(crate::session::status(&place), Status::Connected | Status::Off);
-            if takes && (place != current || !window) && (window || place != crate::session::home()) {
+            let first = (place != current || !window) && (window || place != crate::session::home());
+            if takes && (page.is_some() || first) {
                 let label = format!("New session on {name}");
                 let action = AppAction::NewSessionOn(place.clone());
                 starts.push(new(&format!("session.new.{name}"), &label, action));
             }
         }
+        // The first page has a row for each remote, which goes to its page.
+        if page.is_none() {
+            for remote in crate::session::remotes() {
+                let place = Place::Remote(remote.name.clone());
+                let status = crate::session::status(&place);
+                of.push_str(&format!("{}{status:?}", remote.name));
+                let state = match status {
+                    Status::Connected => "Enter shows its sessions and folders".to_owned(),
+                    Status::Off | Status::Idle => "not connected: Enter connects".to_owned(),
+                    Status::Connecting => "connecting\u{2026}".to_owned(),
+                    Status::Lost => "connection lost: Enter connects again".to_owned(),
+                    Status::Unavailable(reason) => {
+                        format!("cannot be reached: {}", reason.lines().last().unwrap_or_default().trim())
+                    }
+                };
+                starts.push(crate::actions::Entry {
+                    id: format!("place.{}", remote.name),
+                    label: String::new(),
+                    shortcut: None,
+                    cells: vec![remote.name, state],
+                    action: AppAction::PlacePage(place),
+                });
+            }
+        }
         // With folders to start one in, the picker goes on to list each it
-        // finds. Without, one row makes a new workspace where the window is.
-        if !self.picker_bindings.new_workspace_roots.is_empty() {
+        // finds. Without, on the first page, one row makes a new workspace
+        // where the window is.
+        if !self.page_folders().1.is_empty() {
             of.push_str("folders");
+        } else if page.is_some() {
+            // Its row "New session on" the remote makes one.
         } else if window {
             let create = AppAction::Workspace(WorkspaceAction::CreateWorkspace);
             // It is made where the current one is.
@@ -624,7 +666,10 @@ impl TerminalView {
     /// with or without a terminal: it is about no pane. Its rows are given
     /// to it, so it reads no terminal.
     pub(super) fn open_workspace_picker(&mut self, ctx: &egui::Context) {
+        // Opened again on the page it was asked for.
+        let page = self.window_picker_page.clone();
         self.close_window_picker();
+        self.window_picker_page = page;
         let (rows, of) = self.workspace_picker_rows();
         self.window_picker_rows = of;
         self.window_picker = Some(Box::new(crate::picker::Picker::start_replacing(
@@ -638,11 +683,12 @@ impl TerminalView {
             None,
         )));
         // After those rows, the folders a new one can be started in, which
-        // this machine's daemon finds: see `show_window_picker`.
-        if !self.picker_bindings.new_workspace_roots.is_empty()
+        // the daemon of the page's place finds: see `show_window_picker`.
+        let (place, roots, _) = self.page_folders();
+        if !roots.is_empty()
             && let Some(picker) = self.window_picker.as_mut()
         {
-            self.window_folders = picker.list_folders(ctx).map(|rows| (rows, None));
+            self.window_folders = picker.list_folders(ctx, place).map(|rows| (rows, None));
         }
         // One opened again as a window empties says what emptied it.
         if let (Some(picker), Some((said, at))) = (self.window_picker.as_mut(), &self.picker_said)
@@ -653,8 +699,27 @@ impl TerminalView {
         ctx.request_repaint();
     }
 
+    /// The place whose folders the page of the picker of workspaces lists,
+    /// the folders they are inside, and to how many levels: this machine's
+    /// on the first page, a remote's on its own.
+    fn page_folders(&self) -> (crate::session::Place, Vec<String>, i32) {
+        use crate::session::Place;
+        let depth = self.picker_bindings.new_workspace_depth;
+        let Some(place) = &self.window_picker_page else {
+            let roots = self.picker_bindings.new_workspace_roots.iter();
+            return (Place::Here, roots.map(|root| root.to_string_lossy().into_owned()).collect(), depth);
+        };
+        let remote = crate::session::remotes().into_iter().find(|remote| place.name() == Some(&remote.name));
+        match remote {
+            Some(remote) => (place.clone(), remote.new_roots, remote.new_depth.unwrap_or(depth)),
+            None => (place.clone(), Vec::new(), depth),
+        }
+    }
+
     pub(super) fn close_window_picker(&mut self) {
         self.window_folders = None;
+        // It opens next on its first page.
+        self.window_picker_page = None;
         if let Some(picker) = self.window_picker.take() {
             picker.surrender_focus();
             self.context.request_repaint();
@@ -675,6 +740,7 @@ impl TerminalView {
             .and_then(|pane| self.pane_mut(pane))
             .map(|pane| pane.picker_typography(ctx));
         let (rows, of) = self.workspace_picker_rows();
+        let folders = self.page_folders();
         let builtin = self.picker_bindings.builtin_pickers;
         let padding = self.picker_bindings.cursor_scroll_padding;
         let picker = self.window_picker.as_mut()?;
@@ -683,17 +749,15 @@ impl TerminalView {
         }
         picker.builtin_pickers = builtin;
         picker.set_cursor_scroll_padding(padding);
-        // The folders it lists are found by this machine's daemon, for what
-        // is typed. Asked for once there is a connection, and again over a
-        // new one.
+        // The folders it lists are found by the daemon of the page's place,
+        // for what is typed. Asked for once there is a connection, and again
+        // over a new one.
         if let Some((rows, search)) = &mut self.window_folders {
             if !search.as_ref().is_some_and(|search| search.live()) {
-                let bindings = &self.picker_bindings;
-                let roots = bindings.new_workspace_roots.iter().map(|root| root.to_string_lossy().into_owned());
+                let (place, roots, depth) = folders;
                 let to = rows.clone();
                 let found = move |found: Vec<String>, done| to.set(&found, done);
-                let here = crate::session::Place::Here;
-                *search = crate::session::folders(&here, roots.collect(), bindings.new_workspace_depth, found);
+                *search = crate::session::folders(&place, roots, depth, found);
             }
             if let Some(search) = search {
                 search.typed(picker.typed());
@@ -714,6 +778,12 @@ impl TerminalView {
         let action = picker.show_scoped(ctx, content, None, true)?;
         // Its rows run no Lua.
         if matches!(action, crate::picker::Action::Custom(_)) {
+            return None;
+        }
+        // Escape on a remote's page goes back to the first.
+        if matches!(action, crate::picker::Action::Cancel) && self.window_picker_page.is_some() {
+            self.window_picker_page = None;
+            self.open_workspace_picker(ctx);
             return None;
         }
         // Done to a row with the picker left open. Its rows change as the
@@ -739,16 +809,19 @@ impl TerminalView {
         self.close_window_picker();
         Some(action)
     }
-    /// Make a workspace whose first shell starts in `cwd`, and go to it.
-    /// One started in a chosen directory is called after it.
+    /// Make a workspace and go to it: in `folder`, a folder of a place, and
+    /// then of that place and called after the folder; without one, where
+    /// the current workspace is, its first shell where the active pane is.
     pub(super) fn create_workspace_in(
         &mut self,
-        cwd: Option<String>,
+        folder: Option<(crate::session::Place, String)>,
         gl: &glow::Context,
     ) -> Result<(), String> {
-        let name = cwd.as_deref().and_then(|cwd| workspace::named_after(cwd, &self.workspaces));
-        // A folder chosen is this machine's, and so is the workspace.
-        let options = workspace::CreateOptions::in_folder(cwd);
+        let name = folder.as_ref().and_then(|(_, cwd)| workspace::named_after(cwd, &self.workspaces));
+        let options = match folder {
+            Some((place, cwd)) => workspace::CreateOptions::in_folder(place, cwd),
+            None => workspace::CreateOptions::default(),
+        };
         let w = self.workspace_request(Request::Create(options), gl)?;
         let id = w["id"].as_u64().unwrap();
         if let Some(workspace) = self.workspaces.iter_mut().find(|w| w.id == id) {
@@ -1336,6 +1409,7 @@ impl TerminalView {
                 let place = o.place.clone().unwrap_or_else(|| self.current_place());
                 let spawn = super::pane::SpawnOptions {
                     cwd: o.cwd.clone(),
+                    there: o.there.clone(),
                     place: Some(place.clone()),
                     ..Default::default()
                 };

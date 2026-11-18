@@ -60,14 +60,16 @@ remotes = {
     daemon = "C:\\Program Files\\nterm\\nterm-daemon.exe",
     directory = "C:\\src",
     session = "work",
+    new_roots = { "C:/src" },
   },
 }
 ```
 
 Each has a row in the workspace picker, and nothing is connected to until its
-row is chosen. Choosing `vm` connects; its row then gives way to the sessions
-waiting there, each marked `detached on vm`, and to `New session on vm`. A
-workspace is of one place: its splits and new panes are made where it is, and
+row is chosen. Choosing `vm` connects and shows its page: the sessions
+waiting there, each marked `detached on vm`, `New session on vm`, and the
+folders there a workspace can be started in. Escape goes back. A workspace is
+of one place: its splits and new panes are made where it is, and
 a pane cannot move to a workspace of another place. The status line says
 which machine the current workspace is on, and the picker's rows say it of
 each. When a connection is lost, that machine's workspaces close, the others
@@ -86,6 +88,10 @@ stay, and its row offers to connect again: its shells are still there.
   directory.
 - `session` is which daemon there, for a machine that runs several. Without
   it, the one called `default`.
+- `new_roots` are folders there: each folder inside one is listed on the
+  remote's page, found by its daemon, and starts a workspace there in it.
+  `new_depth` is how many levels inside them; without it,
+  `workspaces.new_depth`.
 
 A name that `remotes` does not have is taken as an address:
 `nterm --remote me@host`.
@@ -100,7 +106,9 @@ this one. A new shell is given the daemon's environment and the home
 directory there, not this machine's. Pickers that a program in the shell asks
 for (`npick`) are refused, as they would run here; your own key bindings'
 pickers still open, and are about this machine. The workspace picker lists
-the sessions there, and not the folders of `workspaces.new_roots`.
+no folders of `workspaces.new_roots`, which are this machine's; the remote's
+page lists its own `new_roots`. A folder chosen there is the one folder of the
+window's that a new shell on that machine is started in: its daemon named it.
 
 ## Prompt patterns
 
