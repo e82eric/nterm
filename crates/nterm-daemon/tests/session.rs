@@ -27,8 +27,34 @@ fn size(cols: u16, rows: u16) -> Size {
 /// With `NTERM_TEST_RELAY=1`, every UI in every test here reaches its daemon
 /// through a relay, so the whole suite says whether a relay carries all that
 /// the pipe does. Without it, one test does (`a_ui_through_a_relay`).
+///
+/// With `NTERM_TEST_RELAY_VIA` as well, the relay is run by that command, as
+/// a UI on another machine would run it: `ssh -T -o BatchMode=yes HOST`,
+/// where HOST is this machine and this account, reached with no password.
 fn relayed() -> bool {
     std::env::var_os("NTERM_TEST_RELAY").is_some_and(|value| value == "1")
+}
+
+/// The relay to a session's daemon: this build's, run here or by the
+/// command in `NTERM_TEST_RELAY_VIA`.
+fn relay_command(session: &str) -> std::process::Command {
+    let via = std::env::var("NTERM_TEST_RELAY_VIA").unwrap_or_default();
+    let mut via = via.split_whitespace();
+    let Some(program) = via.next() else {
+        let mut relay = std::process::Command::new(DAEMON);
+        relay.args(["--relay", "--session", session]);
+        return relay;
+    };
+    // The other sign-in has neither this one's directory nor its PATH, on
+    // which the daemon finds the terminal library.
+    let libraries = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../out/bin");
+    let libraries = libraries.canonicalize().expect("out/bin");
+    let libraries = libraries.to_str().unwrap().trim_start_matches(r"\\?\");
+    let mut relay = std::process::Command::new(program);
+    relay.args(via).arg(format!(
+        "set \"PATH={libraries};%PATH%\" && \"{DAEMON}\" --relay --session {session}"
+    ));
+    relay
 }
 
 /// A session name no other test or run uses.
@@ -104,9 +130,7 @@ impl Ui {
     /// Connect as a UI on another machine does: through `nterm-daemon
     /// --relay`, whose input and output stand for the pipe.
     fn through_relay(session: &str) -> Self {
-        let mut relay = std::process::Command::new(DAEMON);
-        relay.args(["--relay", "--session", session]);
-        Self::over(relay::connect(&mut relay).expect("connect through a relay"))
+        Self::over(relay::connect(&mut relay_command(session)).expect("connect through a relay"))
     }
 
     fn over(connection: Connection) -> Self {

@@ -27,6 +27,8 @@ const MARKER_PREFIX: &str = "nterm-relay ";
 
 /// How long a relay gets to say it is ready.
 const READY: Duration = Duration::from_secs(30);
+/// How long a relay gets to pass on what it holds once its input has ended.
+const LEAVING: Duration = Duration::from_secs(2);
 /// No line before the marker is worth more than this.
 const LONGEST_LINE: usize = 4096;
 
@@ -37,6 +39,8 @@ pub(crate) struct Child {
     process: Mutex<std::process::Child>,
     pid: u32,
     closed: AtomicBool,
+    /// Whether the one writer has been given out.
+    writing: AtomicBool,
     input: Mutex<Option<ChildStdin>>,
     output: Mutex<Option<ChildStdout>>,
 }
@@ -46,9 +50,43 @@ impl Child {
         self.pid
     }
 
-    /// End the child, which ends reads and writes.
-    pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+    /// End the connection: no more is written, and reads end once the child
+    /// has gone.
+    ///
+    /// The child is not killed at once. What was written just before may
+    /// still be on its way through it, and a pipe would have delivered that.
+    /// Its input is closed instead, which a relay takes as the UI leaving: it
+    /// passes on what it holds and goes. One that has not gone after
+    /// `LEAVING` is killed.
+    pub(crate) fn close(self: &Arc<Self>) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let child = self.clone();
+        let leave = move || child.leave();
+        if std::thread::Builder::new().name("relay leaving".into()).spawn(leave).is_err() {
+            self.kill();
+        }
+    }
+
+    /// Close the child's input and wait for it to go, for `LEAVING` at most.
+    fn leave(&self) {
+        match self.input.try_lock() {
+            Ok(mut input) => drop(input.take()),
+            // A write is stuck in the child: there is nothing to wait for.
+            Err(_) => return self.kill(),
+        }
+        let deadline = std::time::Instant::now() + LEAVING;
+        while std::time::Instant::now() < deadline {
+            if !matches!(self.process.lock().unwrap().try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.kill();
+    }
+
+    fn kill(&self) {
         let _ = self.process.lock().unwrap().kill();
     }
 
@@ -65,17 +103,19 @@ impl Child {
     }
 
     pub(crate) fn writer(self: &Arc<Self>) -> io::Result<ChildWriter> {
-        let input = self.input.lock().unwrap().take();
-        let input = input.ok_or_else(|| io::Error::other("a relay has one writer"))?;
-        Ok(ChildWriter { child: self.clone(), input })
+        if self.writing.swap(true, Ordering::AcqRel) {
+            return Err(io::Error::other("a relay has one writer"));
+        }
+        Ok(ChildWriter { child: self.clone() })
     }
 }
 
 impl Drop for Child {
+    /// The last of the connection going is a close, and as gentle: something
+    /// may have been written just before.
     fn drop(&mut self) {
-        let process = self.process.get_mut().unwrap();
-        let _ = process.kill();
-        let _ = process.wait();
+        self.leave();
+        let _ = self.process.get_mut().unwrap().wait();
     }
 }
 
@@ -103,18 +143,20 @@ impl Read for ChildReader {
 
 pub(crate) struct ChildWriter {
     child: Arc<Child>,
-    input: ChildStdin,
 }
 
 impl Write for ChildWriter {
+    /// The child's input stays with the child, so that `close` can end it.
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if let Some(aborted) = self.child.aborted() {
-            return Err(aborted);
+        let closed = || io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed");
+        let mut input = self.child.input.lock().unwrap();
+        match (self.child.aborted(), input.as_mut()) {
+            (None, Some(input)) => input.write(buffer),
+            _ => Err(closed()),
         }
-        self.input.write(buffer)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.input.flush()
+        Ok(())
     }
 }
 
@@ -170,6 +212,7 @@ pub fn connect(command: &mut Command) -> io::Result<crate::pipe::Connection> {
         pid: process.id(),
         process: Mutex::new(process),
         closed: AtomicBool::new(false),
+        writing: AtomicBool::new(false),
         input: Mutex::new(input),
         output: Mutex::new(None),
     });
