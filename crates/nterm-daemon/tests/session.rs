@@ -1082,7 +1082,7 @@ impl Ui {
         params: serde_json::Value,
     ) -> (Asker, u32) {
         let asker = Asker::ask(session, pane, name, params);
-        let Control::PickerOpen { picker, pane: over, .. } =
+        let Control::PickerOpen { picker, pane: Some(over), .. } =
             self.control(|c| matches!(c, Control::PickerOpen { .. }))
         else {
             unreachable!()
@@ -1565,7 +1565,7 @@ fn a_ui_asks_for_a_picker_for_itself_and_is_told_what_the_row_it_chose_is() {
     // No program is in it: the UI asks, and is the one told.
     ui.send(Control::PickerAsk { ask: 41, pane, picker: "files".into(), params: params(&[("cwd", &cwd), ("query", "gam")]) });
     let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
-    let Control::PickerOpen { picker, pane: over, label, query, ask, .. } = opened else { unreachable!() };
+    let Control::PickerOpen { picker, pane: Some(over), label, query, ask, .. } = opened else { unreachable!() };
     assert_eq!((over, label.as_str(), query.as_str(), ask), (pane, "Files", "gam", Some(41)));
     let found = ui.query(picker, 0, "gam");
     ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
@@ -2170,4 +2170,54 @@ fn a_picker_of_the_machines_file_with_columns_shows_them_lined_up_under_their_na
     assert!(message.contains("columns do not go with"), "{message}");
     ui.shutdown();
     assert!(daemon.wait().unwrap().success());
+}
+
+#[test]
+fn a_ui_is_given_a_search_of_folders_over_no_pane() {
+    let session = session("folders");
+    let tree = Tree::new("folders");
+    for folder in ["one/inner/deepest", "two", "three-of-them"] {
+        std::fs::create_dir_all(tree.0.join("roots").join(folder)).unwrap();
+    }
+    std::fs::write(tree.0.join("roots/one/a-file.txt"), "text").unwrap();
+    let root = tree.0.join("roots").to_string_lossy().into_owned();
+    let mut ui = Ui::connect(&session);
+    // No pane at all: a window with no shell yet asks.
+    let mut ask = |ui: &mut Ui, ask: u64, roots: Vec<String>, depth: i32| {
+        ui.send(Control::FoldersAsk { ask, roots, depth });
+        ui.control(|c| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. }))
+    };
+    let opened = ask(&mut ui, 7, vec![root.clone()], 1);
+    let Control::PickerOpen { picker, pane, ask: said, .. } = opened else { panic!("{opened:?}") };
+    assert_eq!((pane, said), (None, Some(7)));
+    // The folders one level down, each as its whole path, and no files.
+    let found = ui.query(picker, 0, "");
+    let mut folders = found.texts();
+    folders.sort();
+    let whole = |name: &str| std::path::Path::new(&root).join(name).to_string_lossy().into_owned();
+    assert_eq!(folders, [whole("one"), whole("three-of-them"), whole("two")]);
+    // What is typed finds among them, and what a folder holds shows for it.
+    let found = ui.query(picker, 1, "thr");
+    assert_eq!(found.texts(), [whole("three-of-them")]);
+    let found = ui.query(picker, 2, "one");
+    let shown = ui.preview(picker, 1, found.serial, found.rows[0].0);
+    let Control::PickerPreviewed { text, .. } = shown else { unreachable!() };
+    assert!(text.contains("inner") && text.contains("a-file.txt"), "{text}");
+    ui.send(Control::PickerClose { picker, refused: None });
+
+    // Two levels of them.
+    let opened = ask(&mut ui, 8, vec![root.clone()], 2);
+    let Control::PickerOpen { picker, .. } = opened else { panic!("{opened:?}") };
+    let found = ui.query(picker, 0, "inner");
+    assert_eq!(found.texts(), [whole("one").to_owned() + "\\inner"]);
+    // A third level is not listed, whatever else of the path matches.
+    assert!(ui.query(picker, 1, "deepest").texts().iter().all(|folder| !folder.ends_with("deepest")));
+    ui.send(Control::PickerClose { picker, refused: None });
+
+    // With nowhere to look, or somewhere that is no folder, it is refused.
+    for roots in [Vec::new(), vec![whole("none-such")]] {
+        let refused = ask(&mut ui, 9, roots, 1);
+        assert!(matches!(refused, Control::PickerRefused { ask: 9, .. }), "{refused:?}");
+    }
+    ui.shutdown();
 }

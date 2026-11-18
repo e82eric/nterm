@@ -383,7 +383,7 @@ impl Session {
                     session.panes.lock().unwrap().remove(&pane.id);
                 }
                 session.end_channels(|_, channel| channel.pane == pane.id, true);
-                session.pickers.end_where(|of, _| of == pane.id, true);
+                session.pickers.end_where(|of, _| of == Some(pane.id), true);
                 session.broadcast(Control::Exited { pane: pane.id, code });
                 session.sessions_changed();
             })
@@ -627,6 +627,10 @@ fn converse(
         if session.pickers.from_ui(id, &control) {
             continue;
         }
+        if let Control::FoldersAsk { ask, roots, depth } = &control {
+            session.pickers.folders(id, outbox, *ask, roots, *depth);
+            continue;
+        }
         if let Control::PickerAsk { ask, pane, picker, params } = &control {
             let shows = session.pane(*pane).is_some_and(|pane| {
                 pane.state.lock().unwrap().shown.as_ref().is_some_and(|(shown, _)| *shown == id)
@@ -699,7 +703,7 @@ fn converse(
                 }
                 // After it has left the pane, so no program finds it there.
                 session.end_channels(|_, c| c.pane == pane_id && c.ui == id, false);
-                session.pickers.end_where(|pane, ui| pane == pane_id && ui == id, true);
+                session.pickers.end_where(|pane, ui| pane == Some(pane_id) && ui == id, true);
                 session.sessions_changed();
             }
             Control::SessionSet { id: name, panes, layout } => {
@@ -871,7 +875,7 @@ fn pick(
             && let Some(ui) = ui
             && !shown_by(ui)
         {
-            session.pickers.end_where(|of, by| of == pane_id && by == ui, true);
+            session.pickers.end_where(|of, by| of == Some(pane_id) && by == ui, true);
         }
         if !goes_on {
             break;

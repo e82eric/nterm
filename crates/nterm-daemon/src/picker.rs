@@ -394,10 +394,12 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
             preview = Some(params.get("preview").is_some_and(|preview| preview == "true"));
             // Under one folder a row says where it is from there; under
             // several that would not say which.
-            let relative = roots.len() == 1;
+            let relative = roots.len() == 1 && !params.contains_key("whole");
+            // How many levels of folders under them: all, unless it says.
+            let max_depth = params.get("max_depth").and_then(|depth| depth.parse::<i32>().ok()).unwrap_or(0).max(0);
             Lists::Walk(ScanOptions {
                 roots,
-                max_depth: 0,
+                max_depth,
                 directories_only,
                 files_only: !directories_only,
                 relative,
@@ -883,7 +885,8 @@ struct Row {
 
 struct Picker {
     number: u32,
-    pane: PaneId,
+    /// The pane it is over: none for a search of folders a UI asked for.
+    pane: Option<PaneId>,
     /// The UI that shows it: its client number and the way to it.
     ui: u64,
     ui_outbox: Outbox,
@@ -1085,7 +1088,7 @@ impl Pickers {
                 };
                 let opened = json!({"type": "opened", "request_id": request_id});
                 let asker = Asker::Program { to: showing.program, request_id };
-                *mine = Some(self.open(definition, asker, None, showing.pane, showing.ui, showing.ui_outbox));
+                *mine = Some(self.open(definition, asker, None, Some(showing.pane), showing.ui, showing.ui_outbox));
                 reply(program, opened);
                 true
             }
@@ -1117,7 +1120,7 @@ impl Pickers {
         }
     }
 
-    fn open(&self, definition: Definition, asker: Asker, ask: Option<u64>, pane: PaneId, ui: u64, ui_outbox: Outbox) -> u32 {
+    fn open(&self, definition: Definition, asker: Asker, ask: Option<u64>, pane: Option<PaneId>, ui: u64, ui_outbox: Outbox) -> u32 {
         limit_search_threads();
         let number = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let of = match &definition.lists {
@@ -1131,7 +1134,8 @@ impl Pickers {
             Lists::Given => "of what its program gives".to_owned(),
             Lists::Fixed(rows) => format!("of {} rows", rows.len()),
         };
-        log(format_args!("picker {number}: {} {of} for pane {}", definition.label, pane));
+        let over = pane.map(|pane| format!("pane {pane}")).unwrap_or_else(|| "no pane".to_owned());
+        log(format_args!("picker {number}: {} {of} for {over}", definition.label));
         // What reads a file or runs a command, begun once the picker is one
         // of those open: it may fail at once, and that ends the picker.
         let mut begin: Option<Box<dyn FnOnce()>> = None;
@@ -1353,13 +1357,40 @@ impl Pickers {
         };
         match definition {
             Ok(definition) => {
-                self.open(definition, Asker::Ui, Some(ask), pane, ui, ui_outbox.clone());
+                self.open(definition, Asker::Ui, Some(ask), Some(pane), ui, ui_outbox.clone());
             }
             Err(message) => {
                 log(format_args!("picker {name} refused: {message}"));
                 let refused = Control::PickerRefused { ask, message };
                 let _ = ui_outbox.send(Frame::Control(refused).encode());
             }
+        }
+    }
+
+    /// The UI `ui` asks for a search of folders over no pane, with its own
+    /// number `ask` for it: see `Control::FoldersAsk`. It is the daemon's
+    /// picker of folders, told to list whole paths, and it ends when the
+    /// UI closes it or goes.
+    pub(crate) fn folders(&self, ui: u64, ui_outbox: &Outbox, ask: u64, roots: &[String], depth: i32) {
+        let refuse = |message: String| {
+            log(format_args!("a search of folders was refused: {message}"));
+            let _ = ui_outbox.send(Frame::Control(Control::PickerRefused { ask, message }).encode());
+        };
+        if roots.is_empty() {
+            return refuse("no folders to look under were given".into());
+        }
+        let params: BTreeMap<String, String> = [
+            ("roots".to_owned(), serde_json::to_string(roots).unwrap_or_default()),
+            ("max_depth".to_owned(), depth.to_string()),
+            ("whole".to_owned(), "true".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        match define("directories", &params) {
+            Ok(definition) => {
+                self.open(definition, Asker::Ui, Some(ask), None, ui, ui_outbox.clone());
+            }
+            Err(message) => refuse(message),
         }
     }
 
@@ -1456,7 +1487,7 @@ impl Pickers {
 
     /// End every picker `which` picks: its UI has left its pane or gone, or
     /// its pane's shell has ended. The UI is told unless it has gone.
-    pub(crate) fn end_where(&self, which: impl Fn(PaneId, u64) -> bool, tell_ui: bool) {
+    pub(crate) fn end_where(&self, which: impl Fn(Option<PaneId>, u64) -> bool, tell_ui: bool) {
         let ended: Vec<u32> = {
             let open = self.open.lock().unwrap();
             open.values().filter(|p| which(p.pane, p.ui)).map(|p| p.number).collect()

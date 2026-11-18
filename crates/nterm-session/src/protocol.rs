@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -253,6 +253,19 @@ pub enum Control {
         #[serde(default)]
         params: std::collections::BTreeMap<String, String>,
     },
+    /// From a UI: a search of the folders under `roots`, to `depth` levels
+    /// of them (nothing or less is all), over no pane: for what the UI
+    /// shows of its own, as its list of where a workspace can be started.
+    /// It is answered and goes on as a picker asked for with `PickerAsk`
+    /// does, with no pane in its `PickerOpen`, and its rows are the
+    /// folders' whole paths. The UI lists them; the daemon does nothing
+    /// with the one chosen.
+    FoldersAsk {
+        ask: u64,
+        roots: Vec<String>,
+        #[serde(default)]
+        depth: i32,
+    },
     /// From a UI: what would show for row `row` of the rows sent with
     /// `serial`. Answered `PickerPreviewed` with the same `request`; a UI
     /// that has asked again wants only the last.
@@ -287,7 +300,10 @@ pub enum Control {
     /// `query`, and ends the picker with `PickerAccept` or `PickerClose`.
     PickerOpen {
         picker: u32,
-        pane: PaneId,
+        /// The pane it is over. None for a search of folders the UI asked
+        /// for with `FoldersAsk`, which is over none.
+        #[serde(default)]
+        pane: Option<PaneId>,
         /// What the picker is of, to show with it.
         label: String,
         /// The query it starts with.

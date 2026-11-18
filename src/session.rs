@@ -1134,7 +1134,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
             // it to be shown. The daemon finds the rows, where the program
             // is; only what it sends is drawn here, so this is the same for
             // a daemon on another machine.
-            Frame::Control(Control::PickerOpen { picker, pane, label, query, preview, at_cursor, ask, keys }) => match daemon.pane(pane) {
+            Frame::Control(Control::PickerOpen { picker, pane, label, query, preview, at_cursor, ask, keys }) => match pane.and_then(|pane| daemon.pane(pane)) {
                 Some(link) => {
                     let (to, woken) = (daemon.clone(), link.clone());
                     let tell = move |control: Control| {
