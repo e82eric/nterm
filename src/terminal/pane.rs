@@ -1233,6 +1233,9 @@ impl TerminalPane {
             if options.position == crate::picker::config::Position::Cursor {
                 params.entry("position".into()).or_insert_with(|| "cursor".into());
             }
+            // Whether it opens with its preview showing, as `preview_visible`
+            // says of any picker.
+            params.entry("preview".into()).or_insert_with(|| options.preview_visible.to_string());
             let cwd = params.contains_key("cwd");
             let Some(ask) = self.session.as_ref().and_then(|session| session.ask_picker(name, params))
             else {

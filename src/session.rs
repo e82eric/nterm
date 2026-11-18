@@ -812,6 +812,8 @@ pub(crate) struct Previewed {
     /// The name of the file the text is of, or none for text shown plain.
     pub(crate) name: Option<String>,
     pub(crate) truncated: bool,
+    /// The line of the text, from one, to show in the middle and mark.
+    pub(crate) line: Option<usize>,
 }
 
 /// How long a preview is waited for.
@@ -1168,14 +1170,14 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                     );
                 }
             }
-            Frame::Control(Control::PickerPreviewed { picker, request, text, name, truncated, error }) => {
+            Frame::Control(Control::PickerPreviewed { picker, request, text, name, truncated, line, error }) => {
                 let shown = daemon.pickers.lock().unwrap().get(&picker).cloned();
                 if let Some(shown) = shown {
                     shown.previewed(
                         request,
                         match error {
                             Some(error) => Err(error),
-                            None => Ok(Previewed { text, name, truncated }),
+                            None => Ok(Previewed { text, name, truncated, line: line.and_then(|line| usize::try_from(line).ok()).filter(|line| *line > 0) }),
                         },
                     );
                 }

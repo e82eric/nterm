@@ -176,11 +176,17 @@ struct Shown {
     /// The file's name, for one shown as it is.
     name: Option<String>,
     truncated: bool,
+    /// The line of the text, from one, that the row is about.
+    line: Option<u64>,
     error: Option<String>,
 }
 impl Shown {
-    fn of(path: &Path) -> Self {
-        let shown = if path.is_dir() { Self::folder(path) } else { Self::file(path) };
+    fn of(path: &Path, line: Option<u64>) -> Self {
+        let shown = match line {
+            _ if path.is_dir() => Self::folder(path),
+            Some(line) => Self::at(path, line),
+            None => Self::file(path),
+        };
         shown.unwrap_or_else(|error| Self { error: Some(error.to_string()), ..Default::default() })
     }
 
@@ -204,6 +210,70 @@ impl Shown {
             text: String::from_utf8_lossy(&bytes).into_owned(),
             name: path.file_name().map(|name| name.to_string_lossy().into_owned()),
             truncated,
+            line: None,
+            error: None,
+        })
+    }
+
+    /// The file with `line` of it, from one, to be shown in the middle. A
+    /// file too long to send whole is sent as the lines round that one,
+    /// and `line` is then which of those it is.
+    fn at(path: &Path, line: u64) -> std::io::Result<Self> {
+        use std::io::{BufRead, Read};
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        if size <= MOST_PREVIEW as u64 {
+            let whole = Self::file(path)?;
+            let lines = whole.text.lines().count() as u64;
+            let line = (whole.name.is_some() && line >= 1 && line <= lines).then_some(line);
+            return Ok(Self { line, ..whole });
+        }
+        let mut reader = std::io::BufReader::new(file);
+        let mut kept: std::collections::VecDeque<Vec<u8>> = Default::default();
+        let (mut held, mut number, mut checked) = (0usize, 0u64, 0usize);
+        let (mut at, mut left_out) = (None, false);
+        loop {
+            let mut one = Vec::new();
+            let read = (&mut reader).take(MOST_PREVIEW as u64).read_until(b'\n', &mut one)?;
+            if read == 0 {
+                break;
+            }
+            if checked < 8192 {
+                if one.iter().take(8192 - checked).any(|byte| *byte == 0) {
+                    return Ok(Self { text: format!("Not text: {size} bytes"), ..Default::default() });
+                }
+                checked += one.len();
+            }
+            if read == MOST_PREVIEW && !one.ends_with(b"\n") {
+                return Ok(Self { text: "It has a line too long to show".into(), ..Default::default() });
+            }
+            number += 1;
+            if at.is_some() {
+                // After the line: as much as there is room left for.
+                if held + one.len() > MOST_PREVIEW {
+                    left_out = true;
+                    break;
+                }
+            } else {
+                // Before it: no more than half of what is sent.
+                while held + one.len() > MOST_PREVIEW / 2 {
+                    let Some(first) = kept.pop_front() else { break };
+                    held -= first.len();
+                    left_out = true;
+                }
+            }
+            held += one.len();
+            kept.push_back(one);
+            if number == line {
+                at = Some(kept.len() as u64);
+            }
+        }
+        let bytes: Vec<u8> = kept.into_iter().flatten().collect();
+        Ok(Self {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            name: path.file_name().map(|name| name.to_string_lossy().into_owned()),
+            truncated: left_out,
+            line: at,
             error: None,
         })
     }
@@ -229,6 +299,20 @@ impl Shown {
         let text = if lines.is_empty() { "Empty folder".to_owned() } else { lines.join("\n") };
         Ok(Self { text, truncated, ..Default::default() })
     }
+}
+
+/// The file and the line of a row that is `path:line:column:text`, as a
+/// search of files prints them. The path may have colons of its own.
+fn place(row: &str) -> Option<(&str, u64)> {
+    let digits = |text: &str| text.bytes().take_while(u8::is_ascii_digit).count();
+    row.match_indices(':').find_map(|(colon, _)| {
+        let rest = &row[colon + 1..];
+        let line = digits(rest);
+        let after = rest[line..].strip_prefix(':')?;
+        let column = digits(after);
+        (line > 0 && colon > 0 && column > 0 && after[column..].starts_with(':'))
+            .then(|| rest[..line].parse().ok().map(|line| (&row[..colon], line)))?
+    })
 }
 
 /// The pickers there are, each starting with `query` and shown at the
@@ -319,6 +403,7 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
             command.working_directory = Some(folder);
             // Of what it says went wrong, which is all that is kept of it.
             command.output_limit = 16 * 1024;
+            preview = Some(params.get("preview").is_some_and(|preview| preview == "true"));
             Lists::Command(command)
         }
         "items" => {
@@ -580,7 +665,10 @@ struct Picker {
     source: Source,
     sort: SearchSortMode,
     /// The way to the thread that reads previews, once one was asked for.
-    previews: Mutex<Option<std::sync::mpsc::Sender<(u64, PathBuf)>>>,
+    previews: Mutex<Option<std::sync::mpsc::Sender<(u64, PathBuf, Option<u64>)>>>,
+    /// The folder the files are in of rows that are `path:line:column:text`,
+    /// for a picker of what a search of files found.
+    found_in: Option<PathBuf>,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -711,6 +799,10 @@ impl Pickers {
         // What reads a file or runs a command, begun once the picker is one
         // of those open: it may fail at once, and that ends the picker.
         let mut begin: Option<Box<dyn FnOnce()>> = None;
+        let found_in = match &definition.lists {
+            Lists::Command(command) => command.working_directory.clone(),
+            _ => None,
+        };
         let source = match definition.lists {
             Lists::Walk(scan) => {
                 let store = Arc::new(FileSystemSearchStore::new_append_only());
@@ -756,6 +848,7 @@ impl Pickers {
             source,
             sort: definition.sort,
             previews: Mutex::default(),
+            found_in,
             state: Mutex::new(State { flow: Some(Flow::new()), ..Default::default() }),
         });
         self.open.lock().unwrap().insert(number, picker.clone());
@@ -1132,37 +1225,46 @@ impl Picker {
     /// says, and only the last asked for is read. Only a row that is a file
     /// or a folder has anything to show.
     fn preview(&self, request: u64, serial: u64, row: u64) {
-        let path = match (&self.source, self.row(serial, row)) {
-            (Source::Walk { .. }, Some(Row { value: Value::String(path), .. })) => path,
-            _ => {
-                let error = Some(format!("row {row} of answer {serial} is not one the picker can show"));
-                return self.tell_ui(Control::PickerPreviewed {
-                    picker: self.number,
-                    request,
-                    text: String::new(),
-                    name: None,
-                    truncated: false,
-                    error,
-                });
-            }
+        // A file or a folder, or for what a search of files found the file
+        // at the line it was found on.
+        let shows = match (&self.source, self.row(serial, row)) {
+            (Source::Walk { .. }, Some(Row { value: Value::String(path), .. })) => Some((PathBuf::from(path), None)),
+            (Source::Read { .. }, Some(Row { value: Value::String(found), .. })) => self
+                .found_in
+                .as_ref()
+                .and_then(|folder| place(&found).map(|(path, line)| (folder.join(path), Some(line)))),
+            _ => None,
+        };
+        let Some((path, line)) = shows else {
+            let error = Some(format!("row {row} of answer {serial} is not one the picker can show"));
+            return self.tell_ui(Control::PickerPreviewed {
+                picker: self.number,
+                request,
+                text: String::new(),
+                name: None,
+                truncated: false,
+                line: None,
+                error,
+            });
         };
         let mut previews = self.previews.lock().unwrap();
         let asked = previews.get_or_insert_with(|| {
-            let (asked, asking) = std::sync::mpsc::channel::<(u64, PathBuf)>();
+            let (asked, asking) = std::sync::mpsc::channel::<(u64, PathBuf, Option<u64>)>();
             let (number, ui) = (self.number, self.ui_outbox.clone());
             let read = move || {
                 while let Ok(mut last) = asking.recv() {
                     while let Ok(newer) = asking.try_recv() {
                         last = newer;
                     }
-                    let (request, path) = last;
-                    let shown = Shown::of(&path);
+                    let (request, path, line) = last;
+                    let shown = Shown::of(&path, line);
                     let previewed = Control::PickerPreviewed {
                         picker: number,
                         request,
                         text: shown.text,
                         name: shown.name,
                         truncated: shown.truncated,
+                        line: shown.line,
                         error: shown.error,
                     };
                     if ui.send(Frame::Control(previewed).encode()).is_err() {
@@ -1173,7 +1275,7 @@ impl Picker {
             let _ = std::thread::Builder::new().name(format!("picker {number} previews")).spawn(read);
             asked
         });
-        let _ = asked.send((request, PathBuf::from(path)));
+        let _ = asked.send((request, path, line));
     }
 
     /// The row the UI chose, of those sent with `serial`.
@@ -1192,6 +1294,61 @@ impl Picker {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn a_row_of_a_search_says_which_file_and_line_it_is() {
+        assert_eq!(place(r"src\main.rs:12:5:fn main() {"), Some((r"src\main.rs", 12)));
+        // The path's own colons, and those of the text, are not taken for it.
+        assert_eq!(place(r"C:\a\b.rs:7:1:let x = y::z:3:4:;"), Some((r"C:\a\b.rs", 7)));
+        assert_eq!(place("a:1:b.txt:30:2:text"), Some(("a:1:b.txt", 30)));
+        for not in ["", "just text", "a.rs:12:text", ":1:2:text", "a.rs:1:2", "a.rs::2:text"] {
+            assert_eq!(place(not), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn a_file_is_shown_at_a_line_and_a_long_one_as_the_lines_round_it() {
+        let root = std::env::temp_dir().join(format!("nterm-at-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("short.rs"), "one\ntwo\nthree\n").unwrap();
+        let short = Shown::of(&root.join("short.rs"), Some(2));
+        assert_eq!((short.text.as_str(), short.line, short.truncated), ("one\ntwo\nthree\n", Some(2), false));
+        // A line it does not have is not marked.
+        assert_eq!(Shown::of(&root.join("short.rs"), Some(4)).line, None);
+        assert_eq!(Shown::of(&root.join("short.rs"), Some(0)).line, None);
+
+        // 40,000 lines of 20 bytes: more than is sent.
+        let long: String = (1..=40_000).map(|number| format!("line {number:>13}\r\n")).collect();
+        std::fs::write(root.join("long.log"), &long).unwrap();
+        let line_of = |shown: &Shown| shown.text.lines().nth(shown.line.unwrap() as usize - 1).unwrap().to_owned();
+        // Near the start, it is the start that is sent.
+        let near = Shown::of(&root.join("long.log"), Some(3));
+        assert_eq!((near.line, near.truncated), (Some(3), true));
+        assert!(near.text.starts_with("line             1\r\n") && near.text.len() <= MOST_PREVIEW);
+        // In the middle, as much before the line as after it.
+        let middle = Shown::of(&root.join("long.log"), Some(20_000));
+        assert_eq!(line_of(&middle), "line         20000");
+        let before = middle.line.unwrap() as usize;
+        let lines = middle.text.lines().count();
+        assert!(middle.truncated && middle.text.len() <= MOST_PREVIEW && lines > 10_000);
+        assert!(before.abs_diff(lines - before) < 10, "{before} of {lines}");
+        // At the end, the end of it.
+        let last = Shown::of(&root.join("long.log"), Some(40_000));
+        assert_eq!(line_of(&last), "line         40000");
+        assert!(last.text.ends_with("40000\r\n") && last.truncated);
+        // A line it does not have: what there is, with none marked.
+        assert_eq!(Shown::of(&root.join("long.log"), Some(50_000)).line, None);
+
+        let mut binary = vec![0u8; 16];
+        binary.resize(MOST_PREVIEW + 100, b'x');
+        std::fs::write(root.join("data.bin"), &binary).unwrap();
+        assert!(Shown::of(&root.join("data.bin"), Some(1)).text.starts_with("Not text"));
+        std::fs::write(root.join("one.min.js"), vec![b'x'; MOST_PREVIEW * 2]).unwrap();
+        let one = Shown::of(&root.join("one.min.js"), Some(1));
+        assert_eq!((one.text.as_str(), one.line), ("It has a line too long to show", None));
+        assert!(Shown::of(&root.join("none.rs"), Some(1)).error.is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn a_query_is_answered_at_once_and_more_waits_to_be_taken() {
         let mut flow = Flow::new();
@@ -1303,7 +1460,7 @@ mod tests {
         // The pattern is the last, after `--`, however it begins.
         let last = &command.arguments[command.arguments.len() - 2..];
         assert_eq!(last, ["--", "-e fn main"]);
-        assert_eq!((found.label.as_str(), found.preview), ("Ripgrep", None));
+        assert_eq!((found.label.as_str(), found.preview), ("Ripgrep", Some(false)));
         for given in [
             params(&[("cwd", &cwd)]),
             params(&[("cwd", &cwd), ("pattern", "")]),
@@ -1328,26 +1485,26 @@ mod tests {
         let long = "123456789\n".repeat(MOST_PREVIEW / 10 + 5);
         std::fs::write(root.join("long.log"), format!("{long}tail with no end")).unwrap();
 
-        let file = Shown::of(&root.join("b.rs"));
+        let file = Shown::of(&root.join("b.rs"), None);
         let whole = Shown { text: "fn main() {}\n".into(), name: Some("b.rs".into()), ..Default::default() };
         assert_eq!(file, whole);
-        assert_eq!(Shown::of(&root.join("A.txt")).text, "caf\u{e9}");
+        assert_eq!(Shown::of(&root.join("A.txt"), None).text, "caf\u{e9}");
 
         // Cut at the end of a line, and said to be cut.
-        let cut = Shown::of(&root.join("long.log"));
+        let cut = Shown::of(&root.join("long.log"), None);
         assert!(cut.truncated && cut.text.len() <= MOST_PREVIEW);
         assert!(cut.text.ends_with("123456789\n") && cut.text.len() > MOST_PREVIEW - 10);
 
-        let binary = Shown::of(&root.join("data.bin"));
+        let binary = Shown::of(&root.join("data.bin"), None);
         assert_eq!((binary.text.as_str(), &binary.name), ("Not text: 4 bytes", &None));
 
         // Folders first, then files, neither by the case of its name.
-        let folder = Shown::of(&root);
+        let folder = Shown::of(&root, None);
         assert_eq!(folder.text, "sub\\\nA.txt\nb.rs\ndata.bin\nlong.log");
         assert_eq!((&folder.name, folder.truncated), (&None, false));
-        assert_eq!(Shown::of(&root.join("sub")).text, "Empty folder");
+        assert_eq!(Shown::of(&root.join("sub"), None).text, "Empty folder");
 
-        let missing = Shown::of(&root.join("none.txt"));
+        let missing = Shown::of(&root.join("none.txt"), None);
         assert!(missing.error.is_some() && missing.text.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -319,6 +319,10 @@ pub enum Control {
         /// Whether there is more of it than was sent.
         #[serde(default)]
         truncated: bool,
+        /// The line of `text`, from one, that the row is about: shown in
+        /// the middle, and marked.
+        #[serde(default)]
+        line: Option<u64>,
         /// Why there is nothing to show, in place of `text`.
         #[serde(default)]
         error: Option<String>,

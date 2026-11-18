@@ -1477,7 +1477,7 @@ fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
     else {
         unreachable!()
     };
-    assert_eq!((label.as_str(), preview), ("Ripgrep", None));
+    assert_eq!((label.as_str(), preview), ("Ripgrep", Some(false)));
     let closed = ui.control(|c| matches!(c, Control::PickerClosed { picker: of, .. } if *of == picker));
     let Control::PickerClosed { message, .. } = closed else { unreachable!() };
     assert!(message.is_some());
@@ -1506,6 +1506,19 @@ fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
     let (status, result) = asker.result();
     assert_eq!(status, "accepted");
     assert_eq!(result["selected"][0]["value"], "b\\gamma.rs:1:3:b/gamma.rs");
+
+    // A row shows its file, at the line it was found on. One more line is
+    // put before what was found, so that it is not the first.
+    std::fs::write(std::path::Path::new(&tree.path()).join("b").join("gamma.rs"), "// first\nb/gamma.rs\n").unwrap();
+    let params = serde_json::json!({"cwd": tree.path(), "pattern": "gamma", "preview": "true"});
+    let (asker, picker) = ui.picker(&session, pane, "ripgrep", params);
+    let found = ui.query(picker, 0, "");
+    assert_eq!(found.texts(), [r"b\gamma.rs:2:3:b/gamma.rs"]);
+    let shown = ui.preview(picker, 1, found.serial, found.rows[0].0);
+    let Control::PickerPreviewed { text, name, line, error, .. } = shown else { unreachable!() };
+    assert_eq!((text.as_str(), name.as_deref(), line, error), ("// first\nb/gamma.rs\n", Some("gamma.rs"), Some(2), None));
+    ui.send(Control::PickerClose { picker, refused: None });
+    assert_eq!(asker.result().0, "cancelled");
 
     // Nothing found is a picker of nothing, not one that failed.
     let params = serde_json::json!({"cwd": tree.path(), "pattern": "nowhere in any of them"});

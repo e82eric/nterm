@@ -140,7 +140,12 @@ nothing (a pattern it cannot read, say), the picker ends with what it said.
 Invoke-NtermPicker -DaemonPicker ripgrep -Parameters @{ cwd = $PWD.Path; pattern = 'fn main' }
 ```
 
-`history`, `ripgrep` and `items` have no previews.
+A row's preview is its file with the line it was found on in the middle,
+marked; `preview` `true` opens it showing. A file of more than 256 KB is sent
+as the lines round that one, so line numbers shown beside it count from the
+first line sent, not the file's first.
+
+`history` and `items` have no previews.
 
 Each row of `files` and `directories` has a preview, hidden until Ctrl+P shows it; with `preview = "true"`
 in the parameters it opens shown. A file shows its first 256 KB as text,

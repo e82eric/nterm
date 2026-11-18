@@ -156,7 +156,7 @@ fn plan(previewed: crate::session::Previewed) -> nfm_preview_file::resolved::Pre
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
-        text.push_str("[there is more: only the start is shown]\n");
+        text.push_str("[there is more: only part is shown]\n");
     }
     // Text of no file is shown as it is: a listing, or a note.
     let content = match &previewed.name {
@@ -168,8 +168,8 @@ fn plan(previewed: crate::session::Previewed) -> nfm_preview_file::resolved::Pre
             source: Arc::new(SnapshotSource(content)),
             name: previewed.name,
             extension: None,
-            center_line: None,
-            highlight_line: None,
+            center_line: previewed.line,
+            highlight_line: previewed.line,
             syntax: None,
         },
         options: TextPreviewOptions::default(),
@@ -527,7 +527,7 @@ mod preview_tests {
         // Which row of which answer, and nothing of what the row is.
         assert_eq!(asked, Control::PickerPreview { picker: 7, request: 1, serial: 3, row: 5 });
         let text = "fn main() {}\n".to_owned();
-        shown.previewed(1, Ok(Previewed { text, name: Some("main.rs".into()), truncated: false }));
+        shown.previewed(1, Ok(Previewed { text, name: Some("main.rs".into()), truncated: false, line: None }));
         frame(&ctx, &mut fed);
 
         // A picker with no previews asks for none.
@@ -561,8 +561,8 @@ mod preview_tests {
         assert_eq!(asked(&daemon), (1, 4, 5));
         // An answer to another request is not this one's.
         shown.previewed(9, Err("stale".into()));
-        let text = Previewed { text: "x".into(), name: None, truncated: false };
-        shown.previewed(1, Ok(Previewed { text: "x".into(), name: None, truncated: false }));
+        let text = Previewed { text: "x".into(), name: None, truncated: false, line: None };
+        shown.previewed(1, Ok(Previewed { text: "x".into(), name: None, truncated: false, line: None }));
         assert_eq!(waiting.join().unwrap(), Ok(text));
 
         // The daemon says there is none.
@@ -595,13 +595,17 @@ mod preview_tests {
             let content = request.source.read(usize::MAX, &|| false).unwrap();
             (content.text, content.syntax.is_some(), request.name)
         };
+        // The line a row is about is shown in the middle, and marked.
+        let at = Previewed { text: "a\nb\nc\n".into(), name: Some("a.rs".into()), truncated: false, line: Some(2) };
+        let PreviewPlan::Text { request, .. } = plan(at) else { panic!("not text") };
+        assert_eq!((request.center_line, request.highlight_line), (Some(2), Some(2)));
         // A file is coloured by its name.
-        let file = Previewed { text: "fn a() {}\n".into(), name: Some("a.rs".into()), truncated: false };
+        let file = Previewed { text: "fn a() {}\n".into(), name: Some("a.rs".into()), truncated: false, line: None };
         assert_eq!(read(file), ("fn a() {}\n".into(), false, Some("a.rs".into())));
         // A listing is shown plain.
-        let listing = Previewed { text: "sub\\\nb.txt".into(), name: None, truncated: true };
+        let listing = Previewed { text: "sub\\\nb.txt".into(), name: None, truncated: true, line: None };
         let (text, plain, name) = read(listing);
-        assert_eq!(text, "sub\\\nb.txt\n[there is more: only the start is shown]\n");
+        assert_eq!(text, "sub\\\nb.txt\n[there is more: only part is shown]\n");
         assert!(plain && name.is_none());
     }
 }

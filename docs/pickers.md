@@ -447,7 +447,7 @@ daemon picker's: `app:push_picker("Ripgrep", { pattern = item.value })` gives
 shell reports it. Enter runs the `action` callback with the row as `item`, or
 without one types the row's value into the pane. Of the options every picker
 takes, it uses `position` and `initial_query`; its previews are the daemon's
-own. The sample `Ripgrep` picker is one.
+own, shown at open unless `preview_visible = false`. The sample `Ripgrep` picker is one.
 
 `Output` has nothing to pick from either: it runs the `args` array without a
 shell and shows what the program prints, standard output and standard error
