@@ -233,6 +233,9 @@ pub(crate) struct SpawnOptions {
     /// Whether the pane starts a shell or takes one the session daemon is
     /// running.
     pub start: crate::session::Start,
+    /// Where the shell runs. `None` is the current workspace's place, which
+    /// the window fills in.
+    pub place: Option<crate::session::Place>,
 }
 impl SpawnOptions {
     pub fn validate(&self) -> Result<(), String> {
@@ -501,6 +504,11 @@ impl TerminalPane {
             self.size[1].saturating_sub(u32::from(surface.rows) * cell[1]),
         ];
         Some((extra, cell))
+    }
+
+    /// Where this pane's shell runs. One with a shell of its own is here.
+    pub(super) fn place(&self) -> crate::session::Place {
+        self.session.as_ref().map(|session| session.place()).unwrap_or_default()
     }
 
     /// The session daemon's pane this one shows, once known.
@@ -802,7 +810,8 @@ impl TerminalPane {
         let command = text(&options.command, "pane command")?;
         let cwd = text(&options.cwd, "pane directory")?;
         let userdata: *mut c_void = (&mut *wake as *mut WakeState).cast();
-        let session = crate::session::Link::prepare(userdata, &options.start, &crate::session::home())
+        let place = options.place.clone().unwrap_or_else(crate::session::home);
+        let session = crate::session::Link::prepare(userdata, &options.start, &place)
             .map_err(|e| FatalError::new("show a running shell", e))?;
         // A shell of the pane's own is reached by a pipe of the pane's own.
         #[cfg(unix)]

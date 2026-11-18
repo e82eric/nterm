@@ -504,6 +504,9 @@ pub(crate) fn install_lua_helpers(lua: &mlua::Lua, nterm: &mlua::Table) -> mlua:
         })?,
     )
 }
+/// Why a pane stays in its workspace: its shell is where it is.
+const OTHER_PLACE: &str = "A pane cannot move to a workspace on another machine.";
+
 impl TerminalView {
     /// The rows of the picker of workspaces and sessions: this window's
     /// workspaces, the sessions the daemon holds that no window shows, and
@@ -523,6 +526,10 @@ impl TerminalView {
             let floats = workspace.floats.ids().iter().filter_map(|id| self.floating.get(*id));
             let floats = floats.map(|float| float.panes.len());
             entry.cells[3] = super::restore::counted(workspace.panes.len(), floats);
+            // One whose shells are on another machine says which.
+            if let Some(place) = workspace.place.name() {
+                entry.cells[1] = format!("{} on {place}", entry.cells[1]).trim_start().to_owned();
+            }
         }
         // So far all a workspace's row says is the user's doing. What its
         // shells call themselves and where they are is left out of what the
@@ -538,10 +545,6 @@ impl TerminalView {
             entry.cells[0] = name;
             entry.cells.push(running);
         }
-        if let Some(listing) = crate::session::sessions(&crate::session::home()) {
-            entries.extend(super::restore::session_rows(&listing));
-            of.push_str(&super::restore::session_rows_key(&listing));
-        }
         // Under the names, as it has no number.
         let new = |id: &str, name: &str, action| crate::actions::Entry {
             id: id.into(),
@@ -550,18 +553,69 @@ impl TerminalView {
             cells: vec![name.into()],
             action,
         };
+        // What each place's daemon holds that nothing shows: this machine's,
+        // then each remote's. A place that is not connected has one row,
+        // which connects to it: its sessions take that row's place once it
+        // is. Nothing is connected to until it is asked for.
+        use crate::session::{Place, Status};
+        let current = self.current_place();
+        let mut starts = Vec::new();
+        let remotes = crate::session::remotes().into_iter().map(|remote| Place::Remote(remote.name));
+        for place in std::iter::once(Place::Here).chain(remotes) {
+            let status = crate::session::status(&place);
+            let name = place.name().unwrap_or("this machine").to_owned();
+            of.push_str(&format!("{name}{status:?}"));
+            let row = |state: &str| crate::actions::Entry {
+                id: format!("place.{name}"),
+                label: String::new(),
+                shortcut: None,
+                cells: vec![name.clone(), state.to_owned()],
+                action: AppAction::Connect(place.clone()),
+            };
+            match status {
+                Status::Connected => {
+                    if let Some(listing) = crate::session::sessions(&place) {
+                        entries.extend(super::restore::session_rows(&listing));
+                        of.push_str(&super::restore::session_rows_key(&listing));
+                    }
+                }
+                // Shells of this machine that are not kept in a daemon.
+                Status::Off => {}
+                Status::Idle => starts.push(row("not connected: Enter connects")),
+                Status::Connecting => starts.push(row("connecting\u{2026}")),
+                Status::Lost => starts.push(row("connection lost: Enter connects again")),
+                Status::Unavailable(reason) => {
+                    let reason = reason.lines().last().unwrap_or_default().trim();
+                    starts.push(row(&format!("cannot be reached: {reason}")));
+                }
+            }
+            // A new workspace is made where the current one is, by the rows
+            // below. Any other place that can take one has a row of its own.
+            let takes = matches!(crate::session::status(&place), Status::Connected | Status::Off);
+            if takes && (place != current || !window) && (window || place != crate::session::home()) {
+                let label = format!("New session on {name}");
+                let action = AppAction::NewSessionOn(place.clone());
+                starts.push(new(&format!("session.new.{name}"), &label, action));
+            }
+        }
         // With folders to start one in, the picker goes on to list each it
         // finds. Without, one row makes a new workspace where the window is.
         if !self.picker_bindings.new_workspace_roots.is_empty() {
             of.push_str("folders");
         } else if window {
             let create = AppAction::Workspace(WorkspaceAction::CreateWorkspace);
-            entries.push(new("workspace.new", "New workspace", create));
+            // It is made where the current one is.
+            let label = match current.name() {
+                Some(place) => format!("New workspace on {place}"),
+                None => "New workspace".into(),
+            };
+            entries.push(new("workspace.new", &label, create));
         } else {
             // A window with no terminal starts a shell once its picker has
             // gone, whatever was chosen: see `chosen`.
             entries.push(new("session.new", "New session", AppAction::NewSession));
         }
+        entries.extend(starts);
         of.push_str(if window { "window" } else { "launch" });
         (entries, of)
     }
@@ -649,7 +703,7 @@ impl TerminalView {
             let done = match action {
                 AppAction::DetachWorkspaceId(id) => self.detach_workspace(id),
                 AppAction::EndWorkspaceId(id) => Ok(self.end_workspace(id)),
-                AppAction::EndSession(id) => Ok(self.end_session(&id)),
+                AppAction::EndSession(held) => Ok(self.end_session(&held)),
                 _ => Ok(()),
             };
             match done {
@@ -718,6 +772,16 @@ impl TerminalView {
             workspace.name = name;
         }
         self.select_workspace(id)
+    }
+    /// Make a workspace whose shells run in `place`, and go to it.
+    pub(super) fn create_workspace_on(
+        &mut self,
+        place: crate::session::Place,
+        gl: &glow::Context,
+    ) -> Result<(), String> {
+        let options = workspace::CreateOptions { place: Some(place), ..Default::default() };
+        let w = self.workspace_request(Request::Create(options), gl)?;
+        self.select_workspace(w["id"].as_u64().unwrap())
     }
     /// Ask what to call a workspace, starting from what it is called now.
     /// Nothing typed takes its name away.
@@ -914,7 +978,17 @@ impl TerminalView {
         gl: &glow::Context,
     ) -> Result<u64, String> {
         spawn.validate()?;
-        if spawn.cwd.is_none() {
+        // In the place of the workspace `from` is in, tiled or in a float.
+        let owner = self.workspaces.iter().find(|w| {
+            let in_float = |float: &u64| {
+                self.floating.get(*float).is_some_and(|entry| entry.panes.contains(&from))
+            };
+            w.panes.contains(&from) || w.floats.ids().iter().any(in_float)
+        });
+        let place = owner.map_or_else(|| self.current_place(), |w| w.place.clone());
+        let local = place == crate::session::Place::Here;
+        spawn.place = Some(place);
+        if spawn.cwd.is_none() && local {
             spawn.cwd = self
                 .tiled_ref(from)
                 .and_then(|pane| pane.pwd())
@@ -1133,6 +1207,8 @@ impl TerminalView {
         let id = self.next_workspace;
         self.next_workspace += 1;
         let mut w = Workspace::new(id, index);
+        // Until its maker says otherwise.
+        w.place = crate::session::home();
         w.set_layout(layout.unwrap_or(self.picker_bindings.default_layout));
         self.workspaces.push(w);
         self.workspaces.sort_by_key(|w| w.index);
@@ -1274,8 +1350,10 @@ impl TerminalView {
                 }
                 // Spawn before publishing the workspace so failures leave the
                 // workspace collection and focus untouched.
+                let place = o.place.clone().unwrap_or_else(|| self.current_place());
                 let spawn = super::pane::SpawnOptions {
                     cwd: o.cwd.clone(),
+                    place: Some(place.clone()),
                     ..Default::default()
                 };
                 let pane = self.create_pane(gl, &self.beside_active(spawn))?;
@@ -1283,6 +1361,7 @@ impl TerminalView {
                 self.next_pane += 1;
                 self.tiled.push((pane_id, pane));
                 let w = self.push_workspace(index, o.layout);
+                w.place = place;
                 w.panes.push(pane_id);
                 w.focus(pane_id);
                 let result = json!(w);
@@ -1333,12 +1412,13 @@ impl TerminalView {
                 Ok(Value::Null)
             }
             Request::CreatePane(options) => {
-                let spawn = options.spawn();
+                let mut spawn = options.spawn();
                 spawn.validate()?;
                 let target = options.workspace.unwrap_or(self.current);
                 if !self.workspaces.iter().any(|w| w.id == target) {
                     return Err("workspace does not exist".into());
                 }
+                spawn.place = Some(self.place_of(target));
                 let pane = self.create_pane(gl, &self.beside_active(spawn))?;
                 let id = self.next_pane;
                 self.next_pane += 1;
@@ -1352,8 +1432,11 @@ impl TerminalView {
                 if !self.workspaces.iter().any(|w| w.id == target) {
                     return Err("workspace does not exist".into());
                 }
-                if !self.workspaces.iter().any(|w| w.panes.contains(&id)) {
+                let Some(source) = self.workspaces.iter().find(|w| w.panes.contains(&id)) else {
                     return Err("pane does not exist".into());
+                };
+                if source.place != self.place_of(target) {
+                    return Err(OTHER_PLACE.into());
                 }
                 for w in &mut self.workspaces {
                     w.remove(id);
@@ -1368,11 +1451,15 @@ impl TerminalView {
                 if !self.workspaces.iter().any(|w| w.id == target) {
                     return Err("workspace does not exist".into());
                 }
+                let place = self.place_of(target);
                 let source = self
                     .workspaces
                     .iter_mut()
                     .find(|w| w.floats.contains(id))
                     .ok_or("floating pane does not exist")?;
+                if source.place != place {
+                    return Err(OTHER_PLACE.into());
+                }
                 // The source shows its next float, if any; the destination
                 // shows the moved float when it is next selected.
                 source.floats.remove(id);

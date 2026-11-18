@@ -87,6 +87,10 @@ pub(crate) struct Remote {
     pub(crate) command: Option<String>,
     /// The daemon program there, when it is not found by name.
     pub(crate) daemon: Option<String>,
+    /// Where a new shell there starts; the home directory without it.
+    pub(crate) directory: Option<String>,
+    /// Which of the daemons there, as `--session` says which here.
+    pub(crate) session: Option<String>,
 }
 
 /// What a new shell on another machine is started with when its remote
@@ -107,6 +111,12 @@ impl Remote {
         }
         if self.command.as_deref().is_some_and(|command| !plain(command)) {
             return Err("command must not be empty".into());
+        }
+        if self.directory.as_deref().is_some_and(|directory| !plain(directory)) {
+            return Err("directory must not be empty".into());
+        }
+        if self.session.as_deref().is_some_and(|session| !nterm_session::is_session_name(session)) {
+            return Err(format!("session: {}", nterm_session::SESSION_NAME_RULE));
         }
         if self.daemon.as_deref().is_some_and(|daemon| !plain(daemon) || daemon.contains('"')) {
             return Err("daemon must be the path of a program, without quotes".into());
@@ -159,9 +169,52 @@ impl Place {
     fn remote(&self) -> Option<Remote> {
         match self {
             Place::Here => None,
-            Place::Remote(name) => remote().filter(|remote| remote.name == *name),
+            Place::Remote(name) => remotes().into_iter().find(|remote| remote.name == *name),
         }
     }
+
+    /// What a row or the status line calls it; nothing for this machine.
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Place::Here => None,
+            Place::Remote(name) => Some(name),
+        }
+    }
+}
+
+/// A session a daemon holds: which place's daemon, and its name there. Two
+/// places may each hold one of the same name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Held {
+    pub(crate) place: Place,
+    pub(crate) id: String,
+}
+
+#[cfg(test)]
+impl From<&str> for Held {
+    fn from(id: &str) -> Self {
+        Held { place: Place::Here, id: id.to_owned() }
+    }
+}
+
+/// The remotes the configuration names.
+static REMOTES: Mutex<Vec<Remote>> = Mutex::new(Vec::new());
+
+/// Called with the configuration's remotes before the first pane is made.
+pub(crate) fn set_remotes(remotes: Vec<Remote>) {
+    *REMOTES.lock().unwrap() = remotes;
+}
+
+/// Every remote a workspace can be on: those the configuration names, and
+/// the one the window was started for if it is none of them.
+pub(crate) fn remotes() -> Vec<Remote> {
+    let mut remotes = REMOTES.lock().unwrap().clone();
+    if let Some(started) = remote()
+        && !remotes.iter().any(|remote| remote.name == started.name)
+    {
+        remotes.insert(0, started);
+    }
+    remotes
 }
 
 /// The place the window was started for: `--remote NAME`'s, or this machine.
@@ -230,6 +283,8 @@ pub(crate) struct Listing {
     /// The connection that gave it. Its pane numbers mean nothing to
     /// another daemon.
     daemon: u64,
+    /// The place whose daemon holds them.
+    pub(crate) place: Place,
 }
 
 impl Listing {
@@ -544,6 +599,13 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
         Place::Here => None,
         place => Some(place.remote().ok_or_else(|| other("that remote is not known".into()))?),
     };
+    // A remote's daemon is the one its entry names. `--session` names this
+    // machine's, and that of the remote the window was started for.
+    let session = match &remote {
+        Some(remote) if remote.session.is_some() => remote.session.clone().unwrap_or_default(),
+        Some(_) if client.place != home() => DEFAULT_SESSION.to_owned(),
+        _ => session,
+    };
     for attempt in 0..2 {
         let connection = match &remote {
             Some(remote) => nterm_session::relay::connect(&mut remote.ssh(&session))?,
@@ -605,7 +667,7 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             starting: Mutex::default(),
             programs: Mutex::default(),
             snapshots: Mutex::default(),
-            sessions: Mutex::new(Arc::new(Listing { sessions, daemon: number })),
+            sessions: Mutex::new(Arc::new(Listing { sessions, daemon: number, place: client.place.clone() })),
             next_request: AtomicU32::new(1),
             settings: Mutex::default(),
             gone: AtomicBool::new(false),
@@ -749,7 +811,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 let mut held = daemon.sessions.lock().unwrap();
                 // The daemon says again what it said at the greeting.
                 if held.sessions != sessions {
-                    *held = Arc::new(Listing { sessions, daemon: daemon.number });
+                    *held = Arc::new(Listing { sessions, daemon: daemon.number, place: daemon.client.place.clone() });
                     drop(held);
                     wake_ui();
                 }
@@ -816,7 +878,15 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
     let mut links: Vec<Arc<Link>> = daemon.panes.lock().unwrap().drain().map(|(_, l)| l).collect();
     links.extend(daemon.starting.lock().unwrap().drain().map(|(_, link)| link));
     if !links.is_empty() {
-        report("The session daemon went away", &format!("{error}\n\nIts panes are closed."));
+        match &daemon.remote {
+            Some(remote) => report(
+                &format!("The connection to {} was lost", remote.name),
+                &format!("{error}\n\nIts workspaces here are closed. Its shells run on there."),
+            ),
+            None => {
+                report("The session daemon went away", &format!("{error}\n\nIts panes are closed."))
+            }
+        }
     }
     // Only if this is still the connection in use: a later one is not lost.
     {
@@ -920,6 +990,11 @@ pub(crate) struct Link {
 }
 
 impl Link {
+    /// Where the shell runs.
+    pub(crate) fn place(&self) -> Place {
+        self.daemon.client.place.clone()
+    }
+
     fn with_host(&self, feed: impl FnOnce(*mut Host)) {
         let host = self.host.lock().unwrap();
         if *host != 0 {
@@ -1381,7 +1456,7 @@ extern "C" fn on_spawn(userdata: *mut c_void, spawn: *const HostSpawn) {
             // environment and directory.
             Some(remote) => SpawnSpec {
                 command: remote.command.unwrap_or_else(|| REMOTE_COMMAND.into()),
-                cwd: None,
+                cwd: remote.directory,
                 env: Vec::new(),
             },
             None => SpawnSpec {
@@ -1499,6 +1574,8 @@ mod tests {
             address: address.into(),
             command: command.map(str::to_owned),
             daemon: daemon.map(str::to_owned),
+            directory: None,
+            session: None,
         };
         assert!(remote("me@host", Some("pwsh.exe -NoLogo"), Some(r"C:\a b\d.exe")).check().is_ok());
         for bad in [

@@ -261,6 +261,9 @@ impl TerminalView {
         floating_padding: Option<crate::config::FloatingPadding>,
     ) -> Self {
         let first = pane.is_some();
+        // A pane moved here brings its place; a window with none starts in
+        // the place it was started for.
+        let place = pane.as_ref().map_or_else(crate::session::home, |pane| pane.place());
         Self {
             messages: crate::messages::Messages::new(issues),
             toasts: Default::default(),
@@ -272,6 +275,7 @@ impl TerminalView {
             workspaces: vec![{
                 let mut w = workspace::Workspace::new(1, 1);
                 w.layout = picker_bindings.default_layout;
+                w.place = place;
                 if first {
                     w.panes.push(0);
                     w.focused = Some(0);
@@ -312,18 +316,33 @@ impl TerminalView {
         gl: &glow::Context,
         options: &pane::SpawnOptions,
     ) -> Result<TerminalPane, String> {
+        // One that names no place is the current workspace's.
+        let mut options = options.clone();
+        options.place.get_or_insert_with(|| self.current_place());
         let pane = TerminalPane::create(
             &self.app,
             &self.context,
             gl,
             self.proxy.clone(),
             self.window,
-            options,
+            &options,
         )
         .map_err(|e| e.to_string())?;
         #[cfg(any(windows, unix))]
         pane.set_pipe_policy(&self.picker_bindings.pipe_policy);
         Ok(pane)
+    }
+
+    /// Where the current workspace's shells run, which is where a new pane
+    /// of it is made.
+    pub(super) fn current_place(&self) -> crate::session::Place {
+        self.place_of(self.current)
+    }
+
+    /// Where a workspace's shells run.
+    pub(super) fn place_of(&self, workspace: u64) -> crate::session::Place {
+        let found = self.workspaces.iter().find(|w| w.id == workspace);
+        found.map_or_else(crate::session::home, |w| w.place.clone())
     }
 
     /// `spawn` for a new shell, which starts where the active pane's shell
@@ -333,7 +352,11 @@ impl TerminalView {
     /// next prompt, and the daemon would start the shell in its own
     /// directory.
     fn beside_active(&self, mut spawn: pane::SpawnOptions) -> pane::SpawnOptions {
-        if spawn.cwd.is_none() {
+        // Only on this machine, and from a pane of it: another machine's
+        // directory is not one of this one's.
+        let here = crate::session::Place::Here;
+        let local = self.current_place() == here && spawn.place.as_ref().is_none_or(|p| *p == here);
+        if spawn.cwd.is_none() && local {
             let active = self
                 .visible_float_pane()
                 .or_else(|| self.focused_id().and_then(|id| self.tiled_ref(id)));
@@ -572,15 +595,26 @@ impl TerminalView {
                 }
             }
             AppAction::EndWorkspaceId(id) => self.end_workspace(id),
-            AppAction::EndSession(id) => self.end_session(&id),
-            AppAction::AttachSession(id) => {
-                if let Err(error) = self.attach_session(&id, gl) {
+            AppAction::EndSession(held) => self.end_session(&held),
+            AppAction::AttachSession(held) => {
+                if let Err(error) = self.attach_session(&held, gl) {
                     self.show_error("Session could not be shown", error);
                 }
             }
             // The row of the picker a window without a terminal asks with,
             // which acts on it itself.
             AppAction::NewSession => {}
+            AppAction::NewSessionOn(place) => {
+                if let Err(error) = self.create_workspace_on(place, gl) {
+                    self.show_error("Session could not be started", error);
+                }
+            }
+            // Its row gives way to what the place holds, so the picker is
+            // shown again to choose from that.
+            AppAction::Connect(place) => {
+                crate::session::connect(&place);
+                self.open_workspace_picker(ctx);
+            }
             AppAction::ReloadConfig => match self.reload_source.reload() {
                 Ok(config) => {
                     if config.theme.is_some()
@@ -921,10 +955,21 @@ impl TerminalView {
             self.show_messages(ui.ctx());
         }
         let mut right_edge = messages_left;
+        // A workspace on another machine says which, where one of this
+        // machine only says what it runs.
+        let elsewhere = self
+            .current_place()
+            .name()
+            .map(|name| format!("{} \u{b7} {}", self.command_label, name.to_uppercase()));
         let mut status = match self.active_pane_opt() {
             Some(pane) => pane.status(&self.command_label),
             None => self.empty_status(),
         };
+        if let Some(elsewhere) = &elsewhere
+            && std::ptr::eq(status.label, self.command_label.as_str())
+        {
+            status.label = elsewhere;
+        }
         if let Some(picker) = &self.window_picker {
             status.label = picker.label();
         }

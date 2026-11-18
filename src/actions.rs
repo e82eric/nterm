@@ -14,7 +14,7 @@ pub(crate) enum AppAction {
     /// End every shell in a workspace of this window.
     EndWorkspaceId(u64),
     /// End every shell of a session waiting in the daemon, by its name.
-    EndSession(String),
+    EndSession(crate::session::Held),
     /// Call a workspace of this window `name`; nothing takes its name away.
     RenameWorkspace { id: u64, name: String },
     /// Make a workspace whose first shell starts in a directory, and go to
@@ -22,9 +22,13 @@ pub(crate) enum AppAction {
     CreateWorkspaceIn(Option<String>),
     /// Show a session waiting in the session daemon as a workspace. The
     /// name is the daemon's; empty for the shells no session describes.
-    AttachSession(String),
+    AttachSession(crate::session::Held),
     /// The launch picker's choice of a new session over the waiting ones.
     NewSession,
+    /// A new workspace whose shells run in that place.
+    NewSessionOn(crate::session::Place),
+    /// Connect to a place, to see what its daemon holds.
+    Connect(crate::session::Place),
     ReloadConfig,
     NewWindow,
     ShowMessages,
@@ -176,6 +180,8 @@ impl AppAction {
                 | Self::EndSession(_)
                 | Self::AttachSession(_)
                 | Self::NewSession
+                | Self::NewSessionOn(_)
+                | Self::Connect(_)
                 | Self::NewWindow
                 | Self::ReloadConfig
                 | Self::ShowMessages

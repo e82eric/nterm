@@ -34,7 +34,7 @@ const FIRST: [u32; 2] = [640, 480];
 /// The waiting session whose row is selected, and the panes looking at it.
 pub(super) struct Peek {
     /// The session's id; empty for the shells no session describes.
-    session: String,
+    session: crate::session::Held,
     /// The session's layout. Its pane ids are the daemon's pane numbers.
     workspace: Workspace,
     panes: Vec<Looking>,
@@ -107,12 +107,12 @@ impl TerminalView {
     ) {
         let selected = self.window_picker.as_ref().and_then(|picker| picker.previewed()).cloned();
         let session = match &selected {
-            Some((AppAction::AttachSession(id), _)) => Some(id.as_str()),
+            Some((AppAction::AttachSession(held), _)) => Some(held),
             _ => None,
         };
-        if self.peek.as_ref().map(|peek| peek.session.as_str()) != session {
+        if self.peek.as_ref().map(|peek| &peek.session) != session {
             self.drop_peek();
-            self.peek = session.map(|id| self.open_peek(id, gl));
+            self.peek = session.map(|held| self.open_peek(held, gl));
         }
         self.refresh_peek(ctx);
         let Some((action, preview)) = selected else { return };
@@ -204,16 +204,16 @@ impl TerminalView {
     /// Panes that look at each shell a waiting session shows. One that
     /// cannot be looked at comes back with no panes, so that it is not
     /// asked about again every frame.
-    fn open_peek(&mut self, id: &str, gl: &glow::Context) -> Peek {
+    fn open_peek(&mut self, held: &crate::session::Held, gl: &glow::Context) -> Peek {
         let mut peek = Peek {
-            session: id.to_owned(),
+            session: held.clone(),
             workspace: Workspace::new(0, 0),
             panes: Vec::new(),
             float: None,
             float_size: None,
             asked: Instant::now(),
         };
-        let Some(waiting) = super::restore::waiting_workspace(id) else { return peek };
+        let Some(waiting) = super::restore::waiting_workspace(held) else { return peek };
         peek.workspace = waiting.workspace;
         peek.float = waiting.float;
         peek.float_size = waiting.float_size;
@@ -222,6 +222,7 @@ impl TerminalView {
             let grid = [shell.info.size.cols, shell.info.size.rows];
             let options = super::pane::SpawnOptions {
                 start: crate::session::Start::Look(Box::new(shell)),
+                place: Some(held.place.clone()),
                 ..Default::default()
             };
             let Ok(pane) = self.create_pane(gl, &options) else { continue };

@@ -198,18 +198,27 @@ pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::acti
         let place = panes.iter().find_map(|pane| pane.pwd.clone());
         let (name, running) = called(session_name(session), &titles, place.as_ref());
         let kind = if session.id.is_empty() { "Shells in no session: " } else { "" };
+        let held = crate::session::Held { place: listing.place.clone(), id: session.id.clone() };
+        // A session of another machine says which.
+        let state = match listing.place.name() {
+            Some(place) => format!("detached on {place}"),
+            None => "detached".into(),
+        };
         Some(crate::actions::Entry {
-            id: format!("session.{}", session.id),
+            id: match listing.place.name() {
+                Some(place) => format!("session@{place}.{}", session.id),
+                None => format!("session.{}", session.id),
+            },
             label: String::new(),
             shortcut: None,
             cells: vec![
                 format!("{kind}{name}"),
-                "detached".into(),
+                state,
                 saved.layout.tag().to_owned(),
                 counted(saved.panes.len(), saved.floats.iter().map(|float| float.all().len())),
                 running,
             ],
-            action: AppAction::AttachSession(session.id.clone()),
+            action: AppAction::AttachSession(held),
         })
     };
     listing.sessions.iter().filter_map(row).collect()
@@ -269,9 +278,9 @@ fn float_size(saved: &Saved) -> Option<crate::config::FloatingPadding> {
 
 /// A session waiting in the daemon, as the daemon last described it. `None`
 /// when it is not waiting.
-pub(super) fn waiting_workspace(id: &str) -> Option<Waiting> {
-    let listing = crate::session::sessions(&crate::session::home())?;
-    let saved = listing.sessions.iter().find(|session| session.id == id).and_then(arrangement)?;
+pub(super) fn waiting_workspace(held: &crate::session::Held) -> Option<Waiting> {
+    let listing = crate::session::sessions(&held.place)?;
+    let saved = listing.sessions.iter().find(|session| session.id == held.id).and_then(arrangement)?;
     // A group as saved, its pane ids the daemon's pane numbers.
     let group = |layout: Layout,
                  ratio: Option<f32>,
@@ -314,15 +323,23 @@ pub(super) fn waiting_workspace(id: &str) -> Option<Waiting> {
 impl TerminalView {
     /// Show a waiting session as a new workspace of this window, and go to
     /// it. In a window that had no terminal it is the only workspace.
-    pub(super) fn attach_session(&mut self, id: &str, gl: &glow::Context) -> Result<(), String> {
+    pub(super) fn attach_session(
+        &mut self,
+        held: &crate::session::Held,
+        gl: &glow::Context,
+    ) -> Result<(), String> {
+        let id = held.id.as_str();
         // Nothing looks at the session once it is shown.
         self.drop_peek();
         // The sessions as they are now, which the rows chosen from followed.
-        let listing = crate::session::sessions(&crate::session::home()).ok_or("That session is no longer waiting.")?;
+        let listing =
+            crate::session::sessions(&held.place).ok_or("That session is no longer waiting.")?;
         let session = listing.sessions.iter().find(|session| session.id == id);
         let saved = session.and_then(arrangement).ok_or("That session is no longer waiting.")?;
         let index = self.free_index();
-        let workspace_id = self.push_workspace(index, Some(saved.layout)).id;
+        let workspace = self.push_workspace(index, Some(saved.layout));
+        workspace.place = held.place.clone();
+        let workspace_id = workspace.id;
         // Daemon pane to this window's tiled and floating panes.
         let mut tiled: HashMap<u32, u64> = HashMap::new();
         let mut floating: HashMap<u32, u64> = HashMap::new();
@@ -431,6 +448,7 @@ impl TerminalView {
         };
         let options = super::pane::SpawnOptions {
             start: crate::session::Start::Adopt(Box::new(adopt)),
+            place: Some(listing.place.clone()),
             ..Default::default()
         };
         let pane = self.create_pane(gl, &options);
@@ -517,11 +535,13 @@ impl TerminalView {
             // `None` while the daemon has numbered none of its panes.
             let Some(saved) = self.describe(&self.workspaces[at]) else { continue };
             let Ok(text) = serde_json::to_string(&saved) else { continue };
+            let place = self.workspaces[at].place.clone();
             let session = self.workspaces[at]
                 .session
                 .get_or_insert_with(|| workspace::Session { id: new_id(), sent: String::new() });
             if session.sent != text {
-                crate::session::set_session(&crate::session::home(), session.id.clone(), saved.members(), text.clone());
+                let (id, panes) = (session.id.clone(), saved.members());
+                crate::session::set_session(&place, id, panes, text.clone());
                 session.sent = text;
             }
         }
@@ -601,13 +621,13 @@ impl TerminalView {
     /// End every shell of a session nothing shows. The daemon forgets a
     /// session once none of its shells runs, and says so, which takes its
     /// row out of the picker.
-    pub(super) fn end_session(&self, id: &str) {
-        let Some(listing) = crate::session::sessions(&crate::session::home()) else { return };
-        let Some(session) = listing.sessions.iter().find(|session| session.id == id) else {
+    pub(super) fn end_session(&self, held: &crate::session::Held) {
+        let Some(listing) = crate::session::sessions(&held.place) else { return };
+        let Some(session) = listing.sessions.iter().find(|session| session.id == held.id) else {
             return;
         };
         for pane in takeable(session) {
-            crate::session::close_pane(&crate::session::home(), pane.pane);
+            crate::session::close_pane(&held.place, pane.pane);
         }
     }
 

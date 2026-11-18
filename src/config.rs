@@ -412,6 +412,10 @@ struct RemoteConfig {
     command: Option<String>,
     /// Where `nterm-daemon` is there, when its `PATH` does not have it.
     daemon: Option<String>,
+    /// Where a new shell there starts. Without it, the home directory.
+    directory: Option<String>,
+    /// Which of the daemons there. Without it, the one called "default".
+    session: Option<String>,
 }
 
 impl RemoteConfig {
@@ -423,6 +427,8 @@ impl RemoteConfig {
             address: self.address.unwrap_or_else(|| name.to_owned()),
             command: self.command,
             daemon: self.daemon,
+            directory: self.directory,
+            session: self.session,
         };
         remote.check().map_err(|error| format!("remotes.{name}: {error}"))?;
         Ok(remote)
@@ -977,10 +983,19 @@ pub(crate) fn prepare_with_reload(
                 .and_then(|mut config| {
                     crate::session::configure(config.terminal.session_daemon);
                     // Before the rest is made, which differs for a remote.
-                    if let Some(name) = remote.take() {
-                        let known = config.remotes.remove(&name).unwrap_or_default();
-                        crate::session::set_remote(known.named(&name)?);
+                    let mut remotes = Vec::new();
+                    for (name, known) in std::mem::take(&mut config.remotes) {
+                        remotes.push(known.named(&name)?);
                     }
+                    if let Some(name) = remote.take() {
+                        let known = remotes.iter().find(|known| known.name == name).cloned();
+                        let known = match known {
+                            Some(known) => known,
+                            None => RemoteConfig::default().named(&name)?,
+                        };
+                        crate::session::set_remote(known);
+                    }
+                    crate::session::set_remotes(remotes);
                     Ok((
                         config.ghostty_args()?,
                         crate::picker::config::Bindings::compile_with_actions(
@@ -3974,8 +3989,9 @@ mod tests {
             r#"return { remotes = {
                 vm = { address = "me@10.0.0.5", command = "pwsh.exe -NoLogo",
                        daemon = "C:\\Program Files\\nterm\\nterm-daemon.exe" },
-                bare = {},
+                bare = { directory = "C:\\src", session = "work" },
                 bad = { address = "-oProxyCommand=calc" },
+                unnamed = { session = "two words" },
             } }"#,
         );
         let mut remotes = config.unwrap().remotes;
@@ -3984,7 +4000,10 @@ mod tests {
         assert_eq!(vm.command.as_deref(), Some("pwsh.exe -NoLogo"));
         assert_eq!(vm.daemon.as_deref(), Some(r"C:\Program Files\nterm\nterm-daemon.exe"));
         // With no address, its name is one.
-        assert_eq!(remotes.remove("bare").unwrap().named("bare").unwrap().address, "bare");
+        let bare = remotes.remove("bare").unwrap().named("bare").unwrap();
+        assert_eq!(bare.address, "bare");
+        assert_eq!((bare.directory.as_deref(), bare.session.as_deref()), (Some(r"C:\src"), Some("work")));
+        assert!(remotes.remove("unnamed").unwrap().named("unnamed").unwrap_err().contains("session"));
         // A name the configuration does not have is an address too.
         let unknown = RemoteConfig::default().named("me@host").unwrap();
         assert_eq!((unknown.address.as_str(), unknown.command), ("me@host", None));

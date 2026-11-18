@@ -232,6 +232,10 @@ pub(crate) struct Workspace {
     /// daemon of itself.
     #[serde(skip)]
     pub session: Option<Session>,
+    /// Where its shells run: every pane of it, tiled or floating, is made
+    /// there, and that place's daemon keeps its session.
+    #[serde(skip)]
+    pub place: crate::session::Place,
 }
 /// The longest name a workspace keeps.
 const NAME_LENGTH: usize = 64;
@@ -269,6 +273,7 @@ impl Workspace {
             name: None,
             floats: Default::default(),
             session: None,
+            place: Default::default(),
         }
     }
 }
@@ -464,6 +469,9 @@ pub(crate) struct CreateOptions {
     pub layout: Option<Layout>,
     /// Where the first shell starts. `None` is where the active pane is.
     pub cwd: Option<String>,
+    /// The place its shells run in. `None` is the current workspace's.
+    #[serde(skip)]
+    pub place: Option<crate::session::Place>,
 }
 /// `app:create_pane` options: the destination workspace (current by default)
 /// and how to start the shell. Tiled panes have no names.

@@ -45,12 +45,10 @@ Use the command palette's Reload configuration action to apply supported Lua set
 
 ## Remotes
 
-`nterm --remote NAME` opens a window whose shells run in the nterm daemon of
-another machine. The window reaches it by running `ssh`, so the other machine
-needs an ssh server and this build of nterm, and nothing else. The shells
-stay there when the window closes or the connection is lost, and the next
-`nterm --remote NAME` shows them again. `--session NAME` picks one of several
-daemons there, as it does here.
+A workspace's shells can run in the nterm daemon of another machine. The
+window reaches it by running `ssh`, so the other machine needs an ssh server
+and this build of nterm, and nothing else. The shells stay there when the
+window closes or the connection is lost, to be shown again.
 
 `remotes` names the machines:
 
@@ -60,9 +58,23 @@ remotes = {
     address = "me@192.168.56.10",
     command = "pwsh.exe -NoLogo",
     daemon = "C:\\Program Files\\nterm\\nterm-daemon.exe",
+    directory = "C:\\src",
+    session = "work",
   },
 }
 ```
+
+Each has a row in the workspace picker, and nothing is connected to until its
+row is chosen. Choosing `vm` connects; its row then gives way to the sessions
+waiting there, each marked `detached on vm`, and to `New session on vm`. A
+workspace is of one place: its splits and new panes are made where it is, and
+a pane cannot move to a workspace of another place. The status line says
+which machine the current workspace is on, and the picker's rows say it of
+each. When a connection is lost, that machine's workspaces close, the others
+stay, and its row offers to connect again: its shells are still there.
+
+`nterm --remote NAME` opens a window that starts on that machine, and
+`--session NAME` then picks which of its daemons, as it does here.
 
 - `address` is what `ssh` is given: `user@host`, or a `Host` of your ssh
   configuration. Without it, the remote's name is used.
@@ -70,6 +82,10 @@ remotes = {
   `terminal.command` is this machine's and is not used.
 - `daemon` is where `nterm-daemon` is there. Without it, it is found by name,
   so its folder must be on that account's `PATH`.
+- `directory` is where a new shell there starts. Without it, the home
+  directory.
+- `session` is which daemon there, for a machine that runs several. Without
+  it, the one called `default`.
 
 A name that `remotes` does not have is taken as an address:
 `nterm --remote me@host`.

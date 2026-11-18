@@ -170,7 +170,13 @@ impl TerminalView {
         gl: &glow::Context,
     ) -> Option<Empty> {
         if let Some(crate::picker::Action::Execute(action)) = action {
+            // Connecting shows the picker again, to choose from what the
+            // place holds: the window goes on asking.
+            let asks_again = matches!(action, crate::actions::AppAction::Connect(_));
             self.execute_action(action, false, ctx, gl);
+            if asks_again && self.window_picker.is_some() {
+                return Some(Empty::Choose);
+            }
         }
         if self.has_panes() { None } else { self.first_shell(gl) }
     }
