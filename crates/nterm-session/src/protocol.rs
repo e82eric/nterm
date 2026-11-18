@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -323,6 +323,14 @@ pub enum Control {
         /// the middle, and marked.
         #[serde(default)]
         line: Option<u64>,
+        /// How `text` is coloured, in place of by `name`: `PlainText` for
+        /// not at all, or the name of a language.
+        #[serde(default)]
+        syntax: Option<String>,
+        /// How the name of a file of what `text` is ends, to colour it by
+        /// where it has no `name`.
+        #[serde(default)]
+        extension: Option<String>,
         /// Why there is nothing to show, in place of `text`.
         #[serde(default)]
         error: Option<String>,
@@ -356,7 +364,9 @@ pub enum Frame {
     /// To a UI: what shows for the row it asked of with `request`, where
     /// that is not text: see `Control::PickerPreviewed`. It is content,
     /// and nothing for the UI to open or run.
-    Previewed { picker: u32, request: u64, kind: PreviewKind, bytes: Vec<u8> },
+    /// `line` is the line of what a program printed, from one, to show in
+    /// the middle.
+    Previewed { picker: u32, request: u64, kind: PreviewKind, line: Option<u32>, bytes: Vec<u8> },
 }
 
 /// What the bytes of a preview are.
@@ -406,10 +416,12 @@ impl Frame {
                 [cols.to_le_bytes(), rows.to_le_bytes()].concat().into(),
             ),
             Self::Shell { channel, bytes } => (KIND_SHELL, Some(*channel), bytes.as_slice().into()),
-            Self::Previewed { picker, request, kind, bytes } => {
-                let mut body = Vec::with_capacity(9 + bytes.len());
+            Self::Previewed { picker, request, kind, line, bytes } => {
+                let mut body = Vec::with_capacity(13 + bytes.len());
                 body.extend_from_slice(&request.to_le_bytes());
                 body.push(kind.byte());
+                // No line is line nothing: they are counted from one.
+                body.extend_from_slice(&line.unwrap_or(0).to_le_bytes());
                 body.extend_from_slice(bytes);
                 (KIND_PREVIEWED, Some(*picker), body.into())
             }
@@ -468,9 +480,11 @@ impl Frame {
             KIND_PREVIEWED => {
                 let (request, rest) = bytes.split_first_chunk::<8>().ok_or_else(|| invalid("previewed frame"))?;
                 let (kind, bytes) = rest.split_first().ok_or_else(|| invalid("previewed frame"))?;
+                let (line, bytes) = bytes.split_first_chunk::<4>().ok_or_else(|| invalid("previewed frame"))?;
+                let line = Some(u32::from_le_bytes(*line)).filter(|line| *line > 0);
                 // A kind from a newer version.
                 let Some(kind) = PreviewKind::of(*kind) else { return Ok(Self::Control(Control::Unknown)) };
-                Ok(Self::Previewed { picker: id, request: u64::from_le_bytes(*request), kind, bytes: bytes.to_vec() })
+                Ok(Self::Previewed { picker: id, request: u64::from_le_bytes(*request), kind, line, bytes: bytes.to_vec() })
             }
             // A frame kind from a newer version.
             _ => Ok(Self::Control(Control::Unknown)),
@@ -517,8 +531,8 @@ mod tests {
         round_trip(Frame::Input { pane: 7, bytes: vec![] });
         round_trip(Frame::Screen { pane: 1, bytes: vec![0, 1, 2] });
         round_trip(Frame::Snapshot { request: 9, bytes: vec![255; 300] });
-        round_trip(Frame::Previewed { picker: 4, request: u64::MAX - 1, kind: PreviewKind::Image, bytes: vec![0, 137, 80] });
-        round_trip(Frame::Previewed { picker: 4, request: 2, kind: PreviewKind::Ansi, bytes: vec![] });
+        round_trip(Frame::Previewed { picker: 4, request: u64::MAX - 1, kind: PreviewKind::Image, line: None, bytes: vec![0, 137, 80] });
+        round_trip(Frame::Previewed { picker: 4, request: 2, kind: PreviewKind::Ansi, line: Some(70_000), bytes: vec![] });
         round_trip(Control::Hello { protocol: PROTOCOL_VERSION, ghostty: "abc".into() }.into());
         round_trip(
             Control::Spawn {

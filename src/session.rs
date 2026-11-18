@@ -817,6 +817,11 @@ pub(crate) struct Previewed {
     /// What shows where that is not text: what a program printed, or a
     /// picture.
     pub(crate) bytes: Option<(nterm_session::protocol::PreviewKind, Vec<u8>)>,
+    /// How the text is coloured, in place of by its name: `PlainText`, or
+    /// the name of a language.
+    pub(crate) syntax: Option<String>,
+    /// How the name of a file of the text ends, to colour it by.
+    pub(crate) extension: Option<String>,
 }
 
 /// How long a preview is waited for.
@@ -1173,15 +1178,23 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                     );
                 }
             }
-            Frame::Previewed { picker, request, kind, bytes } => {
+            Frame::Previewed { picker, request, kind, line, bytes } => {
                 let shown = daemon.pickers.lock().unwrap().get(&picker).cloned();
                 if let Some(shown) = shown {
                     let previewed =
-                        Previewed { text: String::new(), name: None, truncated: false, line: None, bytes: Some((kind, bytes)) };
+                        Previewed {
+                            text: String::new(),
+                            name: None,
+                            truncated: false,
+                            line: line.map(|line| line as usize),
+                            bytes: Some((kind, bytes)),
+                            syntax: None,
+                            extension: None,
+                        };
                     shown.previewed(request, Ok(previewed));
                 }
             }
-            Frame::Control(Control::PickerPreviewed { picker, request, text, name, truncated, line, error }) => {
+            Frame::Control(Control::PickerPreviewed { picker, request, text, name, truncated, line, syntax, extension, error }) => {
                 let shown = daemon.pickers.lock().unwrap().get(&picker).cloned();
                 if let Some(shown) = shown {
                     shown.previewed(
@@ -1194,6 +1207,8 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                                 truncated,
                                 line: line.and_then(|line| usize::try_from(line).ok()).filter(|line| *line > 0),
                                 bytes: None,
+                                syntax,
+                                extension,
                             }),
                         },
                     );

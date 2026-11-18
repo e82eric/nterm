@@ -12,6 +12,8 @@ mod configured;
 #[cfg(windows)]
 mod picker;
 #[cfg(windows)]
+mod previewing;
+#[cfg(windows)]
 pub mod relay;
 #[cfg(windows)]
 pub mod server;

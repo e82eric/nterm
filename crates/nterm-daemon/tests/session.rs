@@ -1332,7 +1332,7 @@ fn a_ui_is_sent_what_shows_for_a_row_of_a_picker() {
     assert_eq!(found.texts(), ["Top.PNG"]);
     ui.send(Control::PickerPreview { picker, request: 7, serial: found.serial, row: found.rows[0].0 });
     let sent = ui.frame(|frame| matches!(frame, Frame::Previewed { .. }));
-    let Frame::Previewed { picker: of, request, kind, bytes } = sent else { unreachable!() };
+    let Frame::Previewed { picker: of, request, kind, bytes, .. } = sent else { unreachable!() };
     assert_eq!((of, request, kind), (picker, 7, nterm_session::protocol::PreviewKind::Image));
     assert_eq!(bytes, picture);
     ui.send(Control::PickerClose { picker, refused: None });
@@ -1732,4 +1732,140 @@ fn the_pickers_of_the_machines_file_are_opened_by_name_as_the_daemons_own_are() 
     assert!(message.contains("could not be read"), "{message}");
     ui.shutdown();
     assert!(daemon.wait().unwrap().success());
+}
+
+#[test]
+fn a_function_of_the_machines_file_says_what_shows_for_a_row() {
+    let session = session("pick-resolve");
+    let tree = Tree::new("resolve");
+    let cwd = tree.path();
+    let file = tree.0.join("nterm-daemon.lua");
+    std::fs::write(
+        &file,
+        r#"local shows = { type = "Dynamic", resolve = function(item, params)
+          if item.value == "text" then
+            local file = assert(io.open(params.cwd .. "/b/gamma.rs", "rb"))
+            local text = file:read("a")
+            file:close()
+            return { type = "Text", text = text .. "\nsecond", name = "gamma.rs", extension = "rs", center_line = 2 }
+          end
+          if item.value == "plain" then return { type = "Text", text = item.text, syntax = "PlainText" } end
+          if item.value == "ran" then
+            local printed = preview.run { args = { "cmd.exe", "/c", "echo", params.word }, cwd = params.cwd }
+            return { type = "Ansi", bytes = printed.stdout, center_line = 1 }
+          end
+          if item.value == "picture" then return { type = "Image", bytes = "\137PNG\0\255" } end
+          if item.value == "slow" then
+            preview.run { args = { "cmd.exe", "/c", "ping -n 30 127.0.0.1 > nul" }, timeout_ms = 60000 }
+          end
+          if item.value == "wrong" then error("no such thing", 0) end
+          return nil
+        end }
+        local rows = {}
+        for _, value in ipairs({ "text", "plain", "ran", "picture", "slow", "wrong", "none" }) do
+          rows[#rows + 1] = { text = "row " .. value, value = value }
+        end
+        return { pickers = {
+          Rows = { type = "Items", items = rows, preview = shows, sort = "SourceOrder" },
+          Hidden = { type = "Items", items = rows, preview = shows, preview_visible = false },
+          Here = { type = "FileSystem", files_only = true, relative = true,
+                   preview = { type = "Dynamic", resolve = function(item) return { type = "Text", text = "is " .. item.path } end } },
+        } }"#,
+    )
+    .unwrap();
+    let mut command = std::process::Command::new(DAEMON);
+    command.args(["--session", &session, "--lua-config"]).arg(&file).env_remove("NTERM_CONPTY_DLL");
+    let mut daemon = command.spawn().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while let Err(error) = pipe::connect(&session) {
+        assert!(Instant::now() < deadline, "the daemon never served: {error}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    let params = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    };
+    let mut open = |ui: &mut Ui, ask: u64, name: &str| -> (u32, Option<bool>) {
+        let given = params(&[("cwd", &cwd), ("word", "said")]);
+        ui.send(Control::PickerAsk { ask, pane, picker: name.into(), params: given });
+        let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. }));
+        let Control::PickerOpen { picker, preview, .. } = opened else { panic!("{name}: {opened:?}") };
+        (picker, preview)
+    };
+
+    // Every row of it has a preview, shown or hidden at first as it says.
+    let (hidden, preview) = open(&mut ui, 1, "Hidden");
+    assert_eq!(preview, Some(false));
+    ui.send(Control::PickerClose { picker: hidden, refused: None });
+    let (picker, preview) = open(&mut ui, 2, "Rows");
+    assert_eq!(preview, Some(true));
+    let found = ui.query(picker, 0, "");
+    let row = |value: &str| found.rows.iter().find(|(_, text)| text == &format!("row {value}")).unwrap().0;
+    let mut request = 0;
+    let mut ask = |ui: &mut Ui, value: &str| -> u64 {
+        request += 1;
+        ui.send(Control::PickerPreview { picker, request, serial: found.serial, row: row(value) });
+        request
+    };
+    let answered = |ui: &mut Ui, request: u64| {
+        ui.frame(|frame| match frame {
+            Frame::Previewed { request: of, .. } => *of == request,
+            Frame::Control(Control::PickerPreviewed { request: of, .. }) => *of == request,
+            _ => false,
+        })
+    };
+
+    // Text of a file of this machine, at a line, and how to colour it.
+    let asked = ask(&mut ui, "text");
+    let Frame::Control(Control::PickerPreviewed { text, name, line, extension, syntax, error, .. }) = answered(&mut ui, asked)
+    else {
+        panic!("not text")
+    };
+    assert_eq!((text.as_str(), name.as_deref(), line), ("b/gamma.rs\nsecond", Some("gamma.rs"), Some(2)));
+    assert_eq!((extension.as_deref(), syntax, error), (Some("rs"), None, None));
+    let asked = ask(&mut ui, "plain");
+    let Frame::Control(Control::PickerPreviewed { text, syntax, .. }) = answered(&mut ui, asked) else { panic!() };
+    assert_eq!((text.as_str(), syntax.as_deref()), ("row plain", Some("PlainText")));
+    // What a program printed, and a picture, as the bytes they are.
+    let asked = ask(&mut ui, "ran");
+    let Frame::Previewed { kind, line, bytes, .. } = answered(&mut ui, asked) else { panic!("not bytes") };
+    assert_eq!((kind, line), (nterm_session::protocol::PreviewKind::Ansi, Some(1)));
+    assert!(String::from_utf8_lossy(&bytes).contains("said"));
+    let asked = ask(&mut ui, "picture");
+    let Frame::Previewed { kind, bytes, .. } = answered(&mut ui, asked) else { panic!("not bytes") };
+    assert_eq!((kind, bytes.as_slice()), (nterm_session::protocol::PreviewKind::Image, &b"\x89PNG\0\xff"[..]));
+    // Nothing to show is no text, and what goes wrong is said.
+    let asked = ask(&mut ui, "none");
+    let Frame::Control(Control::PickerPreviewed { text, error, .. }) = answered(&mut ui, asked) else { panic!() };
+    assert_eq!((text.as_str(), error), ("", None));
+    let asked = ask(&mut ui, "wrong");
+    let Frame::Control(Control::PickerPreviewed { error, .. }) = answered(&mut ui, asked) else { panic!() };
+    assert!(error.is_some_and(|error| error.contains("no such thing")));
+    // A row rested on while a program runs for another: the program is
+    // stopped, and the row is answered long before it would have ended.
+    let began = Instant::now();
+    ask(&mut ui, "slow");
+    std::thread::sleep(Duration::from_millis(300));
+    let asked = ask(&mut ui, "plain");
+    let Frame::Control(Control::PickerPreviewed { text, .. }) = answered(&mut ui, asked) else { panic!() };
+    assert_eq!(text, "row plain");
+    assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+    // A picker that ends while a program runs for a row does not wait.
+    ask(&mut ui, "slow");
+    std::thread::sleep(Duration::from_millis(300));
+    ui.send(Control::PickerClose { picker, refused: None });
+
+    // Rows that are files are given as `item.path`, and the file's
+    // function is what says what shows: not the daemon's own.
+    let (picker, preview) = open(&mut ui, 3, "Here");
+    assert_eq!(preview, Some(true));
+    let found = ui.query(picker, 0, "gam");
+    let shown = ui.preview(picker, 1, found.serial, found.rows[0].0);
+    let Control::PickerPreviewed { text, .. } = shown else { unreachable!() };
+    assert!(text.starts_with("is ") && text.ends_with("gamma.rs"), "{text}");
+    ui.send(Control::PickerClose { picker, refused: None });
+    ui.shutdown();
+    assert!(daemon.wait().unwrap().success());
+    assert!(began.elapsed() < Duration::from_secs(20), "the daemon waited for a stopped program");
 }

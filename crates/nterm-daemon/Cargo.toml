@@ -27,6 +27,8 @@ serde_json = "1"
 png = "0.18"
 # The file of the pickers of the machine the daemon is on; see `configured`.
 mlua = { version = "0.9.9", features = ["lua54", "vendored", "serialize"] }
+# The programs a preview of that file runs.
+nfm-preview-command = { git = "https://github.com/e82eric/npicker", rev = "95ee4f7c2aab659fee9c1b0bdf677a01105e3a90" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

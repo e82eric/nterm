@@ -140,6 +140,8 @@ pub(crate) enum Lists {
 pub(crate) struct Defined {
     pub(crate) presentation: Presentation,
     pub(crate) lists: Lists,
+    /// Whether the file says what shows for a row of it: see `previewing`.
+    pub(crate) preview: bool,
 }
 
 /// The fields of a picker that are for every kind.
@@ -148,6 +150,9 @@ const COMMON: [&str; 6] = ["position", "sort", "initial_query", "preview_visible
 /// and what is done with the row chosen. The daemon does not run them yet,
 /// and a picker that has them is one all the same.
 const NOT_YET: [&str; 3] = ["action", "preview", "keys"];
+/// The one kind of preview the daemon runs: a function that says what
+/// shows for a row.
+pub(crate) const PREVIEW: &str = "Dynamic";
 
 /// What was read of the file: its pickers, or for one that could not be
 /// one, why not.
@@ -179,6 +184,11 @@ impl Configured {
         let own = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
         let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
         [own, beside].into_iter().flatten().map(|folder| folder.join(FILE)).find(|path| path.is_file())
+    }
+
+    /// The file last read.
+    pub(crate) fn file(&self) -> Option<PathBuf> {
+        self.read.lock().unwrap().0.as_ref().map(|(path, _)| path.clone())
     }
 
     /// The picker called `name`: none when the file has no such picker, or
@@ -215,30 +225,42 @@ impl Configured {
     }
 }
 
-impl Read {
-    fn of(path: &Path) -> Self {
-        Self::run(path).unwrap_or_else(|error| Self { error: Some(error), ..Default::default() })
-    }
-
-    fn run(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-        let lua = Lua::new();
-        modules(&lua, path).map_err(|error| error.to_string())?;
-        // A file that never ends does not hold the daemon.
-        let until = Instant::now() + MOST_TIME;
-        lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), move |_, _| {
-            if Instant::now() > until {
-                return Err(mlua::Error::RuntimeError("it took too long".into()));
-            }
-            Ok(())
-        });
-        let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+/// Run the file, leaving its `pickers` in Lua's registry under that name.
+/// A file that never ends does not hold the daemon.
+pub(crate) fn open(path: &Path) -> Result<Lua, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let lua = Lua::new();
+    modules(&lua, path).map_err(|error| error.to_string())?;
+    crate::previewing::helpers(&lua).map_err(|error| error.to_string())?;
+    let until = Instant::now() + MOST_TIME;
+    lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), move |_, _| {
+        if Instant::now() > until {
+            return Err(mlua::Error::RuntimeError("it took too long".into()));
+        }
+        Ok(())
+    });
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    {
         let returned: mlua::Value =
             lua.load(&text).set_name(format!("@{name}")).eval().map_err(|error| short(&error))?;
         let mlua::Value::Table(config) = returned else {
             return Err("it does not return a table".into());
         };
         let pickers: Option<mlua::Table> = config.get("pickers").map_err(|_| "pickers is not a table".to_owned())?;
+        lua.set_named_registry_value("pickers", pickers).map_err(|error| short(&error))?;
+    }
+    lua.remove_hook();
+    Ok(lua)
+}
+
+impl Read {
+    fn of(path: &Path) -> Self {
+        Self::run(path).unwrap_or_else(|error| Self { error: Some(error), ..Default::default() })
+    }
+
+    fn run(path: &Path) -> Result<Self, String> {
+        let lua = open(path)?;
+        let pickers: Option<mlua::Table> = lua.named_registry_value("pickers").map_err(|error| short(&error))?;
         let mut read = Self::default();
         let Some(pickers) = pickers else { return Ok(read) };
         for pair in pickers.pairs::<String, mlua::Value>() {
@@ -257,8 +279,10 @@ impl Read {
 }
 
 /// An error of Lua's, without the lines of where in Lua's own code it was.
-fn short(error: &mlua::Error) -> String {
-    error.to_string().lines().next().unwrap_or_default().to_owned()
+pub(crate) fn short(error: &mlua::Error) -> String {
+    let first = error.to_string().lines().next().unwrap_or_default().to_owned();
+    // What went wrong, without Lua's name for the kind of error it is.
+    first.strip_prefix("runtime error: ").map(str::to_owned).unwrap_or(first)
 }
 
 /// Modules are found beside the file and in what is installed with the
@@ -291,6 +315,25 @@ fn define(lua: &Lua, value: mlua::Value) -> Result<Defined, String> {
         mlua::Value::Table(table) => table,
         mlua::Value::Function(_) => return Err("a picker that is a function is not one the daemon runs yet".into()),
         _ => return Err("it is not a table".into()),
+    };
+    // What shows for a row is a function's to say, run when a row is
+    // rested on: see `previewing`.
+    let preview = match table.raw_get::<_, mlua::Value>("preview").map_err(|error| short(&error))? {
+        mlua::Value::Nil => false,
+        mlua::Value::Table(preview) => {
+            let kind: Option<String> = preview.raw_get("type").ok();
+            if kind.as_deref() != Some(PREVIEW) {
+                return Err(format!(
+                    "the daemon runs no preview of type {}: only {PREVIEW}",
+                    kind.as_deref().unwrap_or("none")
+                ));
+            }
+            if !matches!(preview.raw_get::<_, mlua::Value>("resolve"), Ok(mlua::Value::Function(_))) {
+                return Err(format!("a {PREVIEW} preview has a function, resolve"));
+            }
+            true
+        }
+        _ => return Err("preview is not a table".into()),
     };
     // A copy without what the daemon does not run yet: the file's own
     // table is left as it was written.
@@ -346,7 +389,7 @@ fn define(lua: &Lua, value: mlua::Value) -> Result<Defined, String> {
         }
         _ => {}
     }
-    Ok(Defined { presentation, lists })
+    Ok(Defined { presentation, lists, preview })
 }
 
 #[cfg(test)]

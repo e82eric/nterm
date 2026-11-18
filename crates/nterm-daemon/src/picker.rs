@@ -21,6 +21,7 @@
 //!   `code` and `message`.
 
 use crate::configured::{Configured, Defined};
+use crate::previewing::{Previewer, Shows};
 use crate::log::log;
 use nfm_file_system::{
     walker::{FileWalkerScan, PublishedSnapshot, ScanOptions, start_scan},
@@ -47,7 +48,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::Sender,
     },
 };
@@ -151,6 +152,8 @@ struct Definition {
     preview: Option<bool>,
     /// Whether it is shown at the pane's cursor.
     at_cursor: bool,
+    /// What says what shows for a row, for a picker of the machine's file.
+    resolves: Option<Resolves>,
 }
 /// What a picker's rows are.
 enum Lists {
@@ -448,6 +451,7 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
         sort,
         preview,
         at_cursor: params.get("position").is_some_and(|position| position == "cursor"),
+        resolves: None,
     })
 }
 
@@ -468,13 +472,18 @@ fn given<'a>(text: &'a str, params: &'a BTreeMap<String, String>) -> Result<&'a 
 /// A picker of the machine's file, opened with `params`. They fill what
 /// the file leaves to be given, as `{name}`, and say where: they are never
 /// which program is run, and each is one argument whole, whatever is in it.
-fn configured(name: &str, defined: Defined, params: &BTreeMap<String, String>) -> Result<Definition, String> {
+fn configured(
+    name: &str,
+    defined: Defined,
+    file: Option<PathBuf>,
+    params: &BTreeMap<String, String>,
+) -> Result<Definition, String> {
     use crate::configured::{Lists as Of, Position, Sort};
     let cwd = params.get("cwd").map(PathBuf::from);
     if let Some(cwd) = cwd.as_ref().filter(|cwd| cwd.is_relative() || !cwd.is_dir()) {
         return Err(format!("{} is not a folder", cwd.display()));
     }
-    let Defined { presentation, lists } = defined;
+    let Defined { presentation, lists, preview: resolved } = defined;
     let mut preview = None;
     let lists = match lists {
         Of::Command { args, cwd: folder, line_continuation, success_exit_codes, unique, .. } => {
@@ -548,6 +557,16 @@ fn configured(name: &str, defined: Defined, params: &BTreeMap<String, String>) -
             })
         }
     };
+    // Where the file says what shows for a row, every row has a preview,
+    // and it is the file's and not the daemon's own.
+    let resolves = match (resolved, file) {
+        (true, Some(file)) => {
+            let shown = params.get("preview").map(|preview| preview == "true");
+            preview = Some(shown.unwrap_or(presentation.preview_visible));
+            Some(Resolves { file, name: name.to_owned(), params: params.clone() })
+        }
+        _ => None,
+    };
     Ok(Definition {
         label: name.chars().take(MOST_LABEL).collect(),
         lists,
@@ -559,6 +578,7 @@ fn configured(name: &str, defined: Defined, params: &BTreeMap<String, String>) -
         preview,
         at_cursor: presentation.position == Position::Cursor
             || params.get("position").is_some_and(|position| position == "cursor"),
+        resolves,
     })
 }
 
@@ -804,7 +824,13 @@ struct Picker {
     source: Source,
     sort: SearchSortMode,
     /// The way to the thread that reads previews, once one was asked for.
-    previews: Mutex<Option<std::sync::mpsc::Sender<(u64, PathBuf, Option<u64>)>>>,
+    previews: Mutex<Option<std::sync::mpsc::Sender<(u64, Wanted)>>>,
+    /// The function of the machine's file that says what shows for a row.
+    resolves: Option<Resolves>,
+    /// The preview the UI last asked for, by its number for it: what is
+    /// being found for one before it is stopped. The most there is once
+    /// the picker has ended.
+    wanted: Arc<AtomicU64>,
     /// The folder the files are in of rows that are `path:line:column:text`,
     /// for a picker of what a search of files found.
     found_in: Option<PathBuf>,
@@ -839,6 +865,54 @@ enum Outcome {
     Accepted(Row),
     Cancelled(&'static str),
     Error { code: &'static str, message: String },
+}
+
+/// What the thread that finds a picker's previews is asked for.
+enum Wanted {
+    /// A file or a folder, and the line of the file to show in the middle.
+    File(PathBuf, Option<u64>),
+    /// What the picker's file says shows for a row: what the row shows as,
+    /// and what it is.
+    Row { text: String, value: String },
+}
+
+/// Where the function is that says what shows for a row of a picker of the
+/// machine's file, and what the picker was opened with: see `previewing`.
+#[derive(Clone)]
+struct Resolves {
+    file: PathBuf,
+    name: String,
+    params: BTreeMap<String, String>,
+}
+
+/// To a UI: there is nothing to show for the row, and why.
+fn said(picker: u32, request: u64, error: String) -> Control {
+    Control::PickerPreviewed {
+        picker,
+        request,
+        text: String::new(),
+        name: None,
+        truncated: false,
+        line: None,
+        syntax: None,
+        extension: None,
+        error: Some(error),
+    }
+}
+
+/// To a UI: `text` shows for the row, as the file called `name` or plain.
+fn text_of(picker: u32, request: u64, text: String, name: Option<String>) -> Control {
+    Control::PickerPreviewed {
+        picker,
+        request,
+        text,
+        name,
+        truncated: false,
+        line: None,
+        syntax: None,
+        extension: None,
+        error: None,
+    }
 }
 
 /// The pickers under way.
@@ -880,7 +954,7 @@ impl Pickers {
             return define(name, params);
         }
         match self.configured.picker(name)? {
-            Some(defined) => configured(name, defined, params).map_err(|why| format!("{name}: {why}")),
+            Some(defined) => configured(name, defined, self.configured.file(), params).map_err(|why| format!("{name}: {why}")),
             None => Err(format!("no picker named {name}")),
         }
     }
@@ -1016,6 +1090,8 @@ impl Pickers {
             source,
             sort: definition.sort,
             previews: Mutex::default(),
+            resolves: definition.resolves,
+            wanted: Arc::default(),
             found_in,
             state: Mutex::new(State { flow: Some(Flow::new()), ..Default::default() }),
         });
@@ -1211,6 +1287,7 @@ impl Pickers {
 fn end(open: &Mutex<HashMap<u32, Arc<Picker>>>, number: u32, outcome: Outcome, tell_ui: bool) {
     let Some(picker) = open.lock().unwrap().remove(&number) else { return };
     picker.source.stop();
+    picker.wanted.store(u64::MAX, Ordering::Release);
     let query = {
         let mut state = picker.state.lock().unwrap();
         if let Some(search) = state.search.take() {
@@ -1388,57 +1465,125 @@ impl Picker {
         })
     }
 
-    /// The UI asks what shows for a row. It is read on a thread of the
-    /// picker's own, so that a slow folder holds up nothing else the UI
-    /// says, and only the last asked for is read. Only a row that is a file
-    /// or a folder has anything to show.
+    /// The UI asks what shows for a row. It is found on a thread of the
+    /// picker's own, so that a slow folder or program holds up nothing else
+    /// the UI says, and only the last asked for is. Where the picker's file
+    /// says what shows, its function is run; otherwise only a row that is a
+    /// file or a folder has anything to show.
     fn preview(&self, request: u64, serial: u64, row: u64) {
-        // A file or a folder, or for what a search of files found the file
-        // at the line it was found on.
-        let shows = match (&self.source, self.row(serial, row)) {
-            (Source::Walk { .. }, Some(Row { value: Value::String(path), .. })) => Some((PathBuf::from(path), None)),
-            (Source::Read { .. }, Some(Row { value: Value::String(found), .. })) => self
+        let found = self.row(serial, row);
+        let wanted = match (&self.resolves, &self.source, found) {
+            (Some(_), _, Some(Row { text, value, .. })) => {
+                let value = match value {
+                    Value::String(value) => value,
+                    other => other.to_string(),
+                };
+                Some(Wanted::Row { text, value })
+            }
+            // A file or a folder, or for what a search of files found the
+            // file at the line it was found on.
+            (None, Source::Walk { .. }, Some(Row { value: Value::String(path), .. })) => {
+                Some(Wanted::File(PathBuf::from(path), None))
+            }
+            (None, Source::Read { .. }, Some(Row { value: Value::String(found), .. })) => self
                 .found_in
                 .as_ref()
-                .and_then(|folder| place(&found).map(|(path, line)| (folder.join(path), Some(line)))),
+                .and_then(|folder| place(&found).map(|(path, line)| Wanted::File(folder.join(path), Some(line)))),
             _ => None,
         };
-        let Some((path, line)) = shows else {
-            let error = Some(format!("row {row} of answer {serial} is not one the picker can show"));
-            return self.tell_ui(Control::PickerPreviewed {
-                picker: self.number,
-                request,
-                text: String::new(),
-                name: None,
-                truncated: false,
-                line: None,
-                error,
-            });
+        let Some(wanted) = wanted else {
+            let error = format!("row {row} of answer {serial} is not one the picker can show");
+            return self.tell_ui(said(self.number, request, error));
         };
+        // What is being found for a row before this one is stopped.
+        self.wanted.store(request, Ordering::Release);
         let mut previews = self.previews.lock().unwrap();
         let asked = previews.get_or_insert_with(|| {
-            let (asked, asking) = std::sync::mpsc::channel::<(u64, PathBuf, Option<u64>)>();
+            let (asked, asking) = std::sync::mpsc::channel::<(u64, Wanted)>();
             let (number, ui) = (self.number, self.ui_outbox.clone());
+            let (resolves, latest) = (self.resolves.clone(), self.wanted.clone());
+            let files = matches!(self.source, Source::Walk { .. });
             let read = move || {
+                // The picker's Lua, made when a row is first rested on.
+                let mut previewer: Option<Result<Previewer, String>> = None;
                 while let Ok(mut last) = asking.recv() {
                     while let Ok(newer) = asking.try_recv() {
                         last = newer;
                     }
-                    let (request, path, line) = last;
-                    let shown = Shown::of(&path, line);
-                    let previewed = match shown.picture {
-                        Some(bytes) => {
-                            Frame::Previewed { picker: number, request, kind: PreviewKind::Image, bytes }
+                    let (request, wanted) = last;
+                    let previewed = match (wanted, &resolves) {
+                        (Wanted::Row { text, value }, Some(resolves)) => {
+                            let previewer = previewer.get_or_insert_with(|| {
+                                let made = Previewer::new(
+                                    &resolves.file,
+                                    &resolves.name,
+                                    resolves.params.clone(),
+                                    files,
+                                    latest.clone(),
+                                );
+                                if let Err(error) = &made {
+                                    log(format_args!("picker {number}: its previews cannot be run: {error}"));
+                                }
+                                made
+                            });
+                            let shows = match previewer {
+                                Ok(previewer) => previewer.resolve(request, &text, &value),
+                                Err(error) => Some(Err(error.clone())),
+                            };
+                            // Stopped for another row: that one is next.
+                            let Some(shows) = shows else { continue };
+                            match shows {
+                                Ok(Shows::Nothing) => Frame::Control(text_of(number, request, String::new(), None)),
+                                Ok(Shows::Text { text, name, extension, syntax, line }) => {
+                                    Frame::Control(Control::PickerPreviewed {
+                                        picker: number,
+                                        request,
+                                        text,
+                                        name,
+                                        truncated: false,
+                                        line,
+                                        syntax,
+                                        extension,
+                                        error: None,
+                                    })
+                                }
+                                Ok(Shows::Ansi { bytes, line }) => {
+                                    Frame::Previewed { picker: number, request, kind: PreviewKind::Ansi, line, bytes }
+                                }
+                                Ok(Shows::Image { bytes }) => Frame::Previewed {
+                                    picker: number,
+                                    request,
+                                    kind: PreviewKind::Image,
+                                    line: None,
+                                    bytes,
+                                },
+                                Err(error) => Frame::Control(said(number, request, error)),
+                            }
                         }
-                        None => Frame::Control(Control::PickerPreviewed {
-                            picker: number,
-                            request,
-                            text: shown.text,
-                            name: shown.name,
-                            truncated: shown.truncated,
-                            line: shown.line,
-                            error: shown.error,
-                        }),
+                        (Wanted::File(path, line), _) => {
+                            let shown = Shown::of(&path, line);
+                            match shown.picture {
+                                Some(bytes) => Frame::Previewed {
+                                    picker: number,
+                                    request,
+                                    kind: PreviewKind::Image,
+                                    line: None,
+                                    bytes,
+                                },
+                                None => Frame::Control(Control::PickerPreviewed {
+                                    picker: number,
+                                    request,
+                                    text: shown.text,
+                                    name: shown.name,
+                                    truncated: shown.truncated,
+                                    line: shown.line,
+                                    syntax: None,
+                                    extension: None,
+                                    error: shown.error,
+                                }),
+                            }
+                        }
+                        (Wanted::Row { .. }, None) => continue,
                     };
                     if ui.send(previewed.encode()).is_err() {
                         break;
@@ -1448,7 +1593,7 @@ impl Picker {
             let _ = std::thread::Builder::new().name(format!("picker {number} previews")).spawn(read);
             asked
         });
-        let _ = asked.send((request, path, line));
+        let _ = asked.send((request, wanted));
     }
 
     /// The row the UI chose, of those sent with `serial`.

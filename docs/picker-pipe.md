@@ -209,14 +209,32 @@ The program a `Command` runs is always the one the file names: `args[1]`
 cannot be `"{name}"`. Nothing a window or a program in a shell sends can make
 the daemon run a program the file does not name.
 
-Not yet: `action`, `preview` and `keys` may be written and are not run by the
-daemon (Enter gives the row's value to whoever opened the picker, and only
-`FileSystem` rows have previews, those of the daemon's `files` picker); a
-picker that is a function, `items` that is a function, and `columns`, are
-refused. A picker that cannot be one is refused when it is opened, saying
-why, and the file's other pickers still open. The names `files`,
-`directories`, `history`, `ripgrep` and `items` are the daemon's own and
-cannot be given to a picker of the file.
+What shows for a row is the file's to say, as in `nterm.lua`: `preview = {
+type = "Dynamic", resolve = function(item, params) ... end }`. The daemon runs
+`resolve` when a row is rested on, on its own machine, so `io.open` reads that
+machine's files and `preview.run { args = ..., cwd = ..., timeout_ms = ... }`
+and `preview.directory_items(path)` run its programs and list its folders.
+`item` has `text` and `value` (and `path`, for a `FileSystem` row); `params`
+is what the picker was opened with. It returns what a window's does: `{ type =
+"Text", text | lines, name, extension, syntax, center_line, highlight_line }`,
+`{ type = "Ansi", bytes, center_line }`, `{ type = "Image", bytes }`, `{ type
+= "Command", args, cwd, output, center_line, success_exit_codes }` for a
+program the daemon then runs, or nil for nothing. The window lays it out; a
+`theme` is read and not used, the colours being the window's. A picker with a
+preview opens showing it unless `preview_visible = false`.
+
+A `resolve` still running when another row is rested on, or when the picker
+closes, is stopped, and so is the program it waits for. One row may take 12
+seconds and show 10 MiB. `nterm.json_parse` and `nterm.json_encode_pretty`
+are there as in `nterm.lua`.
+
+Not yet: `action` and `keys` may be written and are not run by the daemon
+(Enter gives the row's value to whoever opened the picker); previews of types
+other than `Dynamic`, a picker that is a function, `items` that is a
+function, and `columns`, are refused. A picker that cannot be one is refused
+when it is opened, saying why, and the file's other pickers still open. The
+names `files`, `directories`, `history`, `ripgrep` and `items` are the
+daemon's own and cannot be given to a picker of the file.
 
 ## npick
 

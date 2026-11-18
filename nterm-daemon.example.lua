@@ -17,16 +17,25 @@
 -- opened with fills the arguments written as "{name}", each as one argument
 -- whole, and is never which program is run.
 --
--- So far: types Command, File, Items and FileSystem. `action`, `preview` and
--- `keys` are read and not yet run: Enter gives the row's value to whoever
--- opened the picker, and only FileSystem rows have previews. The names
--- files, directories, history, ripgrep and items are the daemon's own.
+-- So far: types Command, File, Items and FileSystem, and previews of type
+-- Dynamic, whose function runs here: it reads this machine's files and runs
+-- its programs. `action` and `keys` are read and not yet run: Enter gives the
+-- row's value to whoever opened the picker. The names files, directories,
+-- history, ripgrep and items are the daemon's own.
 return {
   pickers = {
     -- The commits of the repository the shell is in.
     Commits = {
       type = "Command", sort = "SourceOrder",
       args = { "git", "log", "--oneline", "--decorate", "-n", "500" },
+      -- What shows for a commit: the daemon runs the program this gives.
+      preview = { type = "Dynamic", resolve = function(item, params)
+        local hash = item.value:match("^(%x+)")
+        if not hash then return nil end
+        return { type = "Command", output = "Ansi", cwd = params.cwd,
+                 args = { "git", "show", "--stat", "--patch", "--color=always", hash } }
+      end },
+      preview_visible = false,
     },
     -- The lines a pattern is found on, with flags of your own. Opened with
     -- a pattern: app:push_picker("Search", { pattern = item.value }).

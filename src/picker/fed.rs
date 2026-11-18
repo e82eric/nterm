@@ -163,7 +163,7 @@ fn plan(previewed: crate::session::Previewed) -> nfm_preview_file::resolved::Pre
             return nfm_preview_file::resolved::PreviewPlan::Ansi {
                 max_bytes: bytes.len().max(1),
                 bytes: bytes.into(),
-                center_line: None,
+                center_line: previewed.line.filter(|line| *line > 0),
                 max_scrollback_lines: MOST_PRINTED_LINES,
             };
         }
@@ -176,19 +176,18 @@ fn plan(previewed: crate::session::Previewed) -> nfm_preview_file::resolved::Pre
         }
         text.push_str("[there is more: only part is shown]\n");
     }
-    // Text of no file is shown as it is: a listing, or a note.
-    let content = match &previewed.name {
-        Some(_) => TextContent::new(text),
-        None => TextContent::plain(text),
-    };
+    // Text of no file, with nothing said of how to colour it, is shown as
+    // it is: a listing, or a note.
+    let said = previewed.name.is_some() || previewed.extension.is_some() || previewed.syntax.is_some();
+    let content = if said { TextContent::new(text) } else { TextContent::plain(text) };
     nfm_preview_file::resolved::PreviewPlan::Text {
         request: TextPreviewRequest {
             source: Arc::new(SnapshotSource(content)),
             name: previewed.name,
-            extension: None,
+            extension: previewed.extension,
             center_line: previewed.line,
             highlight_line: previewed.line,
-            syntax: None,
+            syntax: previewed.syntax.as_deref().map(crate::picker::config::file_syntax),
         },
         options: TextPreviewOptions::default(),
     }
@@ -545,7 +544,7 @@ mod preview_tests {
         // Which row of which answer, and nothing of what the row is.
         assert_eq!(asked, Control::PickerPreview { picker: 7, request: 1, serial: 3, row: 5 });
         let text = "fn main() {}\n".to_owned();
-        shown.previewed(1, Ok(Previewed { text, name: Some("main.rs".into()), truncated: false, line: None, bytes: None }));
+        shown.previewed(1, Ok(Previewed { text, name: Some("main.rs".into()), truncated: false, line: None, bytes: None, syntax: None, extension: None }));
         frame(&ctx, &mut fed);
 
         // A picker with no previews asks for none.
@@ -579,8 +578,8 @@ mod preview_tests {
         assert_eq!(asked(&daemon), (1, 4, 5));
         // An answer to another request is not this one's.
         shown.previewed(9, Err("stale".into()));
-        let text = Previewed { text: "x".into(), name: None, truncated: false, line: None, bytes: None };
-        shown.previewed(1, Ok(Previewed { text: "x".into(), name: None, truncated: false, line: None, bytes: None }));
+        let text = Previewed { text: "x".into(), name: None, truncated: false, line: None, bytes: None, syntax: None, extension: None };
+        shown.previewed(1, Ok(Previewed { text: "x".into(), name: None, truncated: false, line: None, bytes: None, syntax: None, extension: None }));
         assert_eq!(waiting.join().unwrap(), Ok(text));
 
         // The daemon says there is none.
@@ -614,7 +613,7 @@ mod preview_tests {
             (content.text, content.syntax.is_some(), request.name)
         };
         // The line a row is about is shown in the middle, and marked.
-        let at = Previewed { text: "a\nb\nc\n".into(), name: Some("a.rs".into()), truncated: false, line: Some(2), bytes: None };
+        let at = Previewed { text: "a\nb\nc\n".into(), name: Some("a.rs".into()), truncated: false, line: Some(2), bytes: None, syntax: None, extension: None };
         let PreviewPlan::Text { request, .. } = plan(at) else { panic!("not text") };
         assert_eq!((request.center_line, request.highlight_line), (Some(2), Some(2)));
         // A picture, and what a program printed, are laid out as those.
@@ -625,6 +624,8 @@ mod preview_tests {
             truncated: false,
             line: None,
             bytes: Some((kind, bytes.to_vec())),
+            syntax: None,
+            extension: None,
         };
         let picture = plan(bytes(PreviewKind::Image, &[137, 80, 78, 71]));
         assert!(matches!(&picture, PreviewPlan::Image { bytes } if bytes[..] == [137, 80, 78, 71]));
@@ -634,11 +635,30 @@ mod preview_tests {
             assert!(matches!(&laid, PreviewPlan::Ansi { bytes, .. } if &bytes[..] == printed));
             assert!(laid.validate().is_ok());
         }
+        // Text the daemon says how to colour is not shown plain, and what a
+        // program printed is shown at the line named.
+        let coloured = |syntax: Option<&str>, extension: Option<&str>| Previewed {
+            text: "x = 1\n".into(),
+            name: None,
+            truncated: false,
+            line: None,
+            bytes: None,
+            syntax: syntax.map(str::to_owned),
+            extension: extension.map(str::to_owned),
+        };
+        let PreviewPlan::Text { request, .. } = plan(coloured(None, Some("lua"))) else { panic!("not text") };
+        assert_eq!(request.extension.as_deref(), Some("lua"));
+        assert!(request.source.read(usize::MAX, &|| false).unwrap().syntax.is_none());
+        let PreviewPlan::Text { request, .. } = plan(coloured(Some("PlainText"), None)) else { panic!("not text") };
+        assert!(matches!(request.syntax, Some(nfm_preview_file::SyntaxChoice::PlainText)));
+        let mut printed = bytes(PreviewKind::Ansi, b"a\nb\nc\n");
+        printed.line = Some(3);
+        assert!(matches!(plan(printed), PreviewPlan::Ansi { center_line: Some(3), .. }));
         // A file is coloured by its name.
-        let file =Previewed { text: "fn a() {}\n".into(), name: Some("a.rs".into()), truncated: false, line: None, bytes: None };
+        let file = Previewed { text: "fn a() {}\n".into(), name: Some("a.rs".into()), truncated: false, line: None, bytes: None, syntax: None, extension: None };
         assert_eq!(read(file), ("fn a() {}\n".into(), false, Some("a.rs".into())));
         // A listing is shown plain.
-        let listing = Previewed { text: "sub\\\nb.txt".into(), name: None, truncated: true, line: None, bytes: None };
+        let listing = Previewed { text: "sub\\\nb.txt".into(), name: None, truncated: true, line: None, bytes: None, syntax: None, extension: None };
         let (text, plain, name) = read(listing);
         assert_eq!(text, "sub\\\nb.txt\n[there is more: only part is shown]\n");
         assert!(plain && name.is_none());
