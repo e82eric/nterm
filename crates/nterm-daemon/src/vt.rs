@@ -71,6 +71,8 @@ const OPT_RESIZE_PULL_SCROLLBACK: i32 = 41;
 
 const DATA_COLS: i32 = 1;
 const DATA_ROWS: i32 = 2;
+const DATA_CURSOR_X: i32 = 3;
+const DATA_CURSOR_Y: i32 = 4;
 const DATA_TITLE: i32 = 12;
 const DATA_PWD: i32 = 13;
 const DATA_TOTAL_ROWS: i32 = 14;
@@ -630,6 +632,49 @@ impl Terminal {
         unsafe { ghostty_terminal_get(self.raw, DATA_TOTAL_ROWS, (&raw mut rows).cast()) };
         rows
     }
+
+    /// Where the shell's cursor is: its line, the part of the line before
+    /// it, its column, and the last lines printed that are not blank, the
+    /// newest last. It is what a picker that is a function is told of the
+    /// pane it opens over. A row is a line here: one that wrapped is given
+    /// as the row the cursor is on, and a wide character counts as one
+    /// column.
+    pub fn at_cursor(&mut self) -> AtCursor {
+        const RECENT: usize = 10;
+        const SEEN: usize = 256;
+        let (mut column, mut row) = (0u16, 0u16);
+        unsafe {
+            ghostty_terminal_get(self.raw, DATA_CURSOR_X, (&raw mut column).cast());
+            ghostty_terminal_get(self.raw, DATA_CURSOR_Y, (&raw mut row).cast());
+        }
+        let (_, rows) = self.grid();
+        // The cursor's row, counted from the first row of the history.
+        let at = self.total_rows().saturating_sub(rows as usize) + row as usize;
+        let text = self.text();
+        let lines: Vec<&str> = text.lines().collect();
+        let line = lines.get(at).copied().unwrap_or_default().trim_end().to_owned();
+        let before: String = line.chars().take(column as usize).collect();
+        let seen = &lines[lines.len().saturating_sub(SEEN)..];
+        let mut recent: Vec<String> = seen
+            .iter()
+            .rev()
+            .map(|line| line.trim_end())
+            .filter(|line| !line.trim().is_empty())
+            .take(RECENT)
+            .map(str::to_owned)
+            .collect();
+        recent.reverse();
+        AtCursor { line, before, column, recent }
+    }
+}
+
+/// What is at a shell's cursor: see `Terminal::at_cursor`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AtCursor {
+    pub line: String,
+    pub before: String,
+    pub column: u16,
+    pub recent: Vec<String>,
 }
 
 impl Drop for Terminal {
@@ -670,6 +715,28 @@ mod tests {
 
     fn terminal() -> Terminal {
         Terminal::new(size(80, 24), &TerminalSettings::default()).unwrap()
+    }
+
+    #[test]
+    fn what_is_at_the_cursor_is_its_line_and_the_last_lines_printed() {
+        let mut terminal = terminal();
+        // Enough to push some lines into the history.
+        for number in 0..40 {
+            terminal.feed(format!("line {number}\r\n\r\n").as_bytes());
+        }
+        terminal.feed(b"PS C:/src> git switch main");
+        // The cursor goes back over `main`.
+        terminal.feed(b"\x1b[4D");
+        let at = terminal.at_cursor();
+        assert_eq!(at.line, "PS C:/src> git switch main");
+        assert_eq!(at.before, "PS C:/src> git switch ");
+        assert_eq!(at.column, 22);
+        assert_eq!(at.recent.len(), 10);
+        assert_eq!(at.recent[9], "PS C:/src> git switch main");
+        assert_eq!(at.recent[8], "line 39");
+        assert_eq!(at.recent[0], "line 31");
+        // A terminal with nothing printed.
+        assert_eq!(super::Terminal::new(size(80, 24), &TerminalSettings::default()).unwrap().at_cursor(), AtCursor::default());
     }
 
     /// A PNG of noise, which nothing packs small, and its pixel count.

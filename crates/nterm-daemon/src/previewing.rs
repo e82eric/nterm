@@ -195,6 +195,7 @@ pub(crate) struct Previewer {
 
 impl Previewer {
     /// The `resolve` of the picker `name` of `file`.
+    #[cfg(test)]
     pub(crate) fn new(
         file: &Path,
         name: &str,
@@ -202,11 +203,23 @@ impl Previewer {
         files: bool,
         wanted: Arc<AtomicU64>,
     ) -> Result<Self, String> {
+        Self::called(file, name, params, files, wanted, None)
+    }
+
+    /// As `new`. A picker that is a function is called with `context`, as
+    /// it was to open: what its function kept is then what its previews
+    /// and actions see.
+    pub(crate) fn called(
+        file: &Path,
+        name: &str,
+        params: BTreeMap<String, String>,
+        files: bool,
+        wanted: Arc<AtomicU64>,
+        context: Option<&serde_json::Value>,
+    ) -> Result<Self, String> {
         let lua = crate::configured::open(file)?;
         {
-            let pickers: Option<mlua::Table> = lua.named_registry_value("pickers").map_err(|error| short(&error))?;
-            let picker: Option<mlua::Table> = pickers.and_then(|pickers| pickers.get(name).ok());
-            let picker = picker.ok_or("the file no longer has this picker")?;
+            let picker = crate::configured::table_of(&lua, name, context)?;
             let preview: Option<mlua::Table> = picker.get("preview").ok();
             let resolve: Option<mlua::Function> = preview.and_then(|preview| preview.get("resolve").ok());
             lua.set_named_registry_value("resolve", resolve).map_err(|error| short(&error))?;

@@ -2045,3 +2045,75 @@ fn a_key_of_the_machines_file_acts_on_a_row_and_leaves_the_picker_open() {
     ui.shutdown();
     assert!(daemon.wait().unwrap().success());
 }
+
+#[test]
+fn a_picker_of_the_machines_file_that_is_a_function_is_told_what_is_at_the_cursor() {
+    let session = session("pick-function");
+    let tree = Tree::new("function");
+    let cwd = tree.path();
+    let file = tree.0.join("nterm-daemon.lua");
+    std::fs::write(
+        &file,
+        r#"return { pickers = {
+          Told = function(context)
+            -- What the function keeps is what its action sees.
+            local kept = context.line_before_cursor
+            return { type = "Items",
+              items = {
+                { text = "line", value = context.line },
+                { text = "before", value = context.line_before_cursor },
+                { text = "column", value = tostring(context.cursor_column) },
+                { text = "recent", value = context.recent_lines[#context.recent_lines] or "" },
+                { text = "folder", value = context.cwd or "" },
+                { text = "copied", value = context.copy_line .. "|" .. context.copy_line_before_cursor },
+              },
+              action = function(app, item) app:send_text(kept .. "+" .. item.text) end,
+            }
+          end,
+          Wrong = function() return "not a table" end,
+          Fails = function() error("no such thing", 0) end,
+        } }"#,
+    )
+    .unwrap();
+    let mut command = std::process::Command::new(DAEMON);
+    command.args(["--session", &session, "--lua-config"]).arg(&file).env_remove("NTERM_CONPTY_DLL");
+    let mut daemon = command.spawn().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while let Err(error) = pipe::connect(&session) {
+        assert!(Instant::now() < deadline, "the daemon never served: {error}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    // Something at the shell's prompt, with the cursor after it.
+    ui.input(pane, "rem marker-typed");
+    ui.until_text("what was typed", |text| text.contains("rem marker-typed"));
+    let given: std::collections::BTreeMap<String, String> = [
+        ("cwd".to_owned(), cwd.clone()),
+        ("copy_line".to_owned(), "a copied line".to_owned()),
+        ("copy_line_before_cursor".to_owned(), "a copied".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    ui.send(Control::PickerAsk { ask: 1, pane, picker: "Told".into(), params: given.clone() });
+    let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. }));
+    let Control::PickerOpen { picker, .. } = opened else { panic!("{opened:?}") };
+    // The rows say what the function was told: read through an action,
+    // which sees what the function kept.
+    let found = ui.query(picker, 0, "line");
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
+    let told = ui.control(|c| matches!(c, Control::PickerActed { .. } | Control::PickerClosed { .. }));
+    let Control::PickerActed { steps, .. } = told else { panic!("{told:?}") };
+    let [nterm_session::protocol::PickerStep::SendText { text }] = &steps[..] else { panic!("{steps:?}") };
+    assert!(text.ends_with("rem marker-typed+line"), "{text}");
+
+    // One that gives no table, and one that fails, are refused saying why.
+    for (ask, name, why) in [(2, "Wrong", "does not return a picker's table"), (3, "Fails", "no such thing")] {
+        ui.send(Control::PickerAsk { ask, pane, picker: name.into(), params: given.clone() });
+        let refused = ui.control(|c| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. }));
+        let Control::PickerRefused { message, .. } = refused else { panic!("{refused:?}") };
+        assert!(message.contains(why), "{message}");
+    }
+    ui.shutdown();
+    assert!(daemon.wait().unwrap().success());
+}

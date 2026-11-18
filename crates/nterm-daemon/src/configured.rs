@@ -150,6 +150,9 @@ pub(crate) struct Defined {
     pub(crate) action: bool,
     /// Its own keys, each with a function of the file to run.
     pub(crate) keys: Vec<PickerBinding>,
+    /// What it was called with, of one that is a function: its previews
+    /// and actions are run in a Lua that calls it with the same.
+    pub(crate) context: Option<serde_json::Value>,
 }
 
 /// The fields of a picker that are for every kind.
@@ -167,6 +170,8 @@ pub(crate) const PREVIEW: &str = "Dynamic";
 #[derive(Default)]
 struct Read {
     pickers: HashMap<String, Result<Defined, String>>,
+    /// Those that are functions, called each time one is opened.
+    functions: std::collections::HashSet<String>,
     /// Why the file gave no pickers at all.
     error: Option<String>,
 }
@@ -201,7 +206,18 @@ impl Configured {
 
     /// The picker called `name`: none when the file has no such picker, or
     /// there is no file.
+    #[cfg(test)]
     pub(crate) fn picker(&self, name: &str) -> Result<Option<Defined>, String> {
+        self.picker_for(name, &|| serde_json::Value::Null)
+    }
+
+    /// As `picker`, for a pane: `context` is what is at its cursor, read
+    /// only for a picker that is a function.
+    pub(crate) fn picker_for(
+        &self,
+        name: &str,
+        context: &dyn Fn() -> serde_json::Value,
+    ) -> Result<Option<Defined>, String> {
         let at = self.path().and_then(|path| {
             let changed = std::fs::metadata(&path).and_then(|file| file.modified()).ok()?;
             Some((path, changed))
@@ -223,6 +239,11 @@ impl Configured {
                 None => Read::default(),
             };
             read.0 = at;
+        }
+        if read.1.functions.contains(name) {
+            let Some((path, _)) = read.0.clone() else { return Ok(None) };
+            drop(read);
+            return called(&path, name, context()).map(Some).map_err(|why| format!("{FILE}: pickers.{name}: {why}"));
         }
         match (read.1.pickers.get(name), &read.1.error) {
             (Some(Ok(defined)), _) => Ok(Some(defined.clone())),
@@ -261,6 +282,58 @@ pub(crate) fn open(path: &Path) -> Result<Lua, String> {
     Ok(lua)
 }
 
+/// The picker `name` of a file that was run: its table. One that is a
+/// function is called for it with `context`, what is at the cursor of the
+/// pane it opens over, and gives the table. A function that never ends
+/// does not hold the daemon.
+pub(crate) fn table_of<'lua>(
+    lua: &'lua Lua,
+    name: &str,
+    context: Option<&serde_json::Value>,
+) -> Result<mlua::Table<'lua>, String> {
+    let pickers: Option<mlua::Table> = lua.named_registry_value("pickers").map_err(|error| short(&error))?;
+    let picker: mlua::Value = match pickers {
+        Some(pickers) => pickers.get(name).map_err(|error| short(&error))?,
+        None => mlua::Value::Nil,
+    };
+    match picker {
+        mlua::Value::Table(table) => Ok(table),
+        mlua::Value::Function(function) => {
+            let given = lua.to_value(context.unwrap_or(&serde_json::Value::Null)).map_err(|error| short(&error))?;
+            let given = match given {
+                mlua::Value::Table(given) => given,
+                _ => lua.create_table().map_err(|error| short(&error))?,
+            };
+            let until = Instant::now() + MOST_TIME;
+            lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10_000), move |_, _| {
+                if Instant::now() > until {
+                    return Err(mlua::Error::RuntimeError("it took too long".into()));
+                }
+                Ok(())
+            });
+            let returned = function.call::<_, mlua::Value>(given);
+            lua.remove_hook();
+            match returned.map_err(|error| short(&error))? {
+                mlua::Value::Table(table) => Ok(table),
+                _ => Err("its function does not return a picker's table".into()),
+            }
+        }
+        mlua::Value::Nil => Err("the file no longer has this picker".into()),
+        _ => Err("it is not a table".into()),
+    }
+}
+
+/// The picker `name` of `path`, which is a function: what it gives for
+/// `context`. The file is run for it, so what the function keeps is the
+/// one opening's alone.
+fn called(path: &Path, name: &str, context: serde_json::Value) -> Result<Defined, String> {
+    let lua = open(path)?;
+    let table = table_of(&lua, name, Some(&context))?;
+    let mut defined = define(&lua, mlua::Value::Table(table))?;
+    defined.context = Some(context);
+    Ok(defined)
+}
+
 impl Read {
     fn of(path: &Path) -> Self {
         Self::run(path).unwrap_or_else(|error| Self { error: Some(error), ..Default::default() })
@@ -275,6 +348,10 @@ impl Read {
             let (name, value) = pair.map_err(|_| "a picker's name is not text".to_owned())?;
             if read.pickers.len() == MOST_PICKERS {
                 return Err(format!("it has more than {MOST_PICKERS} pickers"));
+            }
+            if matches!(value, mlua::Value::Function(_)) && !crate::picker::BUILT_IN.contains(&name.as_str()) {
+                read.functions.insert(name);
+                continue;
             }
             let defined = match crate::picker::BUILT_IN.contains(&name.as_str()) {
                 true => Err("the daemon has a picker of that name of its own".to_owned()),
@@ -436,7 +513,7 @@ fn define(lua: &Lua, value: mlua::Value) -> Result<Defined, String> {
         }
         _ => {}
     }
-    Ok(Defined { presentation, lists, preview, action, keys })
+    Ok(Defined { presentation, lists, preview, action, keys, context: None })
 }
 
 #[cfg(test)]

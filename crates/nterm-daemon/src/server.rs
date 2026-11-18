@@ -631,7 +631,12 @@ fn converse(
             let shows = session.pane(*pane).is_some_and(|pane| {
                 pane.state.lock().unwrap().shown.as_ref().is_some_and(|(shown, _)| *shown == id)
             });
-            session.pickers.asked(id, outbox, *ask, *pane, picker, params, shows);
+            let of = session.pane(*pane);
+            let at_cursor = || match &of {
+                Some(pane) => pane.state.lock().unwrap().terminal.at_cursor(),
+                None => Default::default(),
+            };
+            session.pickers.asked(id, outbox, *ask, *pane, picker, params, shows, &at_cursor);
             continue;
         }
         match control {
@@ -857,7 +862,8 @@ fn pick(
             ui = Some(shown);
             Ok(Showing { pane: pane_id, ui: shown, ui_outbox, program: outbox.clone() })
         };
-        let goes_on = session.pickers.said(&bytes, &mut mine, showing, outbox);
+        let at_cursor = || pane.state.lock().unwrap().terminal.at_cursor();
+        let goes_on = session.pickers.said(&bytes, &mut mine, showing, outbox, &at_cursor);
         // A UI that left the pane while the picker was being opened did not
         // find it to end.
         if had.is_none()

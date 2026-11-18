@@ -258,8 +258,19 @@ another picker. A key's function that fails shows why, and the picker stays.
 The rows are not read again after a key. Keys work however the picker was
 opened, by a window or by a program in a shell.
 
+A picker may be a function, as in `nterm.lua`: `Name = function(context)
+return { type = ..., ... } end`. It is called each time the picker is opened,
+and what it keeps is what its `preview`, `action` and `keys` see. `context`
+has `line`, `line_before_cursor`, `cursor_column` and `recent_lines` (the
+last ten lines printed that are not blank), which the daemon reads from the
+pane's shell itself, so they are there however the picker was opened; `cwd`;
+and `copy_line` and `copy_line_before_cursor`, which only a window knows and
+sends when the picker was opened from its copy mode. The daemon reads a row
+of the screen as a line: one that wrapped is given as the row the cursor is
+on.
+
 Not yet: previews of types
-other than `Dynamic`, a picker that is a function, `items` that is a
+other than `Dynamic`, `items` that is a
 function, and `columns`, are refused. A picker that cannot be one is refused
 when it is opened, saying why, and the file's other pickers still open. The
 names `files`, `directories`, `history`, `ripgrep` and `items` are the

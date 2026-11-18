@@ -483,7 +483,7 @@ fn configured(
     if let Some(cwd) = cwd.as_ref().filter(|cwd| cwd.is_relative() || !cwd.is_dir()) {
         return Err(format!("{} is not a folder", cwd.display()));
     }
-    let Defined { presentation, lists, preview: resolved, action: acts, keys } = defined;
+    let Defined { presentation, lists, preview: resolved, action: acts, keys, context } = defined;
     let mut preview = None;
     let lists = match lists {
         Of::Command { args, cwd: folder, line_continuation, success_exit_codes, unique, .. } => {
@@ -565,7 +565,7 @@ fn configured(
                 let shown = params.get("preview").map(|preview| preview == "true");
                 preview = Some(shown.unwrap_or(presentation.preview_visible));
             }
-            Some(Resolves { file, name: name.to_owned(), params: params.clone(), preview: resolved, action: acts, keys })
+            Some(Resolves { file, name: name.to_owned(), params: params.clone(), preview: resolved, action: acts, keys, context })
         }
         _ => None,
     };
@@ -898,6 +898,8 @@ struct Resolves {
     preview: bool,
     action: bool,
     keys: Vec<PickerBinding>,
+    /// What a picker that is a function was called with.
+    context: Option<serde_json::Value>,
 }
 
 /// To a UI: there is nothing to show for the row, and why.
@@ -964,11 +966,33 @@ impl Pickers {
 
     /// The picker called `name`, opened with `params`: one of the daemon's
     /// own, or one of the machine's file.
-    fn define(&self, name: &str, params: &BTreeMap<String, String>) -> Result<Definition, String> {
+    fn define(
+        &self,
+        name: &str,
+        params: &BTreeMap<String, String>,
+        at_cursor: &dyn Fn() -> crate::vt::AtCursor,
+    ) -> Result<Definition, String> {
         if BUILT_IN.contains(&name) {
             return define(name, params);
         }
-        match self.configured.picker(name)? {
+        // What a picker that is a function is told of the pane: what is at
+        // the shell's cursor, which is this daemon's to read, and what was
+        // at a window's own cursor over what it copies from, which the
+        // window gave.
+        let context = || {
+            let at = at_cursor();
+            let given = |name: &str| params.get(name).cloned().unwrap_or_default();
+            json!({
+                "line": at.line,
+                "line_before_cursor": at.before,
+                "cursor_column": at.column,
+                "recent_lines": at.recent,
+                "cwd": params.get("cwd"),
+                "copy_line": given("copy_line"),
+                "copy_line_before_cursor": given("copy_line_before_cursor"),
+            })
+        };
+        match self.configured.picker_for(name, &context)? {
             Some(defined) => configured(name, defined, self.configured.file(), params).map_err(|why| format!("{name}: {why}")),
             None => Err(format!("no picker named {name}")),
         }
@@ -976,7 +1000,7 @@ impl Pickers {
 
     /// A program's message. `mine` is the picker it has open, if it has.
     /// Returns false when the conversation is over.
-    pub(crate) fn said(&self, bytes: &[u8], mine: &mut Option<u32>, showing: impl FnOnce() -> Result<Showing, String>, program: &Outbox) -> bool {
+    pub(crate) fn said(&self, bytes: &[u8], mine: &mut Option<u32>, showing: impl FnOnce() -> Result<Showing, String>, program: &Outbox, at_cursor: &dyn Fn() -> crate::vt::AtCursor) -> bool {
         let said = if bytes.len() > MAX_REQUEST { None } else { serde_json::from_slice(bytes).ok() };
         match said {
             Some(Said::Open { request_id, picker, params }) if mine.is_none() => {
@@ -985,7 +1009,7 @@ impl Pickers {
                     result(program, &request_id, "error", json!({"code": code, "message": message}));
                     false
                 };
-                let definition = match self.define(&picker, &params) {
+                let definition = match self.define(&picker, &params, at_cursor) {
                     Ok(definition) => definition,
                     Err(message) => return refuse("bad_request", message),
                 };
@@ -1179,8 +1203,9 @@ impl Pickers {
         name: &str,
         params: &BTreeMap<String, String>,
         shows: bool,
+        at_cursor: &dyn Fn() -> crate::vt::AtCursor,
     ) {
-        let definition = if shows { self.define(name, params) } else { Err(format!("pane {pane} is not shown here")) };
+        let definition = if shows { self.define(name, params, at_cursor) } else { Err(format!("pane {pane} is not shown here")) };
         let definition = match definition {
             // It has no program to give it rows.
             Ok(Definition { lists: Lists::Given, .. }) => Err(format!("{name} is a picker for a program")),
@@ -1548,12 +1573,13 @@ impl Picker {
                 // acted on.
                 let make = || match &resolves {
                     Some(resolves) => {
-                        let made = Previewer::new(
+                        let made = Previewer::called(
                             &resolves.file,
                             &resolves.name,
                             resolves.params.clone(),
                             files,
                             latest.clone(),
+                            resolves.context.as_ref(),
                         );
                         if let Err(error) = &made {
                             log(format_args!("picker {number}: its file cannot be run: {error}"));

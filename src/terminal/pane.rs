@@ -1236,6 +1236,15 @@ impl TerminalPane {
             // Whether it opens with its preview showing, as `preview_visible`
             // says of any picker.
             params.entry("preview".into()).or_insert_with(|| options.preview_visible.to_string());
+            // What is at this window's own cursor over what it copies from,
+            // which the daemon cannot see. The shell's cursor and what it
+            // printed are the daemon's to read.
+            if !context.copy_line.is_empty() {
+                params.entry("copy_line".into()).or_insert_with(|| context.copy_line.clone());
+                params
+                    .entry("copy_line_before_cursor".into())
+                    .or_insert_with(|| context.copy_line_before_cursor.clone());
+            }
             let cwd = params.contains_key("cwd");
             let Some(ask) = self.session.as_ref().and_then(|session| session.ask_picker(name, params))
             else {
