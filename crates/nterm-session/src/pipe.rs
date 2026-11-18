@@ -34,13 +34,8 @@ const CLIENT_ACCESS: u32 = 0x0012_0083;
 
 /// The pipe of a session, for this account and elevation.
 pub fn name(session: &str) -> io::Result<String> {
-    if session.is_empty()
-        || !session.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a session name is letters, digits, '-' and '_'",
-        ));
+    if !crate::is_session_name(session) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, crate::SESSION_NAME_RULE));
     }
     let own = identity::own_identity()?;
     // An elevated UI gets its own daemon; the two could not talk anyway.

@@ -887,6 +887,19 @@ pub(crate) fn prepare_with_reload(
             remaining.extend(incoming);
             break;
         }
+        // nterm's own, like `--lua-config`: the terminal library is not shown it.
+        let session = if arg == "--session" {
+            Some(incoming.next().ok_or("--session requires a name")?)
+        } else {
+            arg.strip_prefix("--session=").map(str::to_owned)
+        };
+        if let Some(session) = session {
+            if !nterm_session::is_session_name(&session) {
+                return Err(format!("--session: {}", nterm_session::SESSION_NAME_RULE));
+            }
+            crate::session::choose(session);
+            continue;
+        }
         let path = if arg == "--lua-config" {
             Some(incoming.next().ok_or("--lua-config requires a path")?)
         } else {
@@ -3900,6 +3913,19 @@ mod tests {
         ] {
             assert!(parse(source).unwrap().ghostty_args().is_err());
         }
+    }
+
+    #[test]
+    fn a_session_name_is_taken_and_a_bad_one_refused() {
+        let passed_on =
+            |args: &[&str]| prepare_args(args.iter().map(|arg| arg.to_string()).collect());
+        // Refused before anything is chosen.
+        for bad in [vec!["app", "--session"], vec!["app", "--session=two words"], vec!["app", "--session", ""]] {
+            assert!(passed_on(&bad).unwrap_err().contains("--session"), "{bad:?}");
+        }
+        // After `-e` it is the command's own.
+        let args = passed_on(&["app", "-e", "child", "--session=x"]).unwrap();
+        assert!(args.ends_with(&["-e".into(), "child".into(), "--session=x".into()]), "{args:?}");
     }
 
     #[test]

@@ -58,6 +58,16 @@ const QUEUED_INPUT_MAX: usize = 1 << 16;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// The daemon session named on the command line, if one was.
+static CHOSEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// `--session NAME`: use the daemon of that name, not the default one. The
+/// shells of one session are not seen from another. Naming one asks for the
+/// daemon, whatever the configuration says.
+pub(crate) fn choose(session: String) {
+    *CHOSEN.lock().unwrap() = Some(session);
+}
+
 // Defined by the pane, which is what the surface tells of a title or a
 // directory. `userdata` is the pane's `WakeState`.
 unsafe extern "C" {
@@ -153,7 +163,7 @@ fn enabled() -> bool {
     match std::env::var("NTERM_SESSION_DAEMON").as_deref() {
         Ok("1") => true,
         Ok("0") => false,
-        _ => ENABLED.load(Ordering::Acquire),
+        _ => ENABLED.load(Ordering::Acquire) || CHOSEN.lock().unwrap().is_some(),
     }
 }
 
@@ -366,7 +376,8 @@ fn target() -> io::Result<(String, std::path::PathBuf)> {
     } else {
         "nterm-daemon"
     });
-    Ok((DEFAULT_SESSION.to_owned(), program))
+    let session = CHOSEN.lock().unwrap().clone();
+    Ok((session.unwrap_or_else(|| DEFAULT_SESSION.to_owned()), program))
 }
 
 /// Make connection `number`: find or start the daemon, greet it, and ask
