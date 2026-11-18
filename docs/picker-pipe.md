@@ -101,13 +101,38 @@ Invoke-NtermPicker -DaemonPicker directories -Parameters @{
 }
 ```
 
-The daemon has two pickers, `files` and `directories`. `roots` is a JSON list
-of folders; without it `cwd` is the one root. `query` is the text the picker
-opens with. With one root the rows are paths from it; the value returned is
-always the whole path. The window needs `picker_pipe.enabled`, and nothing in
-`named`.
+The daemon has four pickers. For all of them `query` is the text the picker
+opens with, and `position = "cursor"` shows it at the pane's cursor instead of
+in the middle of the pane. The window needs `picker_pipe.enabled`, and nothing
+in `named`.
 
-Each row has a preview, hidden until Ctrl+P shows it; with `preview = "true"`
+`files` and `directories`: `roots` is a JSON list of folders; without it `cwd`
+is the one root. With one root the rows are paths from it; the value returned
+is always the whole path.
+
+`history` lists the lines of the file `path` names, the last first and each
+once, joining lines that end in a backtick to the next: PSReadLine's history
+file. What matches stays in that order. The value returned is the command as
+it was typed, on its own lines.
+
+```powershell
+Invoke-NtermPicker -DaemonPicker history -Parameters @{
+    path = (Get-PSReadLineOption).HistorySavePath
+    position = 'cursor'
+}
+```
+
+`items` lists what is piped in, as the window's own stream picker does, and
+is called `label`. It takes up to 100,000 rows.
+
+```powershell
+Get-Process | Invoke-NtermPicker -DaemonPicker items -DisplayProperty Name `
+    -Parameters @{ label = 'Processes' }
+```
+
+`history` and `items` have no previews.
+
+Each row of `files` and `directories` has a preview, hidden until Ctrl+P shows it; with `preview = "true"`
 in the parameters it opens shown. A file shows its first 256 KB as text,
 coloured by its name, and a folder shows what is in it. The daemon reads them
 and the window lays them out. Images and the rest of a longer file are not
@@ -115,7 +140,8 @@ shown yet.
 
 `profile.example.ps1` binds these pickers to
 Ctrl+Shift+O and Ctrl+Shift+T (under the current directory) and to Alt+Shift+O
-and Alt+Shift+T (under the roots).
+and Alt+Shift+T (under the roots), history to Alt+Shift+R, and PowerShell's
+completions, through `items`, to Ctrl+Shift+Space.
 
 ## npick
 

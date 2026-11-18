@@ -92,7 +92,7 @@ impl Fed {
         self.anchor_bounds = Some(pane);
         let appearance = super::appearance(&self.typography, ctx);
         let placement = super::placement(
-            config::Position::default(),
+            if self.shown.at_cursor { config::Position::Cursor } else { config::Position::default() },
             self.cursor_row,
             self.anchor_bounds,
             self.typography.row_height,

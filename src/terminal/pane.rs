@@ -1769,7 +1769,11 @@ impl TerminalPane {
                     match refused {
                         Some(why) => shown.close(Some(why.into())),
                         None => {
-                            let page = crate::picker::Fed::start(ctx.clone(), shown);
+                            let at_cursor = shown.at_cursor;
+                            let mut page = crate::picker::Fed::start(ctx.clone(), shown);
+                            if at_cursor {
+                                page.cursor_row = self.picker_cursor_row();
+                            }
                             self.place_page(true, page);
                             ctx.request_repaint();
                         }

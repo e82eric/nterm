@@ -202,6 +202,8 @@ fn win32_picker_key(key: egui::Key, modifiers: egui::Modifiers, pressed: bool) -
         (true, false, egui::Key::O) => (79, 24, 15, 24),
         (true, false, egui::Key::P) => (80, 25, 16, 24),
         (true, false, egui::Key::T) => (84, 20, 20, 24),
+        // As a byte this is the same as Ctrl+Space without Shift.
+        (true, false, egui::Key::Space) => (32, 57, 32, 24),
         // As bytes this is ESC O, which is also how the codes of function
         // keys begin: the console waits for the rest, and takes the next
         // key typed for it.
@@ -365,6 +367,11 @@ mod tests {
             win32_picker_key(egui::Key::T, modifiers, false).unwrap().to_bytes(),
             b"\x1b[84;20;20;0;24;1_"
         );
+        assert_eq!(
+            win32_picker_key(egui::Key::Space, modifiers, true).unwrap().to_bytes(),
+            b"\x1b[32;57;32;1;24;1_"
+        );
+        assert!(win32_picker_key(egui::Key::Space, egui::Modifiers::CTRL, true).is_none());
         let alt_shift = egui::Modifiers::ALT | egui::Modifiers::SHIFT;
         assert_eq!(
             win32_picker_key(egui::Key::O, alt_shift, true).unwrap().to_bytes(),

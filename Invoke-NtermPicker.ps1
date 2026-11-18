@@ -24,14 +24,16 @@ function Invoke-NtermPicker {
     [CmdletBinding(DefaultParameterSetName='Stream')]
     param(
         [Parameter(Mandatory, ParameterSetName='Named')][string] $Name,
-        # One of the pickers the daemon has: files, directories.
+        # One of the pickers the daemon has: files, directories, history, and
+        # items, whose rows are what is piped in.
         [Parameter(Mandatory, ParameterSetName='Daemon')][string] $DaemonPicker,
         [Parameter(ParameterSetName='Named')][Parameter(ParameterSetName='Daemon')][hashtable] $Parameters = @{},
         [Parameter(ValueFromPipeline, ParameterSetName='Stream')]
-        [Parameter(ValueFromPipeline, ParameterSetName='Named')][AllowNull()][object] $InputObject,
+        [Parameter(ValueFromPipeline, ParameterSetName='Named')]
+        [Parameter(ValueFromPipeline, ParameterSetName='Daemon')][AllowNull()][object] $InputObject,
         [Parameter(ParameterSetName='Stream')][hashtable] $Options = @{},
-        [Parameter(ParameterSetName='Stream')][Parameter(ParameterSetName='Named')][string] $DisplayProperty,
-        [Parameter(ParameterSetName='Stream')][Parameter(ParameterSetName='Named')][string] $ValueProperty,
+        [string] $DisplayProperty,
+        [string] $ValueProperty,
         [switch] $PassThruResult,
         # Accepted for profiles that pass it: every request has its own connection.
         [switch] $FreshConnection,
@@ -48,10 +50,11 @@ function Invoke-NtermPicker {
         $nextId = 0L
         $originals = [System.Collections.Generic.Dictionary[string,object]]::new()
         $requestId = [guid]::NewGuid().ToString('N')
-        # Piping into -Name streams the items of a configured Items picker.
+        # Piping into -Name streams the items of a configured Items picker,
+        # and piping into -DaemonPicker gives the daemon's picker its rows.
         $daemonRuns = $PSCmdlet.ParameterSetName -eq 'Daemon'
-        $streaming = -not $daemonRuns -and ($PSCmdlet.ParameterSetName -eq 'Stream' -or
-            $MyInvocation.ExpectingInput -or $PSBoundParameters.ContainsKey('InputObject'))
+        $streaming = $PSCmdlet.ParameterSetName -eq 'Stream' -or
+            $MyInvocation.ExpectingInput -or $PSBoundParameters.ContainsKey('InputObject')
         $pane = [uint32]0
         if (-not $env:NTERM_DAEMON_PIPE -or -not [uint32]::TryParse($env:NTERM_PANE, [ref]$pane)) {
             throw 'Run this function inside an nterm pane whose shell the session daemon runs.'

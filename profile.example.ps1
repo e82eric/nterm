@@ -64,22 +64,35 @@ Set-PSReadLineKeyHandler -Chord Alt+O -ScriptBlock { Set-LocationFromPicker -Dae
 Set-PSReadLineKeyHandler -Chord Ctrl+Shift+t -ScriptBlock { Insert-FilePickerResult -Roots @($PWD.Path) -Daemon }
 Set-PSReadLineKeyHandler -Chord Alt+T -ScriptBlock { Insert-FilePickerResult -Daemon }
 
-Set-PSReadLineKeyHandler -Chord Alt+r -ScriptBlock {
+function Invoke-ProfileHistoryPicker {
+    param([switch]$Daemon)
     $line = ''; $cursor = 0
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
     $historyPath = (Get-PSReadLineOption).HistorySavePath
     if (-not (Test-Path -LiteralPath $historyPath)) { return }
-    # nterm reads the history file newest first, joining backtick continuations.
-    $result = Invoke-NtermPicker -Name ProfileHistory -Parameters @{
-        history = $historyPath
-        query = $line
-        cwd = $PWD.Path
+    # The history file is read newest first, joining backtick continuations:
+    # by the session daemon with -Daemon, on the machine this shell is on,
+    # and by nterm without.
+    $result = if ($Daemon) {
+        Invoke-NtermPicker -DaemonPicker history -Parameters @{
+            path = $historyPath
+            query = $line
+            position = 'cursor'
+        }
+    } else {
+        Invoke-NtermPicker -Name ProfileHistory -Parameters @{
+            history = $historyPath
+            query = $line
+            cwd = $PWD.Path
+        }
     }
     if ($null -ne $result) {
         [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
         [Microsoft.PowerShell.PSConsoleReadLine]::Insert([string]$result)
     }
 }
+Set-PSReadLineKeyHandler -Chord Alt+r -ScriptBlock { Invoke-ProfileHistoryPicker }
+Set-PSReadLineKeyHandler -Chord Alt+R -ScriptBlock { Invoke-ProfileHistoryPicker -Daemon }
 
 Set-PSReadLineKeyHandler -Chord Ctrl+Shift+g -ScriptBlock {
     $line = ''; $cursor = 0
@@ -97,32 +110,43 @@ Set-PSReadLineKeyHandler -Chord Ctrl+Shift+g -ScriptBlock {
     [Microsoft.PowerShell.PSConsoleReadLine]::Insert("nvim +$row '$path'")
 }
 
-Set-PSReadLineKeyHandler -Chord 'Ctrl+@', 'Ctrl+Spacebar' -ScriptBlock {
+function Invoke-ProfileCompletionPicker {
+    param([switch]$Daemon)
     $line = ''; $cursor = 0
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
     $completions = [System.Management.Automation.CommandCompletion]::CompleteInput($line, $cursor, @{})
     if ($completions.CompletionMatches.Count -eq 0) { return }
-    # The innermost command around the cursor, so the preview can show
-    # parameter help for completions such as -Path.
-    $tokens = $null; $parseErrors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseInput($line, [ref]$tokens, [ref]$parseErrors)
-    $commandAst = $ast.FindAll({
-        param($node)
-        $node -is [System.Management.Automation.Language.CommandAst] -and
-            $node.Extent.StartOffset -le $cursor -and $node.Extent.EndOffset -ge $cursor
-    }, $true) | Sort-Object { $_.Extent.StartOffset } -Descending | Select-Object -First 1
-    $commandName = if ($commandAst) { [string]$commandAst.GetCommandName() } else { '' }
-    # Streams the matches into the ProfileCompletions Items picker, whose
-    # configured preview shows Get-Help for the highlighted completion.
-    $result = $completions.CompletionMatches |
-        Invoke-NtermPicker -Name ProfileCompletions -Parameters @{ commandName = $commandName; cwd = $PWD.Path } `
-            -DisplayProperty ListItemText -ValueProperty CompletionText
+    $result = if ($Daemon) {
+        # The matches are given to the session daemon's items picker, which
+        # searches them. It has no preview.
+        $completions.CompletionMatches |
+            Invoke-NtermPicker -DaemonPicker items -Parameters @{ label = 'Completions'; position = 'cursor' } `
+                -DisplayProperty ListItemText -ValueProperty CompletionText
+    } else {
+        # The innermost command around the cursor, so the preview can show
+        # parameter help for completions such as -Path.
+        $tokens = $null; $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($line, [ref]$tokens, [ref]$parseErrors)
+        $commandAst = $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+                $node.Extent.StartOffset -le $cursor -and $node.Extent.EndOffset -ge $cursor
+        }, $true) | Sort-Object { $_.Extent.StartOffset } -Descending | Select-Object -First 1
+        $commandName = if ($commandAst) { [string]$commandAst.GetCommandName() } else { '' }
+        # Streams the matches into the ProfileCompletions Items picker, whose
+        # configured preview shows Get-Help for the highlighted completion.
+        $completions.CompletionMatches |
+            Invoke-NtermPicker -Name ProfileCompletions -Parameters @{ commandName = $commandName; cwd = $PWD.Path } `
+                -DisplayProperty ListItemText -ValueProperty CompletionText
+    }
     if ($null -ne $result) {
         [Microsoft.PowerShell.PSConsoleReadLine]::Replace(
             $completions.ReplacementIndex, $completions.ReplacementLength, [string]$result
         )
     }
 }
+Set-PSReadLineKeyHandler -Chord 'Ctrl+@', 'Ctrl+Spacebar' -ScriptBlock { Invoke-ProfileCompletionPicker }
+Set-PSReadLineKeyHandler -Chord Ctrl+Shift+Spacebar -ScriptBlock { Invoke-ProfileCompletionPicker -Daemon }
 
 # # Report the working directory to the terminal (OSC 7) so pickers run in it.
 # # The guard keeps a re-sourced profile from wrapping the wrapper.

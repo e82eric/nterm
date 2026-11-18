@@ -242,6 +242,10 @@ pub enum Control {
         /// `PickerPreview`, and if so whether it opens showing them.
         #[serde(default)]
         preview: Option<bool>,
+        /// Whether it is shown at the pane's cursor, as a picker of what to
+        /// put there is, and not in the middle of the pane.
+        #[serde(default)]
+        at_cursor: bool,
     },
     /// What was found for the query with this revision. There can be
     /// several for one revision while the picker's source is still being

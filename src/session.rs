@@ -793,6 +793,8 @@ pub(crate) struct Shown {
     /// Whether its rows have previews, and if so whether it opens showing
     /// them.
     pub(crate) preview: Option<bool>,
+    /// Whether it is shown at the pane's cursor.
+    pub(crate) at_cursor: bool,
     state: Mutex<Showing>,
 }
 
@@ -843,6 +845,7 @@ impl Shown {
             label,
             query,
             preview: None,
+            at_cursor: false,
             state: Mutex::default(),
         }
     }
@@ -1060,7 +1063,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
             // it to be shown. The daemon finds the rows, where the program
             // is; only what it sends is drawn here, so this is the same for
             // a daemon on another machine.
-            Frame::Control(Control::PickerOpen { picker, pane, label, query, preview }) => match daemon.pane(pane) {
+            Frame::Control(Control::PickerOpen { picker, pane, label, query, preview, at_cursor }) => match daemon.pane(pane) {
                 Some(link) => {
                     let (to, woken) = (daemon.clone(), link.clone());
                     let tell = move |control: Control| {
@@ -1071,7 +1074,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                         to.control(control);
                     };
                     let shown = Shown::new(picker, label, query, tell, move || woken.wake_pane());
-                    let shown = Arc::new(Shown { preview, ..shown });
+                    let shown = Arc::new(Shown { preview, at_cursor, ..shown });
                     daemon.pickers.lock().unwrap().insert(picker, shown.clone());
                     let _ = link.requests.0.send(Event::Shown(shown));
                     link.wake_pane();

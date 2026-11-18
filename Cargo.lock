@@ -1559,6 +1559,7 @@ name = "nterm-daemon"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "nfm-picker-sources",
  "nfm_file_system",
  "nfm_search_core",
  "nterm-session",

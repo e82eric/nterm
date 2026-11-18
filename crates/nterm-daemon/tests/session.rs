@@ -1334,3 +1334,131 @@ fn a_ui_is_sent_what_shows_for_a_row_of_a_picker() {
     assert_eq!(asker.result().0, "cancelled");
     ui.shutdown();
 }
+
+impl Asker {
+    /// Say something more to the daemon, and take what it answers.
+    fn say(&mut self, what: serde_json::Value) -> serde_json::Value {
+        self.0.send(what.to_string().as_bytes()).expect("send");
+        self.told()
+    }
+}
+
+#[test]
+fn a_picker_of_what_was_typed_lists_the_last_first_and_gives_a_command_whole() {
+    let session = session("pick-history");
+    let tree = Tree::new("history");
+    // The second command is of two lines, and the first was typed twice.
+    let typed = tree.0.join("history.txt");
+    std::fs::write(&typed, "git status\r\nls`\r\n  -Force\r\ngit status\r\ncargo build\r\n").unwrap();
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+
+    let params = serde_json::json!({"path": typed.to_string_lossy(), "query": "g", "position": "cursor"});
+    let asker = Asker::ask(&session, pane, "history", params);
+    let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
+    let Control::PickerOpen { picker, label, query, preview, at_cursor, .. } = opened else { unreachable!() };
+    // No previews, and where the cursor is.
+    assert_eq!((label.as_str(), query.as_str(), preview, at_cursor), ("History", "g", None, true));
+    assert_eq!(asker.told()["type"], "opened");
+
+    // The last typed first, each once, and a command of two lines as one.
+    let all = ui.query(picker, 0, "");
+    let texts: Vec<&str> = all.rows.iter().map(|(_, text)| text.as_str()).collect();
+    assert_eq!(texts, ["cargo build", "git status", "ls`   -Force"]);
+    // What matches stays in that order, whichever matches best.
+    let some = ui.query(picker, 1, "s");
+    let texts: Vec<&str> = some.rows.iter().map(|(_, text)| text.as_str()).collect();
+    assert_eq!(texts, ["git status", "ls`   -Force"]);
+    // There is nothing to show for a row.
+    let (row, _) = some.rows[1];
+    let Control::PickerPreviewed { error, .. } = ui.preview(picker, 1, some.serial, row) else { unreachable!() };
+    assert!(error.is_some());
+
+    // The program is given the command as it was typed, on its two lines.
+    ui.send(Control::PickerAccept { picker, serial: some.serial, row });
+    let (status, result) = asker.result();
+    assert_eq!((status.as_str(), &result["query"]), ("accepted", &"s".into()));
+    assert_eq!(result["selected"][0]["text"], "ls`   -Force");
+    assert_eq!(result["selected"][0]["value"], "ls\n  -Force");
+
+    // A file there is not is refused, with no picker shown.
+    let asker = Asker::ask(&session, pane, "history", serde_json::json!({"path": tree.0.join("none").to_string_lossy()}));
+    let (status, result) = asker.result();
+    assert_eq!((status.as_str(), &result["code"]), ("error", &"bad_request".into()));
+    ui.shutdown();
+}
+
+#[test]
+fn a_picker_of_rows_its_program_gives_and_what_the_program_is_told_of_one() {
+    let session = session("pick-items");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+
+    let mut asker = Asker::ask(&session, pane, "items", serde_json::json!({"label": "Completions"}));
+    let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
+    let Control::PickerOpen { picker, label, preview, at_cursor, .. } = opened else { unreachable!() };
+    assert_eq!((label.as_str(), preview, at_cursor), ("Completions", None, false));
+    assert_eq!(asker.told()["type"], "opened");
+
+    // Each lot of rows is answered by its number.
+    let ack = asker.say(serde_json::json!({"type": "items", "request_id": "r1", "sequence": 0, "items": [
+        {"id": "a", "text": "Get-Item", "value": "Get-Item"},
+        {"id": "b", "text": "Get-ChildItem", "value": {"x": 1}},
+    ]}));
+    assert_eq!((&ack["type"], &ack["request_id"], &ack["sequence"]), (&"ack".into(), &"r1".into(), &0.into()));
+    // They are found before the program has given them all.
+    ui.send(Control::PickerQuery { picker, revision: 0, query: String::new(), rows: 200 });
+    loop {
+        let found = ui.control(|c| matches!(c, Control::PickerRows { .. }));
+        let Control::PickerRows { serial, rows, done, .. } = found else { unreachable!() };
+        ui.send(Control::PickerSeen { picker, serial });
+        if rows.len() == 2 {
+            assert!(!done);
+            break;
+        }
+    }
+    // A row with no name or value of its own: its place, and what it shows.
+    let ack = asker.say(serde_json::json!({"type": "items", "request_id": "r1", "sequence": 1, "items": [
+        {"text": "two\nlines"},
+    ]}));
+    assert_eq!((&ack["type"], &ack["sequence"]), (&"ack".into(), &1.into()));
+    let ended = asker.say(serde_json::json!({"type": "end_items", "request_id": "r1", "last_sequence": 1}));
+    assert_eq!((&ended["type"], &ended["request_id"]), (&"input_complete".into(), &"r1".into()));
+    // Rows given after the last are not taken, and are answered all the same.
+    let ack = asker.say(serde_json::json!({"type": "items", "request_id": "r1", "sequence": 2, "items": [
+        {"text": "late"},
+    ]}));
+    assert_eq!(ack["type"], "ack");
+
+    let all = ui.query(picker, 1, "");
+    assert_eq!(all.texts(), ["Get-ChildItem", "Get-Item", "two lines"]);
+    // The program is told its own name for the row chosen, and its value.
+    let some = ui.query(picker, 2, "child");
+    assert_eq!(some.texts(), ["Get-ChildItem"]);
+    ui.send(Control::PickerAccept { picker, serial: some.serial, row: some.rows[0].0 });
+    let (status, result) = asker.result();
+    assert_eq!(status, "accepted");
+    let chosen = &result["selected"][0];
+    assert_eq!((&chosen["id"], &chosen["text"]), (&"b".into(), &"Get-ChildItem".into()));
+    assert_eq!(chosen["value"], serde_json::json!({"x": 1}));
+
+    let (mut asker, picker) = ui.picker(&session, pane, "items", serde_json::json!({}));
+    asker.say(serde_json::json!({"type": "items", "request_id": "r1", "sequence": 0, "items": [
+        {"text": "one"}, {"text": "two\nlines"},
+    ]}));
+    asker.say(serde_json::json!({"type": "end_items", "request_id": "r1"}));
+    let some = ui.query(picker, 0, "lines");
+    ui.send(Control::PickerAccept { picker, serial: some.serial, row: some.rows[0].0 });
+    let chosen = asker.result().1["selected"][0].clone();
+    assert_eq!((&chosen["id"], &chosen["text"], &chosen["value"]), (&"1".into(), &"two lines".into(), &"two\nlines".into()));
+
+    // Rows given a picker that lists something else are answered, not listed.
+    let tree = Tree::new("items");
+    let (mut asker, picker) = ui.picker(&session, pane, "files", serde_json::json!({"cwd": tree.path()}));
+    let ack = asker.say(serde_json::json!({"type": "items", "request_id": "r1", "sequence": 0, "items": [{"text": "x"}]}));
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ui.query(picker, 0, "").matched, 4);
+    ui.send(Control::PickerClose { picker, refused: None });
+    assert_eq!(asker.result().0, "cancelled");
+    ui.shutdown();
+}

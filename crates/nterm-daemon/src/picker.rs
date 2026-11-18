@@ -10,6 +10,11 @@
 //! - `{"type":"open","request_id":ID,"picker":NAME,"params":{...}}` asks
 //!   for a picker, and is answered `{"type":"opened","request_id":ID}` once a UI has been
 //!   asked to show it;
+//! - `{"type":"items","request_id":ID,"sequence":N,"items":[{"id":..,
+//!   "text":..,"value":..}]}` gives the picker `items` rows, and is
+//!   answered `{"type":"ack","request_id":ID,"sequence":N}`;
+//!   `{"type":"end_items","request_id":ID}` says there are no more, and is
+//!   answered `{"type":"input_complete","request_id":ID}`;
 //! - `{"type":"cancel"}`, or leaving, ends it;
 //! - `{"type":"result","request_id":ID,"status":...}` is how it ended:
 //!   `accepted` with `selected` and `query`, `cancelled`, or `error` with
@@ -20,10 +25,17 @@ use nfm_file_system::{
     walker::{FileWalkerScan, PublishedSnapshot, ScanOptions, start_scan},
     walker_search_store::FileSystemSearchStore,
 };
+use nfm_picker_sources::{
+    file::{self, FileSourceOptions},
+    records::{StreamControl, StreamSink, StreamValues},
+};
 use nfm_search_core::{
     fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate, SearchSnapshotProvider},
     search::SearchSortMode,
-    store::{ItemsSource, SearchPlan},
+    snapshot_store::SnapshotStore,
+    store::{
+        ItemsSource, PublishingStreamingItemStoreWithPayload, SearchPlan, StreamingItemSnapshotWithPayload,
+    },
 };
 use nterm_session::protocol::{Control, Frame, PaneId, PickerRow};
 use serde::Deserialize;
@@ -33,7 +45,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::Sender,
     },
 };
@@ -48,6 +60,10 @@ const MOST_ROWS: usize = 1000;
 const KEPT_ANSWERS: usize = 8;
 /// The largest request a program can make.
 const MAX_REQUEST: usize = 1 << 20;
+/// The most rows a program can give a picker: more are left out and counted.
+const MOST_GIVEN: usize = 100_000;
+/// The most characters of the name a program gives a picker of its rows.
+const MOST_LABEL: usize = 64;
 
 /// A search runs on as many threads as it is let, and the daemon's first
 /// work is its shells: searches are left all the processors but two, so
@@ -78,19 +94,58 @@ enum Said {
         #[serde(default)]
         params: BTreeMap<String, String>,
     },
+    Items {
+        #[serde(default)]
+        request_id: Value,
+        #[serde(default)]
+        sequence: Value,
+        items: Vec<Item>,
+    },
+    EndItems {
+        #[serde(default)]
+        request_id: Value,
+    },
     Cancel,
     #[serde(other)]
     Other,
 }
 
+/// One of the rows a program gives a picker of its own rows.
+#[derive(Deserialize)]
+struct Item {
+    /// The program's name for it, which it is told of the one chosen.
+    #[serde(default)]
+    id: Option<String>,
+    /// What the row shows, and is searched by.
+    text: String,
+    /// What the program is given when it is chosen: `text` when there is
+    /// none.
+    #[serde(default)]
+    value: Option<Value>,
+}
+
 /// A picker the daemon has: what it lists.
 struct Definition {
-    label: &'static str,
-    scan: ScanOptions,
+    label: String,
+    lists: Lists,
     query: String,
-    /// Whether it opens showing the preview of the selected row.
-    preview_shown: bool,
+    sort: SearchSortMode,
+    /// Whether its rows have previews, and if so whether it opens showing
+    /// the one of the selected row.
+    preview: Option<bool>,
+    /// Whether it is shown at the pane's cursor.
+    at_cursor: bool,
 }
+/// What a picker's rows are.
+enum Lists {
+    /// The files or the folders a walk finds.
+    Walk(ScanOptions),
+    /// The lines of a file of what was typed at a shell, the newest first.
+    History(PathBuf),
+    /// What the program that asked gives, as `items`.
+    Given,
+}
+
 
 /// The most of a file that is sent as its preview.
 const MOST_PREVIEW: usize = 256 * 1024;
@@ -159,66 +214,115 @@ impl Shown {
     }
 }
 
-/// The pickers there are. `files` and `directories` list what is under the
-/// folders `roots` names, a JSON array, or under `cwd` with none; `query`
-/// is what the picker starts with.
+/// The pickers there are, each starting with `query` and shown at the
+/// pane's cursor when `position` is `cursor`.
+///
+/// - `files` and `directories` list what is under the folders `roots`
+///   names, a JSON array, or under `cwd` with none. `preview` `true` opens
+///   them showing previews.
+/// - `history` lists the lines of the file `path` names, the last first and
+///   each once, with lines that end in a backtick joined to the next: the
+///   file PSReadLine keeps of what was typed.
+/// - `items` lists what the program gives after it, and is called `label`.
 fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, String> {
-    let (label, directories_only) = match name {
-        "files" => ("Files", false),
-        "directories" => ("Directories", true),
+    let cwd = params.get("cwd").map(PathBuf::from);
+    let whole = |path: PathBuf| -> Result<PathBuf, String> {
+        if path.is_relative() {
+            let cwd = cwd.as_ref().ok_or_else(|| format!("{} is not a whole path", path.display()))?;
+            return Ok(cwd.join(path));
+        }
+        Ok(path)
+    };
+    let mut label = String::new();
+    let mut sort = SearchSortMode::Score;
+    let mut preview = None;
+    let lists = match name {
+        "files" | "directories" => {
+            let directories_only = name == "directories";
+            label.push_str(if directories_only { "Directories" } else { "Files" });
+            let mut roots: Vec<PathBuf> = match params.get("roots") {
+                Some(roots) => serde_json::from_str::<Vec<String>>(roots)
+                    .map_err(|error| format!("roots is not a list of folders: {error}"))?
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+                None => Vec::new(),
+            };
+            if roots.is_empty() {
+                roots.push(cwd.clone().ok_or("neither roots nor cwd was given")?);
+            }
+            for root in &mut roots {
+                *root = whole(std::mem::take(root))?;
+                if !root.is_dir() {
+                    return Err(format!("{} is not a folder", root.display()));
+                }
+            }
+            preview = Some(params.get("preview").is_some_and(|preview| preview == "true"));
+            // Under one folder a row says where it is from there; under
+            // several that would not say which.
+            let relative = roots.len() == 1;
+            Lists::Walk(ScanOptions {
+                roots,
+                max_depth: 0,
+                directories_only,
+                files_only: !directories_only,
+                relative,
+            })
+        }
+        "history" => {
+            label.push_str("History");
+            let path = whole(PathBuf::from(params.get("path").ok_or("no path was given")?))?;
+            if !path.is_file() {
+                return Err(format!("{} is not a file", path.display()));
+            }
+            // As they are in the file, not the best match first: the last
+            // typed of what matches is the one most likely wanted.
+            sort = SearchSortMode::SourceOrder;
+            Lists::History(path)
+        }
+        "items" => {
+            let given = params.get("label").map(|label| label.trim()).filter(|label| !label.is_empty());
+            label.extend(given.unwrap_or("Items").chars().take(MOST_LABEL));
+            Lists::Given
+        }
         _ => return Err(format!("no picker named {name}")),
     };
-    let mut roots: Vec<PathBuf> = match params.get("roots") {
-        Some(roots) => serde_json::from_str::<Vec<String>>(roots)
-            .map_err(|error| format!("roots is not a list of folders: {error}"))?
-            .into_iter()
-            .map(PathBuf::from)
-            .collect(),
-        None => Vec::new(),
-    };
-    let cwd = params.get("cwd").map(PathBuf::from);
-    if roots.is_empty() {
-        roots.push(cwd.clone().ok_or("neither roots nor cwd was given")?);
-    }
-    for root in &mut roots {
-        if root.is_relative() {
-            let cwd = cwd.as_ref().ok_or_else(|| format!("{} is not a whole path", root.display()))?;
-            *root = cwd.join(&*root);
-        }
-        if !root.is_dir() {
-            return Err(format!("{} is not a folder", root.display()));
-        }
-    }
-    // Under one folder a row says where it is from there; under several
-    // that would not say which.
-    let relative = roots.len() == 1;
     Ok(Definition {
         label,
-        scan: ScanOptions {
-            roots,
-            max_depth: 0,
-            directories_only,
-            files_only: !directories_only,
-            relative,
-        },
+        lists,
         query: params.get("query").cloned().unwrap_or_default(),
-        preview_shown: params.get("preview").is_some_and(|preview| preview == "true"),
+        sort,
+        preview,
+        at_cursor: params.get("position").is_some_and(|position| position == "cursor"),
     })
 }
 
-/// What a walk has found so far, as a picker searches it: all but the
-/// folders the walk was given, which are entries of it too.
-struct Files(Arc<PublishedSnapshot>);
-impl ItemsSource for Files {
+/// Rows that are lines of text: of a file, or what a program gave.
+type Lines = StreamingItemSnapshotWithPayload<()>;
+
+/// What a picker lists so far, as it is searched.
+enum Listed {
+    /// What a walk has found: all but the folders the walk was given, which
+    /// are entries of it too.
+    Files(Arc<PublishedSnapshot>),
+    Lines(Arc<Lines>),
+}
+impl ItemsSource for Listed {
     type Item = String;
     fn version(&self) -> u64 {
-        self.0.version()
+        match self {
+            Self::Files(found) => found.version(),
+            Self::Lines(lines) => lines.version(),
+        }
     }
     fn len(&self) -> usize {
-        self.0.len()
+        match self {
+            Self::Files(found) => found.len(),
+            Self::Lines(lines) => lines.len(),
+        }
     }
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len() == 0
     }
     fn get_string<'a>(
         &'a self,
@@ -226,17 +330,32 @@ impl ItemsSource for Files {
         stack_buffer: &'a mut [u8],
         heap_buffer: &'a mut Vec<u8>,
     ) -> &'a [u8] {
-        self.0.get_string(index, stack_buffer, heap_buffer)
+        match self {
+            Self::Files(found) => found.get_string(index, stack_buffer, heap_buffer),
+            Self::Lines(lines) => lines.get_string(index, stack_buffer, heap_buffer),
+        }
     }
     fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String {
-        self.0.get_string_lossy(node_index, out)
+        match self {
+            Self::Files(found) => found.get_string_lossy(node_index, out),
+            Self::Lines(lines) => lines.get_string_lossy(node_index, out),
+        }
     }
+    /// What a row is: the whole path of a file, and for a line what it
+    /// shows.
     fn item(&self, node_index: usize) -> Option<String> {
-        let path = self.0.absolute_path(node_index)?;
-        Some(path.to_string_lossy().into_owned())
+        match self {
+            Self::Files(found) => Some(found.absolute_path(node_index)?.to_string_lossy().into_owned()),
+            Self::Lines(lines) => {
+                (node_index < lines.len()).then(|| lines.get_string_lossy(node_index, &mut Vec::new()))
+            }
+        }
     }
     fn create_search_plan(&self, query: &str) -> Box<dyn SearchPlan + '_> {
-        Box::new(Inside { plan: self.0.create_search_plan(query), found: &self.0 })
+        match self {
+            Self::Files(found) => Box::new(Inside { plan: found.create_search_plan(query), found }),
+            Self::Lines(lines) => lines.create_search_plan(query),
+        }
     }
 }
 struct Inside<'a> {
@@ -263,25 +382,45 @@ impl SearchPlan for Inside<'_> {
         self.plan.display_text(index)
     }
 }
-/// A walk's store, as what a search of `Files` reads.
-struct Walk(Arc<FileSystemSearchStore>);
-impl SearchSnapshotProvider<Files> for Walk {
-    fn snapshot(&self) -> Option<Arc<Files>> {
-        Some(Arc::new(Files(SearchSnapshotProvider::snapshot(&*self.0)?)))
+/// Where what a picker lists is added to, as what a search of `Listed`
+/// reads.
+enum Found {
+    Walk(Arc<FileSystemSearchStore>),
+    Lines(Arc<SnapshotStore<Lines>>),
+}
+impl SearchSnapshotProvider<Listed> for Found {
+    fn snapshot(&self) -> Option<Arc<Listed>> {
+        Some(Arc::new(match self {
+            Self::Walk(store) => Listed::Files(SearchSnapshotProvider::snapshot(&**store)?),
+            Self::Lines(store) => Listed::Lines(SearchSnapshotProvider::snapshot(&**store)?),
+        }))
     }
     fn snapshot_version(&self) -> u64 {
-        self.0.snapshot_version()
+        match self {
+            Self::Walk(store) => SearchSnapshotProvider::snapshot_version(&**store),
+            Self::Lines(store) => SearchSnapshotProvider::snapshot_version(&**store),
+        }
     }
     fn is_done(&self) -> bool {
-        self.0.is_done()
+        match self {
+            Self::Walk(store) => SearchSnapshotProvider::is_done(&**store),
+            Self::Lines(store) => SearchSnapshotProvider::is_done(&**store),
+        }
     }
     fn subscribe_updates(&self, wake: crossbeam_channel::Sender<()>) -> bool {
-        self.0.subscribe_updates(wake)
+        match self {
+            Self::Walk(store) => store.subscribe_updates(wake),
+            Self::Lines(store) => store.subscribe_updates(wake),
+        }
     }
     fn skipped_items(&self) -> usize {
-        self.0.skipped_items()
+        match self {
+            Self::Walk(store) => store.skipped_items(),
+            Self::Lines(store) => store.skipped_items(),
+        }
     }
 }
+
 
 /// When a UI is sent what was found. An answer to a query not yet answered
 /// goes at once. More found for a query already answered, as while a walk
@@ -337,10 +476,55 @@ impl<T> Flow<T> {
     }
 }
 
+
 /// What was found for a query, before it has a serial.
+#[derive(Clone)]
 struct Answer {
-    update: FuzzySearchUpdate,
-    source: Arc<Files>,
+    update: Arc<FuzzySearchUpdate>,
+    source: Arc<Listed>,
+}
+
+/// What a picker lists, and how that is added to and stopped.
+enum Source {
+    Walk { store: Arc<FileSystemSearchStore>, scan: FileWalkerScan },
+    /// The lines of a file, read on a thread that stops when `cancelled`.
+    /// `whole` has, by row, what a row is where that is not what it shows:
+    /// a command of several lines, which shows as one.
+    File { store: Arc<SnapshotStore<Lines>>, cancelled: Arc<AtomicBool>, whole: StreamValues },
+    /// What the program gives.
+    Given { store: Arc<SnapshotStore<Lines>>, given: Mutex<Given> },
+}
+/// The rows a program has given.
+struct Given {
+    /// Where they are added, until the program says it has no more.
+    adding: Option<PublishingStreamingItemStoreWithPayload<()>>,
+    /// By row: the program's name for it, and what it is.
+    rows: Vec<(String, Value)>,
+}
+impl Source {
+    fn found(&self) -> Found {
+        match self {
+            Self::Walk { store, .. } => Found::Walk(store.clone()),
+            Self::File { store, .. } | Self::Given { store, .. } => Found::Lines(store.clone()),
+        }
+    }
+    fn skipped(&self) -> usize {
+        self.found().skipped_items()
+    }
+    fn stop(&self) {
+        match self {
+            Self::Walk { scan, .. } => scan.cancel(),
+            Self::File { cancelled, .. } => cancelled.store(true, Ordering::Release),
+            Self::Given { given, .. } => given.lock().unwrap().adding = None,
+        }
+    }
+}
+
+/// A row of a picker: what a program is told of the one chosen.
+struct Row {
+    id: String,
+    text: String,
+    value: Value,
 }
 
 struct Picker {
@@ -352,28 +536,30 @@ struct Picker {
     /// The way to the program that asked.
     program: Outbox,
     request_id: Value,
-    store: Arc<FileSystemSearchStore>,
-    scan: FileWalkerScan,
+    source: Source,
+    sort: SearchSortMode,
     /// The way to the thread that reads previews, once one was asked for.
     previews: Mutex<Option<std::sync::mpsc::Sender<(u64, PathBuf)>>>,
     state: Mutex<State>,
 }
 #[derive(Default)]
 struct State {
-    search: Option<FuzzySearchSession<Files, Walk>>,
+    search: Option<FuzzySearchSession<Listed, Found>>,
     /// The revision of each query the search was given, in order: the
     /// search counts them from none, and says which it found for.
     revisions: Vec<u64>,
     rows: usize,
     flow: Option<Flow<Answer>>,
     /// What the last answers sent were of, by serial.
-    sent: VecDeque<(u64, Arc<Files>)>,
+    sent: VecDeque<(u64, Arc<Listed>)>,
     query: String,
+    /// What the search last found for that query.
+    last: Option<Answer>,
 }
 
 /// How a picker ended.
 enum Outcome {
-    Accepted { row: u64, text: String, value: String },
+    Accepted(Row),
     Cancelled(&'static str),
     Error { code: &'static str, message: String },
 }
@@ -429,6 +615,22 @@ impl Pickers {
                 reply(program, opened);
                 true
             }
+            // Each lot of rows is answered, so that a program sends no more
+            // at a time than are taken; also when they are not wanted.
+            Some(Said::Items { request_id, sequence, items }) => {
+                if let Some(number) = *mine {
+                    self.given(number, items);
+                }
+                reply(program, json!({"type": "ack", "request_id": request_id, "sequence": sequence}));
+                true
+            }
+            Some(Said::EndItems { request_id }) => {
+                if let Some(number) = *mine {
+                    self.given_all(number);
+                }
+                reply(program, json!({"type": "input_complete", "request_id": request_id}));
+                true
+            }
             Some(Said::Cancel) => {
                 if let Some(number) = *mine {
                     self.end(number, Outcome::Cancelled("cancelled"), true);
@@ -444,12 +646,51 @@ impl Pickers {
     fn open(&self, definition: Definition, request_id: Value, showing: Showing) -> u32 {
         limit_search_threads();
         let number = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let store = Arc::new(FileSystemSearchStore::new_append_only());
-        log(format_args!(
-            "picker {number}: {} under {:?} for pane {}",
-            definition.label, definition.scan.roots, showing.pane
-        ));
-        let scan = start_scan(definition.scan, store.clone());
+        let of = match &definition.lists {
+            Lists::Walk(scan) => format!("under {:?}", scan.roots),
+            Lists::History(path) => format!("of {}", path.display()),
+            Lists::Given => "of what its program gives".to_owned(),
+        };
+        log(format_args!("picker {number}: {} {of} for pane {}", definition.label, showing.pane));
+        let source = match definition.lists {
+            Lists::Walk(scan) => {
+                let store = Arc::new(FileSystemSearchStore::new_append_only());
+                let scan = start_scan(scan, store.clone());
+                Source::Walk { store, scan }
+            }
+            Lists::History(path) => {
+                let store = Arc::new(SnapshotStore::new_append_only());
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let whole = StreamValues::default();
+                let mut options = FileSourceOptions::new(path);
+                options.reverse = true;
+                options.unique = true;
+                options.line_continuation = Some("`".to_owned());
+                let sink = StreamSink {
+                    store: store.clone(),
+                    payload: (),
+                    values: Some(whole.clone()),
+                    error: Arc::default(),
+                };
+                let failed = move |message: &str| log(format_args!("picker {number}: its file was not read: {message}"));
+                let control = StreamControl {
+                    cancelled: cancelled.clone(),
+                    changed: Arc::new(|| {}),
+                    failed: Arc::new(failed),
+                };
+                if let Err(message) = file::start(options, sink, control) {
+                    // Nothing reads it: it lists nothing, and says so.
+                    failed(&message);
+                    PublishingStreamingItemStoreWithPayload::new(store.clone()).complete();
+                }
+                Source::File { store, cancelled, whole }
+            }
+            Lists::Given => {
+                let store = Arc::new(SnapshotStore::new_append_only());
+                let adding = Some(PublishingStreamingItemStoreWithPayload::new(store.clone()));
+                Source::Given { store, given: Mutex::new(Given { adding, rows: Vec::new() }) }
+            }
+        };
         let picker = Arc::new(Picker {
             number,
             pane: showing.pane,
@@ -457,8 +698,8 @@ impl Pickers {
             ui_outbox: showing.ui_outbox,
             program: showing.program,
             request_id,
-            store,
-            scan,
+            source,
+            sort: definition.sort,
             previews: Mutex::default(),
             state: Mutex::new(State { flow: Some(Flow::new()), ..Default::default() }),
         });
@@ -466,11 +707,47 @@ impl Pickers {
         picker.tell_ui(Control::PickerOpen {
             picker: number,
             pane: picker.pane,
-            label: definition.label.to_owned(),
+            label: definition.label,
             query: definition.query,
-            preview: Some(definition.preview_shown),
+            preview: definition.preview,
+            at_cursor: definition.at_cursor,
         });
         number
+    }
+
+    /// The program that asked for `number` gives it rows. They are not
+    /// taken by a picker that lists something else, or one that has ended.
+    fn given(&self, number: u32, items: Vec<Item>) {
+        let Some(picker) = self.open.lock().unwrap().get(&number).cloned() else { return };
+        let Source::Given { store, given } = &picker.source else { return };
+        let mut given = given.lock().unwrap();
+        let Given { adding: Some(adding), rows } = &mut *given else { return };
+        let mut left_out = 0;
+        for item in items {
+            if rows.len() >= MOST_GIVEN {
+                left_out += 1;
+                continue;
+            }
+            // A row is one line, whatever is in what it shows.
+            let shows: String =
+                item.text.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
+            adding.add_item(shows.as_bytes(), ());
+            let id = item.id.unwrap_or_else(|| rows.len().to_string());
+            rows.push((id, item.value.unwrap_or(Value::String(item.text))));
+        }
+        adding.publish();
+        if left_out > 0 {
+            store.add_skipped(left_out);
+        }
+    }
+
+    /// The program has given `number` all its rows.
+    fn given_all(&self, number: u32) {
+        let Some(picker) = self.open.lock().unwrap().get(&number).cloned() else { return };
+        let Source::Given { given, .. } = &picker.source else { return };
+        if let Some(mut adding) = given.lock().unwrap().adding.take() {
+            adding.complete();
+        }
     }
 
     /// The picker `number`, if UI `ui` is the one that shows it.
@@ -536,18 +813,19 @@ impl Pickers {
 
     fn end(&self, number: u32, outcome: Outcome, tell_ui: bool) {
         let Some(picker) = self.open.lock().unwrap().remove(&number) else { return };
-        picker.scan.cancel();
+        picker.source.stop();
         let query = {
             let mut state = picker.state.lock().unwrap();
             if let Some(search) = state.search.take() {
                 search.stop();
             }
             state.flow = None;
+            state.last = None;
             state.sent.clear();
             std::mem::take(&mut state.query)
         };
         let how = match &outcome {
-            Outcome::Accepted { .. } => "accepted".to_owned(),
+            Outcome::Accepted(_) => "accepted".to_owned(),
             Outcome::Cancelled(reason) => format!("cancelled ({reason})"),
             Outcome::Error { message, .. } => format!("failed: {message}"),
         };
@@ -557,11 +835,11 @@ impl Pickers {
             _ => None,
         };
         match outcome {
-            Outcome::Accepted { row, text, value } => result(
+            Outcome::Accepted(row) => result(
                 &picker.program,
                 &picker.request_id,
                 "accepted",
-                json!({"selected": [{"id": row.to_string(), "text": text, "value": value}], "query": query}),
+                json!({"selected": [{"id": row.id, "text": row.text, "value": row.value}], "query": query}),
             ),
             Outcome::Cancelled(reason) => {
                 result(&picker.program, &picker.request_id, "cancelled", json!({"reason": reason}))
@@ -591,8 +869,22 @@ impl Picker {
         let Some(flow) = &mut state.flow else { return };
         flow.asked(revision);
         state.rows = rows.clamp(1, MOST_ROWS);
+        if state.search.is_some() && state.query == query {
+            // Asked for again, as when the UI has room for more rows. The
+            // search finds nothing new for a query it has, and counts it
+            // as the same one: what it last found is the answer.
+            if let Some(last) = state.revisions.last_mut() {
+                *last = revision;
+            }
+            let found = state.last.clone().and_then(|last| state.flow.as_mut()?.found(revision, last));
+            if let Some((serial, answer)) = found {
+                self.send(&mut state, serial, revision, answer);
+            }
+            return;
+        }
         state.query = query.clone();
         state.revisions.push(revision);
+        state.last = None;
         if let Some(search) = &state.search {
             search.set_query(query);
             return;
@@ -600,12 +892,12 @@ impl Picker {
         let picker = Arc::downgrade(self);
         let search = FuzzySearchSession::new_with_snapshot_observer(
             u64::from(self.number),
-            Arc::new(Walk(self.store.clone())),
+            Arc::new(self.source.found()),
             query,
-            SearchSortMode::Score,
+            self.sort,
             move |update, source| {
                 if let Some(picker) = picker.upgrade() {
-                    picker.found(Answer { update, source });
+                    picker.found(Answer { update: Arc::new(update), source });
                 }
             },
         );
@@ -620,6 +912,11 @@ impl Picker {
         let Some(revision) = state.revisions.get(answer.update.generation as usize).copied() else {
             return;
         };
+        // Only of the query the search has now: an answer to one before it
+        // is not what that is asked for again with.
+        if answer.update.generation as usize + 1 == state.revisions.len() {
+            state.last = Some(answer.clone());
+        }
         let Some(flow) = &mut state.flow else { return };
         if let Some((serial, answer)) = flow.found(revision, answer) {
             self.send(&mut state, serial, revision, answer);
@@ -639,9 +936,9 @@ impl Picker {
         let Answer { update, source } = answer;
         let rows = update
             .results
-            .into_iter()
+            .iter()
             .take(state.rows)
-            .map(|result| PickerRow { index: result.node_index as u64, text: result.path })
+            .map(|result| PickerRow { index: result.node_index as u64, text: result.path.clone() })
             .collect();
         state.sent.push_back((serial, source.clone()));
         while state.sent.len() > KEPT_ANSWERS {
@@ -652,41 +949,57 @@ impl Picker {
             serial,
             revision,
             matched_against: source.effective_query(&update.query),
-            query: update.query,
+            query: update.query.clone(),
             header: None,
             rows,
             matched: update.matched as u64,
             total: update.total as u64,
-            skipped: self.store.skipped_items() as u64,
+            skipped: self.source.skipped() as u64,
             done: update.source_done,
             version: update.source_version,
             append_only: true,
         });
     }
 
-    /// Row `row` of those sent with `serial`: what it shows, and what it is.
-    fn row(&self, serial: u64, row: u64) -> Option<(String, String)> {
-        let state = self.state.lock().unwrap();
-        let source = state.sent.iter().find(|(sent, _)| *sent == serial).map(|(_, source)| source)?;
-        let index = usize::try_from(row).ok().filter(|index| *index < source.len())?;
-        let text = source.get_string_lossy(index, &mut Vec::new());
-        Some((text, source.item(index)?))
+    /// Row `row` of those sent with `serial`.
+    fn row(&self, serial: u64, row: u64) -> Option<Row> {
+        let (index, text, shown) = {
+            let state = self.state.lock().unwrap();
+            let source = state.sent.iter().find(|(sent, _)| *sent == serial).map(|(_, source)| source)?;
+            let index = usize::try_from(row).ok().filter(|index| *index < source.len())?;
+            (index, source.get_string_lossy(index, &mut Vec::new()), source.item(index)?)
+        };
+        Some(match &self.source {
+            Source::Walk { .. } => Row { id: row.to_string(), text, value: Value::String(shown) },
+            Source::File { whole, .. } => {
+                let whole = whole.lock().unwrap().get(&index).cloned();
+                Row { id: row.to_string(), text, value: Value::String(whole.unwrap_or(shown)) }
+            }
+            Source::Given { given, .. } => {
+                let (id, value) = given.lock().unwrap().rows.get(index)?.clone();
+                Row { id, text, value }
+            }
+        })
     }
 
     /// The UI asks what shows for a row. It is read on a thread of the
     /// picker's own, so that a slow folder holds up nothing else the UI
-    /// says, and only the last asked for is read.
+    /// says, and only the last asked for is read. Only a row that is a file
+    /// or a folder has anything to show.
     fn preview(&self, request: u64, serial: u64, row: u64) {
-        let Some((_, path)) = self.row(serial, row) else {
-            let error = Some(format!("row {row} of answer {serial} is not one the picker has"));
-            return self.tell_ui(Control::PickerPreviewed {
-                picker: self.number,
-                request,
-                text: String::new(),
-                name: None,
-                truncated: false,
-                error,
-            });
+        let path = match (&self.source, self.row(serial, row)) {
+            (Source::Walk { .. }, Some(Row { value: Value::String(path), .. })) => path,
+            _ => {
+                let error = Some(format!("row {row} of answer {serial} is not one the picker can show"));
+                return self.tell_ui(Control::PickerPreviewed {
+                    picker: self.number,
+                    request,
+                    text: String::new(),
+                    name: None,
+                    truncated: false,
+                    error,
+                });
+            }
         };
         let mut previews = self.previews.lock().unwrap();
         let asked = previews.get_or_insert_with(|| {
@@ -720,9 +1033,8 @@ impl Picker {
 
     /// The row the UI chose, of those sent with `serial`.
     fn chosen(&self, serial: u64, row: u64) -> Outcome {
-        let chosen = self.row(serial, row);
-        match chosen {
-            Some((text, value)) => Outcome::Accepted { row, text, value },
+        match self.row(serial, row) {
+            Some(row) => Outcome::Accepted(row),
             None => Outcome::Error {
                 code: "no_such_row",
                 message: format!("row {row} of answer {serial} is not one the picker has"),
@@ -771,22 +1083,27 @@ mod tests {
         assert_eq!(flow.seen(3), Some((4, "more")));
     }
 
+
+    fn params(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
     #[test]
     fn a_picker_is_of_files_or_folders_under_roots_or_the_folder_the_program_is_in() {
         let here = std::env::temp_dir();
-        let params = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
-            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
-        };
         let cwd = here.to_string_lossy().into_owned();
+        let scan = |definition: &Definition| match &definition.lists {
+            Lists::Walk(scan) => (scan.roots.clone(), scan.files_only, scan.directories_only, scan.relative),
+            _ => panic!("not a walk"),
+        };
         let files = define("files", &params(&[("cwd", &cwd), ("query", "ab")])).unwrap();
-        assert_eq!(files.scan.roots, [here.clone()]);
-        assert!(files.scan.files_only && !files.scan.directories_only && files.scan.relative);
-        assert_eq!(files.query, "ab");
+        assert_eq!(scan(&files), (vec![here.clone()], true, false, true));
+        assert_eq!((files.label.as_str(), files.query.as_str()), ("Files", "ab"));
+        assert!(matches!(files.sort, SearchSortMode::Score) && !files.at_cursor);
 
         let roots = serde_json::to_string(&[&cwd, "."]).unwrap();
         let folders = define("directories", &params(&[("cwd", &cwd), ("roots", &roots)])).unwrap();
-        assert_eq!(folders.scan.roots, [here.clone(), here.join(".")]);
-        assert!(folders.scan.directories_only && !folders.scan.relative);
+        assert_eq!(scan(&folders), (vec![here.clone(), here.join(".")], false, true, false));
 
         for (name, given) in [
             ("themes", params(&[("cwd", &cwd)])),
@@ -798,8 +1115,36 @@ mod tests {
             assert!(define(name, &given).is_err(), "{name} with {given:?} was taken");
         }
         // Previews are hidden unless asked for shown.
-        assert!(!files.preview_shown);
-        assert!(define("files", &params(&[("cwd", &cwd), ("preview", "true")])).unwrap().preview_shown);
+        assert_eq!(files.preview, Some(false));
+        assert_eq!(define("files", &params(&[("cwd", &cwd), ("preview", "true")])).unwrap().preview, Some(true));
+    }
+
+    #[test]
+    fn a_picker_is_of_the_lines_of_a_file_or_of_what_its_program_gives() {
+        let file = std::env::temp_dir().join(format!("nterm-history-{}.txt", std::process::id()));
+        std::fs::write(&file, "one\n").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let history = define("history", &params(&[("path", &path), ("query", "git"), ("position", "cursor")])).unwrap();
+        assert!(matches!(&history.lists, Lists::History(read) if *read == file));
+        // In the order of the file, with no previews, where the cursor is.
+        assert!(matches!(history.sort, SearchSortMode::SourceOrder) && history.at_cursor);
+        assert_eq!((history.label.as_str(), history.query.as_str(), history.preview), ("History", "git", None));
+        // A name alone is a file of the folder the program is in.
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let beside = define("history", &params(&[("path", &name), ("cwd", &cwd)])).unwrap();
+        assert!(matches!(&beside.lists, Lists::History(read) if *read == file));
+        std::fs::remove_file(&file).unwrap();
+        for given in [params(&[]), params(&[("path", &path)]), params(&[("path", &name)]), params(&[("path", &cwd)])] {
+            assert!(define("history", &given).is_err(), "history with {given:?} was taken");
+        }
+
+        let items = define("items", &params(&[])).unwrap();
+        assert!(matches!(items.lists, Lists::Given) && matches!(items.sort, SearchSortMode::Score));
+        assert_eq!((items.label.as_str(), items.preview, items.at_cursor), ("Items", None, false));
+        let long = "x".repeat(MOST_LABEL + 10);
+        assert_eq!(define("items", &params(&[("label", " Completions ")])).unwrap().label, "Completions");
+        assert_eq!(define("items", &params(&[("label", &long)])).unwrap().label.len(), MOST_LABEL);
     }
 
     #[test]
