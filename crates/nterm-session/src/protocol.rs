@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped when a frame kind or a required field changes meaning.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// A snapshot with a very long history is the largest frame.
 pub const MAX_FRAME: usize = 1 << 30;
@@ -199,6 +199,10 @@ pub enum Control {
         #[serde(default)]
         refused: Option<String>,
     },
+    /// From a UI: what would show for row `row` of the rows sent with
+    /// `serial`. Answered `PickerPreviewed` with the same `request`; a UI
+    /// that has asked again wants only the last.
+    PickerPreview { picker: u32, request: u64, serial: u64, row: u64 },
     /// End every shell and the daemon.
     Shutdown,
 
@@ -234,6 +238,10 @@ pub enum Control {
         label: String,
         /// The query it starts with.
         query: String,
+        /// Whether its rows have previews, to be asked for with
+        /// `PickerPreview`, and if so whether it opens showing them.
+        #[serde(default)]
+        preview: Option<bool>,
     },
     /// What was found for the query with this revision. There can be
     /// several for one revision while the picker's source is still being
@@ -271,6 +279,24 @@ pub enum Control {
         picker: u32,
         #[serde(default)]
         message: Option<String>,
+    },
+    /// To a UI: what shows for the row it asked of with `request`. The UI
+    /// lays it out; it is content, and nothing for the UI to open or run.
+    PickerPreviewed {
+        picker: u32,
+        request: u64,
+        /// What to show, as text.
+        text: String,
+        /// The name of the file the text is of, to colour it by. Without
+        /// one the text is shown plain: a listing, or a note.
+        #[serde(default)]
+        name: Option<String>,
+        /// Whether there is more of it than was sent.
+        #[serde(default)]
+        truncated: bool,
+        /// Why there is nothing to show, in place of `text`.
+        #[serde(default)]
+        error: Option<String>,
     },
 
     /// A message from a newer version.

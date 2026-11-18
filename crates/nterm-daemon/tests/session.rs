@@ -1277,3 +1277,60 @@ fn a_client_that_comes_and_goes_before_it_is_waited_for_does_not_stop_the_next()
     listener.accept().expect("the next client is taken");
     client.join().unwrap().unwrap();
 }
+
+impl Ui {
+    /// Ask what shows for a row of an answer, and take the answer to that.
+    fn preview(&mut self, picker: u32, request: u64, serial: u64, row: u64) -> Control {
+        self.send(Control::PickerPreview { picker, request, serial, row });
+        self.control(
+            |c| matches!(c, Control::PickerPreviewed { request: of, .. } if *of == request),
+        )
+    }
+}
+
+#[test]
+fn a_ui_is_sent_what_shows_for_a_row_of_a_picker() {
+    let session = session("pick-preview");
+    let tree = Tree::new("preview");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+
+    // Files: hidden unless asked for shown, and the file as it is.
+    let asker = Asker::ask(&session, pane, "files", serde_json::json!({"cwd": tree.path()}));
+    let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
+    let Control::PickerOpen { picker, preview, .. } = opened else { unreachable!() };
+    assert_eq!(preview, Some(false));
+    assert_eq!(asker.told()["type"], "opened");
+    let found = ui.query(picker, 0, "gam");
+    let (row, _) = found.rows[0];
+    let shown = ui.preview(picker, 1, found.serial, row);
+    let Control::PickerPreviewed { text, name, truncated, error, .. } = shown else { unreachable!() };
+    // The tree's files hold their own names.
+    assert_eq!((text.as_str(), name.as_deref()), ("b/gamma.rs", Some("gamma.rs")));
+    assert_eq!((truncated, error), (false, None));
+
+    // A row that is not one of an answer's is said to be none, and the
+    // picker goes on.
+    let shown = ui.preview(picker, 2, found.serial, 9999);
+    let Control::PickerPreviewed { error, .. } = shown else { unreachable!() };
+    assert!(error.is_some());
+    assert_eq!(ui.query(picker, 1, "alp").texts(), ["a\\alpha.txt"]);
+    ui.send(Control::PickerClose { picker, refused: None });
+    assert_eq!(asker.result().0, "cancelled");
+
+    // Folders: what is in the one selected.
+    let params = serde_json::json!({"cwd": tree.path(), "preview": "true"});
+    let asker = Asker::ask(&session, pane, "directories", params);
+    let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
+    let Control::PickerOpen { picker, preview, .. } = opened else { unreachable!() };
+    assert_eq!(preview, Some(true));
+    assert_eq!(asker.told()["type"], "opened");
+    let found = ui.query(picker, 0, "a");
+    let (row, _) = found.rows.iter().find(|(_, text)| text == "a").unwrap().clone();
+    let shown = ui.preview(picker, 1, found.serial, row);
+    let Control::PickerPreviewed { text, name, .. } = shown else { unreachable!() };
+    assert_eq!((text.as_str(), name), ("alpha.txt\nbeta.txt", None));
+    ui.send(Control::PickerClose { picker, refused: None });
+    assert_eq!(asker.result().0, "cancelled");
+    ui.shutdown();
+}

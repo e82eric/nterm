@@ -30,7 +30,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -88,6 +88,75 @@ struct Definition {
     label: &'static str,
     scan: ScanOptions,
     query: String,
+    /// Whether it opens showing the preview of the selected row.
+    preview_shown: bool,
+}
+
+/// The most of a file that is sent as its preview.
+const MOST_PREVIEW: usize = 256 * 1024;
+/// The most entries of a folder that are.
+const MOST_LISTED: usize = 1000;
+
+/// What shows for a row: the start of a file, or what is in a folder.
+#[derive(Debug, Default, PartialEq)]
+struct Shown {
+    text: String,
+    /// The file's name, for one shown as it is.
+    name: Option<String>,
+    truncated: bool,
+    error: Option<String>,
+}
+impl Shown {
+    fn of(path: &Path) -> Self {
+        let shown = if path.is_dir() { Self::folder(path) } else { Self::file(path) };
+        shown.unwrap_or_else(|error| Self { error: Some(error.to_string()), ..Default::default() })
+    }
+
+    fn file(path: &Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        let mut bytes = Vec::new();
+        file.take(MOST_PREVIEW as u64).read_to_end(&mut bytes)?;
+        // A file with a zero byte near its start is not one to read as text.
+        if bytes.iter().take(8192).any(|byte| *byte == 0) {
+            return Ok(Self { text: format!("Not text: {size} bytes"), ..Default::default() });
+        }
+        let truncated = size > bytes.len() as u64;
+        if truncated {
+            // Not half a line, nor half a character.
+            let whole = bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
+            bytes.truncate(whole);
+        }
+        Ok(Self {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            name: path.file_name().map(|name| name.to_string_lossy().into_owned()),
+            truncated,
+            error: None,
+        })
+    }
+
+    /// Folders first, each with a `\` after it, then files, by name.
+    fn folder(path: &Path) -> std::io::Result<Self> {
+        let mut entries = Vec::new();
+        let mut truncated = false;
+        for entry in std::fs::read_dir(path)? {
+            if entries.len() == MOST_LISTED {
+                truncated = true;
+                break;
+            }
+            let entry = entry?;
+            let folder = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            entries.push((!folder, entry.file_name().to_string_lossy().into_owned()));
+        }
+        entries.sort_by(|a, b| (a.0, a.1.to_lowercase()).cmp(&(b.0, b.1.to_lowercase())));
+        let lines: Vec<String> = entries
+            .into_iter()
+            .map(|(file, name)| if file { name } else { format!("{name}\\") })
+            .collect();
+        let text = if lines.is_empty() { "Empty folder".to_owned() } else { lines.join("\n") };
+        Ok(Self { text, truncated, ..Default::default() })
+    }
 }
 
 /// The pickers there are. `files` and `directories` list what is under the
@@ -133,6 +202,7 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
             relative,
         },
         query: params.get("query").cloned().unwrap_or_default(),
+        preview_shown: params.get("preview").is_some_and(|preview| preview == "true"),
     })
 }
 
@@ -284,6 +354,8 @@ struct Picker {
     request_id: Value,
     store: Arc<FileSystemSearchStore>,
     scan: FileWalkerScan,
+    /// The way to the thread that reads previews, once one was asked for.
+    previews: Mutex<Option<std::sync::mpsc::Sender<(u64, PathBuf)>>>,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -387,6 +459,7 @@ impl Pickers {
             request_id,
             store,
             scan,
+            previews: Mutex::default(),
             state: Mutex::new(State { flow: Some(Flow::new()), ..Default::default() }),
         });
         self.open.lock().unwrap().insert(number, picker.clone());
@@ -395,6 +468,7 @@ impl Pickers {
             pane: picker.pane,
             label: definition.label.to_owned(),
             query: definition.query,
+            preview: Some(definition.preview_shown),
         });
         number
     }
@@ -422,6 +496,11 @@ impl Pickers {
                 if let Some(found) = self.shown_by(*picker, ui) {
                     let outcome = found.chosen(*serial, *row);
                     self.end(*picker, outcome, false);
+                }
+            }
+            Control::PickerPreview { picker, request, serial, row } => {
+                if let Some(picker) = self.shown_by(*picker, ui) {
+                    picker.preview(*request, *serial, *row);
                 }
             }
             Control::PickerClose { picker, refused } => {
@@ -585,15 +664,63 @@ impl Picker {
         });
     }
 
+    /// Row `row` of those sent with `serial`: what it shows, and what it is.
+    fn row(&self, serial: u64, row: u64) -> Option<(String, String)> {
+        let state = self.state.lock().unwrap();
+        let source = state.sent.iter().find(|(sent, _)| *sent == serial).map(|(_, source)| source)?;
+        let index = usize::try_from(row).ok().filter(|index| *index < source.len())?;
+        let text = source.get_string_lossy(index, &mut Vec::new());
+        Some((text, source.item(index)?))
+    }
+
+    /// The UI asks what shows for a row. It is read on a thread of the
+    /// picker's own, so that a slow folder holds up nothing else the UI
+    /// says, and only the last asked for is read.
+    fn preview(&self, request: u64, serial: u64, row: u64) {
+        let Some((_, path)) = self.row(serial, row) else {
+            let error = Some(format!("row {row} of answer {serial} is not one the picker has"));
+            return self.tell_ui(Control::PickerPreviewed {
+                picker: self.number,
+                request,
+                text: String::new(),
+                name: None,
+                truncated: false,
+                error,
+            });
+        };
+        let mut previews = self.previews.lock().unwrap();
+        let asked = previews.get_or_insert_with(|| {
+            let (asked, asking) = std::sync::mpsc::channel::<(u64, PathBuf)>();
+            let (number, ui) = (self.number, self.ui_outbox.clone());
+            let read = move || {
+                while let Ok(mut last) = asking.recv() {
+                    while let Ok(newer) = asking.try_recv() {
+                        last = newer;
+                    }
+                    let (request, path) = last;
+                    let shown = Shown::of(&path);
+                    let previewed = Control::PickerPreviewed {
+                        picker: number,
+                        request,
+                        text: shown.text,
+                        name: shown.name,
+                        truncated: shown.truncated,
+                        error: shown.error,
+                    };
+                    if ui.send(Frame::Control(previewed).encode()).is_err() {
+                        break;
+                    }
+                }
+            };
+            let _ = std::thread::Builder::new().name(format!("picker {number} previews")).spawn(read);
+            asked
+        });
+        let _ = asked.send((request, PathBuf::from(path)));
+    }
+
     /// The row the UI chose, of those sent with `serial`.
     fn chosen(&self, serial: u64, row: u64) -> Outcome {
-        let state = self.state.lock().unwrap();
-        let source = state.sent.iter().find(|(sent, _)| *sent == serial).map(|(_, source)| source);
-        let chosen = source.and_then(|source| {
-            let index = usize::try_from(row).ok().filter(|index| *index < source.len())?;
-            let text = source.get_string_lossy(index, &mut Vec::new());
-            Some((text, source.item(index)?))
-        });
+        let chosen = self.row(serial, row);
         match chosen {
             Some((text, value)) => Outcome::Accepted { row, text, value },
             None => Outcome::Error {
@@ -670,5 +797,44 @@ mod tests {
         ] {
             assert!(define(name, &given).is_err(), "{name} with {given:?} was taken");
         }
+        // Previews are hidden unless asked for shown.
+        assert!(!files.preview_shown);
+        assert!(define("files", &params(&[("cwd", &cwd), ("preview", "true")])).unwrap().preview_shown);
+    }
+
+    #[test]
+    fn a_row_shows_as_the_start_of_its_file_or_what_is_in_its_folder() {
+        let root = std::env::temp_dir().join(format!("nterm-shown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("b.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("A.txt"), "caf\u{e9}").unwrap();
+        std::fs::write(root.join("data.bin"), [1u8, 0, 2, 3]).unwrap();
+        // Lines of ten bytes, to past the most that is sent.
+        let long = "123456789\n".repeat(MOST_PREVIEW / 10 + 5);
+        std::fs::write(root.join("long.log"), format!("{long}tail with no end")).unwrap();
+
+        let file = Shown::of(&root.join("b.rs"));
+        let whole = Shown { text: "fn main() {}\n".into(), name: Some("b.rs".into()), ..Default::default() };
+        assert_eq!(file, whole);
+        assert_eq!(Shown::of(&root.join("A.txt")).text, "caf\u{e9}");
+
+        // Cut at the end of a line, and said to be cut.
+        let cut = Shown::of(&root.join("long.log"));
+        assert!(cut.truncated && cut.text.len() <= MOST_PREVIEW);
+        assert!(cut.text.ends_with("123456789\n") && cut.text.len() > MOST_PREVIEW - 10);
+
+        let binary = Shown::of(&root.join("data.bin"));
+        assert_eq!((binary.text.as_str(), &binary.name), ("Not text: 4 bytes", &None));
+
+        // Folders first, then files, neither by the case of its name.
+        let folder = Shown::of(&root);
+        assert_eq!(folder.text, "sub\\\nA.txt\nb.rs\ndata.bin\nlong.log");
+        assert_eq!((&folder.name, folder.truncated), (&None, false));
+        assert_eq!(Shown::of(&root.join("sub")).text, "Empty folder");
+
+        let missing = Shown::of(&root.join("none.txt"));
+        assert!(missing.error.is_some() && missing.text.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

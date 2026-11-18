@@ -29,12 +29,26 @@ impl Fed {
             nfm_egui::PickerConfig {
                 title: label.clone(),
                 initial_query: shown.query.chars().take(4096).collect(),
-                // The daemon sends no previews yet.
-                preview_visible: false,
+                preview_visible: shown.preview == Some(true),
                 ..Default::default()
             },
             move |ask| asked.ask(ask),
         );
+        let mut shared = shared;
+        if shown.preview.is_some() {
+            // The daemon says what shows for a row, as text, and it is laid
+            // out here: coloured by the name of the file it is of. Nothing
+            // is opened or run for it on this machine.
+            let asked = shown.clone();
+            let provider = nfm_preview_file::resolved::ResolvedPreviewProvider::new(
+                move |selection: &nfm_egui::Selection<usize>, cancel| {
+                    let rows = selection.source_snapshot::<Rows>().ok_or("The rows have changed")?;
+                    let previewed = asked.preview_of(&rows, selection.item, &|| cancel.is_cancelled())?;
+                    Ok(Some(plan(previewed)))
+                },
+            );
+            shared.set_preview_provider(&ctx, Arc::new(provider));
+        }
         shown.feed(feed);
         Self {
             context: ctx,
@@ -95,6 +109,34 @@ impl Fed {
             }
             _ => None,
         }
+    }
+}
+
+/// How what the daemon sent is laid out.
+fn plan(previewed: crate::session::Previewed) -> nfm_preview_file::resolved::PreviewPlan {
+    use nfm_preview_file::text::{SnapshotSource, TextContent, TextPreviewOptions, TextPreviewRequest};
+    let mut text = previewed.text;
+    if previewed.truncated {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("[there is more: only the start is shown]\n");
+    }
+    // Text of no file is shown as it is: a listing, or a note.
+    let content = match &previewed.name {
+        Some(_) => TextContent::new(text),
+        None => TextContent::plain(text),
+    };
+    nfm_preview_file::resolved::PreviewPlan::Text {
+        request: TextPreviewRequest {
+            source: Arc::new(SnapshotSource(content)),
+            name: previewed.name,
+            extension: None,
+            center_line: None,
+            highlight_line: None,
+            syntax: None,
+        },
+        options: TextPreviewOptions::default(),
     }
 }
 
@@ -260,5 +302,159 @@ mod tests {
         frame(&ctx, &mut fed, vec![egui::Event::Text("x".into())]);
         drop(fed);
         assert_eq!(told(&daemon), []);
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::session::Previewed;
+    use nfm_egui::fed::{Found, Page, Row};
+    use nterm_session::protocol::Control;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn shown(preview: Option<bool>) -> (Arc<Shown>, mpsc::Receiver<Control>) {
+        let (tell, told) = mpsc::channel();
+        let tell = std::sync::Mutex::new(tell);
+        let tell = move |control| {
+            let _ = tell.lock().unwrap().send(control);
+        };
+        let shown = Shown::new(7, "Files".into(), String::new(), tell, || {});
+        let mut shown = shown;
+        shown.preview = preview;
+        (Arc::new(shown), told)
+    }
+    /// The daemon's answer `serial` to the first query: one row, number 5.
+    fn found(shown: &Shown, serial: u64) -> Arc<Rows> {
+        let rows = vec![Row { index: 5, text: "src\\main.rs".into(), fields: None }];
+        let page = Page { version: 1, rows, matched_against: String::new(), header: None, template: None };
+        let (source, results) = page.into_rows();
+        let source = Arc::new(source);
+        shown.found(
+            serial,
+            Found {
+                revision: 0,
+                query: String::new(),
+                source: source.clone(),
+                epoch: 0,
+                append_only: true,
+                results,
+                matched: 1,
+                total: 1,
+                skipped: 0,
+                done: true,
+            },
+        );
+        source
+    }
+    fn frame(ctx: &egui::Context, fed: &mut Fed) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let mut output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+            |ui| {
+                fed.show_scoped(ui.ctx(), ui.ctx().content_rect(), None, true);
+            },
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn the_daemon_is_asked_what_shows_for_the_selected_row() {
+        let ctx = egui::Context::default();
+        let (shown, daemon) = shown(Some(true));
+        let mut fed = Fed::start(ctx.clone(), shown.clone());
+        found(&shown, 3);
+        // The preview is asked for from the thread that lays it out, once
+        // the row has been drawn as the selected one.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let asked = loop {
+            frame(&ctx, &mut fed);
+            let asked = daemon.try_iter().find(|said| matches!(said, Control::PickerPreview { .. }));
+            if let Some(asked) = asked {
+                break asked;
+            }
+            assert!(Instant::now() < deadline, "no preview was asked for");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Which row of which answer, and nothing of what the row is.
+        assert_eq!(asked, Control::PickerPreview { picker: 7, request: 1, serial: 3, row: 5 });
+        let text = "fn main() {}\n".to_owned();
+        shown.previewed(1, Ok(Previewed { text, name: Some("main.rs".into()), truncated: false }));
+        frame(&ctx, &mut fed);
+
+        // A picker with no previews asks for none.
+        let (plain, daemon) = self::shown(None);
+        let mut fed = Fed::start(ctx.clone(), plain.clone());
+        found(&plain, 1);
+        for _ in 0..20 {
+            frame(&ctx, &mut fed);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!daemon.try_iter().any(|said| matches!(said, Control::PickerPreview { .. })));
+    }
+
+    #[test]
+    fn a_preview_is_waited_for_until_it_comes_or_is_not_wanted() {
+        let (shown, daemon) = shown(Some(false));
+        let rows = found(&shown, 4);
+        let wait = |shown: &Arc<Shown>, rows: &Arc<Rows>, cancelled: bool| {
+            let (shown, rows) = (shown.clone(), rows.clone());
+            std::thread::spawn(move || shown.preview_of(&rows, 5, &move || cancelled))
+        };
+        let asked = |daemon: &mpsc::Receiver<Control>| loop {
+            match daemon.recv_timeout(Duration::from_secs(10)).expect("no preview was asked for") {
+                Control::PickerPreview { request, serial, row, .. } => break (request, serial, row),
+                _ => {}
+            }
+        };
+
+        // It comes.
+        let waiting = wait(&shown, &rows, false);
+        assert_eq!(asked(&daemon), (1, 4, 5));
+        // An answer to another request is not this one's.
+        shown.previewed(9, Err("stale".into()));
+        let text = Previewed { text: "x".into(), name: None, truncated: false };
+        shown.previewed(1, Ok(Previewed { text: "x".into(), name: None, truncated: false }));
+        assert_eq!(waiting.join().unwrap(), Ok(text));
+
+        // The daemon says there is none.
+        let waiting = wait(&shown, &rows, false);
+        assert_eq!(asked(&daemon).0, 2);
+        shown.previewed(2, Err("Access is denied.".into()));
+        assert_eq!(waiting.join().unwrap(), Err("Access is denied.".into()));
+
+        // Another row was selected.
+        assert!(wait(&shown, &rows, true).join().unwrap().is_err());
+        // Rows that are not of an answer the picker was given.
+        let (other, _) = self::shown(Some(false));
+        let stranger = found(&other, 1);
+        assert!(shown.preview_of(&stranger, 5, &|| false).is_err());
+
+        // The picker ends while one is waited for.
+        let waiting = wait(&shown, &rows, false);
+        asked(&daemon);
+        asked(&daemon);
+        shown.ended(None);
+        assert!(waiting.join().unwrap().is_err());
+        assert!(shown.preview_of(&rows, 5, &|| false).is_err());
+    }
+
+    #[test]
+    fn what_the_daemon_sent_is_laid_out_as_text_and_said_to_be_cut() {
+        use nfm_preview_file::resolved::PreviewPlan;
+        let read = |previewed: Previewed| {
+            let PreviewPlan::Text { request, .. } = plan(previewed) else { panic!("not text") };
+            let content = request.source.read(usize::MAX, &|| false).unwrap();
+            (content.text, content.syntax.is_some(), request.name)
+        };
+        // A file is coloured by its name.
+        let file = Previewed { text: "fn a() {}\n".into(), name: Some("a.rs".into()), truncated: false };
+        assert_eq!(read(file), ("fn a() {}\n".into(), false, Some("a.rs".into())));
+        // A listing is shown plain.
+        let listing = Previewed { text: "sub\\\nb.txt".into(), name: None, truncated: true };
+        let (text, plain, name) = read(listing);
+        assert_eq!(text, "sub\\\nb.txt\n[there is more: only the start is shown]\n");
+        assert!(plain && name.is_none());
     }
 }

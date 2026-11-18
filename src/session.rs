@@ -790,8 +790,23 @@ pub(crate) struct Shown {
     pub(crate) label: String,
     /// The query it starts with.
     pub(crate) query: String,
+    /// Whether its rows have previews, and if so whether it opens showing
+    /// them.
+    pub(crate) preview: Option<bool>,
     state: Mutex<Showing>,
 }
+
+/// What the daemon says shows for a row.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Previewed {
+    pub(crate) text: String,
+    /// The name of the file the text is of, or none for text shown plain.
+    pub(crate) name: Option<String>,
+    pub(crate) truncated: bool,
+}
+
+/// How long a preview is waited for.
+const PREVIEW_WAIT: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 struct Showing {
@@ -805,6 +820,10 @@ struct Showing {
     over: bool,
     /// Ended by the daemon, with what went wrong if something did.
     closed: Option<Option<String>>,
+    /// How many previews were asked for: the number of the last.
+    previews: u64,
+    /// Who waits for the last preview asked for.
+    previewing: Option<(u64, mpsc::Sender<Result<Previewed, String>>)>,
 }
 
 impl Shown {
@@ -817,7 +836,65 @@ impl Shown {
         tell: impl Fn(Control) + Send + Sync + 'static,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Self {
-        Self { tell: Box::new(tell), wake: Box::new(wake), picker, label, query, state: Mutex::default() }
+        Self {
+            tell: Box::new(tell),
+            wake: Box::new(wake),
+            picker,
+            label,
+            query,
+            preview: None,
+            state: Mutex::default(),
+        }
+    }
+
+    /// What shows for `row` of the answer `rows`, asked of the daemon and
+    /// waited for: for the thread that lays previews out, not the one that
+    /// draws. Given up when `cancelled`, as it is when another row is
+    /// selected, or when the picker ends.
+    pub(crate) fn preview_of(
+        &self,
+        rows: &Arc<Rows>,
+        row: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Previewed, String> {
+        let (request, answer) = {
+            let mut state = self.state.lock().unwrap();
+            if state.over {
+                return Err("The picker has ended".into());
+            }
+            let serial = state.answers.iter().find(|(answer, _)| Arc::ptr_eq(answer, rows));
+            let Some(serial) = serial.map(|(_, serial)| *serial) else {
+                return Err("The rows have changed".into());
+            };
+            state.previews += 1;
+            let (said, answer) = mpsc::channel();
+            state.previewing = Some((state.previews, said));
+            (Control::PickerPreview { picker: self.picker, request: state.previews, serial, row: row as u64 }, answer)
+        };
+        (self.tell)(request);
+        let deadline = std::time::Instant::now() + PREVIEW_WAIT;
+        loop {
+            match answer.recv_timeout(Duration::from_millis(50)) {
+                Ok(previewed) => return previewed,
+                // Another was asked for in its place, or the picker ended.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err("Preview cancelled".into()),
+                Err(mpsc::RecvTimeoutError::Timeout) if cancelled() => return Err("Preview cancelled".into()),
+                Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() >= deadline => {
+                    return Err("The session daemon did not send the preview".into());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    /// The daemon's answer to the preview asked for with `request`.
+    pub(crate) fn previewed(&self, request: u64, previewed: Result<Previewed, String>) {
+        let mut state = self.state.lock().unwrap();
+        if state.previewing.as_ref().is_some_and(|(asked, _)| *asked == request)
+            && let Some((_, waiting)) = state.previewing.take()
+        {
+            let _ = waiting.send(previewed);
+        }
     }
 
     /// The page wants this found.
@@ -893,6 +970,8 @@ impl Shown {
             return;
         }
         state.closed = Some(message);
+        // Whoever waits for a preview stops waiting.
+        state.previewing = None;
         drop(state);
         (self.wake)();
     }
@@ -981,7 +1060,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
             // it to be shown. The daemon finds the rows, where the program
             // is; only what it sends is drawn here, so this is the same for
             // a daemon on another machine.
-            Frame::Control(Control::PickerOpen { picker, pane, label, query }) => match daemon.pane(pane) {
+            Frame::Control(Control::PickerOpen { picker, pane, label, query, preview }) => match daemon.pane(pane) {
                 Some(link) => {
                     let (to, woken) = (daemon.clone(), link.clone());
                     let tell = move |control: Control| {
@@ -991,7 +1070,8 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                         }
                         to.control(control);
                     };
-                    let shown = Arc::new(Shown::new(picker, label, query, tell, move || woken.wake_pane()));
+                    let shown = Shown::new(picker, label, query, tell, move || woken.wake_pane());
+                    let shown = Arc::new(Shown { preview, ..shown });
                     daemon.pickers.lock().unwrap().insert(picker, shown.clone());
                     let _ = link.requests.0.send(Event::Shown(shown));
                     link.wake_pane();
@@ -1041,6 +1121,18 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                             total: total as usize,
                             skipped: skipped as usize,
                             done,
+                        },
+                    );
+                }
+            }
+            Frame::Control(Control::PickerPreviewed { picker, request, text, name, truncated, error }) => {
+                let shown = daemon.pickers.lock().unwrap().get(&picker).cloned();
+                if let Some(shown) = shown {
+                    shown.previewed(
+                        request,
+                        match error {
+                            Some(error) => Err(error),
+                            None => Ok(Previewed { text, name, truncated }),
                         },
                     );
                 }
