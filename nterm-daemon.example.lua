@@ -20,10 +20,17 @@
 -- So far: types Command, File, Items and FileSystem; previews of type
 -- Dynamic, whose function runs here; and `action`, run here when a window
 -- opened the picker, and `keys`, what they ask of `app` being done to the
--- pane. The names files, directories, history, ripgrep
--- and items are the daemon's own.
+-- pane. A picker may be a function of what is at the shell's cursor, a
+-- Command may have columns, and modules load: see the git pickers below.
+-- The names files, directories, history, ripgrep and items are the daemon's
+-- own.
+local git = require("nterm.git")
 return {
   pickers = {
+    -- The pickers of git that come with nterm, run where the shell is.
+    GitCommits = git.commits {},
+    GitBranches = git.branches {},
+    GitStatus = git.status {},
     -- The commits of the repository the shell is in.
     Commits = {
       type = "Command", sort = "SourceOrder",

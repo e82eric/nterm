@@ -163,6 +163,9 @@ enum Lists {
     File(FileSourceOptions),
     /// The lines a command prints, as a search of files does.
     Command(CommandSourceOptions),
+    /// The lines a command prints, each split into columns of these names
+    /// at `delimiter`.
+    Table { command: CommandSourceOptions, names: Vec<String>, delimiter: String },
     /// Rows that are written in the file of the pickers.
     Fixed(Vec<crate::configured::Item>),
     /// What the program that asked gives, as `items`.
@@ -486,7 +489,7 @@ fn configured(
     let Defined { presentation, lists, preview: resolved, action: acts, keys, context } = defined;
     let mut preview = None;
     let lists = match lists {
-        Of::Command { args, cwd: folder, line_continuation, success_exit_codes, unique, .. } => {
+        Of::Command { args, cwd: folder, line_continuation, success_exit_codes, unique, columns, delimiter, .. } => {
             let mut filled = Vec::with_capacity(args.len());
             for argument in &args {
                 let argument = given(argument, params)?;
@@ -509,7 +512,27 @@ fn configured(
             if let Some(codes) = success_exit_codes {
                 options.success_exit_codes = codes;
             }
-            Lists::Command(options)
+            // With columns, each line is split into them and they show
+            // lined up, under their names.
+            match columns {
+                None if delimiter.is_some() => return Err("delimiter is for a picker with columns".into()),
+                None => Lists::Command(options),
+                Some(names) => {
+                    if names.is_empty() || names.len() > 32 {
+                        return Err("it has from 1 to 32 columns".into());
+                    }
+                    if options.line_continuation.is_some() || options.unique {
+                        return Err("columns do not go with line_continuation or unique".into());
+                    }
+                    nfm_picker_sources::structured::StructuredSchema::new(names.clone())
+                        .map_err(|error| format!("columns: {error}"))?;
+                    let delimiter = delimiter.unwrap_or_else(|| "\t".to_owned());
+                    if delimiter.is_empty() {
+                        return Err("delimiter is empty".into());
+                    }
+                    Lists::Table { command: options, names, delimiter }
+                }
+            }
         }
         Of::File { path, reverse, line_continuation, unique, .. } => {
             let mut path = PathBuf::from(given(&path, params)?);
@@ -546,8 +569,9 @@ fn configured(
             }
             // Its rows are files and folders: they show as those of the
             // daemon's own pickers of them do.
-            let shown = params.get("preview").map(|preview| preview == "true");
-            preview = Some(shown.unwrap_or(presentation.preview_visible));
+            // Whether it opens showing them is the file's to say, as of
+            // any picker of the file.
+            preview = Some(presentation.preview_visible);
             Lists::Walk(ScanOptions {
                 roots,
                 max_depth: max_depth.unwrap_or(i32::MAX),
@@ -562,8 +586,9 @@ fn configured(
     let resolves = match file {
         Some(file) if resolved || acts || !keys.is_empty() => {
             if resolved {
-                let shown = params.get("preview").map(|preview| preview == "true");
-                preview = Some(shown.unwrap_or(presentation.preview_visible));
+                // The file says whether it opens showing them: what a
+                // window would do with a picker of its own does not.
+                preview = Some(presentation.preview_visible);
             }
             Some(Resolves { file, name: name.to_owned(), params: params.clone(), preview: resolved, action: acts, keys, context })
         }
@@ -586,6 +611,8 @@ fn configured(
 
 /// Rows that are lines of text: of a file, or what a program gave.
 type Lines = StreamingItemSnapshotWithPayload<()>;
+/// Rows of columns: see `Lists::Table`.
+type Table = nfm_picker_sources::structured::StructuredStreamingSnapshot;
 
 /// What a picker lists so far, as it is searched.
 enum Listed {
@@ -593,6 +620,8 @@ enum Listed {
     /// are entries of it too.
     Files(Arc<PublishedSnapshot>),
     Lines(Arc<Lines>),
+    /// Lines split into columns, which show lined up under their names.
+    Table(Arc<Table>),
 }
 impl ItemsSource for Listed {
     type Item = String;
@@ -600,12 +629,14 @@ impl ItemsSource for Listed {
         match self {
             Self::Files(found) => found.version(),
             Self::Lines(lines) => lines.version(),
+            Self::Table(table) => table.version(),
         }
     }
     fn len(&self) -> usize {
         match self {
             Self::Files(found) => found.len(),
             Self::Lines(lines) => lines.len(),
+            Self::Table(table) => table.len(),
         }
     }
     fn is_empty(&self) -> bool {
@@ -620,12 +651,14 @@ impl ItemsSource for Listed {
         match self {
             Self::Files(found) => found.get_string(index, stack_buffer, heap_buffer),
             Self::Lines(lines) => lines.get_string(index, stack_buffer, heap_buffer),
+            Self::Table(table) => table.get_string(index, stack_buffer, heap_buffer),
         }
     }
     fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String {
         match self {
             Self::Files(found) => found.get_string_lossy(node_index, out),
             Self::Lines(lines) => lines.get_string_lossy(node_index, out),
+            Self::Table(table) => table.get_string_lossy(node_index, out),
         }
     }
     /// What a row is: the whole path of a file, and for a line what it
@@ -636,12 +669,35 @@ impl ItemsSource for Listed {
             Self::Lines(lines) => {
                 (node_index < lines.len()).then(|| lines.get_string_lossy(node_index, &mut Vec::new()))
             }
+            Self::Table(table) => (node_index < table.len()).then(|| table.value(node_index)),
+        }
+    }
+    // A table's rows show lined up under its columns' names, and it reads
+    // a query its own way: a column may be named in it.
+    fn header(&self, query: &str) -> Option<String> {
+        match self {
+            Self::Table(table) => ItemsSource::header(&**table, query),
+            _ => None,
+        }
+    }
+    fn display_text(&self, node_index: usize, query: &str) -> Option<String> {
+        match self {
+            Self::Table(table) => ItemsSource::display_text(&**table, node_index, query),
+            _ => None,
+        }
+    }
+    fn effective_query(&self, input: &str) -> String {
+        match self {
+            Self::Files(found) => found.effective_query(input),
+            Self::Lines(lines) => lines.effective_query(input),
+            Self::Table(table) => table.effective_query(input),
         }
     }
     fn create_search_plan(&self, query: &str) -> Box<dyn SearchPlan + '_> {
         match self {
             Self::Files(found) => Box::new(Inside { plan: found.create_search_plan(query), found }),
             Self::Lines(lines) => lines.create_search_plan(query),
+            Self::Table(table) => table.create_search_plan(query),
         }
     }
 }
@@ -674,36 +730,42 @@ impl SearchPlan for Inside<'_> {
 enum Found {
     Walk(Arc<FileSystemSearchStore>),
     Lines(Arc<SnapshotStore<Lines>>),
+    Table(Arc<SnapshotStore<Table>>),
 }
 impl SearchSnapshotProvider<Listed> for Found {
     fn snapshot(&self) -> Option<Arc<Listed>> {
         Some(Arc::new(match self {
             Self::Walk(store) => Listed::Files(SearchSnapshotProvider::snapshot(&**store)?),
             Self::Lines(store) => Listed::Lines(SearchSnapshotProvider::snapshot(&**store)?),
+            Self::Table(store) => Listed::Table(SearchSnapshotProvider::snapshot(&**store)?),
         }))
     }
     fn snapshot_version(&self) -> u64 {
         match self {
             Self::Walk(store) => SearchSnapshotProvider::snapshot_version(&**store),
             Self::Lines(store) => SearchSnapshotProvider::snapshot_version(&**store),
+            Self::Table(store) => SearchSnapshotProvider::snapshot_version(&**store),
         }
     }
     fn is_done(&self) -> bool {
         match self {
             Self::Walk(store) => SearchSnapshotProvider::is_done(&**store),
             Self::Lines(store) => SearchSnapshotProvider::is_done(&**store),
+            Self::Table(store) => SearchSnapshotProvider::is_done(&**store),
         }
     }
     fn subscribe_updates(&self, wake: crossbeam_channel::Sender<()>) -> bool {
         match self {
             Self::Walk(store) => store.subscribe_updates(wake),
             Self::Lines(store) => store.subscribe_updates(wake),
+            Self::Table(store) => store.subscribe_updates(wake),
         }
     }
     fn skipped_items(&self) -> usize {
         match self {
             Self::Walk(store) => store.skipped_items(),
             Self::Lines(store) => store.skipped_items(),
+            Self::Table(store) => store.skipped_items(),
         }
     }
 }
@@ -779,6 +841,9 @@ enum Source {
     /// `whole` has, by row, what a row is where that is not what it shows:
     /// a command of several lines, which shows as one.
     Read { store: Arc<SnapshotStore<Lines>>, cancelled: Arc<AtomicBool>, whole: StreamValues },
+    /// Lines a command prints, split into columns. `whole` has each line
+    /// as it was printed, which is what its row is.
+    Table { store: Arc<SnapshotStore<Table>>, cancelled: Arc<AtomicBool>, whole: StreamValues },
     /// What the program gives.
     Given { store: Arc<SnapshotStore<Lines>>, given: Mutex<Given> },
 }
@@ -794,6 +859,7 @@ impl Source {
         match self {
             Self::Walk { store, .. } => Found::Walk(store.clone()),
             Self::Read { store, .. } | Self::Given { store, .. } => Found::Lines(store.clone()),
+            Self::Table { store, .. } => Found::Table(store.clone()),
         }
     }
     fn skipped(&self) -> usize {
@@ -802,7 +868,7 @@ impl Source {
     fn stop(&self) {
         match self {
             Self::Walk { scan, .. } => scan.cancel(),
-            Self::Read { cancelled, .. } => cancelled.store(true, Ordering::Release),
+            Self::Read { cancelled, .. } | Self::Table { cancelled, .. } => cancelled.store(true, Ordering::Release),
             Self::Given { given, .. } => given.lock().unwrap().adding = None,
         }
     }
@@ -1057,7 +1123,7 @@ impl Pickers {
         let of = match &definition.lists {
             Lists::Walk(scan) => format!("under {:?}", scan.roots),
             Lists::File(file) => format!("of {}", file.path.display()),
-            Lists::Command(command) => format!(
+            Lists::Command(command) | Lists::Table { command, .. } => format!(
                 "of what {} prints in {}",
                 command.command.program.display(),
                 command.command.working_directory.as_deref().unwrap_or(Path::new(".")).display()
@@ -1070,7 +1136,7 @@ impl Pickers {
         // of those open: it may fail at once, and that ends the picker.
         let mut begin: Option<Box<dyn FnOnce()>> = None;
         let found_in = match &definition.lists {
-            Lists::Command(command) => command.command.working_directory.clone(),
+            Lists::Command(command) | Lists::Table { command, .. } => command.command.working_directory.clone(),
             _ => None,
         };
         let source = match definition.lists {
@@ -1098,6 +1164,80 @@ impl Pickers {
                     }
                 }));
                 source
+            }
+            Lists::Table { command, names, delimiter } => {
+                use nfm_picker_sources::structured::{StructuredSchema, StructuredStreamingStore};
+                let store: Arc<SnapshotStore<Table>> = Arc::new(SnapshotStore::new());
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let whole = StreamValues::default();
+                let (open, to, stop, lines) = (self.open.clone(), store.clone(), cancelled.clone(), whole.clone());
+                begin = Some(Box::new(move || {
+                    let read = move || {
+                        // The names were looked at when the picker was defined.
+                        let Ok(schema) = StructuredSchema::new(names.clone()) else { return };
+                        let mut rows = StructuredStreamingStore::new(schema);
+                        // A line is a row: its columns, and the line as it
+                        // was printed, which is what the row is.
+                        let add = |rows: &mut StructuredStreamingStore, line: &[u8]| {
+                            let line = String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(line)).into_owned();
+                            if line.is_empty() || rows.len() >= MOST_LINES {
+                                return;
+                            }
+                            let mut fields: Vec<&str> = line.splitn(names.len(), delimiter.as_str()).collect();
+                            fields.resize(names.len(), "");
+                            if rows.add_record(&csv::StringRecord::from(fields)).is_ok() {
+                                lines.lock().unwrap().insert(rows.len() - 1, line);
+                            }
+                        };
+                        let mut pending = Vec::new();
+                        let output = nfm_preview_command::run_streaming(
+                            &command.command,
+                            || stop.load(Ordering::Acquire),
+                            |stream, bytes| {
+                                if stream != nfm_preview_command::Stream::Stdout {
+                                    return true;
+                                }
+                                pending.extend_from_slice(bytes);
+                                let mut start = 0;
+                                while let Some(end) = pending[start..].iter().position(|&byte| byte == b'\n') {
+                                    add(&mut rows, &pending[start..start + end]);
+                                    start += end + 1;
+                                }
+                                pending.drain(..start);
+                                if start > 0 {
+                                    to.publish(rows.snapshot());
+                                }
+                                rows.len() < MOST_LINES
+                            },
+                        );
+                        let stopped = stop.load(Ordering::Acquire);
+                        if !stopped {
+                            add(&mut rows, &std::mem::take(&mut pending));
+                        }
+                        to.publish(rows.snapshot());
+                        to.complete();
+                        let failed = match output {
+                            _ if stopped || rows.len() >= MOST_LINES => None,
+                            Ok(output) if output.status.code().is_some_and(|code| command.success_exit_codes.contains(&code)) => None,
+                            Ok(output) => Some(format!(
+                                "{} ended with {}: {}",
+                                command.command.program.display(),
+                                output.status,
+                                String::from_utf8_lossy(&output.stderr).trim()
+                            )),
+                            Err(message) => Some(message),
+                        };
+                        if let Some(message) = failed {
+                            log(format_args!("picker {number}: what it lists was not read: {message}"));
+                            // As of lines: with rows it goes on with those.
+                            if rows.len() == 0 {
+                                end(&open, number, Outcome::Error { code: "source_failed", message }, true);
+                            }
+                        }
+                    };
+                    let _ = std::thread::Builder::new().name(format!("picker {number} table")).spawn(read);
+                }));
+                Source::Table { store, cancelled, whole }
             }
             Lists::Fixed(items) => {
                 let store = Arc::new(SnapshotStore::new_append_only());
@@ -1479,7 +1619,10 @@ impl Picker {
             .results
             .iter()
             .take(state.rows)
-            .map(|result| PickerRow { index: result.node_index as u64, text: result.path.clone() })
+            .map(|result| PickerRow {
+                index: result.node_index as u64,
+                text: source.display_text(result.node_index, &update.query).unwrap_or_else(|| result.path.clone()),
+            })
             .collect();
         state.sent.push_back((serial, source.clone()));
         while state.sent.len() > KEPT_ANSWERS {
@@ -1491,7 +1634,7 @@ impl Picker {
             revision,
             matched_against: source.effective_query(&update.query),
             query: update.query.clone(),
-            header: None,
+            header: source.header(&update.query),
             rows,
             matched: update.matched as u64,
             total: update.total as u64,
@@ -1512,7 +1655,7 @@ impl Picker {
         };
         Some(match &self.source {
             Source::Walk { .. } => Row { id: row.to_string(), text, value: Value::String(shown) },
-            Source::Read { whole, .. } => {
+            Source::Read { whole, .. } | Source::Table { whole, .. } => {
                 let whole = whole.lock().unwrap().get(&index).cloned();
                 Row { id: row.to_string(), text, value: Value::String(whole.unwrap_or(shown)) }
             }

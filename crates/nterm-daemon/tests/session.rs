@@ -1002,6 +1002,8 @@ fn a_pseudoconsole_that_goes_on_its_own_is_logged() {
 
 /// What a picker the daemon runs said was found.
 struct Rows {
+    /// The names of its columns, of a picker that has them.
+    header: Option<String>,
     serial: u64,
     query: String,
     matched_against: String,
@@ -1099,7 +1101,7 @@ impl Ui {
             let found = self
                 .control(|c| matches!(c, Control::PickerRows { picker: of, .. } if *of == picker));
             let Control::PickerRows {
-                serial, revision: of, query, matched_against, rows, matched, done, ..
+                serial, revision: of, query, matched_against, rows, matched, done, header, ..
             } = found
             else {
                 unreachable!()
@@ -1107,7 +1109,7 @@ impl Ui {
             self.send(Control::PickerSeen { picker, serial });
             if of == revision && done {
                 let rows = rows.into_iter().map(|row| (row.index, row.text)).collect();
-                return Rows { serial, query, matched_against, rows, matched };
+                return Rows { serial, query, matched_against, rows, matched, header };
             }
         }
     }
@@ -2114,6 +2116,58 @@ fn a_picker_of_the_machines_file_that_is_a_function_is_told_what_is_at_the_curso
         let Control::PickerRefused { message, .. } = refused else { panic!("{refused:?}") };
         assert!(message.contains(why), "{message}");
     }
+    ui.shutdown();
+    assert!(daemon.wait().unwrap().success());
+}
+
+#[test]
+fn a_picker_of_the_machines_file_with_columns_shows_them_lined_up_under_their_names() {
+    let session = session("pick-columns");
+    let tree = Tree::new("columns");
+    let cwd = tree.path();
+    std::fs::write(tree.0.join("rows.txt"), "abc123\t2026-01-02\tFirst subject\r\nde\t2026-11-18\tSecond\twith a tab\r\n").unwrap();
+    let file = tree.0.join("nterm-daemon.lua");
+    std::fs::write(
+        &file,
+        r#"return { pickers = {
+          Table = { type = "Command", sort = "Source", args = { "cmd.exe", "/c", "type", "rows.txt" },
+                    columns = { "Hash", "Date", "Subject" } },
+          Both = { type = "Command", args = { "cmd.exe", "/c", "ver" }, columns = { "A" }, unique = true },
+        } }"#,
+    )
+    .unwrap();
+    let mut command = std::process::Command::new(DAEMON);
+    command.args(["--session", &session, "--lua-config"]).arg(&file).env_remove("NTERM_CONPTY_DLL");
+    let mut daemon = command.spawn().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while let Err(error) = pipe::connect(&session) {
+        assert!(Instant::now() < deadline, "the daemon never served: {error}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    let given: std::collections::BTreeMap<String, String> = [("cwd".to_owned(), cwd.clone())].into_iter().collect();
+    ui.send(Control::PickerAsk { ask: 1, pane, picker: "Table".into(), params: given.clone() });
+    let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. }));
+    let Control::PickerOpen { picker, .. } = opened else { panic!("{opened:?}") };
+    // The rows are padded to their columns, and the header to the same.
+    let found = ui.query(picker, 0, "");
+    assert_eq!(found.header.as_deref(), Some("Hash    Date        Subject"));
+    assert_eq!(found.texts(), ["abc123  2026-01-02  First subject", "de      2026-11-18  Second\twith a tab"]);
+    // What is typed is looked for in the rows.
+    let found = ui.query(picker, 1, "second");
+    assert_eq!(found.texts().len(), 1);
+    // The row chosen is the line as it was printed.
+    ui.send(Control::PickerAccept { picker, serial: found.serial, row: found.rows[0].0 });
+    let Control::PickerChosen { value, .. } = ui.control(|c| matches!(c, Control::PickerChosen { .. })) else {
+        unreachable!()
+    };
+    assert_eq!(value, "de\t2026-11-18\tSecond\twith a tab");
+
+    ui.send(Control::PickerAsk { ask: 2, pane, picker: "Both".into(), params: given });
+    let refused = ui.control(|c| matches!(c, Control::PickerOpen { .. } | Control::PickerRefused { .. }));
+    let Control::PickerRefused { message, .. } = refused else { panic!("{refused:?}") };
+    assert!(message.contains("columns do not go with"), "{message}");
     ui.shutdown();
     assert!(daemon.wait().unwrap().success());
 }

@@ -269,9 +269,24 @@ sends when the picker was opened from its copy mode. The daemon reads a row
 of the screen as a line: one that wrapped is given as the row the cursor is
 on.
 
+A `Command` picker may have `columns = { "Hash", "Date", "Subject" }`, as in
+`nterm.lua`: each line the program prints is split into them at a tab (or at
+`delimiter`), and the rows show lined up under those names. What is typed is
+read as it is for a window's own picker of columns. The row itself is still
+the line as it was printed, which is what `action`, `preview` and `keys` are
+given. `columns` do not go with `line_continuation` or `unique`.
+
+Modules load as in `nterm.lua`: `require("nterm.git")` gives the pickers of
+git that are installed with nterm (`share\nterm\lua`, beside the daemon), so
+`GitCommits = git.commits {}` in the daemon's file is that picker run where
+the shell is.
+
+Whether a picker of the file opens showing its preview is the file's to say
+(`preview_visible`), whatever opened it.
+
 Not yet: previews of types
-other than `Dynamic`, `items` that is a
-function, and `columns`, are refused. A picker that cannot be one is refused
+other than `Dynamic` and `items` that is a
+function are refused. A picker that cannot be one is refused
 when it is opened, saying why, and the file's other pickers still open. The
 names `files`, `directories`, `history`, `ripgrep` and `items` are the
 daemon's own and cannot be given to a picker of the file.

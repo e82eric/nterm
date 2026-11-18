@@ -96,6 +96,13 @@ pub(crate) enum Lists {
         unique: Option<bool>,
         #[serde(default)]
         enter_action: Option<String>,
+        /// The names of the columns each line it prints is split into,
+        /// which then show under those names, lined up.
+        #[serde(default)]
+        columns: Option<Vec<String>>,
+        /// What a line is split at: a tab, unless this says.
+        #[serde(default)]
+        delimiter: Option<String>,
     },
     /// The lines of a file, the last first with `reverse`.
     File {
@@ -231,7 +238,7 @@ impl Configured {
                     crate::log::log(format_args!(
                         "{}: {} pickers, {bad} of them not understood{}",
                         path.display(),
-                        read.pickers.len(),
+                        read.pickers.len() + read.functions.len(),
                         read.error.as_ref().map(|error| format!(": {error}")).unwrap_or_default()
                     ));
                     read
@@ -580,7 +587,7 @@ mod tests {
             r#"return { pickers = {
               Good = { type = "Items", items = {} },
               files = { type = "Items" },
-              Made = function(context) return { type = "Items" } end,
+              Made = function(context) return { type = "Scrollback" } end,
               Asked = { type = "Command", args = {"{program}", "x"} },
               None = { type = "Command", args = {} },
               Typo = { type = "Command", args = {"git"}, cwdd = "x" },
@@ -593,7 +600,7 @@ mod tests {
         assert!(configured.picker("Good").unwrap().is_some());
         for (name, why) in [
             ("files", "of its own"),
-            ("Made", "a function"),
+            ("Made", "type Scrollback"),
             ("Asked", "not one to be given"),
             ("None", "no program"),
             ("Typo", "cwdd"),
@@ -639,11 +646,23 @@ mod tests {
 
     #[test]
     fn the_example_file_has_pickers_that_are_all_understood() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../nterm-daemon.example.lua");
-        let configured = Configured::new(Some(path));
-        for name in ["Commits", "Search", "Typed", "Near", "Servers"] {
+        // With the modules that are installed with the daemon beside it,
+        // as they are found beside any file.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = file("example", &std::fs::read_to_string(root.join("nterm-daemon.example.lua")).unwrap());
+        let modules = path.parent().unwrap().join("nterm");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::copy(root.join("lua/nterm/git.lua"), modules.join("git.lua")).unwrap();
+        let configured = Configured::new(Some(path.clone()));
+        for name in ["Commits", "Search", "Typed", "Near", "Servers", "GitCommits", "GitBranches", "GitStatus"] {
             assert!(configured.picker(name).unwrap().is_some(), "{name}");
         }
+        // The pickers of git have columns, and say what shows for a row.
+        let commits = configured.picker("GitCommits").unwrap().unwrap();
+        let Lists::Command { columns, .. } = &commits.lists else { panic!("not a command") };
+        assert_eq!(columns.as_ref().map(Vec::len), Some(5));
+        assert!(commits.preview && commits.action);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
