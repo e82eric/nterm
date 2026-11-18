@@ -270,7 +270,7 @@ fn float_size(saved: &Saved) -> Option<crate::config::FloatingPadding> {
 /// A session waiting in the daemon, as the daemon last described it. `None`
 /// when it is not waiting.
 pub(super) fn waiting_workspace(id: &str) -> Option<Waiting> {
-    let listing = crate::session::sessions()?;
+    let listing = crate::session::sessions(&crate::session::home())?;
     let saved = listing.sessions.iter().find(|session| session.id == id).and_then(arrangement)?;
     // A group as saved, its pane ids the daemon's pane numbers.
     let group = |layout: Layout,
@@ -318,7 +318,7 @@ impl TerminalView {
         // Nothing looks at the session once it is shown.
         self.drop_peek();
         // The sessions as they are now, which the rows chosen from followed.
-        let listing = crate::session::sessions().ok_or("That session is no longer waiting.")?;
+        let listing = crate::session::sessions(&crate::session::home()).ok_or("That session is no longer waiting.")?;
         let session = listing.sessions.iter().find(|session| session.id == id);
         let saved = session.and_then(arrangement).ok_or("That session is no longer waiting.")?;
         let index = self.free_index();
@@ -521,7 +521,7 @@ impl TerminalView {
                 .session
                 .get_or_insert_with(|| workspace::Session { id: new_id(), sent: String::new() });
             if session.sent != text {
-                crate::session::set_session(session.id.clone(), saved.members(), text.clone());
+                crate::session::set_session(&crate::session::home(), session.id.clone(), saved.members(), text.clone());
                 session.sent = text;
             }
         }
@@ -602,12 +602,12 @@ impl TerminalView {
     /// session once none of its shells runs, and says so, which takes its
     /// row out of the picker.
     pub(super) fn end_session(&self, id: &str) {
-        let Some(listing) = crate::session::sessions() else { return };
+        let Some(listing) = crate::session::sessions(&crate::session::home()) else { return };
         let Some(session) = listing.sessions.iter().find(|session| session.id == id) else {
             return;
         };
         for pane in takeable(session) {
-            crate::session::close_pane(pane.pane);
+            crate::session::close_pane(&crate::session::home(), pane.pane);
         }
     }
 
@@ -620,10 +620,10 @@ impl TerminalView {
         if self.empty.is_some() || self.close_requested || self.has_panes() {
             return;
         }
-        if crate::session::status() != crate::session::Status::Connected {
+        if crate::session::status(&crate::session::home()) != crate::session::Status::Connected {
             return;
         }
-        let waiting = crate::session::sessions()
+        let waiting = crate::session::sessions(&crate::session::home())
             .is_some_and(|listing| !session_rows(&listing).is_empty());
         if !(stay || waiting) {
             return;

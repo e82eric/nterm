@@ -166,7 +166,7 @@ impl TerminalView {
         // With shells kept in the session daemon the window starts with no
         // terminal: what it shows first depends on what the daemon holds,
         // and the daemon is reached while the window is already up.
-        let pane = if crate::session::status() == crate::session::Status::Off {
+        let pane = if crate::session::status(&crate::session::home()) == crate::session::Status::Off {
             let pane = TerminalPane::create(
                 &app,
                 egui_ctx,
@@ -179,7 +179,7 @@ impl TerminalView {
             pane.set_pipe_policy(&picker_bindings.pipe_policy);
             Some(pane)
         } else {
-            crate::session::connect();
+            crate::session::connect(&crate::session::home());
             None
         };
         let mut view = Self::with_pane(

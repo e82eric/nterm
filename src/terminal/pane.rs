@@ -802,7 +802,7 @@ impl TerminalPane {
         let command = text(&options.command, "pane command")?;
         let cwd = text(&options.cwd, "pane directory")?;
         let userdata: *mut c_void = (&mut *wake as *mut WakeState).cast();
-        let session = crate::session::Link::prepare(userdata, &options.start)
+        let session = crate::session::Link::prepare(userdata, &options.start, &crate::session::home())
             .map_err(|e| FatalError::new("show a running shell", e))?;
         // A shell of the pane's own is reached by a pipe of the pane's own.
         #[cfg(unix)]

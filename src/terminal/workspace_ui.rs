@@ -538,7 +538,7 @@ impl TerminalView {
             entry.cells[0] = name;
             entry.cells.push(running);
         }
-        if let Some(listing) = crate::session::sessions() {
+        if let Some(listing) = crate::session::sessions(&crate::session::home()) {
             entries.extend(super::restore::session_rows(&listing));
             of.push_str(&super::restore::session_rows_key(&listing));
         }

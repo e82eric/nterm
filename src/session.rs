@@ -144,6 +144,34 @@ impl Remote {
     }
 }
 
+/// Where a shell runs: in this machine's daemon, or in the daemon of a
+/// remote, by its name. Each place has a connection of its own, made when
+/// it is first wanted, and a pane belongs to the place it was made in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum Place {
+    #[default]
+    Here,
+    Remote(String),
+}
+
+impl Place {
+    /// What is known of the remote, if it is one.
+    fn remote(&self) -> Option<Remote> {
+        match self {
+            Place::Here => None,
+            Place::Remote(name) => remote().filter(|remote| remote.name == *name),
+        }
+    }
+}
+
+/// The place the window was started for: `--remote NAME`'s, or this machine.
+pub(crate) fn home() -> Place {
+    match remote() {
+        Some(remote) => Place::Remote(remote.name),
+        None => Place::Here,
+    }
+}
+
 static REMOTE: Mutex<Option<Remote>> = Mutex::new(None);
 
 /// `--remote NAME`: this window's shells are on that machine.
@@ -151,7 +179,7 @@ pub(crate) fn set_remote(remote: Remote) {
     *REMOTE.lock().unwrap() = Some(remote);
 }
 
-/// The other machine this window's shells are on, if they are.
+/// The other machine the window was started for, if it was for one.
 pub(crate) fn remote() -> Option<Remote> {
     REMOTE.lock().unwrap().clone()
 }
@@ -226,23 +254,23 @@ pub(crate) fn waiting(pane: &PaneInfo) -> bool {
 
 /// Tell the daemon of a workspace: the panes in it, and how they are laid
 /// out, for whichever UI shows it next. Does nothing without a connection.
-pub(crate) fn set_session(id: String, panes: Vec<PaneId>, layout: String) {
-    if let Some(daemon) = daemon() {
+pub(crate) fn set_session(place: &Place, id: String, panes: Vec<PaneId>, layout: String) {
+    if let Some(daemon) = daemon(place) {
         daemon.control(Control::SessionSet { id, panes, layout });
     }
 }
 
 /// End the shell of a daemon pane nothing here shows.
-pub(crate) fn close_pane(pane: PaneId) {
-    if let Some(daemon) = daemon() {
+pub(crate) fn close_pane(place: &Place, pane: PaneId) {
+    if let Some(daemon) = daemon(place) {
         daemon.control(Control::Close { pane });
     }
 }
 
 /// The sessions the daemon holds, as it last gave them. `None` without a
 /// connection.
-pub(crate) fn sessions() -> Option<Arc<Listing>> {
-    Some(daemon()?.sessions.lock().unwrap().clone())
+pub(crate) fn sessions(place: &Place) -> Option<Arc<Listing>> {
+    Some(daemon(place)?.sessions.lock().unwrap().clone())
 }
 
 /// Called with the configuration before the first pane is made.
@@ -251,13 +279,13 @@ pub(crate) fn configure(enabled: bool) {
 }
 
 /// `NTERM_SESSION_DAEMON=1` or `0` overrides the configuration. A remote
-/// window has nowhere else to run a shell.
-fn enabled() -> bool {
+/// has nowhere else to run a shell.
+fn enabled(place: &Place) -> bool {
     #[cfg(test)]
     if tests::TARGET.lock().unwrap().is_some() {
         return true;
     }
-    if remote().is_some() {
+    if *place != Place::Here {
         return true;
     }
     match std::env::var("NTERM_SESSION_DAEMON").as_deref() {
@@ -280,35 +308,50 @@ enum Conn {
     Lost,
 }
 
-/// The connection, whatever state it is in. There is one for the process.
+/// The connection to one place, whatever state it is in.
 struct Client {
+    place: Place,
     state: Mutex<Conn>,
     /// Told of every change of `state`.
     changed: Condvar,
-    /// Counts the connections made, to tell one from the next.
-    connections: Mutex<u64>,
-    /// Wakes the UI when something it may be waiting for arrives.
-    ui: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
-static CLIENT: Client = Client {
-    state: Mutex::new(Conn::Idle),
-    changed: Condvar::new(),
-    connections: Mutex::new(0),
-    ui: Mutex::new(None),
-};
+/// The connection of each place that has been asked after.
+static CLIENTS: Mutex<Vec<Arc<Client>>> = Mutex::new(Vec::new());
+
+/// Counts the connections made, to tell one from the next, whatever place
+/// each was to.
+static CONNECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Wakes the UI when something it may be waiting for arrives.
+static UI: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
+
+fn wake_ui() {
+    if let Some(wake) = &*UI.lock().unwrap() {
+        wake();
+    }
+}
+
+/// The connection to `place`, which starts out not yet made.
+fn client(place: &Place) -> Arc<Client> {
+    let mut clients = CLIENTS.lock().unwrap();
+    if let Some(client) = clients.iter().find(|client| client.place == *place) {
+        return client.clone();
+    }
+    let client = Arc::new(Client {
+        place: place.clone(),
+        state: Mutex::new(Conn::Idle),
+        changed: Condvar::new(),
+    });
+    clients.push(client.clone());
+    client
+}
 
 impl Client {
     fn set(&self, state: Conn) {
         *self.state.lock().unwrap() = state;
         self.changed.notify_all();
-        self.wake_ui();
-    }
-
-    fn wake_ui(&self) {
-        if let Some(wake) = &*self.ui.lock().unwrap() {
-            wake();
-        }
+        wake_ui();
     }
 }
 
@@ -318,31 +361,30 @@ impl Client {
 /// the UI thread it is asked of the root viewport, which no window is, and
 /// egui passes on only the first such request until the root is next run.
 pub(crate) fn set_ui(wake: impl Fn() + Send + 'static) {
-    *CLIENT.ui.lock().unwrap() = Some(Box::new(wake));
+    *UI.lock().unwrap() = Some(Box::new(wake));
 }
 
-/// Start connecting, unless that is under way or done. Returns at once; the
-/// UI is woken when it has succeeded or failed. After a failure or a loss
-/// this tries again.
-pub(crate) fn connect() {
-    if !enabled() {
+/// Start connecting to `place`, unless that is under way or done. Returns at
+/// once; the UI is woken when it has succeeded or failed. After a failure or
+/// a loss this tries again.
+pub(crate) fn connect(place: &Place) {
+    if !enabled(place) {
         return;
     }
+    let client = client(place);
     {
-        let mut state = CLIENT.state.lock().unwrap();
+        let mut state = client.state.lock().unwrap();
         if matches!(*state, Conn::Connecting | Conn::Connected(_)) {
             return;
         }
         *state = Conn::Connecting;
     }
-    CLIENT.changed.notify_all();
-    let started = std::thread::Builder::new().name("session-connect".into()).spawn(|| {
-        let number = {
-            let mut connections = CLIENT.connections.lock().unwrap();
-            *connections += 1;
-            *connections
-        };
-        CLIENT.set(match open(number) {
+    client.changed.notify_all();
+    let connecting = client.clone();
+    let connect = move || {
+        let client = connecting;
+        let number = CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        client.set(match open(number, &client) {
             Ok(daemon) => Conn::Connected(daemon),
             Err(error) => {
                 let error = error.to_string();
@@ -350,11 +392,12 @@ pub(crate) fn connect() {
                 Conn::Unavailable(error)
             }
         });
-    });
+    };
+    let started = std::thread::Builder::new().name("session-connect".into()).spawn(connect);
     if let Err(error) = started {
         let error = error.to_string();
         report("Session daemon unavailable", &error);
-        CLIENT.set(Conn::Unavailable(error));
+        client.set(Conn::Unavailable(error));
     }
 }
 
@@ -373,11 +416,11 @@ pub(crate) enum Status {
     Lost,
 }
 
-pub(crate) fn status() -> Status {
-    if !enabled() {
+pub(crate) fn status(place: &Place) -> Status {
+    if !enabled(place) {
         return Status::Off;
     }
-    match &*CLIENT.state.lock().unwrap() {
+    match &*client(place).state.lock().unwrap() {
         Conn::Idle => Status::Idle,
         Conn::Connecting => Status::Connecting,
         Conn::Connected(_) => Status::Connected,
@@ -386,22 +429,27 @@ pub(crate) fn status() -> Status {
     }
 }
 
-/// Leaving nterm: wait, briefly, until what was queued for the daemon has
+/// Leaving nterm: wait, briefly, until what was queued for each daemon has
 /// been written. A shell's fate is in that queue.
 pub(crate) fn flush() {
-    let Some(daemon) = daemon() else { return };
-    let (done, written) = mpsc::channel();
-    if daemon.queue(Out::Flush(done)) {
-        let _ = written.recv_timeout(FLUSH_WAIT);
+    let clients = CLIENTS.lock().unwrap().clone();
+    let deadline = std::time::Instant::now() + FLUSH_WAIT;
+    for client in clients {
+        let Some(daemon) = daemon(&client.place) else { continue };
+        let (done, written) = mpsc::channel();
+        if daemon.queue(Out::Flush(done)) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let _ = written.recv_timeout(left);
+        }
     }
 }
 
-/// The connection, while there is one.
-fn daemon() -> Option<Arc<Daemon>> {
-    if !enabled() {
+/// The connection to `place`, while there is one.
+fn daemon(place: &Place) -> Option<Arc<Daemon>> {
+    if !enabled(place) {
         return None;
     }
-    match &*CLIENT.state.lock().unwrap() {
+    match &*client(place).state.lock().unwrap() {
         Conn::Connected(daemon) => Some(daemon.clone()),
         _ => None,
     }
@@ -419,6 +467,10 @@ enum Out {
 /// mean nothing to another daemon.
 struct Daemon {
     number: u64,
+    /// Whose connection this is, to say so when it is lost.
+    client: Arc<Client>,
+    /// The other machine the daemon is on, if it is on one.
+    remote: Option<Remote>,
     connection: Connection,
     /// The writer thread's queue; `None` once the connection is gone.
     outbox: Mutex<Option<mpsc::Sender<Out>>>,
@@ -482,13 +534,16 @@ fn target() -> io::Result<(String, std::path::PathBuf)> {
 
 /// Make connection `number`: find or start the daemon, greet it, and ask
 /// what it holds. Runs on the connecting thread.
-fn open(number: u64) -> io::Result<Arc<Daemon>> {
+fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
     let (session, program) = target()?;
     let other = |message: String| io::Error::other(message);
     // A daemon from another build cannot be trusted to speak the same
     // snapshot format. One with no panes is replaced; one with panes is left
     // alone and not used.
-    let remote = remote();
+    let remote = match &client.place {
+        Place::Here => None,
+        place => Some(place.remote().ok_or_else(|| other("that remote is not known".into()))?),
+    };
     for attempt in 0..2 {
         let connection = match &remote {
             Some(remote) => nterm_session::relay::connect(&mut remote.ssh(&session))?,
@@ -541,6 +596,8 @@ fn open(number: u64) -> io::Result<Arc<Daemon>> {
         let (outbox, queued) = mpsc::channel();
         let daemon = Arc::new(Daemon {
             number,
+            client: client.clone(),
+            remote: remote.clone(),
             connection,
             outbox: Mutex::new(Some(outbox)),
             panes: Mutex::default(),
@@ -694,7 +751,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 if held.sessions != sessions {
                     *held = Arc::new(Listing { sessions, daemon: daemon.number });
                     drop(held);
-                    CLIENT.wake_ui();
+                    wake_ui();
                 }
             }
             Frame::Control(Control::Spawned { request, info }) => {
@@ -763,13 +820,13 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
     }
     // Only if this is still the connection in use: a later one is not lost.
     {
-        let mut state = CLIENT.state.lock().unwrap();
+        let mut state = daemon.client.state.lock().unwrap();
         if matches!(&*state, Conn::Connected(current) if current.number == daemon.number) {
             *state = Conn::Lost;
         }
     }
-    CLIENT.changed.notify_all();
-    CLIENT.wake_ui();
+    daemon.client.changed.notify_all();
+    wake_ui();
     for link in links {
         link.close_pane();
     }
@@ -878,8 +935,14 @@ impl Link {
     /// its own. `Err` when they are and the daemon cannot be reached, or
     /// when the shell to be taken cannot be. A shell of the surface's own
     /// in its place would not outlive the window, and nothing would say so.
-    pub(crate) fn prepare(wake: *mut c_void, start: &Start) -> Result<Option<Arc<Link>>, String> {
-        let daemon = daemon();
+    ///
+    /// `place` is where the shell is to run.
+    pub(crate) fn prepare(
+        wake: *mut c_void,
+        start: &Start,
+        place: &Place,
+    ) -> Result<Option<Arc<Link>>, String> {
+        let daemon = daemon(place);
         let want = match (start, &daemon) {
             (Start::Shell, _) => Want::Spawn(None),
             (Start::Adopt(_) | Start::Look(_), None) => {
@@ -901,7 +964,7 @@ impl Link {
             }
         };
         let Some(daemon) = daemon else {
-            return match enabled() {
+            return match enabled(place) {
                 true => Err("the session daemon cannot be reached".into()),
                 false => Ok(None),
             };
@@ -1312,7 +1375,7 @@ extern "C" fn on_spawn(userdata: *mut c_void, spawn: *const HostSpawn) {
         } else {
             unsafe { std::slice::from_raw_parts(spawn.env, spawn.env_len) }
         };
-        let spec = match remote() {
+        let spec = match link.daemon.remote.clone() {
             // The terminal describes a shell for this machine. Another
             // machine's is its remote's command, in the daemon's own
             // environment and directory.
@@ -1478,10 +1541,12 @@ mod tests {
         *TARGET.lock().unwrap() = Some((session, program));
 
         // Once connected, what the daemon holds is known.
-        assert_eq!(status(), Status::Idle);
+        let here = &Place::Here;
+        let (daemon, sessions) = (|| daemon(here), || sessions(here));
+        assert_eq!(status(here), Status::Idle);
         assert!(sessions().is_none());
-        connect();
-        until("the connection", || (status() == Status::Connected).then_some(()));
+        connect(here);
+        until("the connection", || (status(here) == Status::Connected).then_some(()));
         let held = sessions().expect("the daemon was started");
         assert!(held.sessions.is_empty());
         let first = daemon().unwrap().number;
@@ -1503,13 +1568,13 @@ mod tests {
         assert!(listed.adopt(pane + 1).is_none());
 
         // What is queued is written in order: the session is the shell's.
-        set_session("one".into(), vec![pane], "a layout".into());
+        set_session(here, "one".into(), vec![pane], "a layout".into());
         let listed = until("the session", || {
             sessions().filter(|held| held.sessions.iter().any(|session| session.id == "one"))
         });
         assert_eq!(listed.sessions[0].layout, "a layout");
         // The shell is in the session that named it last; the other is gone.
-        set_session("two".into(), vec![pane], "another".into());
+        set_session(here, "two".into(), vec![pane], "another".into());
         let listed = until("the other session", || {
             sessions().filter(|held| held.sessions.iter().any(|session| session.id == "two"))
         });
@@ -1518,12 +1583,12 @@ mod tests {
         // The daemon goes away: the connection is lost, and nothing is
         // known of its sessions.
         daemon_now.control(Control::Shutdown);
-        until("the loss", || (status() == Status::Lost).then_some(()));
+        until("the loss", || (status(here) == Status::Lost).then_some(()));
         assert!(daemon().is_none());
         assert!(sessions().is_none());
 
         // Connecting again starts a new daemon, which holds nothing.
-        connect();
+        connect(here);
         until("the new connection", || daemon().map(|_| ()));
         assert_ne!(daemon().unwrap().number, first);
         let held = sessions().unwrap();

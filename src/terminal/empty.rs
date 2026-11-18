@@ -54,7 +54,7 @@ impl TerminalView {
         if self.empty.is_some() || self.close_requested || self.has_panes() {
             return;
         }
-        let (lost, reason) = match crate::session::status() {
+        let (lost, reason) = match crate::session::status(&crate::session::home()) {
             Status::Lost => (true, String::new()),
             Status::Unavailable(reason) => (false, reason),
             _ => return,
@@ -81,13 +81,13 @@ impl TerminalView {
         let content = egui::Rect::from_min_max(available.min, status.right_top());
         ui.painter().rect_filled(content, 0.0, crate::colors::palette().background);
 
-        let now = crate::session::status();
+        let now = crate::session::status(&crate::session::home());
         let Some(empty) = self.empty.take() else { return };
         let before = std::mem::discriminant(&empty);
         self.empty = match empty {
             Empty::Connecting => match now {
                 Status::Idle => {
-                    crate::session::connect();
+                    crate::session::connect(&crate::session::home());
                     Some(Empty::Connecting)
                 }
                 Status::Connecting => {
@@ -142,7 +142,7 @@ impl TerminalView {
                 };
                 let below = say(ui, content, &title, detail);
                 if retry(ui, content, below) {
-                    crate::session::connect();
+                    crate::session::connect(&crate::session::home());
                     Some(Empty::Connecting)
                 } else {
                     Some(Empty::Unavailable { lost, reason })
