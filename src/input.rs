@@ -191,19 +191,26 @@ fn mods(value: egui::Modifiers) -> i32 {
 
 #[cfg(windows)]
 fn win32_picker_key(key: egui::Key, modifiers: egui::Modifiers, pressed: bool) -> Option<CString> {
-    if !modifiers.ctrl || !modifiers.shift || modifiers.alt {
+    if !modifiers.shift {
         return None;
     }
-    let (virtual_key, scan_code, unicode) = match key {
-        egui::Key::B => (66, 48, 2),
-        egui::Key::G => (71, 34, 7),
-        egui::Key::H => (72, 35, 8),
-        egui::Key::P => (80, 25, 16),
+    // SHIFT_PRESSED with LEFT_CTRL_PRESSED, or with LEFT_ALT_PRESSED.
+    let (virtual_key, scan_code, unicode, state) = match (modifiers.ctrl, modifiers.alt, key) {
+        (true, false, egui::Key::B) => (66, 48, 2, 24),
+        (true, false, egui::Key::G) => (71, 34, 7, 24),
+        (true, false, egui::Key::H) => (72, 35, 8, 24),
+        (true, false, egui::Key::O) => (79, 24, 15, 24),
+        (true, false, egui::Key::P) => (80, 25, 16, 24),
+        (true, false, egui::Key::T) => (84, 20, 20, 24),
+        // As bytes this is ESC O, which is also how the codes of function
+        // keys begin: the console waits for the rest, and takes the next
+        // key typed for it.
+        (false, true, egui::Key::O) => (79, 24, 79, 18),
         _ => return None,
     };
-    // CSI Vk;Sc;Uc;Kd;Cs;Rc _, with SHIFT_PRESSED | LEFT_CTRL_PRESSED.
+    // CSI Vk;Sc;Uc;Kd;Cs;Rc _
     CString::new(format!(
-        "\x1b[{virtual_key};{scan_code};{unicode};{};24;1_",
+        "\x1b[{virtual_key};{scan_code};{unicode};{};{state};1_",
         u8::from(pressed)
     ))
     .ok()
@@ -350,6 +357,21 @@ mod tests {
                 .to_bytes(),
             b"\x1b[80;25;16;1;24;1_"
         );
+        assert_eq!(
+            win32_picker_key(egui::Key::O, modifiers, true).unwrap().to_bytes(),
+            b"\x1b[79;24;15;1;24;1_"
+        );
+        assert_eq!(
+            win32_picker_key(egui::Key::T, modifiers, false).unwrap().to_bytes(),
+            b"\x1b[84;20;20;0;24;1_"
+        );
+        let alt_shift = egui::Modifiers::ALT | egui::Modifiers::SHIFT;
+        assert_eq!(
+            win32_picker_key(egui::Key::O, alt_shift, true).unwrap().to_bytes(),
+            b"\x1b[79;24;79;1;18;1_"
+        );
+        assert!(win32_picker_key(egui::Key::T, alt_shift, true).is_none());
+        assert!(win32_picker_key(egui::Key::O, egui::Modifiers::ALT, true).is_none());
         assert!(win32_picker_key(egui::Key::G, egui::Modifiers::CTRL, true).is_none());
     }
 

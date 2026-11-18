@@ -106,7 +106,8 @@ of folders; without it `cwd` is the one root. `query` is the text the picker
 opens with. With one root the rows are paths from it; the value returned is
 always the whole path. The window needs `picker_pipe.enabled`, and nothing in
 `named`. There are no previews yet. `profile.example.ps1` binds these to
-Ctrl+Alt+O, Alt+Shift+O and Alt+Shift+T.
+Ctrl+Shift+O and Ctrl+Shift+T (under the current directory) and to Alt+Shift+O
+and Alt+Shift+T (under the roots).
 
 ## npick
 

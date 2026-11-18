@@ -57,11 +57,11 @@ Set-PSReadLineKeyHandler -Chord Ctrl+o -ScriptBlock { Set-LocationFromPicker -Ro
 Set-PSReadLineKeyHandler -Chord Alt+o -ScriptBlock { Set-LocationFromPicker }
 Set-PSReadLineKeyHandler -Chord Ctrl+t -ScriptBlock { Insert-FilePickerResult -Roots @($PWD.Path) }
 Set-PSReadLineKeyHandler -Chord Alt+t -ScriptBlock { Insert-FilePickerResult }
-# The same, with the session daemon running the picker. Not on Ctrl+Shift+o
-# and Ctrl+Shift+t: the terminal keeps those two and the shell never sees them.
-# A capital letter is the key with Shift: PSReadLine reads Alt+Shift+o as Alt+o.
-Set-PSReadLineKeyHandler -Chord Ctrl+Alt+o -ScriptBlock { Set-LocationFromPicker -Roots @($PWD.Path) -Daemon }
+# The same four with Shift, with the session daemon running the picker. A
+# capital letter is the key with Shift: PSReadLine reads Alt+Shift+o as Alt+o.
+Set-PSReadLineKeyHandler -Chord Ctrl+Shift+o -ScriptBlock { Set-LocationFromPicker -Roots @($PWD.Path) -Daemon }
 Set-PSReadLineKeyHandler -Chord Alt+O -ScriptBlock { Set-LocationFromPicker -Daemon }
+Set-PSReadLineKeyHandler -Chord Ctrl+Shift+t -ScriptBlock { Insert-FilePickerResult -Roots @($PWD.Path) -Daemon }
 Set-PSReadLineKeyHandler -Chord Alt+T -ScriptBlock { Insert-FilePickerResult -Daemon }
 
 Set-PSReadLineKeyHandler -Chord Alt+r -ScriptBlock {
