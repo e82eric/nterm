@@ -131,22 +131,31 @@ Get-Process | Invoke-NtermPicker -DaemonPicker items -DisplayProperty Name `
     -Parameters @{ label = 'Processes' }
 ```
 
-`ripgrep` runs `rg` once in `cwd` for `pattern`, a regular expression, and
-lists each place it is found as `path:line:column:text`. What is typed in the
-picker narrows those lines; it does not search again. `rg` has to be on the
-`PATH` the daemon was started with. If it cannot be run, or fails having found
-nothing (a pattern it cannot read, say), the picker ends with what it said.
+`history` and `items` have no previews.
 
-```powershell
-Invoke-NtermPicker -DaemonPicker ripgrep -Parameters @{ cwd = $PWD.Path; pattern = 'fn main' }
+The daemon runs no program of its own. A search of files is a picker of the
+machine's file (below), made with the module that comes with nterm:
+
+```lua
+-- nterm-daemon.lua
+local ripgrep = require("nterm.ripgrep")
+return { pickers = { Ripgrep = ripgrep.search { preview_visible = false } } }
 ```
 
-A row's preview is its file with the line it was found on in the middle,
-marked; `preview` `true` opens it showing. A file of more than 256 KB is sent
-as the lines round that one, so line numbers shown beside it count from the
-first line sent, not the file's first.
+It runs `rg` once in `cwd` for `pattern`, a regular expression, and lists each
+place it is found as `path:line:column:text`. What is typed in the picker
+narrows those lines; it does not search again. `rg` has to be on the `PATH`
+the daemon was started with. If it cannot be run, or fails having found nothing
+(a pattern it cannot read, say), the picker ends with what it said. A row's
+preview is its file with the line it was found on in the middle, marked. A file
+of more than 256 KB shows as the lines round that one, so line numbers shown
+beside it count from the first line shown, not the file's first. The flags rg
+is run with are `ripgrep.flags`; `ripgrep.search { flags = { ... } }` gives
+others.
 
-`history` and `items` have no previews.
+```powershell
+Invoke-NtermPicker -DaemonPicker Ripgrep -Parameters @{ cwd = $PWD.Path; pattern = 'fn main' }
+```
 
 Each row of `files` and `directories` has a preview, hidden until Ctrl+P shows it; with `preview = "true"`
 in the parameters it opens shown. A file shows its first 256 KB as text,
@@ -289,7 +298,7 @@ Not yet: previews of types
 other than `Dynamic` and `items` that is a
 function are refused. A picker that cannot be one is refused
 when it is opened, saying why, and the file's other pickers still open. The
-names `files`, `directories`, `history`, `ripgrep` and `items` are the
+names `files`, `directories`, `history` and `items` are the
 daemon's own and cannot be given to a picker of the file.
 
 ## npick

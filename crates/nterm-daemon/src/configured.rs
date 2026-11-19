@@ -652,9 +652,11 @@ mod tests {
         let path = file("example", &std::fs::read_to_string(root.join("nterm-daemon.example.lua")).unwrap());
         let modules = path.parent().unwrap().join("nterm");
         std::fs::create_dir_all(&modules).unwrap();
-        std::fs::copy(root.join("lua/nterm/git.lua"), modules.join("git.lua")).unwrap();
+        for module in ["git.lua", "ripgrep.lua"] {
+            std::fs::copy(root.join("lua/nterm").join(module), modules.join(module)).unwrap();
+        }
         let configured = Configured::new(Some(path.clone()));
-        for name in ["Commits", "Search", "Typed", "Near", "Servers", "GitCommits", "GitBranches", "GitStatus"] {
+        for name in ["Commits", "Ripgrep", "Typed", "Near", "Servers", "GitCommits", "GitBranches", "GitStatus"] {
             assert!(configured.picker(name).unwrap().is_some(), "{name}");
         }
         // The pickers of git have columns, and say what shows for a row.

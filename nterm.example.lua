@@ -384,13 +384,15 @@ return {
     -- Grep asks for a pattern and shows Ripgrep on top with what is found.
     -- The session daemon runs rg where the pane's shell is, so this works
     -- the same in a window on another machine (--remote). The shell has to
-    -- report its directory (OSC 7; see profile.example.ps1).
+    -- report its directory (OSC 7; see profile.example.ps1). Ripgrep is
+    -- the picker of that machine's nterm-daemon.lua, made with
+    -- require("nterm.ripgrep"): see nterm-daemon.example.lua.
     Grep = {
       type = "Argument", prompt = "Grep:",
       action = function(app, item) app:push_picker("Ripgrep", { pattern = item.value }) end,
     },
     Ripgrep = {
-      type = "Daemon", picker = "ripgrep",
+      type = "Daemon", picker = "Ripgrep",
       action = function(app, item)
         local path, line = item.value:match("^(.-):(%d+):%d+:")
         if not path then return end

@@ -1970,7 +1970,7 @@ mod tests {
         assert!(error.contains("Argument requires an action"), "{error}");
         // A picker the session daemon runs is named, with or without an
         // action for the row chosen.
-        assert!(compile("return {pickers={x={type='Daemon', picker='ripgrep'}}}").is_ok());
+        assert!(compile("return {pickers={x={type='Daemon', picker='Ripgrep'}}}").is_ok());
         assert!(
             compile("return {pickers={x={type='Daemon', picker='files', position='Cursor', action=function() end}}}")
                 .is_ok()

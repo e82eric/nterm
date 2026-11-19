@@ -22,9 +22,9 @@
 -- opened the picker, and `keys`, what they ask of `app` being done to the
 -- pane. A picker may be a function of what is at the shell's cursor, a
 -- Command may have columns, and modules load: see the git pickers below.
--- The names files, directories, history, ripgrep and items are the daemon's
--- own.
+-- The names files, directories, history and items are the daemon's own.
 local git = require("nterm.git")
+local ripgrep = require("nterm.ripgrep")
 return {
   pickers = {
     -- The pickers of git that come with nterm, run where the shell is.
@@ -53,14 +53,15 @@ return {
           end },
       },
     },
-    -- The lines a pattern is found on, with flags of your own. Opened with
-    -- a pattern: app:push_picker("Search", { pattern = item.value }).
-    Search = {
-      type = "Command", success_exit_codes = { 0, 1 },
-      args = { "rg.exe", "--crlf", "--no-messages", "--color=never", "-i", "--vimgrep", "--", "{pattern}" },
+    -- The lines a pattern is found on, under the folder the shell is in,
+    -- each showing as its file at that line. Opened with a pattern:
+    -- app:push_picker("Ripgrep", { pattern = item.value }). ripgrep.flags
+    -- are the flags rg is run with; give flags = { ... } for others.
+    Ripgrep = ripgrep.search {
+      preview_visible = false,
       -- Enter, from a window: the line is opened in an editor in the shell.
       action = function(app, item)
-        local path, line = item.value:match("^(.*):(%d+):%d+:")
+        local path, line = ripgrep.place(item.value)
         if not path then return end
         app:send_text("nvim +" .. line .. " '" .. path:gsub("'", "''") .. "'\r")
       end,

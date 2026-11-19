@@ -738,6 +738,79 @@ mod tests {
     }
 
     #[test]
+    fn a_place_ripgrep_found_shows_as_its_file_at_that_line_and_a_long_one_as_the_lines_round_it() {
+        let path = file(
+            "ripgrep",
+            r#"return { pickers = { P = require("nterm.ripgrep").search() } }"#,
+        );
+        let folder = path.parent().unwrap();
+        let modules = folder.join("nterm");
+        std::fs::create_dir_all(&modules).unwrap();
+        let module = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lua/nterm/ripgrep.lua");
+        std::fs::copy(module, modules.join("ripgrep.lua")).unwrap();
+        let (previewer, wanted) = previewer(&path, "P", false);
+        let mut request = 0;
+        let mut shows = |value: &str| {
+            request += 1;
+            ask(&previewer, &wanted, request, value, value)
+        };
+        let at = |shown: Result<Shows, String>| match shown {
+            Ok(Shows::Text { text, name, line, .. }) => (text, name, line),
+            other => panic!("not text: {other:?}"),
+        };
+
+        // A file shows whole, at the line found, under the file's name.
+        std::fs::create_dir_all(folder.join("src")).unwrap();
+        std::fs::write(folder.join("src").join("short.rs"), "one\ntwo\nthree\n").unwrap();
+        let (text, name, line) = at(shows(r"src\short.rs:2:1:two"));
+        assert_eq!((text.as_str(), name.as_deref(), line), ("one\ntwo\nthree\n", Some("short.rs"), Some(2)));
+        // A line it does not have is not marked. A whole path is its own.
+        assert_eq!(at(shows(r"src\short.rs:4:1:four")).2, None);
+        let whole = format!("{}:3:1:three", folder.join("src").join("short.rs").display());
+        assert_eq!(at(shows(&whole)).2, Some(3));
+
+        // 40,000 lines of 20 bytes: more than is shown.
+        let long: String = (1..=40_000).map(|number| format!("line {number:>13}\r\n")).collect();
+        std::fs::write(folder.join("long.log"), &long).unwrap();
+        let most = 256 * 1024;
+        let line_of = |(text, _, line): &(String, Option<String>, Option<u64>)| {
+            text.lines().nth(line.unwrap() as usize - 1).unwrap().to_owned()
+        };
+        // Near the start, it is the start that shows.
+        let near = at(shows("long.log:3:1:line"));
+        assert_eq!(near.2, Some(3));
+        assert!(near.0.starts_with("line             1\r\n") && near.0.len() <= most);
+        // In the middle, as much before the line as after it.
+        let middle = at(shows("long.log:20000:1:line"));
+        assert_eq!(line_of(&middle), "line         20000");
+        let before = middle.2.unwrap() as usize;
+        let lines = middle.0.lines().count();
+        assert!(middle.0.len() <= most && lines > 10_000);
+        assert!(before.abs_diff(lines - before) < 10, "{before} of {lines}");
+        // At the end, the end of it.
+        let last = at(shows("long.log:40000:1:line"));
+        assert_eq!(line_of(&last), "line         40000");
+        assert!(last.0.ends_with("40000\r\n"));
+        // A line it does not have: what there is, with none marked.
+        assert_eq!(at(shows("long.log:50000:1:line")).2, None);
+
+        // What is not text, or not UTF-8 throughout.
+        let mut binary = vec![0u8; 16];
+        binary.resize(most + 100, b'x');
+        std::fs::write(folder.join("data.bin"), &binary).unwrap();
+        let (text, name, _) = at(shows("data.bin:1:1:x"));
+        assert!(text.starts_with("Not text") && name.is_none(), "{text}");
+        std::fs::write(folder.join("one.min.js"), vec![b'x'; most * 2]).unwrap();
+        assert_eq!(at(shows("one.min.js:1:1:x")), ("It has a line too long to show".into(), None, None));
+        std::fs::write(folder.join("latin.txt"), b"caf\xe9\nok\n").unwrap();
+        assert_eq!(at(shows("latin.txt:2:1:ok")).0, "caf\u{fffd}\nok\n");
+        // A file that is not there, and a row that is no place.
+        assert!(shows("none.rs:1:1:x").is_err());
+        assert_eq!(at(shows("just text")).0, "just text");
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
     fn the_helpers_are_for_use_in_a_preview_and_a_picker_without_one_has_no_previewer() {
         let path = file(
             "helpers",

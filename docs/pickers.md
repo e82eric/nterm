@@ -437,13 +437,14 @@ action either shows a page on top with `app:push_picker` or closes it with
 `Ripgrep` with it as `pattern`.
 
 `Daemon` is one of the pickers the session daemon has, named by `picker`:
-`files`, `directories`, `history` or `ripgrep` (see
-[picker-pipe.md](picker-pipe.md) for what each takes). The daemon lists and
+`files`, `directories` or `history`, or one of that machine's
+`nterm-daemon.lua`, such as `Ripgrep` made with `require("nterm.ripgrep")`
+(see [picker-pipe.md](picker-pipe.md) for what each takes). The daemon lists and
 searches where the pane's shell is and the window draws the rows, so it works
 the same in a window on another machine (`--remote`), where the other kinds
 would read that window's own files. The parameters it is opened with are the
 daemon picker's: `app:push_picker("Ripgrep", { pattern = item.value })` gives
-`ripgrep` its pattern, and `cwd` is the shell's working directory when the
+`Ripgrep` its pattern, and `cwd` is the shell's working directory when the
 shell reports it. Enter runs the `action` callback with the row as `item`, or
 without one types the row's value into the pane. Of the options every picker
 takes, it uses `position` and `initial_query`; its previews are the daemon's
@@ -963,9 +964,10 @@ for CommandPalette, newest-first for Scrollback, and scan order for FileSystem.
 
 Search workers start on demand. A worker failure cancels the affected search;
 retrying starts a replacement. Command and preview errors include command/cwd,
-exit status, and bounded stderr. Command pickers accept exit 0 by default;
-ripgrep also accepts exit 1 for no matches. A command picker can specify
-`success_exit_codes = { 0, 1 }` to use another convention. Partial command
+exit status, and bounded stderr. Command pickers accept exit 0 by default.
+A command picker can specify `success_exit_codes = { 0, 1 }` to use another
+convention, as `nterm.ripgrep` does, since rg ends with 1 when it finds
+nothing. Partial command
 results remain visible with an error indicating that they may be incomplete.
 Preview errors leave the picker usable; selecting another item retries naturally.
 

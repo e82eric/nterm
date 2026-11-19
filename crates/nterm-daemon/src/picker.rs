@@ -67,18 +67,6 @@ const MAX_REQUEST: usize = 1 << 20;
 const MOST_GIVEN: usize = 100_000;
 /// The most characters of the name a program gives a picker of its rows.
 const MOST_LABEL: usize = 64;
-/// What `rg` is run with, before the pattern.
-const RIPGREP: [&str; 9] = [
-    "--crlf",
-    "--max-columns=500",
-    "--max-columns-preview",
-    "--no-messages",
-    "--hidden",
-    "--color=never",
-    "-i",
-    "--vimgrep",
-    "--",
-];
 /// The most lines a picker reads of a file or of what a command prints.
 const MOST_LINES: usize = 1_000_000;
 
@@ -189,19 +177,13 @@ struct Shown {
     /// The file's name, for one shown as it is.
     name: Option<String>,
     truncated: bool,
-    /// The line of the text, from one, that the row is about.
-    line: Option<u64>,
     error: Option<String>,
     /// The file itself, where it is a picture, in place of `text`.
     picture: Option<Vec<u8>>,
 }
 impl Shown {
-    fn of(path: &Path, line: Option<u64>) -> Self {
-        let shown = match line {
-            _ if path.is_dir() => Self::folder(path),
-            Some(line) => Self::at(path, line),
-            None => Self::file(path),
-        };
+    fn of(path: &Path) -> Self {
+        let shown = if path.is_dir() { Self::folder(path) } else { Self::file(path) };
         shown.unwrap_or_else(|error| Self { error: Some(error.to_string()), ..Default::default() })
     }
 
@@ -238,71 +220,6 @@ impl Shown {
             text: String::from_utf8_lossy(&bytes).into_owned(),
             name: path.file_name().map(|name| name.to_string_lossy().into_owned()),
             truncated,
-            line: None,
-            error: None,
-            picture: None,
-        })
-    }
-
-    /// The file with `line` of it, from one, to be shown in the middle. A
-    /// file too long to send whole is sent as the lines round that one,
-    /// and `line` is then which of those it is.
-    fn at(path: &Path, line: u64) -> std::io::Result<Self> {
-        use std::io::{BufRead, Read};
-        let file = std::fs::File::open(path)?;
-        let size = file.metadata()?.len();
-        if size <= MOST_PREVIEW as u64 {
-            let whole = Self::file(path)?;
-            let lines = whole.text.lines().count() as u64;
-            let line = (whole.name.is_some() && line >= 1 && line <= lines).then_some(line);
-            return Ok(Self { line, ..whole });
-        }
-        let mut reader = std::io::BufReader::new(file);
-        let mut kept: std::collections::VecDeque<Vec<u8>> = Default::default();
-        let (mut held, mut number, mut checked) = (0usize, 0u64, 0usize);
-        let (mut at, mut left_out) = (None, false);
-        loop {
-            let mut one = Vec::new();
-            let read = (&mut reader).take(MOST_PREVIEW as u64).read_until(b'\n', &mut one)?;
-            if read == 0 {
-                break;
-            }
-            if checked < 8192 {
-                if one.iter().take(8192 - checked).any(|byte| *byte == 0) {
-                    return Ok(Self { text: format!("Not text: {size} bytes"), ..Default::default() });
-                }
-                checked += one.len();
-            }
-            if read == MOST_PREVIEW && !one.ends_with(b"\n") {
-                return Ok(Self { text: "It has a line too long to show".into(), ..Default::default() });
-            }
-            number += 1;
-            if at.is_some() {
-                // After the line: as much as there is room left for.
-                if held + one.len() > MOST_PREVIEW {
-                    left_out = true;
-                    break;
-                }
-            } else {
-                // Before it: no more than half of what is sent.
-                while held + one.len() > MOST_PREVIEW / 2 {
-                    let Some(first) = kept.pop_front() else { break };
-                    held -= first.len();
-                    left_out = true;
-                }
-            }
-            held += one.len();
-            kept.push_back(one);
-            if number == line {
-                at = Some(kept.len() as u64);
-            }
-        }
-        let bytes: Vec<u8> = kept.into_iter().flatten().collect();
-        Ok(Self {
-            text: String::from_utf8_lossy(&bytes).into_owned(),
-            name: path.file_name().map(|name| name.to_string_lossy().into_owned()),
-            truncated: left_out,
-            line: at,
             error: None,
             picture: None,
         })
@@ -331,20 +248,6 @@ impl Shown {
     }
 }
 
-/// The file and the line of a row that is `path:line:column:text`, as a
-/// search of files prints them. The path may have colons of its own.
-fn place(row: &str) -> Option<(&str, u64)> {
-    let digits = |text: &str| text.bytes().take_while(u8::is_ascii_digit).count();
-    row.match_indices(':').find_map(|(colon, _)| {
-        let rest = &row[colon + 1..];
-        let line = digits(rest);
-        let after = rest[line..].strip_prefix(':')?;
-        let column = digits(after);
-        (line > 0 && colon > 0 && column > 0 && after[column..].starts_with(':'))
-            .then(|| rest[..line].parse().ok().map(|line| (&row[..colon], line)))?
-    })
-}
-
 /// `path` with a `~` it starts with, alone or before a separator, taken to
 /// be this machine's home folder.
 fn in_home(path: PathBuf) -> Result<PathBuf, String> {
@@ -367,9 +270,6 @@ fn in_home(path: PathBuf) -> Result<PathBuf, String> {
 /// - `history` lists the lines of the file `path` names, the last first and
 ///   each once, with lines that end in a backtick joined to the next: the
 ///   file PSReadLine keeps of what was typed.
-/// - `ripgrep` lists the lines of the files under `cwd` that `pattern`, a
-///   regular expression, is found in: what `rg` prints, which is run once
-///   and not again as the query changes.
 /// - `items` lists what the program gives after it, and is called `label`.
 ///
 /// A path that starts with `~` is in this machine's home folder.
@@ -436,28 +336,6 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
             options.line_continuation = Some("`".to_owned());
             Lists::File(options)
         }
-        "ripgrep" => {
-            label.push_str("Ripgrep");
-            let pattern = params.get("pattern").filter(|pattern| !pattern.is_empty()).ok_or("no pattern was given")?;
-            if pattern.contains('\0') {
-                return Err("the pattern has a NUL in it".into());
-            }
-            let folder = cwd.clone().ok_or("no cwd was given")?;
-            if folder.is_relative() || !folder.is_dir() {
-                return Err(format!("{} is not a folder", folder.display()));
-            }
-            // One line for each place the pattern is found, as
-            // `path:line:column:text`, whatever the case of its letters.
-            // The pattern is after `--`: it is never read as an option.
-            let mut command = CommandSpec::new("rg");
-            command.arguments = RIPGREP.iter().map(|argument| (*argument).to_owned()).collect();
-            command.arguments.push(pattern.clone());
-            command.working_directory = Some(folder);
-            // Of what it says went wrong, which is all that is kept of it.
-            command.output_limit = 16 * 1024;
-            preview = Some(params.get("preview").is_some_and(|preview| preview == "true"));
-            Lists::Command(CommandSourceOptions::new(command))
-        }
         "items" => {
             let given = params.get("label").map(|label| label.trim()).filter(|label| !label.is_empty());
             label.extend(given.unwrap_or("Items").chars().take(MOST_LABEL));
@@ -478,7 +356,7 @@ fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, S
 
 /// The names of the pickers the daemon has of its own. The file of the
 /// machine's pickers has none of these names: see `configured`.
-pub(crate) const BUILT_IN: [&str; 5] = ["files", "directories", "history", "ripgrep", "items"];
+pub(crate) const BUILT_IN: [&str; 4] = ["files", "directories", "history", "items"];
 
 /// What is given for `{name}`, where `text` is that and no more.
 fn given<'a>(text: &'a str, params: &'a BTreeMap<String, String>) -> Result<&'a str, String> {
@@ -920,9 +798,6 @@ struct Picker {
     wanted: Arc<AtomicU64>,
     /// The pickers under way, of which this is one: its own thread ends it.
     open: std::sync::Weak<Mutex<HashMap<u32, Arc<Picker>>>>,
-    /// The folder the files are in of rows that are `path:line:column:text`,
-    /// for a picker of what a search of files found.
-    found_in: Option<PathBuf>,
     state: Mutex<State>,
 }
 #[derive(Default)]
@@ -960,8 +835,8 @@ enum Outcome {
 
 /// What the thread that finds a picker's previews is asked for.
 enum Wanted {
-    /// A file or a folder, and the line of the file to show in the middle.
-    File(PathBuf, Option<u64>),
+    /// A file or a folder.
+    File(PathBuf),
     /// What the picker's file says shows for a row: what the row shows as,
     /// and what it is.
     Row { text: String, value: String },
@@ -1155,10 +1030,6 @@ impl Pickers {
         // What reads a file or runs a command, begun once the picker is one
         // of those open: it may fail at once, and that ends the picker.
         let mut begin: Option<Box<dyn FnOnce()>> = None;
-        let found_in = match &definition.lists {
-            Lists::Command(command) | Lists::Table { command, .. } => command.command.working_directory.clone(),
-            _ => None,
-        };
         let source = match definition.lists {
             Lists::Walk(scan) => {
                 let store = Arc::new(FileSystemSearchStore::new_append_only());
@@ -1292,7 +1163,6 @@ impl Pickers {
             resolves: definition.resolves,
             wanted: Arc::default(),
             open: Arc::downgrade(&self.open),
-            found_in,
             state: Mutex::new(State { flow: Some(Flow::new()), ..Default::default() }),
         });
         self.open.lock().unwrap().insert(number, picker.clone());
@@ -1728,15 +1598,10 @@ impl Picker {
                 };
                 Some(Wanted::Row { text, value })
             }
-            // A file or a folder, or for what a search of files found the
-            // file at the line it was found on.
+            // A file or a folder.
             (_, Source::Walk { .. }, Some(Row { value: Value::String(path), .. })) => {
-                Some(Wanted::File(PathBuf::from(path), None))
+                Some(Wanted::File(PathBuf::from(path)))
             }
-            (_, Source::Read { .. }, Some(Row { value: Value::String(found), .. })) => self
-                .found_in
-                .as_ref()
-                .and_then(|folder| place(&found).map(|(path, line)| Wanted::File(folder.join(path), Some(line)))),
             _ => None,
         };
         let Some(wanted) = wanted else {
@@ -1877,8 +1742,8 @@ impl Picker {
                                 Err(error) => Frame::Control(said(number, request, error)),
                             }
                         }
-                        (Wanted::File(path, line), _) => {
-                            let shown = Shown::of(&path, line);
+                        (Wanted::File(path), _) => {
+                            let shown = Shown::of(&path);
                             match shown.picture {
                                 Some(bytes) => Frame::Previewed {
                                     picker: number,
@@ -1893,7 +1758,7 @@ impl Picker {
                                     text: shown.text,
                                     name: shown.name,
                                     truncated: shown.truncated,
-                                    line: shown.line,
+                                    line: None,
                                     syntax: None,
                                     extension: None,
                                     error: shown.error,
@@ -1971,61 +1836,6 @@ mod tests {
         assert!(define("directories", &params).is_ok());
     }
 
-
-    #[test]
-    fn a_row_of_a_search_says_which_file_and_line_it_is() {
-        assert_eq!(place(r"src\main.rs:12:5:fn main() {"), Some((r"src\main.rs", 12)));
-        // The path's own colons, and those of the text, are not taken for it.
-        assert_eq!(place(r"C:\a\b.rs:7:1:let x = y::z:3:4:;"), Some((r"C:\a\b.rs", 7)));
-        assert_eq!(place("a:1:b.txt:30:2:text"), Some(("a:1:b.txt", 30)));
-        for not in ["", "just text", "a.rs:12:text", ":1:2:text", "a.rs:1:2", "a.rs::2:text"] {
-            assert_eq!(place(not), None, "{not}");
-        }
-    }
-
-    #[test]
-    fn a_file_is_shown_at_a_line_and_a_long_one_as_the_lines_round_it() {
-        let root = std::env::temp_dir().join(format!("nterm-at-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("short.rs"), "one\ntwo\nthree\n").unwrap();
-        let short = Shown::of(&root.join("short.rs"), Some(2));
-        assert_eq!((short.text.as_str(), short.line, short.truncated), ("one\ntwo\nthree\n", Some(2), false));
-        // A line it does not have is not marked.
-        assert_eq!(Shown::of(&root.join("short.rs"), Some(4)).line, None);
-        assert_eq!(Shown::of(&root.join("short.rs"), Some(0)).line, None);
-
-        // 40,000 lines of 20 bytes: more than is sent.
-        let long: String = (1..=40_000).map(|number| format!("line {number:>13}\r\n")).collect();
-        std::fs::write(root.join("long.log"), &long).unwrap();
-        let line_of = |shown: &Shown| shown.text.lines().nth(shown.line.unwrap() as usize - 1).unwrap().to_owned();
-        // Near the start, it is the start that is sent.
-        let near = Shown::of(&root.join("long.log"), Some(3));
-        assert_eq!((near.line, near.truncated), (Some(3), true));
-        assert!(near.text.starts_with("line             1\r\n") && near.text.len() <= MOST_PREVIEW);
-        // In the middle, as much before the line as after it.
-        let middle = Shown::of(&root.join("long.log"), Some(20_000));
-        assert_eq!(line_of(&middle), "line         20000");
-        let before = middle.line.unwrap() as usize;
-        let lines = middle.text.lines().count();
-        assert!(middle.truncated && middle.text.len() <= MOST_PREVIEW && lines > 10_000);
-        assert!(before.abs_diff(lines - before) < 10, "{before} of {lines}");
-        // At the end, the end of it.
-        let last = Shown::of(&root.join("long.log"), Some(40_000));
-        assert_eq!(line_of(&last), "line         40000");
-        assert!(last.text.ends_with("40000\r\n") && last.truncated);
-        // A line it does not have: what there is, with none marked.
-        assert_eq!(Shown::of(&root.join("long.log"), Some(50_000)).line, None);
-
-        let mut binary = vec![0u8; 16];
-        binary.resize(MOST_PREVIEW + 100, b'x');
-        std::fs::write(root.join("data.bin"), &binary).unwrap();
-        assert!(Shown::of(&root.join("data.bin"), Some(1)).text.starts_with("Not text"));
-        std::fs::write(root.join("one.min.js"), vec![b'x'; MOST_PREVIEW * 2]).unwrap();
-        let one = Shown::of(&root.join("one.min.js"), Some(1));
-        assert_eq!((one.text.as_str(), one.line), ("It has a line too long to show", None));
-        assert!(Shown::of(&root.join("none.rs"), Some(1)).error.is_some());
-        let _ = std::fs::remove_dir_all(&root);
-    }
     #[test]
     fn a_query_is_answered_at_once_and_more_waits_to_be_taken() {
         let mut flow = Flow::new();
@@ -2127,27 +1937,12 @@ mod tests {
     }
 
     #[test]
-    fn a_picker_is_of_the_lines_a_search_of_a_folder_prints() {
-        let here = std::env::temp_dir();
-        let cwd = here.to_string_lossy().into_owned();
-        let found = define("ripgrep", &params(&[("cwd", &cwd), ("pattern", "-e fn main")])).unwrap();
-        let Lists::Command(CommandSourceOptions { command, .. }) = &found.lists else { panic!("not a command") };
-        assert_eq!(command.program, Path::new("rg"));
-        assert_eq!(command.working_directory.as_deref(), Some(here.as_path()));
-        // The pattern is the last, after `--`, however it begins.
-        let last = &command.arguments[command.arguments.len() - 2..];
-        assert_eq!(last, ["--", "-e fn main"]);
-        assert_eq!((found.label.as_str(), found.preview), ("Ripgrep", Some(false)));
-        for given in [
-            params(&[("cwd", &cwd)]),
-            params(&[("cwd", &cwd), ("pattern", "")]),
-            params(&[("cwd", &cwd), ("pattern", "a\0b")]),
-            params(&[("pattern", "a")]),
-            params(&[("cwd", "relative"), ("pattern", "a")]),
-            params(&[("cwd", "Z:\\no\\such\\folder\\anywhere"), ("pattern", "a")]),
-        ] {
-            assert!(define("ripgrep", &given).is_err(), "ripgrep with {given:?} was taken");
-        }
+    fn the_daemon_runs_no_program_of_its_own() {
+        // A search of files is the machine's file's to define: the daemon
+        // has none.
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let asked = define("ripgrep", &params(&[("cwd", &cwd), ("pattern", "fn main")]));
+        assert_eq!(asked.err().as_deref(), Some("no picker named ripgrep"));
     }
 
     #[test]
@@ -2162,38 +1957,37 @@ mod tests {
         let long = "123456789\n".repeat(MOST_PREVIEW / 10 + 5);
         std::fs::write(root.join("long.log"), format!("{long}tail with no end")).unwrap();
 
-        let file = Shown::of(&root.join("b.rs"), None);
+        let file = Shown::of(&root.join("b.rs"));
         let whole = Shown { text: "fn main() {}\n".into(), name: Some("b.rs".into()), ..Default::default() };
         assert_eq!(file, whole);
-        assert_eq!(Shown::of(&root.join("A.txt"), None).text, "caf\u{e9}");
+        assert_eq!(Shown::of(&root.join("A.txt")).text, "caf\u{e9}");
 
         // Cut at the end of a line, and said to be cut.
-        let cut = Shown::of(&root.join("long.log"), None);
+        let cut = Shown::of(&root.join("long.log"));
         assert!(cut.truncated && cut.text.len() <= MOST_PREVIEW);
         assert!(cut.text.ends_with("123456789\n") && cut.text.len() > MOST_PREVIEW - 10);
 
-        let binary = Shown::of(&root.join("data.bin"), None);
+        let binary = Shown::of(&root.join("data.bin"));
         assert_eq!((binary.text.as_str(), &binary.name), ("Not text: 4 bytes", &None));
 
         // Folders first, then files, neither by the case of its name.
-        let folder = Shown::of(&root, None);
+        let folder = Shown::of(&root);
         assert_eq!(folder.text, "sub\\\nA.txt\nb.rs\ndata.bin\nlong.log");
         assert_eq!((&folder.name, folder.truncated), (&None, false));
-        assert_eq!(Shown::of(&root.join("sub"), None).text, "Empty folder");
+        assert_eq!(Shown::of(&root.join("sub")).text, "Empty folder");
 
         // A picture is the file itself, whatever the case of its name, and
         // one too large to send, or with nothing in it, says so.
         std::fs::write(root.join("Dot.PNG"), [137u8, 80, 78, 71, 0, 1]).unwrap();
-        let picture = Shown::of(&root.join("Dot.PNG"), None);
+        let picture = Shown::of(&root.join("Dot.PNG"));
         assert_eq!((picture.picture.as_deref(), picture.text.as_str()), (Some(&[137u8, 80, 78, 71, 0, 1][..]), ""));
-        assert_eq!(Shown::of(&root.join("Dot.PNG"), Some(1)).line, None);
         let large = std::fs::File::create(root.join("large.jpg")).unwrap();
         large.set_len(MOST_PICTURE + 1).unwrap();
-        let large = Shown::of(&root.join("large.jpg"), None);
+        let large = Shown::of(&root.join("large.jpg"));
         assert!(large.picture.is_none() && large.text.starts_with("A picture too large to show"), "{}", large.text);
         std::fs::write(root.join("none.gif"), []).unwrap();
-        assert_eq!(Shown::of(&root.join("none.gif"), None).text, "An empty file");
-        let missing = Shown::of(&root.join("none.txt"), None);
+        assert_eq!(Shown::of(&root.join("none.gif")).text, "An empty file");
+        let missing = Shown::of(&root.join("none.txt"));
         assert!(missing.error.is_some() && missing.text.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }

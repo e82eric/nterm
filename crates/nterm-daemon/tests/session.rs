@@ -1570,16 +1570,46 @@ fn a_picker_of_rows_its_program_gives_and_what_the_program_is_told_of_one() {
     ui.shutdown();
 }
 
+/// A daemon serving `session` whose file of pickers, in `folder`, is
+/// `text`, with the modules that come with nterm beside it.
+fn daemon_with_file(session: &str, folder: &std::path::Path, text: &str) -> std::process::Child {
+    let modules = folder.join("nterm");
+    std::fs::create_dir_all(&modules).unwrap();
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lua/nterm");
+    for module in std::fs::read_dir(shipped).unwrap() {
+        let module = module.unwrap().path();
+        std::fs::copy(&module, modules.join(module.file_name().unwrap())).unwrap();
+    }
+    let file = folder.join("nterm-daemon.lua");
+    std::fs::write(&file, text).unwrap();
+    let mut command = std::process::Command::new(DAEMON);
+    command.args(["--session", session, "--lua-config"]).arg(&file).env_remove("NTERM_CONPTY_DLL");
+    // It holds nothing of the test's, so that a test that fails ends.
+    command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let daemon = command.spawn().unwrap();
+    let deadline = Instant::now() + WAIT;
+    while let Err(error) = pipe::connect(session) {
+        assert!(Instant::now() < deadline, "the daemon never served: {error}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    daemon
+}
+
 #[test]
 fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
     let session = session("pick-ripgrep");
     let tree = Tree::new("ripgrep");
+    // The file is not in the tree searched, so that it is not found in it.
+    let config = Tree::new("ripgrep-file");
+    let text = r#"local ripgrep = require("nterm.ripgrep")
+        return { pickers = { Ripgrep = ripgrep.search { preview_visible = false } } }"#;
+    let mut daemon = daemon_with_file(&session, &config.0, text);
     let mut ui = Ui::connect(&session);
     let pane = ui.shell();
 
     // A search that cannot be run, or that ends saying it failed with
     // nothing found, ends the picker, and both are told why.
-    let asker = Asker::ask(&session, pane, "ripgrep", serde_json::json!({"cwd": tree.path(), "pattern": "("}));
+    let asker = Asker::ask(&session, pane, "Ripgrep", serde_json::json!({"cwd": tree.path(), "pattern": "("}));
     let Control::PickerOpen { picker, label, preview, .. } = ui.control(|c| matches!(c, Control::PickerOpen { .. }))
     else {
         unreachable!()
@@ -1599,11 +1629,12 @@ fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
     if std::process::Command::new("rg").arg("--version").output().is_err() {
         eprintln!("rg is not installed: what a search finds was not tested");
         ui.shutdown();
+        assert!(daemon.wait().unwrap().success());
         return;
     }
     // The tree's files hold their own names. Whatever the case of a letter.
     let params = serde_json::json!({"cwd": tree.path(), "pattern": "ALPHA|gamma"});
-    let (asker, picker) = ui.picker(&session, pane, "ripgrep", params);
+    let (asker, picker) = ui.picker(&session, pane, "Ripgrep", params);
     let all = ui.query(picker, 0, "");
     assert_eq!(all.texts(), ["a\\alpha.txt:1:3:a/alpha.txt", "b\\gamma.rs:1:3:b/gamma.rs"]);
     // What is typed narrows what was found: the search is not run again.
@@ -1618,7 +1649,7 @@ fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
     // put before what was found, so that it is not the first.
     std::fs::write(std::path::Path::new(&tree.path()).join("b").join("gamma.rs"), "// first\nb/gamma.rs\n").unwrap();
     let params = serde_json::json!({"cwd": tree.path(), "pattern": "gamma", "preview": "true"});
-    let (asker, picker) = ui.picker(&session, pane, "ripgrep", params);
+    let (asker, picker) = ui.picker(&session, pane, "Ripgrep", params);
     let found = ui.query(picker, 0, "");
     assert_eq!(found.texts(), [r"b\gamma.rs:2:3:b/gamma.rs"]);
     let shown = ui.preview(picker, 1, found.serial, found.rows[0].0);
@@ -1629,11 +1660,12 @@ fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
 
     // Nothing found is a picker of nothing, not one that failed.
     let params = serde_json::json!({"cwd": tree.path(), "pattern": "nowhere in any of them"});
-    let (asker, picker) = ui.picker(&session, pane, "ripgrep", params);
+    let (asker, picker) = ui.picker(&session, pane, "Ripgrep", params);
     assert_eq!(ui.query(picker, 0, "").matched, 0);
     ui.send(Control::PickerClose { picker, refused: None });
     assert_eq!(asker.result().0, "cancelled");
     ui.shutdown();
+    assert!(daemon.wait().unwrap().success());
 }
 
 #[test]
