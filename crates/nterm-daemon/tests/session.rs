@@ -324,9 +324,10 @@ fn spawn_type_resize_disconnect_reconnect_snapshot() {
 fn lifecycle(session: &str) {
     let session = session.to_owned();
     let mut ui = Ui::connect(&session);
-    let Control::Welcome { protocol, ghostty, pid, session: named } = ui.welcome.clone() else {
+    let Control::Welcome { protocol, ghostty, pid, session: named, files } = ui.welcome.clone() else {
         panic!("no welcome");
     };
+    assert!(files, "the daemon says it keeps files");
     assert_eq!((protocol, ghostty.as_str(), named.as_str()), (PROTOCOL_VERSION, GHOSTTY_REVISION, session.as_str()));
     // Through a relay the peer is the relay, which is not the daemon.
     assert_eq!(pid == ui.connection.peer_pid(), !ui.connection.relayed());
@@ -432,6 +433,30 @@ fn a_ui_through_a_relay() {
     let panes = ui.panes();
     assert_eq!(panes.len(), 1);
     assert_eq!((panes[0].pid, panes[0].exited), (pane.pid, None));
+    ui.shutdown();
+}
+
+#[test]
+fn a_file_sent_is_kept_and_its_path_said() {
+    let session = session("files");
+    let mut ui = Ui::connect(&session);
+    // Large enough to take many reads, through a relay as well.
+    let bytes: Vec<u8> = (0..3_000_000u32).map(|n| (n * 7 % 251) as u8).collect();
+    Frame::File { request: 5, extension: "png".into(), bytes: bytes.clone() }.write(&mut ui.writer).unwrap();
+    let Control::FileKept { request, path } = ui.control(|c| matches!(c, Control::FileKept { .. } | Control::Error { .. })) else {
+        panic!("not kept");
+    };
+    assert_eq!(request, 5);
+    let kept = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(path.ends_with(".png") && path.contains("pasted"), "{path}");
+    assert!(kept == bytes, "the file is what was sent");
+
+    // Refused, with the request it was sent with, and the daemon carries on.
+    Frame::File { request: 6, extension: "../x".into(), bytes: vec![1] }.write(&mut ui.writer).unwrap();
+    let error = ui.control(|c| matches!(c, Control::FileKept { .. } | Control::Error { .. }));
+    assert!(matches!(error, Control::Error { request: Some(6), .. }), "{error:?}");
+    assert!(ui.panes().is_empty());
     ui.shutdown();
 }
 

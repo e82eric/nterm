@@ -580,6 +580,7 @@ fn converse(
         ghostty: GHOSTTY_REVISION.to_owned(),
         pid: std::process::id(),
         session: session.name.clone(),
+        files: true,
     });
     if protocol != PROTOCOL_VERSION {
         fail(None, format!("protocol {protocol} is not supported; this daemon speaks {PROTOCOL_VERSION}"));
@@ -607,6 +608,29 @@ fn converse(
                 continue;
             }
             Frame::Control(control) => control,
+            // Kept away from this thread, so the UI's typing is not held
+            // up while a large file is written.
+            Frame::File { request, extension, bytes } => {
+                let outbox = outbox.clone();
+                let keep = move || {
+                    let answer = match crate::files::keep(&crate::files::directory(), &extension, &bytes) {
+                        Ok(path) => {
+                            log(format_args!("client {id}: kept {} bytes as {}", bytes.len(), path.display()));
+                            Control::FileKept { request, path: path.to_string_lossy().into_owned() }
+                        }
+                        Err(message) => {
+                            log(format_args!("client {id}: file not kept: {message}"));
+                            Control::Error { request: Some(request), message }
+                        }
+                    };
+                    let _ = outbox.send(Frame::Control(answer).encode());
+                };
+                if let Err(error) = std::thread::Builder::new().name("keep file".into()).spawn(keep) {
+                    let message = format!("the file could not be kept: {error}");
+                    fail(Some(request), message);
+                }
+                continue;
+            }
             // Frames only the daemon sends.
             Frame::Shell { channel, bytes } => {
                 let channels = session.channels.lock().unwrap();

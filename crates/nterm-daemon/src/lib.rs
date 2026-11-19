@@ -10,6 +10,8 @@ pub mod log;
 #[cfg(windows)]
 mod configured;
 #[cfg(windows)]
+mod files;
+#[cfg(windows)]
 mod picker;
 #[cfg(windows)]
 mod previewing;

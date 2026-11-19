@@ -279,6 +279,10 @@ pub enum Control {
         ghostty: String,
         pid: u32,
         session: String,
+        /// Whether the daemon keeps files a UI sends it: see `Frame::File`.
+        /// A daemon from before it could leaves this out.
+        #[serde(default)]
+        files: bool,
     },
     Spawned { request: u32, info: PaneInfo },
     /// The attach asked for by `request` was done. `info.attached` is true:
@@ -294,6 +298,9 @@ pub enum Control {
         request: Option<u32>,
         message: String,
     },
+    /// The file sent with `Frame::File` and this `request` was kept, at
+    /// `path` on the daemon's machine. Refused with `Error` instead.
+    FileKept { request: u32, path: String },
 
     /// To the UI attached to `pane`: show a picker over it, whose rows the
     /// daemon finds. The UI asks for them with `PickerQuery`, first for
@@ -439,6 +446,11 @@ pub enum Frame {
     /// `line` is the line of what a program printed, from one, to show in
     /// the middle.
     Previewed { picker: u32, request: u64, kind: PreviewKind, line: Option<u32>, bytes: Vec<u8> },
+    /// From a UI: keep these bytes as a file on the daemon's machine, whose
+    /// name ends `.extension`. The daemon chooses the folder and the name,
+    /// and answers `Control::FileKept` with the same `request`, or `Error`.
+    /// It only writes the file: nothing is run or opened.
+    File { request: u32, extension: String, bytes: Vec<u8> },
 }
 
 /// What the bytes of a preview are.
@@ -469,6 +481,7 @@ const KIND_SNAPSHOT: u8 = 4;
 const KIND_RESIZED: u8 = 6;
 const KIND_SHELL: u8 = 5;
 const KIND_PREVIEWED: u8 = 7;
+const KIND_FILE: u8 = 8;
 
 impl Frame {
     /// The frame as it travels, length first.
@@ -499,6 +512,16 @@ impl Frame {
             }
             Self::Snapshot { request, bytes } => {
                 (KIND_SNAPSHOT, Some(*request), bytes.as_slice().into())
+            }
+            Self::File { request, extension, bytes } => {
+                // The extension's length, the extension, the bytes. One
+                // longer than a byte can say is cut: the daemon refuses it.
+                let extension = &extension.as_bytes()[..extension.len().min(255)];
+                let mut body = Vec::with_capacity(1 + extension.len() + bytes.len());
+                body.push(extension.len() as u8);
+                body.extend_from_slice(extension);
+                body.extend_from_slice(bytes);
+                (KIND_FILE, Some(*request), body.into())
             }
         };
         let len = 1 + id.map_or(0, |_| 4) + bytes.len();
@@ -558,6 +581,17 @@ impl Frame {
                 let Some(kind) = PreviewKind::of(*kind) else { return Ok(Self::Control(Control::Unknown)) };
                 Ok(Self::Previewed { picker: id, request: u64::from_le_bytes(*request), kind, line, bytes: bytes.to_vec() })
             }
+            KIND_FILE => {
+                let (&len, rest) = bytes.split_first().ok_or_else(|| invalid("file frame"))?;
+                if rest.len() < len as usize {
+                    return Err(invalid("file frame"));
+                }
+                let (extension, bytes) = rest.split_at(len as usize);
+                // Not checked here: a bad one is the daemon's to refuse, and
+                // a frame that does not decode ends the connection.
+                let extension = String::from_utf8_lossy(extension).into_owned();
+                Ok(Self::File { request: id, extension, bytes: bytes.to_vec() })
+            }
             // A frame kind from a newer version.
             _ => Ok(Self::Control(Control::Unknown)),
         }
@@ -605,6 +639,9 @@ mod tests {
         round_trip(Frame::Snapshot { request: 9, bytes: vec![255; 300] });
         round_trip(Frame::Previewed { picker: 4, request: u64::MAX - 1, kind: PreviewKind::Image, line: None, bytes: vec![0, 137, 80] });
         round_trip(Frame::Previewed { picker: 4, request: 2, kind: PreviewKind::Ansi, line: Some(70_000), bytes: vec![] });
+        round_trip(Frame::File { request: 3, extension: "png".into(), bytes: vec![137, 80, 0, 255] });
+        round_trip(Frame::File { request: 4, extension: String::new(), bytes: vec![] });
+        round_trip(Control::FileKept { request: 3, path: r"C:\a\b.png".into() }.into());
         round_trip(Control::Hello { protocol: PROTOCOL_VERSION, ghostty: "abc".into() }.into());
         round_trip(
             Control::Spawn {
@@ -640,6 +677,26 @@ mod tests {
             Frame::decode(&[200, 0, 0, 0, 0, 1]).unwrap(),
             Frame::Control(Control::Unknown)
         );
+    }
+
+    #[test]
+    fn a_daemon_from_before_files_keeps_none() {
+        let welcome = br#"{"type":"welcome","protocol":16,"ghostty":"g","pid":1,"session":"s"}"#;
+        let mut body = vec![KIND_CONTROL];
+        body.extend_from_slice(welcome);
+        assert!(matches!(Frame::decode(&body).unwrap(), Frame::Control(Control::Welcome { files: false, .. })));
+    }
+
+    #[test]
+    fn a_file_frame_says_how_long_its_extension_is() {
+        // Cut short: a bad frame.
+        assert!(Frame::decode(&[KIND_FILE, 1, 0, 0, 0, 5, b'p']).is_err());
+        // Longer than a byte can say: cut, for the daemon to refuse.
+        let long = Frame::File { request: 1, extension: "x".repeat(300), bytes: vec![1] }.encode();
+        let Frame::File { extension, bytes, .. } = Frame::read(&mut long.as_slice()).unwrap() else {
+            panic!("not a file frame")
+        };
+        assert_eq!((extension.len(), bytes), (255, vec![1]));
     }
 
     #[test]
