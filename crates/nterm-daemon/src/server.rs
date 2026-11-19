@@ -16,7 +16,7 @@ use crate::{
 use nterm_session::{
     GHOSTTY_REVISION,
     pipe::{Connection, Listener},
-    shell::{DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE},
+    shell::{DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE, SHARE_VARIABLE},
     protocol::{
         Control, Frame, PROTOCOL_VERSION, PaneId, PaneInfo, SessionInfo, Size, TerminalSettings,
     },
@@ -265,8 +265,13 @@ impl Session {
                 })
                 .collect();
         }
-        let ours = [DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE];
-        env.retain(|(key, _)| !ours.contains(&key.as_str()));
+        // A profile loads code from the share folder, so its path is only
+        // ever this daemon's own: one a UI names, from wherever, is dropped.
+        let ours = [DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE, SHARE_VARIABLE];
+        env.retain(|(key, _)| !ours.iter().any(|ours| key.eq_ignore_ascii_case(ours)));
+        if let Some(share) = crate::configured::installed().into_iter().find(|share| share.is_dir()) {
+            env.push((SHARE_VARIABLE.into(), share.to_string_lossy().into_owned()));
+        }
         if let Ok(pipe) = nterm_session::pipe::name(&self.name) {
             env.push((PIPE_VARIABLE.into(), pipe));
         }

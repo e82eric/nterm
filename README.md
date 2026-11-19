@@ -192,7 +192,9 @@ In the PowerShell profile, a key handler that opens it by name and uses the
 result:
 
 ```powershell
-. C:\path\to\nterm\Invoke-NtermPicker.ps1
+# The NTerm module. In a pane, the session daemon names the folder installed
+# with it as NTERM_SHARE; this is the same module in a checkout.
+Import-Module C:\path\to\nterm\powershell\NTerm
 
 Set-PSReadLineKeyHandler -Chord Ctrl+o -ScriptBlock {
     $result = Invoke-NtermPicker -Name ProfileDirectories -Parameters @{

@@ -75,13 +75,17 @@ finally {
 if ($aside) {
     Write-Warning "In use, so kept under another name until the next build: $($aside.Name -join ', '). What is running keeps the old build."
 }
-# Lua modules a config can require, e.g. require("nterm.git").
+# Lua modules a config can require, e.g. require("nterm.git"), and the NTerm
+# PowerShell module a profile imports. The daemon names this folder to its
+# shells as NTERM_SHARE.
 $share = Join-Path $prefix 'share\nterm'
-$lua = Join-Path $share 'lua'
-if (Test-Path -LiteralPath $lua) {
-    Remove-Item -LiteralPath $lua -Recurse -Force
-}
 New-Item -ItemType Directory -Path $share -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'lua') -Destination $share -Recurse
+foreach ($folder in @('lua', 'powershell')) {
+    $installed = Join-Path $share $folder
+    if (Test-Path -LiteralPath $installed) {
+        Remove-Item -LiteralPath $installed -Recurse -Force
+    }
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $folder) -Destination $share -Recurse
+}
 
 Write-Host "Built $(Join-Path $prefix 'bin\nterm.exe')"

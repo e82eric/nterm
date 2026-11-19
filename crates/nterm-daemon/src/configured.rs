@@ -385,11 +385,7 @@ fn modules(lua: &Lua, config: &Path) -> mlua::Result<()> {
     if let Some(folder) = config.parent().and_then(|folder| std::path::absolute(folder).ok()) {
         folders.push(folder);
     }
-    if let Some(folder) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
-        for root in [Some(folder.as_path()), folder.parent()].into_iter().flatten() {
-            folders.push(root.join("share").join("nterm").join("lua"));
-        }
-    }
+    folders.extend(installed().into_iter().map(|share| share.join("lua")));
     let path: Vec<String> = folders
         .iter()
         .filter_map(|folder| folder.to_str())
@@ -400,6 +396,19 @@ fn modules(lua: &Lua, config: &Path) -> mlua::Result<()> {
     let package: mlua::Table = lua.globals().get("package")?;
     package.set("path", path.join(";"))?;
     package.set("cpath", "")
+}
+
+/// Where what is installed with the daemon may be: `share\nterm` beside it
+/// (deploy.ps1) or above it (build.ps1's `out\bin` and `out\share`).
+pub(crate) fn installed() -> Vec<std::path::PathBuf> {
+    let Some(folder) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) else {
+        return Vec::new();
+    };
+    [Some(folder.as_path()), folder.parent()]
+        .into_iter()
+        .flatten()
+        .map(|root| root.join("share").join("nterm"))
+        .collect()
 }
 
 fn define(lua: &Lua, value: mlua::Value) -> Result<Defined, String> {

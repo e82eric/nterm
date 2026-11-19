@@ -443,7 +443,15 @@ Then add this to your PowerShell `$PROFILE`, replacing the path:
 . 'C:\src\nterm\profile.example.ps1' -PickerRoots @('C:\your\projects')
 ```
 
-The helper is loaded relative to the example script. Omit `-PickerRoots` to use
+What each key does is in the NTerm PowerShell module (`powershell\NTerm`):
+`Add-NtermPickedPath`, `Set-NtermLocationFromPicker`, `Set-NtermLineFromHistory`,
+`Set-NtermLineFromRipgrep`, `Complete-NtermLine` and `Enable-NtermShellIntegration`,
+with `Invoke-NtermPicker`. The example only says which key opens which picker,
+so a profile can copy it and change those. build.ps1 installs the module as
+`share\nterm\powershell\NTerm`, beside the Lua modules, and the session daemon
+names that folder to its shells as `NTERM_SHARE`, on its own machine: one a
+window names is never passed on. The example imports the module from there,
+or from beside itself when it is not set. Omit `-PickerRoots` to use
 the directory where the profile loads. Ctrl+T/Ctrl+O search files/directories
 under the current directory; Alt+T/Alt+O use the configured roots. Alt+R searches
 PSReadLine's saved history, Ctrl+Shift+G searches with `rg` and inserts an `nvim`
@@ -453,8 +461,7 @@ editor command and shortcuts as needed; dot-sourcing replaces those bindings.
 PowerShell 7.4+ (for `-CommandWithArgs`) and PSReadLine are required. Ripgrep
 is optional for text search.
 The script does nothing outside an nterm pane: it returns unless
-`NTERM_DAEMON_PIPE` is set, and loads
-`Invoke-NtermPicker.ps1` only when `Invoke-NtermPicker` is not already defined.
+`NTERM_DAEMON_PIPE` is set.
 File and directory bindings use nterm's builtin FileWalker through the named
 FileSystem pickers, passing the selected roots and current directory; no `fd` or
 custom history-reader executable is required.

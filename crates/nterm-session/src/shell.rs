@@ -22,6 +22,10 @@ pub const PANE_VARIABLE: &str = "NTERM_PANE";
 /// The daemon's pipe, whole, for a client that is a script and would
 /// otherwise have to work the name out. See `Invoke-NtermPicker.ps1`.
 pub const PIPE_VARIABLE: &str = "NTERM_DAEMON_PIPE";
+/// The folder installed with the daemon (`share\nterm`: the Lua modules and
+/// the PowerShell module), for a profile on the daemon's machine to load
+/// from. Only the daemon sets it, and only when the folder is there.
+pub const SHARE_VARIABLE: &str = "NTERM_SHARE";
 
 /// What came from the other side.
 #[derive(Debug, PartialEq)]

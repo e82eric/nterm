@@ -583,6 +583,36 @@ fn errors_are_reported_and_the_daemon_carries_on() {
 }
 
 #[test]
+fn the_share_folder_is_never_one_the_ui_names() {
+    // A profile loads code from NTERM_SHARE, so a UI, which may be on
+    // another machine, cannot choose it, in any spelling. The test daemon
+    // has no share folder beside or above it, so the shell has none.
+    let session = session("share");
+    let mut ui = Ui::connect(&session);
+    ui.send(Control::Spawn {
+        request: 1,
+        command: "cmd.exe /d /q /c echo [%NTERM_SHARE%]".into(),
+        cwd: None,
+        beside: None,
+        env: vec![
+            ("NTERM_SHARE".into(), r"C:\from-the-ui".into()),
+            ("nterm_share".into(), r"C:\from-the-ui-too".into()),
+            ("SystemRoot".into(), std::env::var("SystemRoot").unwrap()),
+            ("PATH".into(), std::env::var("PATH").unwrap()),
+        ],
+        size: size(80, 24),
+    });
+    let Control::Spawned { info, .. } = ui.control(|c| matches!(c, Control::Spawned { .. })) else {
+        unreachable!()
+    };
+    ui.control(|c| matches!(c, Control::Exited { .. }));
+    let text = ui.snapshot(info.pane).text();
+    assert!(text.contains("[%NTERM_SHARE%]"), "{text}");
+    assert!(!text.contains("from-the-ui"), "{text}");
+    ui.shutdown();
+}
+
+#[test]
 fn a_shell_started_beside_a_pane_starts_in_the_folder_that_pane_reported() {
     let session = session("beside");
     let mut ui = Ui::connect(&session);
