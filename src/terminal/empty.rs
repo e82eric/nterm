@@ -74,7 +74,7 @@ impl TerminalView {
     pub(super) fn update_empty(&mut self, ui: &mut egui::Ui, gl: &glow::Context) {
         let ctx = ui.ctx().clone();
         let available = ui.max_rect();
-        let status_height = 24.0_f32.min(available.height());
+        let status_height = self.status_height().min(available.height());
         let status = egui::Rect::from_min_max(
             egui::pos2(available.left(), available.bottom() - status_height),
             available.max,

@@ -360,6 +360,7 @@ struct AppConfig {
     colors: ColorConfig,
     theme_colors: std::collections::BTreeMap<String, crate::colors::UiOverrides>,
     floating: FloatingConfig,
+    status_bar: StatusBarConfig,
     /// The machines `--remote NAME` knows by name.
     remotes: std::collections::BTreeMap<String, RemoteConfig>,
     workspaces: crate::terminal::workspace::Config,
@@ -461,6 +462,25 @@ struct ColorConfig {
 #[serde(default, deny_unknown_fields)]
 struct FloatingConfig {
     padding: Option<FloatingPadding>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StatusBarConfig {
+    /// The size of its text, in points. The bar grows with it.
+    font_size: Option<f32>,
+}
+
+impl StatusBarConfig {
+    fn font_size(&self) -> Result<f32, String> {
+        let Some(size) = self.font_size else {
+            return Ok(crate::picker::config::STATUS_FONT_SIZE);
+        };
+        if !size.is_finite() || !(6.0..=48.0).contains(&size) {
+            return Err("status_bar.font_size must be between 6 and 48".into());
+        }
+        Ok(size)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
@@ -881,7 +901,8 @@ impl ReloadSource {
                     config
                         .cursor_scroll_padding
                         .unwrap_or(nfm_egui::copy_mode::SCROLL_PADDING_ROWS),
-                ),
+                )
+                .with_status_font_size(config.status_bar.font_size()?),
                 padding: config
                     .floating
                     .padding
@@ -1028,7 +1049,8 @@ pub(crate) fn prepare_with_reload(
                             config
                                 .cursor_scroll_padding
                                 .unwrap_or(nfm_egui::copy_mode::SCROLL_PADDING_ROWS),
-                        ),
+                        )
+                        .with_status_font_size(config.status_bar.font_size()?),
                         config
                             .floating
                             .padding
@@ -3106,6 +3128,20 @@ mod tests {
             let message = bindings(source).err().unwrap();
             assert!(message.contains(error), "{source}: {message}");
         }
+    }
+
+    #[test]
+    fn the_status_bar_text_is_13_points_unless_given_a_size_it_can_be() {
+        let size = |source: &str| parse(source).and_then(|config| config.status_bar.font_size());
+        assert_eq!(size("return {}"), Ok(13.0));
+        assert_eq!(size("return { status_bar = { font_size = 16 } }"), Ok(16.0));
+        assert_eq!(size("return { status_bar = { font_size = 10.5 } }"), Ok(10.5));
+        for wrong in ["0", "5", "49", "0/0", "1/0"] {
+            let error = size(&format!("return {{ status_bar = {{ font_size = {wrong} }} }}")).unwrap_err();
+            assert!(error.contains("between 6 and 48"), "{wrong}: {error}");
+        }
+        assert!(parse("return { status_bar = { size = 16 } }").is_err());
+        assert!(parse("return { status_bar = { font_size = 'big' } }").is_err());
     }
 
     #[test]

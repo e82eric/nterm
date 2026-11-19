@@ -36,6 +36,9 @@ The file returns a table with optional `font.family`, `font.size` (points),
 sets each inset as a percentage of the terminal area. Omitted sides use zero;
 the four sides must leave at least 5% width and height. Without this setting,
 the pane keeps its original centered 80% × 70% size and 1000 × 700 point caps.
+`status_bar = { font_size = 16 }` sets the size of the status bar's text, in
+points, from 6 to 48; without it, 13. The bar, its chips and its icons grow
+with it. `font.size` is the terminal's text, and does not change the bar.
 Unknown fields
 are rejected. Rust evaluates Lua once, validates the settings, and translates them
 into Ghostty configuration arguments. Ghostty's normal configuration files remain

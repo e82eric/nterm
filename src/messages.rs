@@ -16,7 +16,7 @@ impl Messages {
 
     /// Paints the configuration issue count at the bar's right end. Returns
     /// the space left of it and whether it was clicked to show the messages.
-    pub(crate) fn status(&self, ui: &egui::Ui, rect: egui::Rect) -> (f32, bool) {
+    pub(crate) fn status(&self, ui: &egui::Ui, rect: egui::Rect, font_size: f32) -> (f32, bool) {
         let right = rect.right() - 10.0;
         if self.config_issues.is_empty() {
             return (right, false);
@@ -29,7 +29,7 @@ impl Messages {
         );
         let galley = ui
             .painter()
-            .layout_no_wrap(text, egui::FontId::monospace(13.0), color);
+            .layout_no_wrap(text, egui::FontId::monospace(font_size), color);
         let left = (right - galley.size().x).max(rect.left());
         let hit = egui::Rect::from_min_max(egui::pos2(left, rect.top()), rect.right_bottom());
         let response = ui.interact(hit, ui.id().with("config-messages"), egui::Sense::CLICK);

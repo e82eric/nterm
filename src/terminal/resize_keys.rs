@@ -472,11 +472,11 @@ pub(super) fn hints(
 
 /// Draws `hints` in the status bar after the mode chip `chip`, each key on a
 /// keycap followed by what it does, leaving out those that would pass
-/// `right`.
-pub(super) fn paint_hints(painter: &egui::Painter, hints: &[KeyHint], chip: Rect, right: f32) {
+/// `right`, at `scale` times the default size.
+pub(super) fn paint_hints(painter: &egui::Painter, hints: &[KeyHint], chip: Rect, right: f32, scale: f32) {
     let palette = crate::colors::palette();
-    let key_font = egui::FontId::monospace(12.0);
-    let label_font = egui::FontId::monospace(13.0);
+    let key_font = egui::FontId::monospace(12.0 * scale);
+    let label_font = egui::FontId::monospace(13.0 * scale);
     let cap_height = (chip.height() - 2.0).max(8.0);
     let y = chip.center().y;
     let mut x = chip.right() + 14.0;
@@ -488,7 +488,7 @@ pub(super) fn paint_hints(painter: &egui::Painter, hints: &[KeyHint], chip: Rect
             .collect();
         let widths: Vec<f32> = caps
             .iter()
-            .map(|cap| (cap.size().x + 10.0).max(cap_height))
+            .map(|cap| (cap.size().x + 10.0 * scale).max(cap_height))
             .collect();
         let label =
             painter.layout_no_wrap(hint.label.clone(), label_font.clone(), palette.muted_text);

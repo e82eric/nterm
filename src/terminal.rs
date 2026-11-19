@@ -941,7 +941,8 @@ impl TerminalView {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
         }
-        let (messages_left, messages_clicked) = self.messages.status(ui, rect);
+        let (messages_left, messages_clicked) =
+            self.messages.status(ui, rect, self.picker_bindings.status_font_size);
         if messages_clicked {
             self.show_messages(ui.ctx());
         }
@@ -970,7 +971,8 @@ impl TerminalView {
             ],
             egui::Stroke::new(1.5, separator),
         );
-        let font = egui::FontId::monospace(13.0);
+        let scale = self.picker_bindings.status_scale();
+        let font = egui::FontId::monospace(self.picker_bindings.status_font_size);
         let palette = crate::colors::palette();
         // The label is a chip: filled with the accent while a mode such as
         // COPY or SEARCH is active, otherwise a subtle tint.
@@ -984,7 +986,7 @@ impl TerminalView {
         } else {
             (egui::Color32::from_white_alpha(14), palette.text)
         };
-        let chip_height = (rect.height() - 8.0).clamp(8.0, 22.0);
+        let chip_height = (rect.height() - 8.0 * scale).clamp(8.0, 22.0 * scale);
         let chip_top = rect.center().y + 1.0 - chip_height / 2.0;
         // A menu button at the bar's left end.
         let menu = egui::Rect::from_min_size(
@@ -1002,12 +1004,12 @@ impl TerminalView {
             palette.muted_text
         };
         let stroke = egui::Stroke::new(1.5, menu_color);
-        for dy in [-4.0, 0.0, 4.0] {
+        for dy in [-4.0 * scale, 0.0, 4.0 * scale] {
             let y = menu.center().y + dy;
             painter.line_segment(
                 [
-                    egui::pos2(menu.center().x - 5.0, y),
-                    egui::pos2(menu.center().x + 5.0, y),
+                    egui::pos2(menu.center().x - 5.0 * scale, y),
+                    egui::pos2(menu.center().x + 5.0 * scale, y),
                 ],
                 stroke,
             );
@@ -1027,7 +1029,7 @@ impl TerminalView {
             let text = painter.layout_no_wrap(elsewhere, font.clone(), palette.success);
             let block = egui::Rect::from_min_size(
                 egui::pos2(label_left, chip_top),
-                egui::vec2(text.size().x + 16.0, chip_height),
+                egui::vec2(text.size().x + 16.0 * scale, chip_height),
             );
             painter.rect_filled(block, 4.0, egui::Color32::from_white_alpha(14));
             painter.rect_stroke(
@@ -1046,7 +1048,7 @@ impl TerminalView {
         );
         let label_rect = egui::Rect::from_min_size(
             egui::pos2(label_left, chip_top),
-            egui::vec2(label.size().x + 16.0, chip_height),
+            egui::vec2(label.size().x + 16.0 * scale, chip_height),
         );
         painter.rect_filled(label_rect, 4.0, chip_fill);
         painter.galley(label_rect.center() - label.size() / 2.0, label, chip_text);
@@ -1063,7 +1065,7 @@ impl TerminalView {
                 (None, 0) => (egui::Color32::from_white_alpha(14), palette.muted_text),
                 (None, _) => (egui::Color32::from_white_alpha(14), palette.text),
             };
-            const ICON: f32 = 11.0;
+            let icon_size = 11.0 * scale;
             // Room for two digits keeps the width constant up to 99 floats.
             let digits = painter
                 .layout_no_wrap("99".to_owned(), font.clone(), content)
@@ -1071,7 +1073,7 @@ impl TerminalView {
                 .x;
             let chip = egui::Rect::from_min_max(
                 egui::pos2(
-                    right_edge - (8.0 + ICON + 6.0 + digits + 8.0),
+                    right_edge - (8.0 + icon_size + 6.0 + digits + 8.0),
                     label_rect.top(),
                 ),
                 egui::pos2(right_edge, label_rect.bottom()),
@@ -1080,11 +1082,11 @@ impl TerminalView {
             // Two overlapping windows: a pane floating over another.
             let stroke = egui::Stroke::new(1.0, content);
             let icon = egui::Rect::from_min_size(
-                egui::pos2(chip.left() + 8.0, chip.center().y - ICON / 2.0),
-                egui::vec2(ICON, ICON),
+                egui::pos2(chip.left() + 8.0, chip.center().y - icon_size / 2.0),
+                egui::vec2(icon_size, icon_size),
             );
-            let back = egui::Rect::from_min_size(icon.min, egui::vec2(7.0, 7.0));
-            let front = egui::Rect::from_min_size(icon.min + egui::vec2(4.0, 4.0), back.size());
+            let back = egui::Rect::from_min_size(icon.min, egui::vec2(7.0, 7.0) * scale);
+            let front = egui::Rect::from_min_size(icon.min + egui::vec2(4.0, 4.0) * scale, back.size());
             painter.line_segment([back.left_top(), back.right_top()], stroke);
             painter.line_segment([back.left_top(), back.left_bottom()], stroke);
             painter.line_segment(
@@ -1119,13 +1121,13 @@ impl TerminalView {
             } else {
                 palette.muted_text
             };
-            let left = right_edge - 26.0;
+            let left = right_edge - 26.0 * scale;
             if left > label_rect.right() + 8.0 {
                 let icon = egui::Rect::from_center_size(
-                    egui::pos2(left + 13.0, rect.center().y + 1.0),
-                    egui::vec2(26.0, 18.0),
+                    egui::pos2(left + 13.0 * scale, rect.center().y + 1.0),
+                    egui::vec2(26.0, 18.0) * scale,
                 );
-                let point = |x, y| icon.left_top() + egui::vec2(x, y);
+                let point = |x, y| icon.left_top() + egui::vec2(x, y) * scale;
                 let stroke = egui::Stroke::new(1.5, color);
                 // Two opposing arrows indicate bidirectional picker IPC.
                 painter.line_segment([point(2.0, 6.0), point(24.0, 6.0)], stroke);
@@ -1180,7 +1182,7 @@ impl TerminalView {
             }
         }
         if table.is_some() {
-            resize_keys::paint_hints(&painter, hints, label_rect, hints_right);
+            resize_keys::paint_hints(&painter, hints, label_rect, hints_right, scale);
         }
         if searching {
             let search_rect = egui::Rect::from_min_max(

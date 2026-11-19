@@ -1516,6 +1516,9 @@ impl PickerEntry {
     }
 }
 
+/// The status bar's text without `status_bar.font_size`, in points.
+pub(crate) const STATUS_FONT_SIZE: f32 = 13.0;
+
 #[derive(Clone)]
 pub(crate) struct Bindings {
     pub(crate) workspace_appearance: crate::terminal::workspace::Appearance,
@@ -1528,6 +1531,9 @@ pub(crate) struct Bindings {
     pub(crate) pipe_policy: super::pipe::Policy,
     pub(crate) builtin_pickers: BuiltinPickers,
     pub(crate) cursor_scroll_padding: u32,
+    /// `status_bar.font_size`: the size of the status bar's text, in points.
+    /// The bar and what is in it grow with it.
+    pub(crate) status_font_size: f32,
     pub(crate) prompt_patterns: std::rc::Rc<crate::config::prompts::Patterns>,
     pub(crate) quick_selects: crate::config::quick_selects::Definitions,
     bindings: Vec<Binding>,
@@ -1802,6 +1808,7 @@ impl Bindings {
             model,
             builtin_pickers: BuiltinPickers::default(),
             cursor_scroll_padding: nfm_egui::copy_mode::SCROLL_PADDING_ROWS,
+            status_font_size: STATUS_FONT_SIZE,
             prompt_patterns: Default::default(),
             quick_selects: Default::default(),
         })
@@ -1810,6 +1817,16 @@ impl Bindings {
     pub(crate) fn with_cursor_scroll_padding(mut self, rows: u32) -> Self {
         self.cursor_scroll_padding = rows;
         self
+    }
+
+    pub(crate) fn with_status_font_size(mut self, points: f32) -> Self {
+        self.status_font_size = points;
+        self
+    }
+
+    /// How much bigger than at the default size the status bar is drawn.
+    pub(crate) fn status_scale(&self) -> f32 {
+        self.status_font_size / STATUS_FONT_SIZE
     }
 
     pub(crate) fn with_builtin_pickers(mut self, builtins: BuiltinPickers) -> Self {

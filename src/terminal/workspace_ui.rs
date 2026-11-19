@@ -1752,10 +1752,16 @@ impl TerminalView {
         append(&format!("{pane}/{}", w.panes.len()), palette.text);
         job
     }
+    /// How high the status bar is: 24 at the default size of its text, and
+    /// as much more as its text is bigger.
+    pub(super) fn status_height(&self) -> f32 {
+        24.0 * self.picker_bindings.status_scale()
+    }
     pub(super) fn workspace_bar_width(&self, ui: &egui::Ui, available: f32) -> f32 {
-        let font = egui::FontId::monospace(WORKSPACE_FONT_SIZE);
+        let scale = self.picker_bindings.status_scale();
+        let font = egui::FontId::monospace(WORKSPACE_FONT_SIZE * scale);
         let detail = ui.painter().layout_job(self.workspace_bar_detail(&font));
-        (self.workspaces.len() as f32 * (WORKSPACE_CELL + WORKSPACE_GAP)
+        (self.workspaces.len() as f32 * (WORKSPACE_CELL * scale + WORKSPACE_GAP)
             + WORKSPACE_GAP
             + 10.0
             + detail.size().x)
@@ -1767,10 +1773,11 @@ impl TerminalView {
         }
         let palette = crate::colors::palette();
         let painter = ui.painter().with_clip_rect(rect);
-        let font = egui::FontId::monospace(WORKSPACE_FONT_SIZE);
+        let scale = self.picker_bindings.status_scale();
+        let font = egui::FontId::monospace(WORKSPACE_FONT_SIZE * scale);
         let inner = egui::Rect::from_center_size(
             rect.center() + egui::vec2(0.0, 1.0),
-            egui::vec2(rect.width(), (rect.height() - 8.0).clamp(8.0, 22.0)),
+            egui::vec2(rect.width(), (rect.height() - 8.0 * scale).clamp(8.0, 22.0 * scale)),
         );
         // Status text sits on the right: layout tag and focused/total panes.
         let galley = painter.layout_job(self.workspace_bar_detail(&font));
@@ -1793,7 +1800,8 @@ impl TerminalView {
             inner.min,
             egui::pos2(right.max(inner.left()), inner.bottom()),
         );
-        let pitch = WORKSPACE_CELL + WORKSPACE_GAP;
+        let cell_width = WORKSPACE_CELL * scale;
+        let pitch = cell_width + WORKSPACE_GAP;
         let slots = ((strip.width() + WORKSPACE_GAP) / pitch).floor().max(1.0) as usize;
         let overflow = self.workspaces.len() > slots;
         let visible = if overflow {
@@ -1819,7 +1827,7 @@ impl TerminalView {
         for (slot, w) in self.workspaces.iter().skip(start).take(visible).enumerate() {
             let cell = egui::Rect::from_min_size(
                 egui::pos2(origin + slot as f32 * pitch, strip.top()),
-                egui::vec2(WORKSPACE_CELL, strip.height()),
+                egui::vec2(cell_width, strip.height()),
             )
             .intersect(strip);
             // CLICK without FOCUSABLE: Tab must stay with the terminal, not
@@ -1879,7 +1887,7 @@ impl TerminalView {
         if overflow && slots > 1 {
             let cell = egui::Rect::from_min_size(
                 egui::pos2(origin + visible as f32 * pitch, strip.top()),
-                egui::vec2(WORKSPACE_CELL, strip.height()),
+                egui::vec2(cell_width, strip.height()),
             );
             let response = ui
                 .interact(cell, ui.id().with("workspace-overflow"), egui::Sense::CLICK)
@@ -1891,7 +1899,7 @@ impl TerminalView {
                 cell.center(),
                 egui::Align2::CENTER_CENTER,
                 format!("+{}", self.workspaces.len() - visible),
-                egui::FontId::monospace(WORKSPACE_FONT_SIZE - 2.0),
+                egui::FontId::monospace((WORKSPACE_FONT_SIZE - 2.0) * scale),
                 palette.muted_text,
             );
             if response.clicked() {
@@ -1985,7 +1993,7 @@ impl TerminalView {
         }
         let available = ui.max_rect();
         // Workspaces share the existing status row; reserve only one bar.
-        let status_height = 24.0_f32.min(available.height());
+        let status_height = self.status_height().min(available.height());
         let status = egui::Rect::from_min_max(
             egui::pos2(available.left(), available.bottom() - status_height),
             available.max,
