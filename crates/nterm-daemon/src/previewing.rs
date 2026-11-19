@@ -239,7 +239,7 @@ impl Previewer {
     /// whether the picker is to close.
     /// With `key`, it is the function of that one of the picker's `keys`,
     /// counted from nothing.
-    pub(crate) fn act(&self, text: &str, value: &str, key: Option<usize>) -> Result<Acted, String> {
+    pub(crate) fn act(&self, text: &str, value: &str, description: Option<&str>, key: Option<usize>) -> Result<Acted, String> {
         let lua = &self.lua;
         let failed = |error: mlua::Error| short(&error);
         // Nothing stops it but how long it takes.
@@ -264,7 +264,7 @@ impl Previewer {
             };
             let action = action.ok_or("the file no longer says what is done with a row of this picker")?;
             let app: mlua::Table = lua.named_registry_value("app").map_err(failed)?;
-            action.call::<_, ()>((app, self.item(text, value)?, self.given()?)).map_err(failed)
+            action.call::<_, ()>((app, self.item(text, value, description)?, self.given()?)).map_err(failed)
         })();
         lua.remove_hook();
         lua.remove_app_data::<Asked>();
@@ -273,11 +273,12 @@ impl Previewer {
     }
 
     /// The row, as a function of the file is given it.
-    fn item(&self, text: &str, value: &str) -> Result<mlua::Table<'_>, String> {
+    fn item(&self, text: &str, value: &str, description: Option<&str>) -> Result<mlua::Table<'_>, String> {
         let failed = |error: mlua::Error| short(&error);
         let item = self.lua.create_table().map_err(failed)?;
         item.set("text", text).map_err(failed)?;
         item.set("value", value).map_err(failed)?;
+        item.set("description", description).map_err(failed)?;
         if self.files {
             item.set("path", value).map_err(failed)?;
         }
@@ -294,9 +295,10 @@ impl Previewer {
         Ok(params)
     }
 
-    /// What shows for the row that shows as `text` and is `value`, asked
-    /// for with `request`. None when it was stopped for another.
-    pub(crate) fn resolve(&self, request: u64, text: &str, value: &str) -> Option<Result<Shows, String>> {
+    /// What shows for the row that shows as `text` and is `value`, of which
+    /// its program said `description`, asked for with `request`. None when
+    /// it was stopped for another.
+    pub(crate) fn resolve(&self, request: u64, text: &str, value: &str, description: Option<&str>) -> Option<Result<Shows, String>> {
         let asked = Asked { request, wanted: self.wanted.clone(), until: Instant::now() + MOST_TIME };
         self.lua.set_app_data(asked.clone());
         let stop = asked.clone();
@@ -306,7 +308,7 @@ impl Previewer {
             }
             Ok(())
         });
-        let shows = self.run(&asked, text, value);
+        let shows = self.run(&asked, text, value, description);
         self.lua.remove_hook();
         self.lua.remove_app_data::<Asked>();
         if self.wanted.load(Ordering::Acquire) != request {
@@ -318,22 +320,12 @@ impl Previewer {
         })
     }
 
-    fn run(&self, asked: &Asked, text: &str, value: &str) -> Result<Shows, String> {
+    fn run(&self, asked: &Asked, text: &str, value: &str, description: Option<&str>) -> Result<Shows, String> {
         let lua = &self.lua;
         let failed = |error: mlua::Error| short(&error);
         let resolve: Option<mlua::Function> = lua.named_registry_value("resolve").map_err(failed)?;
         let resolve = resolve.ok_or("the file no longer has a preview for this picker")?;
-        let item = lua.create_table().map_err(failed)?;
-        item.set("text", text).map_err(failed)?;
-        item.set("value", value).map_err(failed)?;
-        if self.files {
-            item.set("path", value).map_err(failed)?;
-        }
-        let params = lua.create_table().map_err(failed)?;
-        for (name, value) in &self.params {
-            params.set(name.as_str(), value.as_str()).map_err(failed)?;
-        }
-        let returned: mlua::Value = resolve.call((item, params)).map_err(failed)?;
+        let returned: mlua::Value = resolve.call((self.item(text, value, description)?, self.given()?)).map_err(failed)?;
         let table = match &returned {
             mlua::Value::Nil => return Ok(Shows::Nothing),
             mlua::Value::Table(table) => table,
@@ -584,7 +576,7 @@ mod tests {
     /// Ask as a picker does: the request is the one wanted, then resolved.
     fn ask(previewer: &Previewer, wanted: &AtomicU64, request: u64, text: &str, value: &str) -> Result<Shows, String> {
         wanted.store(request, Ordering::Release);
-        previewer.resolve(request, text, value).expect("it was not stopped")
+        previewer.resolve(request, text, value, None).expect("it was not stopped")
     }
 
     #[test]
@@ -724,7 +716,7 @@ mod tests {
                 other.store(request + 10, Ordering::Release);
             });
             let began = Instant::now();
-            assert_eq!(previewer.resolve(request, value, value), None);
+            assert_eq!(previewer.resolve(request, value, value, None), None);
             assert!(began.elapsed() < Duration::from_secs(5), "{value} was not stopped: {:?}", began.elapsed());
             next.join().unwrap();
         }
@@ -905,7 +897,7 @@ mod tests {
         let items: Vec<mlua::Table> = early.get("items").unwrap();
         assert_eq!(items[0].get::<_, String>("text").unwrap(), "false");
         let none = Previewer::new(&path, "None", BTreeMap::new(), false, Arc::default()).unwrap();
-        let made = none.resolve(0, "t", "v").unwrap();
+        let made = none.resolve(0, "t", "v", None).unwrap();
         assert!(made.is_err_and(|error| error.contains("no longer has a preview")));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -954,7 +946,7 @@ mod acting_tests {
               end
             end } } }"#,
         );
-        let acted = previewer.act("the text", "all", None).unwrap();
+        let acted = previewer.act("the text", "all", None, None).unwrap();
         let cwd = folder.to_string_lossy().into_owned();
         assert_eq!(
             acted.steps,
@@ -968,19 +960,19 @@ mod acting_tests {
         );
         assert!(acted.close);
         // It may run a program of this machine, as a preview may.
-        let acted = previewer.act("t", "ran", None).unwrap();
+        let acted = previewer.act("t", "ran", None, None).unwrap();
         assert!(matches!(&acted.steps[..], [PickerStep::SendText { text }] if text.contains("from a program")));
         assert!(!acted.close);
-        let acted = previewer.act("found", "next", None).unwrap();
+        let acted = previewer.act("found", "next", None, None).unwrap();
         let with = [("pattern".to_owned(), "found".to_owned())].into_iter().collect();
         assert_eq!(acted.steps, [PickerStep::Picker { name: "Other".into(), params: with }]);
         // What only a window has says so, and nothing is done.
-        assert!(previewer.act("t", "window", None).unwrap_err().contains("app:navigate is not something the daemon has"));
+        assert!(previewer.act("t", "window", None, None).unwrap_err().contains("app:navigate is not something the daemon has"));
         // Of an action that goes wrong, nothing it asked for is done.
-        assert!(previewer.act("t", "wrong", None).unwrap_err().contains("it went wrong"));
-        assert!(previewer.act("t", "long", None).unwrap_err().contains("60000"));
+        assert!(previewer.act("t", "wrong", None, None).unwrap_err().contains("it went wrong"));
+        assert!(previewer.act("t", "long", None, None).unwrap_err().contains("60000"));
         // One row's steps are not the next's.
-        assert_eq!(previewer.act("t", "none", None).unwrap(), Acted::default());
+        assert_eq!(previewer.act("t", "none", None, None).unwrap(), Acted::default());
         let _ = std::fs::remove_dir_all(folder);
     }
 
@@ -992,7 +984,7 @@ mod acting_tests {
               return { type = "Text", text = item.value }
             end } } } }"#,
         );
-        assert!(previewer.act("t", "v", None).unwrap_err().contains("no longer says what is done"));
+        assert!(previewer.act("t", "v", None, None).unwrap_err().contains("no longer says what is done"));
         let _ = std::fs::remove_dir_all(folder);
     }
 }

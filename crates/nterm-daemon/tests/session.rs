@@ -1611,6 +1611,56 @@ fn a_picker_of_rows_its_program_gives_and_what_the_program_is_told_of_one() {
     ui.shutdown();
 }
 
+#[test]
+fn a_picker_of_the_machines_file_takes_the_rows_its_program_gives_and_shows_what_it_said_of_them() {
+    let session = session("pick-completions");
+    let folder = Tree(std::env::temp_dir().join(format!("nterm-pickers-{session}")));
+    let _ = std::fs::remove_dir_all(&folder.0);
+    std::fs::create_dir_all(&folder.0).unwrap();
+    let text = r#"local completions = require("nterm.completions")
+        return { pickers = {
+          Completions = completions.powershell(),
+          Help = completions.powershell { preview = completions.help() },
+        } }"#;
+    let _daemon = daemon_with_file(&session, &folder.0, text);
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    let rows = serde_json::json!({"type": "items", "request_id": "r1", "sequence": 0, "items": [
+        {"id": "0", "text": "-Path", "value": "-Path", "description": "[string[]] Path"},
+        {"id": "1", "text": "-Recurse", "value": "-Recurse"},
+    ]});
+    let shows = |ui: &mut Ui, picker, request, query: &str| {
+        let found = ui.query(picker, request, query);
+        let Control::PickerPreviewed { text, error, .. } = ui.preview(picker, request, found.serial, found.rows[0].0) else {
+            unreachable!()
+        };
+        (text, error)
+    };
+
+    // What the program said of a row, and of one it said nothing of, what it is.
+    let params = serde_json::json!({"commandName": "Get-ChildItem", "position": "cursor"});
+    let (mut asker, picker) = ui.picker(&session, pane, "Completions", params.clone());
+    asker.say(rows.clone());
+    asker.say(serde_json::json!({"type": "end_items", "request_id": "r1"}));
+    assert_eq!(shows(&mut ui, picker, 1, "path"), ("[string[]] Path".to_owned(), None));
+    assert_eq!(shows(&mut ui, picker, 2, "recurse"), ("-Recurse".to_owned(), None));
+    // The program is told the one chosen, as of the daemon's own.
+    let some = ui.query(picker, 3, "path");
+    ui.send(Control::PickerAccept { picker, serial: some.serial, row: some.rows[0].0 });
+    assert_eq!(asker.result().1["selected"][0]["value"], "-Path");
+
+    // Get-Help of the parameter, of the command it was opened with: what it
+    // says of one, with or without the help text downloaded.
+    let (mut asker, picker) = ui.picker(&session, pane, "Help", params);
+    asker.say(rows);
+    asker.say(serde_json::json!({"type": "end_items", "request_id": "r1"}));
+    let (text, error) = shows(&mut ui, picker, 1, "path");
+    assert!(error.is_none() && text.contains("-Path <string[]>") && text.contains("Required?"), "{text} {error:?}");
+    ui.send(Control::PickerClose { picker, refused: None });
+    assert_eq!(asker.result().0, "cancelled");
+    ui.shutdown();
+}
+
 /// A daemon serving `session` with pickers of files, of folders and of what
 /// was typed, made with the modules that come with nterm as a machine's
 /// file makes them. A row of files or folders is said from the folder

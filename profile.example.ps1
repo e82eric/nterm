@@ -48,10 +48,10 @@ Set-PSReadLineKeyHandler -Chord Alt+R -ScriptBlock { Set-NtermLineFromHistory -D
 Set-PSReadLineKeyHandler -Chord Ctrl+Shift+g -ScriptBlock { Set-NtermLineFromRipgrep -Picker ProfileRipgrep }
 
 # PowerShell's tab completions: in the window's ProfileCompletions, whose
-# preview shows Get-Help, or with Shift in the session daemon's own items
-# picker, which has no preview.
+# preview shows Get-Help, or with Shift in nterm-daemon.lua's Completions,
+# whose preview is PowerShell's tooltip (nterm-daemon.example.lua has it).
 Set-PSReadLineKeyHandler -Chord 'Ctrl+@', 'Ctrl+Spacebar' -ScriptBlock { Complete-NtermLine -Picker ProfileCompletions }
-Set-PSReadLineKeyHandler -Chord Ctrl+Shift+Spacebar -ScriptBlock { Complete-NtermLine }
+Set-PSReadLineKeyHandler -Chord Ctrl+Shift+Spacebar -ScriptBlock { Complete-NtermLine -DaemonPicker Completions }
 
 # The prompt tells nterm the shell's folder (OSC 7), so pickers and new panes
 # start there, and where each command starts and ends (OSC 133). It keeps the

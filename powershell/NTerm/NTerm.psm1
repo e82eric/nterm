@@ -143,9 +143,11 @@ function Complete-NtermLine {
     Picks from PowerShell's tab completions for the command line at the cursor.
     .DESCRIPTION
     The completions are piped into the picker. By default that is the session
-    daemon's own `items`, which has no preview. A window picker is opened with
-    `commandName`, the command around the cursor, so its preview can show
-    that command's help for a completion such as -Path.
+    daemon's own `items`, which has no preview. Either kind of picker is
+    opened with `commandName`, the command around the cursor, and `cwd`, so
+    its preview can show that command's help for a completion such as -Path.
+    A daemon picker is also given PowerShell's tooltip of each completion,
+    which nterm.completions shows as its preview.
     #>
     [CmdletBinding(DefaultParameterSetName = 'Daemon')]
     param(
@@ -156,21 +158,25 @@ function Complete-NtermLine {
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
     $completions = [System.Management.Automation.CommandCompletion]::CompleteInput($line, $cursor, @{})
     if ($completions.CompletionMatches.Count -eq 0) { return }
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($line, [ref]$tokens, [ref]$parseErrors)
+    $commandAst = $ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.Extent.StartOffset -le $cursor -and $node.Extent.EndOffset -ge $cursor
+    }, $true) | Sort-Object { $_.Extent.StartOffset } -Descending | Select-Object -First 1
+    $commandName = if ($commandAst) { [string]$commandAst.GetCommandName() } else { '' }
+    $parameters = @{ commandName = $commandName }
+    # A daemon's picker is refused a cwd that is not a folder, as in HKLM:\.
+    if ($PWD.Provider.Name -eq 'FileSystem') { $parameters.cwd = $PWD.ProviderPath }
     $picked = @{ DisplayProperty = 'ListItemText'; ValueProperty = 'CompletionText' }
     $result = if ($PSCmdlet.ParameterSetName -eq 'Daemon') {
+        $parameters.label = 'Completions'
+        $parameters.position = 'cursor'
         $completions.CompletionMatches | Invoke-NtermPicker -DaemonPicker $DaemonPicker `
-            -Parameters @{ label = 'Completions'; position = 'cursor' } @picked
+            -Parameters $parameters -DescriptionProperty ToolTip @picked
     } else {
-        $tokens = $null; $parseErrors = $null
-        $ast = [System.Management.Automation.Language.Parser]::ParseInput($line, [ref]$tokens, [ref]$parseErrors)
-        $commandAst = $ast.FindAll({
-            param($node)
-            $node -is [System.Management.Automation.Language.CommandAst] -and
-                $node.Extent.StartOffset -le $cursor -and $node.Extent.EndOffset -ge $cursor
-        }, $true) | Sort-Object { $_.Extent.StartOffset } -Descending | Select-Object -First 1
-        $commandName = if ($commandAst) { [string]$commandAst.GetCommandName() } else { '' }
-        $completions.CompletionMatches | Invoke-NtermPicker -Name $Picker `
-            -Parameters @{ commandName = $commandName; cwd = $PWD.Path } @picked
+        $completions.CompletionMatches | Invoke-NtermPicker -Name $Picker -Parameters $parameters @picked
     }
     if ($null -ne $result) {
         [Microsoft.PowerShell.PSConsoleReadLine]::Replace(

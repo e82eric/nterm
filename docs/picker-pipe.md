@@ -145,7 +145,9 @@ window's own pickers of its machine's files.
 `history.powershell` lists the lines of the file `history` names, the last
 first and each once, joining lines that end in a backtick to the next:
 PSReadLine's history file. What matches stays in that order. The value returned
-is the command as it was typed, on its own lines. It has no previews.
+is the command as it was typed, on its own lines. It has no previews unless
+given one: `history.powershell { preview = history.preview() }` shows the whole
+command, coloured as PowerShell by the window, with no program run.
 
 ```powershell
 Invoke-NtermPicker -DaemonPicker History -Parameters @{
@@ -177,10 +179,26 @@ Get-Process | Invoke-NtermPicker -DaemonPicker items -DisplayProperty Name `
     -Parameters @{ label = 'Processes' }
 ```
 
+`completions.powershell()`, from `nterm.completions`, is a picker of what is
+piped in that has a preview: `Complete-NtermLine -DaemonPicker Completions`
+pipes PowerShell's completions into it, each with PowerShell's tooltip, and
+the preview shows that tooltip at once (for a parameter its type, for a
+command how it is called, for a file its whole path). `completions.powershell
+{ preview = completions.help() }` shows what `Get-Help` says instead, of the
+parameter of the command around the cursor or of the command itself. That
+starts `pwsh.exe` for each row rested on, about half a second, and may load
+the module a command is in, as running it would. The completion is given to
+PowerShell as an argument, never run as script.
+
+```lua
+local completions = require("nterm.completions")
+-- pickers = { Completions = completions.powershell(), ... }
+```
+
 `profile.example.ps1` binds `Files` and `Directories` to Ctrl+Shift+T and
 Ctrl+Shift+O (under the current directory) and to Alt+Shift+T and Alt+Shift+O
 (under the roots), `History` to Alt+Shift+R, and PowerShell's completions,
-through `items`, to Ctrl+Shift+Space.
+through `Completions`, to Ctrl+Shift+Space.
 
 ### Pickers of your own: `nterm-daemon.lua`
 
@@ -218,7 +236,7 @@ So far it runs these types, with the fields they have in `nterm.lua`:
 | --- | --- |
 | `Command` | `args`, `cwd`, `success_exit_codes`, `line_continuation`, `unique` |
 | `File` | `path`, `reverse`, `line_continuation`, `unique` |
-| `Items` | `items`, a list of `{ text, value }` |
+| `Items` | `items`, a list of `{ text, value }`; with none, the rows the program that opens it pipes in |
 | `FileSystem` | `roots`, `max_depth`, `files_only`, `directories_only`, `relative` |
 
 and of the fields every picker has: `position` (`Cursor` shows it at the
@@ -238,8 +256,10 @@ type = "Dynamic", resolve = function(item, params) ... end }`. The daemon runs
 `resolve` when a row is rested on, on its own machine, so `io.open` reads that
 machine's files and `preview.run { args = ..., cwd = ..., timeout_ms = ... }`
 and `preview.directory_items(path)` run its programs and list its folders.
-`item` has `text` and `value` (and `path`, for a `FileSystem` row); `params`
-is what the picker was opened with. It returns what a window's does: `{ type =
+`item` has `text` and `value` (and `path`, for a `FileSystem` row, and
+`description`, for a row piped in with one: `Invoke-NtermPicker
+-DescriptionProperty NAME` sends that property of each); `params` is what the
+picker was opened with. It returns what a window's does: `{ type =
 "Text", text | lines, name, extension, syntax, center_line, highlight_line }`,
 `{ type = "Ansi", bytes, center_line }`, `{ type = "Image", bytes }`, `{ type
 = "Command", args, cwd, output, center_line, success_exit_codes }` for a

@@ -116,10 +116,11 @@ pub(crate) enum Lists {
         #[serde(default)]
         enter_action: Option<String>,
     },
-    /// The rows written in the file.
+    /// The rows written in the file, or with none written, those the
+    /// program that opens it gives, as to the daemon's own `items`.
     Items {
         #[serde(default)]
-        items: Vec<Item>,
+        items: Option<Vec<Item>>,
         #[serde(default)]
         enter_action: Option<String>,
     },
@@ -521,7 +522,7 @@ fn define(lua: &Lua, value: mlua::Value) -> Result<Defined, String> {
         Lists::Command { args, .. } if args[0].starts_with('{') && args[0].ends_with('}') => {
             return Err("the program to run is not one to be given when the picker is opened".into());
         }
-        Lists::Items { items, .. } if items.len() > MOST_ITEMS => {
+        Lists::Items { items: Some(items), .. } if items.len() > MOST_ITEMS => {
             return Err(format!("it has more than {MOST_ITEMS} rows"));
         }
         Lists::FileSystem { files_only: true, directories_only: true, .. } => {
@@ -580,7 +581,7 @@ mod tests {
         let typed = configured.picker("Typed").unwrap().unwrap();
         assert!(matches!(typed.lists, Lists::File { reverse: true, unique: Some(true), .. }));
         assert_eq!(typed.presentation, Presentation::default());
-        let Lists::Items { items, .. } = configured.picker("Fixed").unwrap().unwrap().lists else { panic!() };
+        let Lists::Items { items: Some(items), .. } = configured.picker("Fixed").unwrap().unwrap().lists else { panic!() };
         assert_eq!(items[1], Item { text: "Two".into(), value: "2".into() });
         let here = configured.picker("Here").unwrap().unwrap();
         assert!(matches!(here.lists, Lists::FileSystem { max_depth: Some(3), files_only: true, relative: true, .. }));

@@ -127,6 +127,11 @@ struct Item {
     /// none.
     #[serde(default)]
     value: Option<Value>,
+    /// What a preview of the machine's file may show for it, such as
+    /// PowerShell's tooltip for a completion: its function is given it as
+    /// `item.description`.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// A picker the daemon has: what it lists.
@@ -404,7 +409,9 @@ fn configured(
             options.unique = unique.unwrap_or(false);
             Lists::File(options)
         }
-        Of::Items { items, .. } => Lists::Fixed(items),
+        Of::Items { items: Some(items), .. } => Lists::Fixed(items),
+        // None written: the program that opens it gives them.
+        Of::Items { items: None, .. } => Lists::Given,
         Of::FileSystem { roots, max_depth, files_only, directories_only, relative, .. } => {
             let mut roots: Vec<PathBuf> = match params.get("roots") {
                 Some(roots) => serde_json::from_str::<Vec<String>>(roots)
@@ -707,8 +714,8 @@ enum Source {
 struct Given {
     /// Where they are added, until the program says it has no more.
     adding: Option<PublishingStreamingItemStoreWithPayload<()>>,
-    /// By row: the program's name for it, and what it is.
-    rows: Vec<(String, Value)>,
+    /// By row: the program's name for it, what it is, and what it said of it.
+    rows: Vec<(String, Value, Option<String>)>,
 }
 impl Source {
     fn found(&self) -> Found {
@@ -735,6 +742,8 @@ struct Row {
     id: String,
     text: String,
     value: Value,
+    /// What the program that gave it said of it.
+    description: Option<String>,
 }
 
 struct Picker {
@@ -798,12 +807,12 @@ enum Wanted {
     /// A file or a folder.
     File(PathBuf),
     /// What the picker's file says shows for a row: what the row shows as,
-    /// and what it is.
-    Row { text: String, value: String },
+    /// what it is, and what the program that gave it said of it.
+    Row { text: String, value: String, description: Option<String> },
     /// A row to do what the picker's file says is done with one.
-    Act { text: String, value: String },
+    Act { text: String, value: String, description: Option<String> },
     /// A row one of the picker's own keys was pressed on, and which key.
-    Key { key: usize, text: String, value: String },
+    Key { key: usize, text: String, value: String, description: Option<String> },
 }
 
 /// Where the function is that says what shows for a row of a picker of the
@@ -1099,7 +1108,7 @@ impl Pickers {
                     let shows: String =
                         item.text.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
                     adding.add_item(shows.as_bytes(), ());
-                    rows.push((rows.len().to_string(), Value::String(item.value)));
+                    rows.push((rows.len().to_string(), Value::String(item.value), None));
                 }
                 adding.publish();
                 adding.complete();
@@ -1246,7 +1255,7 @@ impl Pickers {
                 item.text.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
             adding.add_item(shows.as_bytes(), ());
             let id = item.id.unwrap_or_else(|| rows.len().to_string());
-            rows.push((id, item.value.unwrap_or(Value::String(item.text))));
+            rows.push((id, item.value.unwrap_or(Value::String(item.text)), item.description));
         }
         adding.publish();
         if left_out > 0 {
@@ -1519,14 +1528,14 @@ impl Picker {
             (index, source.get_string_lossy(index, &mut Vec::new()), source.item(index)?)
         };
         Some(match &self.source {
-            Source::Walk { .. } => Row { id: row.to_string(), text, value: Value::String(shown) },
+            Source::Walk { .. } => Row { id: row.to_string(), text, value: Value::String(shown), description: None },
             Source::Read { whole, .. } | Source::Table { whole, .. } => {
                 let whole = whole.lock().unwrap().get(&index).cloned();
-                Row { id: row.to_string(), text, value: Value::String(whole.unwrap_or(shown)) }
+                Row { id: row.to_string(), text, value: Value::String(whole.unwrap_or(shown)), description: None }
             }
             Source::Given { given, .. } => {
-                let (id, value) = given.lock().unwrap().rows.get(index)?.clone();
-                Row { id, text, value }
+                let (id, value, description) = given.lock().unwrap().rows.get(index)?.clone();
+                Row { id, text, value, description }
             }
         })
     }
@@ -1539,12 +1548,12 @@ impl Picker {
     fn preview(&self, request: u64, serial: u64, row: u64) {
         let found = self.row(serial, row);
         let wanted = match (&self.resolves, &self.source, found) {
-            (Some(resolves), _, Some(Row { text, value, .. })) if resolves.preview => {
+            (Some(resolves), _, Some(Row { text, value, description, .. })) if resolves.preview => {
                 let value = match value {
                     Value::String(value) => value,
                     other => other.to_string(),
                 };
-                Some(Wanted::Row { text, value })
+                Some(Wanted::Row { text, value, description })
             }
             // A file or a folder.
             (_, Source::Walk { .. }, Some(Row { value: Value::String(path), .. })) => {
@@ -1608,9 +1617,9 @@ impl Picker {
                     }
                     let Some((request, wanted)) = waiting.pop_front() else { continue };
                     let previewed = match (wanted, &resolves) {
-                        (Wanted::Act { text, value }, _) => {
+                        (Wanted::Act { text, value, description }, _) => {
                             let acted = match previewer.get_or_insert_with(&make) {
-                                Ok(previewer) => previewer.act(&text, &value, None),
+                                Ok(previewer) => previewer.act(&text, &value, description.as_deref(), None),
                                 Err(error) => Err(error.clone()),
                             };
                             // What it asked for is the UI's to do, and the
@@ -1628,9 +1637,9 @@ impl Picker {
                             }
                             break;
                         }
-                        (Wanted::Key { key, text, value }, _) => {
+                        (Wanted::Key { key, text, value, description }, _) => {
                             let acted = match previewer.get_or_insert_with(&make) {
-                                Ok(previewer) => previewer.act(&text, &value, Some(key)),
+                                Ok(previewer) => previewer.act(&text, &value, description.as_deref(), Some(key)),
                                 Err(error) => Err(error.clone()),
                             };
                             // A key leaves the picker open, unless its
@@ -1654,10 +1663,10 @@ impl Picker {
                             }
                             continue;
                         }
-                        (Wanted::Row { text, value }, Some(_)) => {
+                        (Wanted::Row { text, value, description }, Some(_)) => {
                             let previewer = previewer.get_or_insert_with(&make);
                             let shows = match previewer {
-                                Ok(previewer) => previewer.resolve(request, &text, &value),
+                                Ok(previewer) => previewer.resolve(request, &text, &value, description.as_deref()),
                                 Err(error) => Some(Err(error.clone())),
                             };
                             // Stopped for another row: that one is next.
@@ -1730,14 +1739,14 @@ impl Picker {
     /// one: the file's function is run for it, on the picker's own thread,
     /// which then ends the picker. False for a row there is not.
     fn act(&self, serial: u64, row: u64) -> bool {
-        let Some(Row { text, value, .. }) = self.row(serial, row) else { return false };
+        let Some(Row { text, value, description, .. }) = self.row(serial, row) else { return false };
         let value = match value {
             Value::String(value) => value,
             other => other.to_string(),
         };
         // No preview is wanted of a picker a row was chosen of.
         self.wanted.store(u64::MAX, Ordering::Release);
-        self.ask(0, Wanted::Act { text, value });
+        self.ask(0, Wanted::Act { text, value, description });
         true
     }
 
@@ -1745,12 +1754,12 @@ impl Picker {
     /// the file has for it is run, on the picker's own thread.
     fn key(&self, serial: u64, row: u64, key: u32) {
         let has = self.resolves.as_ref().is_some_and(|resolves| (key as usize) < resolves.keys.len());
-        let Some(Row { text, value, .. }) = self.row(serial, row).filter(|_| has) else { return };
+        let Some(Row { text, value, description, .. }) = self.row(serial, row).filter(|_| has) else { return };
         let value = match value {
             Value::String(value) => value,
             other => other.to_string(),
         };
-        self.ask(0, Wanted::Key { key: key as usize, text, value });
+        self.ask(0, Wanted::Key { key: key as usize, text, value, description });
     }
 
     /// The row the UI chose, of those sent with `serial`.

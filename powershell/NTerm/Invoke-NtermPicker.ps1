@@ -34,6 +34,9 @@ function Invoke-NtermPicker {
         [Parameter(ParameterSetName='Stream')][hashtable] $Options = @{},
         [string] $DisplayProperty,
         [string] $ValueProperty,
+        # What a daemon picker's preview is given of each row piped in, as
+        # item.description: PowerShell's tooltip of a completion, say.
+        [Parameter(ParameterSetName='Daemon')][string] $DescriptionProperty,
         [switch] $PassThruResult,
         # Accepted for profiles that pass it: every request has its own connection.
         [switch] $FreshConnection,
@@ -226,7 +229,9 @@ function Invoke-NtermPicker {
                     $text = if ($DisplayProperty) { [string]$InputObject.$DisplayProperty } else { [string]$InputObject }
                     $value = if ($ValueProperty) { $InputObject.$ValueProperty } else { $text }
                     $originals[$id] = $InputObject
-                    $batch.Add(@{ id=$id; text=$text; value=$value })
+                    $row = @{ id=$id; text=$text; value=$value }
+                    if ($DescriptionProperty) { $row.description = [string]$InputObject.$DescriptionProperty }
+                    $batch.Add($row)
                     if ($batch.Count -ge 8) { $result = Flush-PickerItems; $sequence++ }
                 }
             } catch {

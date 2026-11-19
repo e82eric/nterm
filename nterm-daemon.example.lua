@@ -23,6 +23,7 @@
 -- pane. A picker may be a function of what is at the shell's cursor, a
 -- Command may have columns, and modules load: see the git pickers below.
 -- The name items is the daemon's own: what a program in the shell gives.
+local completions = require("nterm.completions")
 local files = require("nterm.files")
 local git = require("nterm.git")
 local history = require("nterm.history")
@@ -72,6 +73,10 @@ return {
     -- path as `history`: profile.example.ps1's Alt+Shift+R does. The
     -- preview is the whole command, coloured as PowerShell.
     History = history.powershell { position = "Cursor", preview = history.preview() },
+    -- PowerShell's completions, piped in: profile.example.ps1's
+    -- Ctrl+Shift+Space does. The preview is PowerShell's tooltip of each;
+    -- preview = completions.help() shows Get-Help, starting pwsh for each.
+    Completions = completions.powershell(),
     -- The files, and the folders, under the folders it is opened with as
     -- `roots`, or under the one the shell is in: profile.example.ps1's
     -- Ctrl+Shift+T and Ctrl+Shift+O do.
