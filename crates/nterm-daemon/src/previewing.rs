@@ -811,6 +811,52 @@ mod tests {
     }
 
     #[test]
+    fn a_file_or_folder_shows_as_the_files_module_says() {
+        let path = file(
+            "files",
+            r#"local files = require("nterm.files")
+            return { pickers = { P = files.all { preview = files.preview { ffprobe = "no-such-ffprobe.exe" } } } }"#,
+        );
+        let folder = path.parent().unwrap();
+        let modules = folder.join("nterm");
+        std::fs::create_dir_all(&modules).unwrap();
+        let module = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lua/nterm/files.lua");
+        std::fs::copy(module, modules.join("files.lua")).unwrap();
+        std::fs::write(folder.join("a.rs"), "\u{feff}fn main() {}\n").unwrap();
+        std::fs::write(folder.join("data.bin"), [1u8, 0, 2]).unwrap();
+        std::fs::write(folder.join("dot.PNG"), [137u8, 80, 78, 71, 0, 255]).unwrap();
+        std::fs::write(folder.join("clip.mp4"), [0u8; 4]).unwrap();
+        std::fs::create_dir(folder.join("empty")).unwrap();
+        let (previewer, wanted) = previewer(&path, "P", true);
+        let mut request = 0;
+        let mut shows = |value: &str| {
+            request += 1;
+            ask(&previewer, &wanted, request, value, value)
+        };
+        let whole = |name: &str| folder.join(name).to_string_lossy().into_owned();
+
+        // Text as it is, without the mark some editors put first, by name.
+        let Ok(Shows::Text { text, name, extension, syntax, .. }) = shows(&whole("a.rs")) else { panic!("not text") };
+        assert_eq!((text.as_str(), extension.as_deref(), syntax.as_deref()), ("fn main() {}\n", Some("rs"), Some("Auto")));
+        assert_eq!(name, Some(whole("a.rs")));
+        // A name in the folder it was opened in is that file.
+        assert!(matches!(shows("a.rs"), Ok(Shows::Text { text, .. }) if text == "fn main() {}\n"));
+        // What is not text is said to be so, with its size.
+        let Ok(Shows::Text { text, .. }) = shows(&whole("data.bin")) else { panic!("not text") };
+        assert!(text.starts_with("Binary file\n") && text.ends_with("3 bytes"), "{text}");
+        // A picture as itself, whatever the case of its name.
+        assert_eq!(shows(&whole("dot.PNG")), Ok(Shows::Image { bytes: vec![137, 80, 78, 71, 0, 255] }));
+        // A folder as what is in it.
+        let Ok(Shows::Text { text, .. }) = shows(&whole("empty")) else { panic!("not text") };
+        assert_eq!(text, "[Empty directory]");
+        let Ok(Shows::Text { text, .. }) = shows(&folder.to_string_lossy()) else { panic!("not text") };
+        assert!(text.contains("a.rs") && text.contains("empty/"), "{text}");
+        // A video needs the programs it is given: without them it says so.
+        assert!(shows(&whole("clip.mp4")).is_err());
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
     fn the_helpers_are_for_use_in_a_preview_and_a_picker_without_one_has_no_previewer() {
         let path = file(
             "helpers",

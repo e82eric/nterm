@@ -180,8 +180,11 @@ function M.lines_round(path, line, most)
   return text_of(table.concat(kept, "", first, last)), at
 end
 
--- A preview of a row: its file, at the line it was found on, in the middle.
-function M.preview()
+-- A preview of a row: its file, at the line it was found on, in the middle
+-- and marked. Options: theme (the colours of text, where the window uses
+-- it: a window drawing a daemon's picker uses its own).
+function M.preview(options)
+  local theme = (options or {}).theme
   return {
     type = "Dynamic",
     resolve = function(item, params)
@@ -195,9 +198,13 @@ function M.preview()
       end
       local text, at = M.lines_round(whole, line)
       if not text then
-        return { type = "Text", text = at, syntax = "PlainText" }
+        return { type = "Text", text = at, syntax = "PlainText", theme = theme }
       end
-      return { type = "Text", text = text, name = path:match("[^\\/]+$"), center_line = at }
+      return {
+        type = "Text", text = text, name = path:match("[^\\/]+$"),
+        syntax = "Auto", extension = path:match("%.([^./\\]+)$"), theme = theme,
+        center_line = at, highlight_line = at,
+      }
     end,
   }
 end

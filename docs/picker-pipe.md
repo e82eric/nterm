@@ -124,8 +124,9 @@ For all of them `query` is the text the picker opens with, and `position =
 "cursor"` shows it at the pane's cursor instead of in the middle of the pane.
 The window needs `picker_pipe.enabled`, and nothing in `named`.
 
-`files.files` and `files.directories` list the files, or the folders, under
-`roots`, a JSON list of whole paths, or under `cwd` without it. A row and the
+`files.files`, `files.directories` and `files.all` list the files, the
+folders, or both, under `roots`, a JSON list of whole paths, or under `cwd`
+without it. A row and the
 value returned are the whole path; `files.files { relative = true }` shows rows
 from the one folder looked under. `max_depth` is how many levels down to go.
 Each row has a preview, hidden until Ctrl+P shows it, or shown at open with
@@ -133,6 +134,13 @@ Each row has a preview, hidden until Ctrl+P shows it, or shown at open with
 its name, a picture (png, jpg, jpeg, gif, bmp, webp, tif, tiff) of up to 10 MiB
 shows as the picture, and a folder shows what is in it. The daemon reads them
 and the window lays them out. The rest of a longer file is not shown yet.
+
+`preview = files.preview()` shows more, in Lua: up to 10 MiB of text, and a
+video (mp4, mkv, mov, avi, webm, m4v, wmv) as a frame a quarter of the way in,
+made by `ffprobe.exe` and `ffmpeg.exe`, which have to be on the daemon's
+`PATH`. `files.preview { ffmpeg = ..., ffprobe = ..., video_position = ... }`
+names others. The same module and preview work in `nterm.lua`, for the
+window's own pickers of its machine's files.
 
 `history.powershell` lists the lines of the file `history` names, the last
 first and each once, joining lines that end in a backtick to the next:
