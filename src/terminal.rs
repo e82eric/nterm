@@ -947,9 +947,9 @@ impl TerminalView {
             self.show_messages(ui.ctx());
         }
         let mut right_edge = messages_left;
-        // A workspace on another machine says which, first, in a block of
-        // its own: who its daemon runs as and where, as the daemon said,
-        // or else the remote's name.
+        // A workspace on another machine says which, first in the label:
+        // who its daemon runs as and where, as the daemon said, or else the
+        // remote's name.
         let place = self.current_place();
         let elsewhere = place
             .name()
@@ -1021,34 +1021,16 @@ impl TerminalView {
                 ui.close();
             }
         });
-        // Not to be missed, as tmux's session is: the theme's green tints
-        // the block and outlines it. The name is the bar's own text colour,
-        // light on dark as the rest of it: a theme's green can be too dark
-        // to read text in, and dark text on a bright fill reads worse.
-        let mut label_left = menu.right() + 6.0;
-        if let Some(elsewhere) = elsewhere {
-            let text = painter.layout_no_wrap(elsewhere, font.clone(), palette.text);
-            let block = egui::Rect::from_min_size(
-                egui::pos2(label_left, chip_top),
-                egui::vec2(text.size().x + 16.0 * scale, chip_height),
-            );
-            painter.rect_filled(block, 4.0, palette.success.gamma_multiply(0.3));
-            painter.rect_stroke(
-                block,
-                4.0,
-                egui::Stroke::new(1.0, palette.success),
-                egui::StrokeKind::Inside,
-            );
-            painter.galley(block.center() - text.size() / 2.0, text, palette.text);
-            label_left = block.right() + 6.0;
-        }
-        let label = painter.layout_no_wrap(
-            table.clone().unwrap_or_else(|| status.label.to_owned()),
-            font.clone(),
-            chip_text,
-        );
+        // The machine comes first in the label, in its own colours: no
+        // colour of its own reads as well as the bar's text does.
+        let shown = table.clone().unwrap_or_else(|| status.label.to_owned());
+        let shown = match elsewhere {
+            Some(elsewhere) => format!("{elsewhere} \u{b7} {shown}"),
+            None => shown,
+        };
+        let label = painter.layout_no_wrap(shown, font.clone(), chip_text);
         let label_rect = egui::Rect::from_min_size(
-            egui::pos2(label_left, chip_top),
+            egui::pos2(menu.right() + 6.0, chip_top),
             egui::vec2(label.size().x + 16.0 * scale, chip_height),
         );
         painter.rect_filled(label_rect, 4.0, chip_fill);
