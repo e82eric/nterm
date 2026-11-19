@@ -1139,7 +1139,12 @@ impl ItemsSource for Snapshot {
         }
     }
     fn header(&self, query: &str) -> Option<String> {
-        delegate_snapshot!(self, header, query)
+        match self {
+            // The workspace picker's rows are under the titles of their
+            // groups, which say what they are; the columns need no names.
+            Self::Structured(rows) if rows.has_groups() => None,
+            _ => delegate_snapshot!(self, header, query),
+        }
     }
     fn display_text(&self, index: usize, query: &str) -> Option<String> {
         delegate_snapshot!(self, display_text, index, query)
@@ -1468,8 +1473,11 @@ mod grouped_rows_tests {
             output.results.iter().map(|result| (result.node_index, title(result.node_index))).collect();
         let titled = |row, title: &str| (row, Some(title.to_owned()));
         assert_eq!(found, [titled(2, "Attached"), titled(1, "Detached"), titled(0, "Remotes")]);
-        // The rows of a command palette are in no groups.
+        // The titles say what the rows are: the columns have no names over them.
+        assert_eq!(snapshot.header(""), None);
+        // The rows of a command palette are in no groups, and keep their names.
         let palette = rows(false);
         assert!(!palette.has_groups() && palette.group(0).is_none());
+        assert!(palette.header("").is_some());
     }
 }
