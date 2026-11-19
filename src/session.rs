@@ -615,6 +615,9 @@ fn daemon(place: &Place) -> Option<Arc<Daemon>> {
     }
 }
 
+/// Told, once, where the daemon kept a file sent to it, or why it did not.
+pub(crate) type Kept = Box<dyn FnOnce(Result<String, String>) + Send>;
+
 /// Something for the writer thread.
 enum Out {
     Frame(Frame),
@@ -656,6 +659,10 @@ struct Daemon {
     /// way, by the daemon's number for each.
     folders: Mutex<HashMap<u64, std::sync::Weak<Folders>>>,
     folder_searches: Mutex<HashMap<u32, std::sync::Weak<Folders>>>,
+    /// Whether the daemon said it keeps files sent to it.
+    files: bool,
+    /// Who waits to hear where a file sent was kept, by request.
+    kept: Mutex<HashMap<u32, Kept>>,
     /// The sessions the daemon holds, as it last gave them.
     sessions: Mutex<Arc<Listing>>,
     next_request: AtomicU32,
@@ -734,7 +741,7 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             ghostty: GHOSTTY_REVISION.to_owned(),
         })
         .write(&mut writer)?;
-        let Frame::Control(Control::Welcome { protocol, ghostty, .. }) = Frame::read(&mut reader)?
+        let Frame::Control(Control::Welcome { protocol, ghostty, files, .. }) = Frame::read(&mut reader)?
         else {
             return Err(other("the daemon did not answer the greeting".into()));
         };
@@ -787,6 +794,8 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             asks: Mutex::default(),
             folders: Mutex::default(),
             folder_searches: Mutex::default(),
+            files,
+            kept: Mutex::default(),
             sessions: Mutex::new(Arc::new(Listing { sessions, daemon: number, place: client.place.clone() })),
             next_request: AtomicU32::new(1),
             settings: Mutex::default(),
@@ -1411,10 +1420,21 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                     link.close_pane();
                 }
             }
+            Frame::Control(Control::FileKept { request, path }) => {
+                let kept = daemon.kept.lock().unwrap().remove(&request);
+                if let Some(kept) = kept {
+                    kept(Ok(path));
+                }
+            }
             Frame::Control(Control::Error { request, message }) => {
                 // Dropping the sender tells whoever waits for a snapshot.
                 if let Some(id) = request {
                     daemon.snapshots.lock().unwrap().remove(&id);
+                    let kept = daemon.kept.lock().unwrap().remove(&id);
+                    if let Some(kept) = kept {
+                        kept(Err(message));
+                        continue;
+                    }
                 }
                 let failed = request.and_then(|id| daemon.starting.lock().unwrap().remove(&id));
                 match failed {
@@ -1440,6 +1460,10 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
         daemon.pickers.lock().unwrap().drain().map(|(_, shown)| shown).collect();
     for shown in pickers {
         shown.ended(None);
+    }
+    let kept: Vec<Kept> = daemon.kept.lock().unwrap().drain().map(|(_, kept)| kept).collect();
+    for kept in kept {
+        kept(Err("the connection to the session daemon was lost".into()));
     }
     let asks: Vec<(u64, Arc<Link>)> = daemon.asks.lock().unwrap().drain().collect();
     for (ask, link) in asks {
@@ -1892,6 +1916,28 @@ impl Link {
         self.daemon.asks.lock().unwrap().insert(ask, self.clone());
         self.daemon.control(Control::PickerAsk { ask, pane, picker, params });
         Some(ask)
+    }
+
+    /// Send `bytes` to the daemon to keep as a file on its machine, whose
+    /// name ends `.extension`. `kept` is told where, or why not, once: on
+    /// the session thread, or here when it cannot be sent.
+    pub(crate) fn send_file(&self, extension: String, bytes: Vec<u8>, kept: Kept) {
+        if !self.daemon.files {
+            return kept(Err("the session daemon there is older than this window".into()));
+        }
+        if self.state.lock().unwrap().pane().is_none() {
+            return kept(Err("the pane's shell has not started".into()));
+        }
+        let request = self.daemon.next_request.fetch_add(1, Ordering::Relaxed);
+        self.daemon.kept.lock().unwrap().insert(request, kept);
+        self.daemon.send(Frame::File { request, extension, bytes });
+        // Gone before or as it was sent: nothing will answer.
+        if self.daemon.gone.load(Ordering::Acquire) {
+            let kept = self.daemon.kept.lock().unwrap().remove(&request);
+            if let Some(kept) = kept {
+                kept(Err("the connection to the session daemon was lost".into()));
+            }
+        }
     }
 
     /// Whether a program in the shell is talking to the pane.

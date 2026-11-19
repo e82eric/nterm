@@ -2,6 +2,7 @@
 
 mod actions;
 mod app;
+mod clipboard;
 mod colors;
 mod config;
 mod error_log;

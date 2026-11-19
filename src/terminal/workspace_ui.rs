@@ -2346,8 +2346,9 @@ impl TerminalView {
             &float_rects,
             float_focus,
         );
-        for (_, p) in &self.tiled {
+        for (_, p) in &mut self.tiled {
             p.drain_clipboard(&ctx);
+            p.answer_laters(&ctx);
         }
         self.toasts
             .show(&ctx, content, egui::Id::new("window-toasts"), None, 0.0);

@@ -318,6 +318,57 @@ action keeps other JSON fields, leaves the text selected, and shows success or
 errors as toasts. It encodes with `nterm.json_encode_pretty(value)` and writes
 with Lua's `io.open(path, "wb")`.
 
+## Pasting a picture into a shell on another machine
+
+A picture copied on this machine can be pasted into a shell that runs on
+another (a `--remote` window): it is sent there as a file, and the file's path
+is typed at the prompt. Claude Code there takes the path as an attached image.
+It needs the session daemon, and works the same in a window on this machine.
+The bundled module gives the action:
+
+```lua
+local clipboard = require("nterm.clipboard")
+return {
+  actions = {
+    PasteImage = { label = "Paste picture from clipboard", action = clipboard.paste_image() },
+  },
+}
+```
+
+It is in the command palette, and can be given a key. `clipboard.paste_image
+{ format = function(path) ... end }` changes what is typed for the path.
+
+The action is made of two methods of `app`, which a configuration can put
+together in other ways:
+
+```lua
+-- What the clipboard holds of the kinds asked for.
+app:clipboard({ "text", "image", "files" }, function(app, clip, why) end)
+
+-- Bytes kept as a file on the machine the pane's shell is on.
+app:send_file(bytes, { extension = "png" }, function(app, path, why) end)
+```
+
+- Both return at once, and call the function given on a later frame, when the
+  answer is there, with a new `app` for the same pane; not at all if the pane
+  has closed by then. That `app` can do what an action's can, but for the
+  workspace and floating pane methods.
+- `clip.text` is the text, `clip.image` a PNG file's bytes, and `clip.files`
+  the full paths of files copied in Explorer. Each is there only when it was
+  asked for and the clipboard holds it; an empty `clip` is not a failure.
+- `path` is where the file was kept, as that machine writes paths:
+  `%LOCALAPPDATA%\nterm\pasted\` there, under a name the daemon chooses. Files
+  it put there are removed a week later, when another is kept; nothing else in
+  that folder is touched. A file is up to 32 MiB, and `extension` up to 10
+  letters and digits (`bin` without one).
+- On failure the function is given `nil` and why: the clipboard could not be
+  opened, the pane's shell is not the session daemon's, the daemon there is
+  older than this window, the file is too large, or no answer came within 30
+  seconds.
+
+A file is sent in one piece, so on a slow connection what is typed after it
+waits until it has gone.
+
 ## Messages and error history
 
 Recoverable errors and fallback warnings are retained in a session history

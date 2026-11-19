@@ -11,6 +11,7 @@
 
 -- Config lookup: --lua-config=PATH, then ~/nterm.lua, then nterm.lua beside
 -- the executable. Only the first available file is loaded.
+local clipboard = require("nterm.clipboard")
 local snippets_path = os.getenv("GHOSTTY_SNIPPETS_FILE")
   or ((os.getenv("USERPROFILE") or os.getenv("HOME") or ".") .. "/ghostty-snippets.json")
 
@@ -246,6 +247,10 @@ return {
     named = { "ProfileFiles", "ProfileFilesPreview", "ProfileDirectories", "ProfileRipgrep", "ProfileHistory", "ProfileCompletions" },
   },
   actions = {
+    -- The clipboard's picture, sent to the machine the pane's shell is on
+    -- (another, in a --remote window), and its path pasted: for Claude Code
+    -- there. In the command palette; see lua/nterm/clipboard.lua.
+    PasteImage = { label = "Paste picture from clipboard", action = clipboard.paste_image() },
     SaveSnippet = {
       label = "Save selection as snippet",
       action = function(app)

@@ -355,6 +355,59 @@ mod tests {
         assert!(result.unwrap_err().contains("action has already returned"));
     }
 
+    #[test]
+    fn a_file_is_sent_with_any_bytes_and_a_safe_extension() {
+        let commands = callback("return function(app) app:send_file('a\\0b', { extension = 'TXT1' }, function() end) end")
+            .call_action(String::new())
+            .unwrap();
+        assert!(
+            matches!(&commands[..], [Command::SendFile { bytes, extension, .. }] if bytes == b"a\0b" && extension == "TXT1")
+        );
+        let commands = callback("return function(app) app:send_file('x', nil, function() end) end")
+            .call_action(String::new())
+            .unwrap();
+        assert!(matches!(&commands[..], [Command::SendFile { extension, .. }] if extension.is_empty()));
+        for extension in ["'p.ng'", "'..'", "'abcdefghijk'", "'a b'"] {
+            let source = format!("return function(app) app:send_file('x', {{ extension = {extension} }}, function() end) end");
+            assert!(callback(&source).call_action(String::new()).is_err(), "{extension}");
+        }
+        // A function is wanted to be told; and the kinds read are named.
+        assert!(callback("return function(app) app:send_file('x') end").call_action(String::new()).is_err());
+        assert!(callback("return function(app) app:clipboard({ 'html' }, function() end) end").call_action(String::new()).is_err());
+    }
+
+    #[test]
+    fn a_function_called_later_has_an_app_of_its_own() {
+        let mut commands = callback(
+            r#"return function(app)
+                 kept = app
+                 app:clipboard({ 'text', 'files' }, function(later, clip, why)
+                   later:paste(clip.text .. '|' .. table.concat(clip.files, ',') .. '|' .. tostring(clip.image) .. '|' .. tostring(why))
+                   -- The app of the action that asked has returned.
+                   assert(not pcall(kept.paste, kept, 'late'))
+                 end)
+               end"#,
+        )
+        .call_action(String::new())
+        .unwrap();
+        let Some(Command::Clipboard { kinds, then }) = commands.pop() else { panic!("no clipboard read") };
+        assert!(kinds.text && kinds.files && !kinds.image);
+        let clip = crate::clipboard::Clip {
+            text: Some("words".into()),
+            files: Some(vec![r"C:\a.txt".into(), r"C:\b c.txt".into()]),
+            image: None,
+        };
+        let later = then.clipboard(Ok(clip)).unwrap();
+        assert!(matches!(&later[..], [Command::Paste(text)] if text == r"words|C:\a.txt,C:\b c.txt|nil|nil"), "{later:?}");
+
+        // Failing, it is told why; an error in it is the caller's to show.
+        let mut commands = callback("return function(app) app:send_file('x', nil, function(app, path, why) app:paste(why); error('after') end) end")
+            .call_action(String::new())
+            .unwrap();
+        let Some(Command::SendFile { then, .. }) = commands.pop() else { panic!("not sent") };
+        assert!(then.kept(Err("refused".into())).unwrap_err().contains("after"));
+    }
+
     fn callback(source: &str) -> Callback {
         let lua = Rc::new(Lua::new());
         let key = lua
@@ -731,12 +784,113 @@ pub(crate) enum Command {
         message: String,
         duration_ms: u64,
     },
+    /// Read the clipboard for `kinds`, on a worker, and call `then`.
+    Clipboard {
+        kinds: crate::clipboard::Kinds,
+        then: Later,
+    },
+    /// Send `bytes` to the pane's daemon to keep as a file, and call `then`
+    /// with where.
+    SendFile {
+        bytes: Vec<u8>,
+        extension: String,
+        then: Later,
+    },
 }
+
+/// A function of Lua's that nterm calls once something it asked for is
+/// there, with a new `app` for the same pane: see `app:clipboard`.
+pub(crate) struct Later {
+    lua: Rc<Lua>,
+    key: RegistryKey,
+}
+impl std::fmt::Debug for Later {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Later")
+    }
+}
+impl Later {
+    /// The function `source` evaluates to, in a state of its own.
+    #[cfg(test)]
+    pub(crate) fn of(source: &str) -> Self {
+        let lua = Rc::new(Lua::new());
+        let key = lua.create_registry_value(lua.load(source).eval::<mlua::Function>().unwrap()).unwrap();
+        Self { lua, key }
+    }
+
+    /// Call it with what the clipboard held, or why it could not be read.
+    pub(crate) fn clipboard(self, clip: Result<crate::clipboard::Clip, String>) -> Result<Vec<Command>, String> {
+        self.call(|lua| match clip {
+            Ok(clip) => {
+                let table = lua.create_table()?;
+                table.set("text", clip.text)?;
+                if let Some(image) = clip.image {
+                    table.set("image", lua.create_string(&image)?)?;
+                }
+                table.set("files", clip.files)?;
+                Ok((mlua::Value::Table(table), mlua::Value::Nil))
+            }
+            Err(why) => Ok((mlua::Value::Nil, mlua::Value::String(lua.create_string(&why)?))),
+        })
+    }
+
+    /// Call it with where a file was kept, or why it was not.
+    pub(crate) fn kept(self, path: Result<String, String>) -> Result<Vec<Command>, String> {
+        self.call(|lua| {
+            Ok(match path {
+                Ok(path) => (mlua::Value::String(lua.create_string(&path)?), mlua::Value::Nil),
+                Err(why) => (mlua::Value::Nil, mlua::Value::String(lua.create_string(&why)?)),
+            })
+        })
+    }
+
+    fn call(
+        self,
+        args: impl for<'lua> FnOnce(&'lua Lua) -> mlua::Result<(mlua::Value<'lua>, mlua::Value<'lua>)>,
+    ) -> Result<Vec<Command>, String> {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let active = Rc::new(Cell::new(true));
+        let result = (|| -> mlua::Result<()> {
+            let function: mlua::Function = self.lua.registry_value(&self.key)?;
+            let (first, second) = args(&self.lua)?;
+            let app = App {
+                commands: commands.clone(),
+                active: active.clone(),
+                generation: None,
+                selection: String::new(),
+                lua: Rc::downgrade(&self.lua),
+            };
+            function.call((app, first, second))
+        })();
+        active.set(false);
+        let _ = self.lua.remove_registry_value(self.key);
+        result.map_err(|error| error.to_string())?;
+        Ok(commands.take())
+    }
+}
+
+/// What `app:send_file` may end a name with, as the daemon checks too:
+/// nothing (the daemon's own), or 1 to 10 ASCII letters and digits.
+fn valid_extension(extension: &str) -> bool {
+    extension.len() <= 10 && extension.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 struct App {
     commands: Rc<RefCell<Vec<Command>>>,
     active: Rc<Cell<bool>>,
     generation: Option<u64>,
     selection: String,
+    /// The state the function runs in, for a function it gives to be called
+    /// later. Not held: the `App` is in that state.
+    lua: std::rc::Weak<Lua>,
+}
+impl App {
+    /// `function`, kept to be called later.
+    fn later(&self, function: mlua::Function) -> mlua::Result<Later> {
+        let lua = self.lua.upgrade().ok_or_else(|| mlua::Error::external("the configuration is gone"))?;
+        let key = lua.create_registry_value(function)?;
+        Ok(Later { lua, key })
+    }
 }
 impl UserData for App {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
@@ -900,6 +1054,27 @@ impl UserData for App {
         methods.add_method("paste", |_, app, text: String| {
             app.push(Command::Paste(text))
         });
+        methods.add_method("clipboard", |_, app, (kinds, then): (Vec<String>, mlua::Function)| {
+            let kinds = crate::clipboard::Kinds::of(&kinds).map_err(mlua::Error::external)?;
+            let then = app.later(then)?;
+            app.push(Command::Clipboard { kinds, then })
+        });
+        methods.add_method(
+            "send_file",
+            |_, app, (bytes, options, then): (mlua::String, Option<Table>, mlua::Function)| {
+                let extension = match &options {
+                    Some(options) => options.get::<_, Option<String>>("extension")?.unwrap_or_default(),
+                    None => String::new(),
+                };
+                if !valid_extension(&extension) {
+                    return Err(mlua::Error::external(format!(
+                        "send_file: {extension:?} cannot end a file's name: up to 10 letters and digits"
+                    )));
+                }
+                let then = app.later(then)?;
+                app.push(Command::SendFile { bytes: bytes.as_bytes().to_vec(), extension, then })
+            },
+        );
         methods.add_method("close_picker", |_, app, ()| app.push(Command::ClosePicker));
         methods.add_method("replace_picker", |_, app, (name, params): (String, Option<std::collections::BTreeMap<String, String>>)| {
             let params = params.unwrap_or_default();
@@ -1061,6 +1236,7 @@ impl Callback {
                 active: active.clone(),
                 generation: None,
                 selection,
+                lua: Rc::downgrade(&self.lua),
             })
         })();
         active.set(false);
@@ -1129,6 +1305,7 @@ impl Callback {
                     active: active.clone(),
                     generation: if filesystem { None } else { generation },
                     selection,
+                    lua: Rc::downgrade(&self.lua),
                 },
                 item,
                 lua_params,

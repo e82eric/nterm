@@ -1,11 +1,17 @@
 # Pasting a picture into a shell on another machine
 
-Status: plan, nothing built. Written 2026-11-18 for whoever implements it;
-the owner's answers to its questions are in "Decided with the owner".
-Line numbers are as of commit `805f204` and have already drifted (the
-folders work landed after it, and protocol is now 16); the function names are
-what to search for. That work was still going on in this checkout when this
-was written: start from a clean tree, after it is committed.
+Status: built 2026-11-18, as below, and run for real (see "What phase 0
+found"). The two open questions were built to their recommendations. Kept as
+the record of the design; `docs/configuration.md` is the user's account.
+
+## What phase 0 found (2026-11-18)
+
+In a `--remote` window over `ssh vm-self`, with Claude Code 2.1.328 in the
+pane, the bare path pasted (a bracketed paste, nothing after it) became
+`[Image #1]` in Claude's prompt, and Claude read the picture: asked the colour
+of a marker drawn on it, it said magenta. So `clipboard.claude_path` gives the
+path as it is. A path with a space in it was not tried: the folder is under
+the user's profile, which had none here.
 
 ## Goal
 

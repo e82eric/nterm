@@ -121,7 +121,10 @@ restarting.
 - **[Actions](docs/configuration.md#actions-and-toasts)** are Lua functions
   that receive an `app` handle. Through it they can read the selection, paste or
   send text to the shell, show a toast, and create, move, or close panes,
-  floats, and workspaces.
+  floats, and workspaces. They can also read the clipboard and send a file to
+  the machine the shell is on: the bundled
+  [picture paste](docs/configuration.md#pasting-a-picture-into-a-shell-on-another-machine)
+  puts a copied screenshot in front of Claude Code over `ssh`.
 - **[Key bindings](docs/configuration.md#key-bindings)** map a key to an action
   or a picker. Every action and picker also appears in the
   [command palette](docs/pickers.md#command-palette) (Ctrl+Shift+P), with

@@ -1524,7 +1524,9 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 name = "nterm"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "cc",
+ "clipboard-win",
  "crossbeam-channel",
  "csv",
  "egui",
@@ -1542,6 +1544,7 @@ dependencies = [
  "nfm_file_system",
  "nfm_search_core",
  "nterm-session",
+ "png",
  "pollster",
  "regex",
  "serde",

@@ -4192,6 +4192,61 @@ mod tests {
     }
 
     #[test]
+    fn bundled_clipboard_module_sends_the_picture_and_pastes_its_path() {
+        use crate::lua_callbacks::Command;
+        let bindings = compile(
+            parse(
+                r#"
+                local clipboard = require('nterm.clipboard')
+                return { actions = {
+                  Paste = { label = 'Paste picture', action = clipboard.paste_image() },
+                  Quoted = { label = 'Quoted', action = clipboard.paste_image {
+                    format = function(path) return '"' .. path .. '"' end } },
+                } }
+                "#,
+            )
+            .unwrap(),
+        );
+        let run = |name: &str| bindings.lua_action(name).unwrap().callback.call_action(String::new()).unwrap();
+        let one = |mut commands: Vec<Command>| {
+            assert_eq!(commands.len(), 1, "{commands:?}");
+            commands.remove(0)
+        };
+        let clipboard = |name: &str| {
+            let Command::Clipboard { kinds, then } = one(run(name)) else { panic!("no clipboard read") };
+            assert_eq!(kinds, crate::clipboard::Kinds { image: true, ..Default::default() });
+            then
+        };
+        let picture = || crate::clipboard::Clip { image: Some(vec![0x89, b'P', 0, 7]), ..Default::default() };
+
+        // The picture is sent as it is, and the path the daemon gives pasted.
+        let Command::SendFile { bytes, extension, then } = one(clipboard("Paste").clipboard(Ok(picture())).unwrap())
+        else {
+            panic!("not sent")
+        };
+        assert_eq!((bytes, extension.as_str()), (vec![0x89, b'P', 0, 7], "png"));
+        let pasted = one(then.kept(Ok(r"C:\kept\pasted-1-2-3.png".into())).unwrap());
+        assert!(matches!(&pasted, Command::Paste(text) if text == r"C:\kept\pasted-1-2-3.png"), "{pasted:?}");
+
+        // What is pasted is the format's.
+        let Command::SendFile { then, .. } = one(clipboard("Quoted").clipboard(Ok(picture())).unwrap()) else {
+            panic!("not sent")
+        };
+        assert!(matches!(one(then.kept(Ok("p".into())).unwrap()), Command::Paste(text) if text == "\"p\""));
+
+        // No picture, a clipboard that cannot be read, a file not kept: said.
+        let said = |command: Command, wanted: &str| {
+            assert!(matches!(&command, Command::ShowToast { message, .. } if message.contains(wanted)), "{command:?}");
+        };
+        said(one(clipboard("Paste").clipboard(Ok(Default::default())).unwrap()), "no picture");
+        said(one(clipboard("Paste").clipboard(Err("held".into())).unwrap()), "held");
+        let Command::SendFile { then, .. } = one(clipboard("Paste").clipboard(Ok(picture())).unwrap()) else {
+            panic!("not sent")
+        };
+        said(one(then.kept(Err("older".into())).unwrap()), "older");
+    }
+
+    #[test]
     fn bundled_git_module_quotes_and_parses_and_builds_pickers() {
         let config = parse(
             r#"

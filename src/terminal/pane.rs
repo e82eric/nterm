@@ -356,6 +356,8 @@ pub(super) struct TerminalPane {
     /// the action shows a page or another picker, and a key's action or an
     /// argument's text does not.
     pub(super) pending_callback: Option<PendingCallback>,
+    /// What its Lua functions asked for that answers later.
+    later: super::later::Laters,
     /// A picker this pane asked the session daemon for, until the daemon
     /// says it is open or will not be.
     asked: Option<Asked>,
@@ -469,6 +471,7 @@ impl TerminalPane {
             decorated_viewport: std::cell::Cell::new(None),
             prompt_patterns: Default::default(),
             pending_callback: None,
+            later: Default::default(),
             asked: None,
         }
     }
@@ -1585,6 +1588,15 @@ impl TerminalPane {
         text
     }
 
+    /// Call the Lua functions whose answers have come, or have waited too
+    /// long. Each frame.
+    pub(super) fn answer_laters(&mut self, ctx: &egui::Context) {
+        for (then, answer) in self.later.answered() {
+            let result = answer.call(then);
+            self.finish_lua_action(result, ctx);
+        }
+    }
+
     pub(super) fn finish_lua_action(
         &mut self,
         result: Result<Vec<crate::lua_callbacks::Command>, String>,
@@ -1593,7 +1605,12 @@ impl TerminalPane {
         match result {
             Ok(commands) => {
                 for command in commands {
+                    let Some(command) = self.later.ask(command, self.session.as_ref(), ctx) else {
+                        continue;
+                    };
                     match command {
+                        crate::lua_callbacks::Command::Clipboard { .. }
+                        | crate::lua_callbacks::Command::SendFile { .. } => {}
                         crate::lua_callbacks::Command::ShowToast {
                             title,
                             message,
@@ -2123,7 +2140,12 @@ impl TerminalPane {
                 let mut navigated = false;
                 let mut sent = false;
                 for command in commands {
+                    let Some(command) = self.later.ask(command, self.session.as_ref(), ctx) else {
+                        continue;
+                    };
                     match command {
+                        crate::lua_callbacks::Command::Clipboard { .. }
+                        | crate::lua_callbacks::Command::SendFile { .. } => {}
                         crate::lua_callbacks::Command::ReplacePicker { name, params } => {
                             if let Some(entry) = bindings.named(&name) {
                                 let opened = self.open_picker_impl(
