@@ -325,10 +325,14 @@ fn spawn_type_resize_disconnect_reconnect_snapshot() {
 fn lifecycle(session: &str) {
     let session = session.to_owned();
     let mut ui = Ui::connect(&session);
-    let Control::Welcome { protocol, ghostty, pid, session: named, files } = ui.welcome.clone() else {
+    let Control::Welcome { protocol, ghostty, pid, session: named, files, machine, user } = ui.welcome.clone()
+    else {
         panic!("no welcome");
     };
     assert!(files, "the daemon says it keeps files");
+    // And where it is: this machine, as this user, here or through a relay.
+    assert_eq!(machine, std::env::var("COMPUTERNAME").unwrap());
+    assert_eq!(user, std::env::var("USERNAME").unwrap());
     assert_eq!((protocol, ghostty.as_str(), named.as_str()), (PROTOCOL_VERSION, GHOSTTY_REVISION, session.as_str()));
     // Through a relay the peer is the relay, which is not the daemon.
     assert_eq!(pid == ui.connection.peer_pid(), !ui.connection.relayed());

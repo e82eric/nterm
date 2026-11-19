@@ -288,6 +288,13 @@ pub enum Control {
         /// A daemon from before it could leaves this out.
         #[serde(default)]
         files: bool,
+        /// The machine the daemon runs on, and the user it runs as, for a
+        /// window to say where its shells are. Nothing is checked with
+        /// them. A daemon from before them leaves them out: empty.
+        #[serde(default)]
+        machine: String,
+        #[serde(default)]
+        user: String,
     },
     Spawned { request: u32, info: PaneInfo },
     /// The attach asked for by `request` was done. `info.attached` is true:
@@ -700,7 +707,11 @@ mod tests {
         let welcome = br#"{"type":"welcome","protocol":16,"ghostty":"g","pid":1,"session":"s"}"#;
         let mut body = vec![KIND_CONTROL];
         body.extend_from_slice(welcome);
-        assert!(matches!(Frame::decode(&body).unwrap(), Frame::Control(Control::Welcome { files: false, .. })));
+        let Frame::Control(Control::Welcome { files, machine, user, .. }) = Frame::decode(&body).unwrap() else {
+            panic!("not a welcome");
+        };
+        // Nor does it say where it is.
+        assert!(!files && machine.is_empty() && user.is_empty());
     }
 
     #[test]

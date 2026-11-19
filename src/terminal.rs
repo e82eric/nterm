@@ -946,21 +946,17 @@ impl TerminalView {
             self.show_messages(ui.ctx());
         }
         let mut right_edge = messages_left;
-        // A workspace on another machine says which, where one of this
-        // machine only says what it runs.
-        let elsewhere = self
-            .current_place()
+        // A workspace on another machine says which, first, in a block of
+        // its own: who its daemon runs as and where, as the daemon said,
+        // or else the remote's name.
+        let place = self.current_place();
+        let elsewhere = place
             .name()
-            .map(|name| format!("{} \u{b7} {}", self.command_label, name.to_uppercase()));
+            .map(|name| crate::session::who_at(&place).unwrap_or_else(|| name.to_owned()));
         let mut status = match self.active_pane_opt() {
             Some(pane) => pane.status(&self.command_label),
             None => self.empty_status(),
         };
-        if let Some(elsewhere) = &elsewhere
-            && std::ptr::eq(status.label, self.command_label.as_str())
-        {
-            status.label = elsewhere;
-        }
         if let Some(picker) = &self.window_picker {
             status.label = picker.label();
         }
@@ -1023,13 +1019,25 @@ impl TerminalView {
                 ui.close();
             }
         });
+        // Bright, as tmux's session is: it is not to be missed.
+        let mut label_left = menu.right() + 6.0;
+        if let Some(elsewhere) = elsewhere {
+            let text = painter.layout_no_wrap(elsewhere, font.clone(), palette.background);
+            let block = egui::Rect::from_min_size(
+                egui::pos2(label_left, chip_top),
+                egui::vec2(text.size().x + 16.0, chip_height),
+            );
+            painter.rect_filled(block, 4.0, palette.success);
+            painter.galley(block.center() - text.size() / 2.0, text, palette.background);
+            label_left = block.right() + 6.0;
+        }
         let label = painter.layout_no_wrap(
             table.clone().unwrap_or_else(|| status.label.to_owned()),
             font.clone(),
             chip_text,
         );
         let label_rect = egui::Rect::from_min_size(
-            egui::pos2(menu.right() + 6.0, chip_top),
+            egui::pos2(label_left, chip_top),
             egui::vec2(label.size().x + 16.0, chip_height),
         );
         painter.rect_filled(label_rect, 4.0, chip_fill);

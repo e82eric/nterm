@@ -609,6 +609,21 @@ pub(crate) fn flush() {
     }
 }
 
+/// Who the daemon of `place` runs as and where, as `user@MACHINE`, while
+/// the window is connected to it and if the daemon said.
+pub(crate) fn who_at(place: &Place) -> Option<String> {
+    daemon(place)?.who.clone()
+}
+
+/// `user@machine`, or what there is of it; nothing when there is neither.
+fn who(user: &str, machine: &str) -> Option<String> {
+    match (user.is_empty(), machine.is_empty()) {
+        (true, true) => None,
+        (false, false) => Some(format!("{user}@{machine}")),
+        _ => Some(format!("{user}{machine}")),
+    }
+}
+
 /// The connection to `place`, while there is one.
 fn daemon(place: &Place) -> Option<Arc<Daemon>> {
     if !enabled(place) {
@@ -639,6 +654,8 @@ struct Daemon {
     client: Arc<Client>,
     /// The other machine the daemon is on, if it is on one.
     remote: Option<Remote>,
+    /// Who the daemon runs as, and where, as `user@MACHINE`, if it said.
+    who: Option<String>,
     connection: Connection,
     /// The writer thread's queue; `None` once the connection is gone.
     outbox: Mutex<Option<mpsc::Sender<Out>>>,
@@ -746,7 +763,8 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             ghostty: GHOSTTY_REVISION.to_owned(),
         })
         .write(&mut writer)?;
-        let Frame::Control(Control::Welcome { protocol, ghostty, files, .. }) = Frame::read(&mut reader)?
+        let Frame::Control(Control::Welcome { protocol, ghostty, files, machine, user, .. }) =
+            Frame::read(&mut reader)?
         else {
             return Err(other("the daemon did not answer the greeting".into()));
         };
@@ -800,6 +818,7 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             folders: Mutex::default(),
             folder_searches: Mutex::default(),
             files,
+            who: who(&user, &machine),
             kept: Mutex::default(),
             sessions: Mutex::new(Arc::new(Listing { sessions, daemon: number, place: client.place.clone() })),
             next_request: AtomicU32::new(1),
@@ -2189,6 +2208,15 @@ mod tests {
             args(&remote).last().unwrap(),
             r#""C:\Program Files\nterm\nterm-daemon.exe" --relay --session work"#
         );
+    }
+
+    #[test]
+    fn a_daemon_is_said_to_be_its_user_at_its_machine_or_what_it_said_of_them() {
+        assert_eq!(who("ClaudeCode", "WIN11DEV").as_deref(), Some("ClaudeCode@WIN11DEV"));
+        assert_eq!(who("", "WIN11DEV").as_deref(), Some("WIN11DEV"));
+        assert_eq!(who("ClaudeCode", "").as_deref(), Some("ClaudeCode"));
+        // A daemon from before it said: the remote's name is used instead.
+        assert_eq!(who("", ""), None);
     }
 
     #[test]

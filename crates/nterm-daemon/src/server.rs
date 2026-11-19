@@ -553,6 +553,12 @@ fn serve(session: &Arc<Session>, connection: Connection) {
     connection.close();
 }
 
+/// The first of two variables the environment has: Windows's name, then
+/// another system's. Empty when it has neither.
+fn either(name: &str, other: &str) -> String {
+    std::env::var(name).or_else(|_| std::env::var(other)).unwrap_or_default()
+}
+
 fn converse(
     session: &Arc<Session>,
     connection: &Connection,
@@ -589,6 +595,8 @@ fn converse(
         pid: std::process::id(),
         session: session.name.clone(),
         files: true,
+        machine: either("COMPUTERNAME", "HOSTNAME"),
+        user: either("USERNAME", "USER"),
     });
     if protocol != PROTOCOL_VERSION {
         fail(None, format!("protocol {protocol} is not supported; this daemon speaks {PROTOCOL_VERSION}"));
