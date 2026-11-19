@@ -356,25 +356,13 @@ impl TerminalView {
     }
 
     /// `spawn` for a new shell, which starts where the active pane's shell
-    /// is unless it names a directory. Ghostty hands a new terminal the
-    /// focused one's directory itself, but only once it has seen the shell
-    /// report it: a pane taken from the session daemon has not until its
-    /// next prompt, and the daemon would start the shell in its own
-    /// directory.
-    fn beside_active(&self, mut spawn: pane::SpawnOptions) -> pane::SpawnOptions {
-        // Only on this machine, and from a pane of it: another machine's
-        // directory is not one of this one's.
-        let here = crate::session::Place::Here;
-        let local = self.current_place() == here && spawn.place.as_ref().is_none_or(|p| *p == here);
-        if spawn.cwd.is_none() && local {
-            let active = self
-                .visible_float_pane()
-                .or_else(|| self.focused_id().and_then(|id| self.tiled_ref(id)));
-            spawn.cwd = active
-                .and_then(|pane| pane.pwd())
-                .filter(|pwd| std::path::Path::new(pwd).is_dir());
-        }
-        spawn
+    /// is unless it names a directory: see `pane::beside`.
+    fn beside_active(&self, spawn: pane::SpawnOptions) -> pane::SpawnOptions {
+        let place = spawn.place.clone().unwrap_or_else(|| self.current_place());
+        let active = self
+            .visible_float_pane()
+            .or_else(|| self.focused_id().and_then(|id| self.tiled_ref(id)));
+        pane::beside(active, spawn, &place)
     }
 
     /// Requests made since the last call, in order, for the app to carry out.

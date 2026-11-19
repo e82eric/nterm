@@ -239,6 +239,49 @@ pub(crate) struct SpawnOptions {
     /// On a remote, the folder there the shell starts in, as that remote's
     /// daemon listed it. Without it, the remote's `directory`.
     pub there: Option<String>,
+    /// The daemon's pane, where the shell runs, whose folder the shell
+    /// starts in: that daemon knows where that pane's shell is. Without
+    /// it, or where that shell has reported no folder there, `cwd`.
+    pub beside: Option<nterm_session::protocol::PaneId>,
+}
+
+/// `spawn` for a shell where `place` is, beside `pane`: started in the
+/// folder `pane`'s shell is in, unless `spawn` names one. A shell in a daemon
+/// is started by its pane's number, and that daemon looks the folder up: a
+/// window names no folder for a shell on another machine, and has not seen
+/// one a shell it has just taken over reports until it next does. A shell of
+/// the window's own starts in what it last reported, on this machine.
+pub(super) fn beside(
+    pane: Option<&TerminalPane>,
+    mut spawn: SpawnOptions,
+    place: &crate::session::Place,
+) -> SpawnOptions {
+    let Some(pane) = pane else { return spawn };
+    let daemon = pane.session_pane().map(|id| (id, pane.place()));
+    start_beside(spawn, place, daemon, || pane.pwd())
+}
+
+/// `beside`, for a pane that is `daemon`'s pane and place if it is in one,
+/// and whose shell last reported `pwd`.
+fn start_beside(
+    mut spawn: SpawnOptions,
+    place: &crate::session::Place,
+    daemon: Option<(nterm_session::protocol::PaneId, crate::session::Place)>,
+    pwd: impl FnOnce() -> Option<String>,
+) -> SpawnOptions {
+    if spawn.cwd.is_some() || spawn.there.is_some() {
+        return spawn;
+    }
+    match daemon {
+        Some((id, of)) if of == *place => spawn.beside = Some(id),
+        // Another daemon's pane is not one of this one's.
+        Some(_) => {}
+        None if *place == crate::session::Place::Here => {
+            spawn.cwd = pwd().filter(|pwd| std::path::Path::new(pwd).is_dir());
+        }
+        None => {}
+    }
+    spawn
 }
 impl SpawnOptions {
     pub fn validate(&self) -> Result<(), String> {
@@ -834,7 +877,7 @@ impl TerminalPane {
         let cwd = text(&options.cwd, "pane directory")?;
         let userdata: *mut c_void = (&mut *wake as *mut WakeState).cast();
         let place = options.place.clone().unwrap_or_else(crate::session::home);
-        let session = crate::session::Link::prepare(userdata, &options.start, &place, options.there.clone())
+        let session = crate::session::Link::prepare(userdata, &options.start, &place, options.there.clone(), options.beside)
             .map_err(|e| FatalError::new("show a running shell", e))?;
         // A shell of the pane's own is reached by a pipe of the pane's own.
         #[cfg(unix)]
@@ -4240,5 +4283,39 @@ fn begin_snapshot(
         Some(Ok(None)) | None => unsafe {
             ghostty_ffi::nterm_host_snapshot_begin(host, generation)
         },
+    }
+}
+#[cfg(test)]
+mod beside_tests {
+    use super::{SpawnOptions, start_beside};
+    use crate::session::Place;
+
+    #[test]
+    fn a_shell_beside_a_pane_starts_where_that_pane_s_daemon_says_or_where_it_reported() {
+        let vm = Place::Remote("vm".into());
+        let here = Place::Here;
+        let folder = std::env::temp_dir().to_string_lossy().into_owned();
+        let reported = || Some(folder.clone());
+        let start = |place: &Place, daemon: Option<(u32, Place)>| {
+            let spawn = start_beside(SpawnOptions::default(), place, daemon, reported);
+            (spawn.beside, spawn.cwd)
+        };
+        // In a daemon, by the pane's number, on either machine: no folder is
+        // named, and the daemon looks it up.
+        assert_eq!(start(&vm, Some((12, vm.clone()))), (Some(12), None));
+        assert_eq!(start(&here, Some((3, here.clone()))), (Some(3), None));
+        // Another daemon's pane is no pane of this one.
+        assert_eq!(start(&vm, Some((3, here.clone()))), (None, None));
+        // A shell of the window's own: what it reported, on this machine only.
+        assert_eq!(start(&here, None), (None, Some(folder.clone())));
+        assert_eq!(start(&vm, None), (None, None));
+        let gone = start_beside(SpawnOptions::default(), &here, None, || Some(r"C:\no-such-nterm".into()));
+        assert_eq!(gone.cwd, None);
+        // A folder named, or one of a remote's, is kept.
+        let named = SpawnOptions { cwd: Some(r"C:\src".into()), ..Default::default() };
+        let named = start_beside(named, &here, Some((3, here.clone())), reported);
+        assert_eq!((named.beside, named.cwd.as_deref()), (None, Some(r"C:\src")));
+        let listed = SpawnOptions { there: Some(r"C:\work".into()), ..Default::default() };
+        assert_eq!(start_beside(listed, &vm, Some((12, vm.clone())), reported).beside, None);
     }
 }

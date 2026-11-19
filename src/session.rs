@@ -1590,6 +1590,8 @@ pub(crate) struct Link {
     /// On a remote, the folder there a shell it starts starts in, as that
     /// remote's daemon listed it.
     there: Option<String>,
+    /// The daemon's pane in whose folder a shell it starts starts.
+    beside: Option<PaneId>,
 }
 
 impl Link {
@@ -1615,12 +1617,14 @@ impl Link {
     /// in its place would not outlive the window, and nothing would say so.
     ///
     /// `place` is where the shell is to run, and on a remote `there` is the
-    /// folder there it starts in: see `SpawnSpec`.
+    /// folder there it starts in: see `SpawnSpec`. `beside` is the daemon's
+    /// pane whose folder a shell it starts starts in, if it knows one.
     pub(crate) fn prepare(
         wake: *mut c_void,
         start: &Start,
         place: &Place,
         there: Option<String>,
+        beside: Option<PaneId>,
     ) -> Result<Option<Arc<Link>>, String> {
         let daemon = daemon(place);
         let want = match (start, &daemon) {
@@ -1664,6 +1668,7 @@ impl Link {
                 queued_input: Vec::new(),
             }),
             there,
+            beside,
         });
         Ok(Some(link))
     }
@@ -1736,6 +1741,7 @@ impl Link {
                     request,
                     command: spec.command,
                     cwd: spec.cwd,
+                    beside: self.beside,
                     env: spec.env,
                     size,
                 });
@@ -2055,34 +2061,7 @@ extern "C" fn on_resize(userdata: *mut c_void, cols: u16, rows: u16, width: u32,
     });
 }
 
-/// The path in the URL a shell reports its directory as, such as
-/// `file://host/C:/my%20src`, with what the URL escaped put back. Text that
-/// is not a URL is taken as the path.
-pub(crate) fn url_path(pwd: &str) -> String {
-    let path = match pwd.split_once("://") {
-        Some((_, rest)) => rest.find('/').map_or("", |at| &rest[at..]),
-        None => return pwd.to_owned(),
-    };
-    let mut bytes = Vec::with_capacity(path.len());
-    let mut rest = path.as_bytes();
-    while let [first, after @ ..] = rest {
-        let escaped = (*first == b'%')
-            .then(|| after.get(..2))
-            .flatten()
-            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
-        match escaped {
-            Some(byte) => {
-                bytes.push(byte);
-                rest = &after[2..];
-            }
-            None => {
-                bytes.push(*first);
-                rest = after;
-            }
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
+pub(crate) use nterm_session::url_path;
 
 extern "C" fn on_spawn(userdata: *mut c_void, spawn: *const HostSpawn) {
     crate::native_error::ffi_boundary("describe a shell for the session daemon", || {
@@ -2280,6 +2259,7 @@ mod tests {
             request: 9,
             command: "cmd.exe /d /q /k".into(),
             cwd: None,
+            beside: None,
             env: vec![],
             size: Size { cols: 80, rows: 24, cell_width: 9, cell_height: 18 },
         });

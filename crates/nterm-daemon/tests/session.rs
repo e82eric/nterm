@@ -279,6 +279,7 @@ impl Ui {
             request: 1,
             command: command.into(),
             cwd: None,
+            beside: None,
             env: vec![],
             size,
         });
@@ -545,6 +546,7 @@ fn errors_are_reported_and_the_daemon_carries_on() {
         request: 9,
         command: "no-such-program-nterm.exe".into(),
         cwd: None,
+        beside: None,
         env: vec![],
         size: size(80, 24),
     });
@@ -559,6 +561,7 @@ fn errors_are_reported_and_the_daemon_carries_on() {
         request: 11,
         command: "cmd.exe /d /q /c echo %NTERM_TEST_VALUE% in %CD%".into(),
         cwd: Some(r"C:\Windows".into()),
+        beside: None,
         env: vec![
             ("NTERM_TEST_VALUE".into(), "from-the-ui".into()),
             ("SystemRoot".into(), std::env::var("SystemRoot").unwrap()),
@@ -572,6 +575,63 @@ fn errors_are_reported_and_the_daemon_carries_on() {
     ui.control(|c| matches!(c, Control::Exited { .. }));
     let text = ui.snapshot(info.pane).text();
     assert!(text.contains(r"from-the-ui in C:\Windows"), "{text}");
+    ui.shutdown();
+}
+
+#[test]
+fn a_shell_started_beside_a_pane_starts_in_the_folder_that_pane_reported() {
+    let session = session("beside");
+    let mut ui = Ui::connect(&session);
+    let env = || {
+        ["SystemRoot", "PATH"].map(|name| (name.to_owned(), std::env::var(name).unwrap())).to_vec()
+    };
+    // A shell whose prompt reports a folder, as a profile's would.
+    let reporting = |ui: &mut Ui, request, folder: &str| {
+        ui.send(Control::Spawn {
+            request,
+            command: format!("cmd.exe /d /q /k prompt $E]7;file://localhost/{folder}$E\\$G"),
+            cwd: None,
+            beside: None,
+            env: env(),
+            size: size(80, 24),
+        });
+        let Control::Spawned { info, .. } = ui.control(|c| matches!(c, Control::Spawned { .. })) else {
+            unreachable!()
+        };
+        info.pane
+    };
+    let there = reporting(&mut ui, 1, "C:/Windows/System32");
+    let gone = reporting(&mut ui, 2, "C:/no-such-folder-nterm");
+    let deadline = Instant::now() + WAIT;
+    while !ui.panes().iter().filter(|p| p.pane == there || p.pane == gone).all(|p| p.pwd.is_some()) {
+        assert!(Instant::now() < deadline, "the shells never reported their folders");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Beside a pane, in its folder; beside one whose folder is not here, or
+    // one there is not, in the folder named.
+    for (request, beside, wanted) in [
+        (3, there, r"in C:\Windows\System32"),
+        (4, gone, r"in C:\Windows"),
+        (5, 999, r"in C:\Windows"),
+    ] {
+        ui.send(Control::Spawn {
+            request,
+            command: "cmd.exe /d /q /c echo in %CD%".into(),
+            cwd: Some(r"C:\Windows".into()),
+            beside: Some(beside),
+            env: env(),
+            size: size(80, 24),
+        });
+        let Control::Spawned { info, .. } =
+            ui.control(|c| matches!(c, Control::Spawned { request: r, .. } if *r == request))
+        else {
+            unreachable!()
+        };
+        ui.control(|c| matches!(c, Control::Exited { pane, .. } if *pane == info.pane));
+        let text = ui.snapshot(info.pane).text();
+        let line = text.lines().find(|line| line.starts_with("in ")).unwrap_or_default().trim_end();
+        assert!(line.eq_ignore_ascii_case(wanted), "beside {beside}: {text}");
+    }
     ui.shutdown();
 }
 

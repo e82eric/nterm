@@ -173,6 +173,11 @@ pub enum Control {
         command: String,
         #[serde(default)]
         cwd: Option<String>,
+        /// A pane of the daemon's. The shell starts in the folder that pane's
+        /// shell last reported, if there is one there; otherwise in `cwd`.
+        /// A daemon from before it takes no notice of it.
+        #[serde(default)]
+        beside: Option<PaneId>,
         /// The complete environment of the new shell.
         env: Vec<(String, String)>,
         size: Size,
@@ -648,11 +653,22 @@ mod tests {
                 request: 1,
                 command: "pwsh.exe".into(),
                 cwd: Some(r"C:\src".into()),
+                beside: Some(4),
                 env: vec![("PATH".into(), r"C:\Windows".into())],
                 size: Size { cols: 120, rows: 30, cell_width: 9, cell_height: 18 },
             }
             .into(),
         );
+    }
+
+    #[test]
+    fn a_shell_asked_for_by_a_ui_from_before_beside_starts_in_its_folder() {
+        let asked = r#"{"type":"spawn","request":2,"command":"cmd.exe","cwd":"C:\\src","env":[],
+            "size":{"cols":80,"rows":24,"cell_width":9,"cell_height":18}}"#;
+        let Control::Spawn { cwd, beside, .. } = serde_json::from_str(asked).unwrap() else {
+            panic!("not a spawn")
+        };
+        assert_eq!((cwd.as_deref(), beside), (Some(r"C:\src"), None));
     }
 
     #[test]

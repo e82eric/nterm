@@ -989,14 +989,8 @@ impl TerminalView {
             w.panes.contains(&from) || w.floats.ids().iter().any(in_float)
         });
         let place = owner.map_or_else(|| self.current_place(), |w| w.place.clone());
-        let local = place == crate::session::Place::Here;
-        spawn.place = Some(place);
-        if spawn.cwd.is_none() && local {
-            spawn.cwd = self
-                .tiled_ref(from)
-                .and_then(|pane| pane.pwd())
-                .filter(|pwd| std::path::Path::new(pwd).is_dir());
-        }
+        spawn.place = Some(place.clone());
+        let spawn = super::pane::beside(self.tiled_ref(from), spawn, &place);
         let float = self
             .floating
             .entries

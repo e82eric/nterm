@@ -57,6 +57,15 @@ first page. See [Remotes](configuration.md#remotes).
 Ctrl+Alt+Shift+W makes a workspace where the current one is, its first shell
 where the active pane is.
 
+A new pane's shell starts in the folder its sibling's shell is in, on this
+machine or a remote, when that shell tells the terminal its folder: a
+prompt that writes OSC 7, as the one in
+[profile.example.ps1](../profile.example.ps1) does. The daemon running both
+looks it up, so it is known for a pane just taken from the daemon too. A
+folder that is not there, or a shell that has said none, leaves the new one
+in the remote's `directory`, or the home folder. A remote's daemon older than
+this one starts it there too.
+
 ## Default bindings
 
 The workspace modifier is **Ctrl+Alt** by default. Existing shortcuts for windows,

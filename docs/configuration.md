@@ -110,8 +110,10 @@ for (`npick`) are refused, as they would run here; your own key bindings'
 pickers still open, and are about this machine. The workspace picker lists
 no folders of `workspaces.new_roots`, which are this machine's: it lists
 those in the remote's home folder, and a remote's page its own `new_roots`.
-A folder chosen there is the one folder of the
-window's that a new shell on that machine is started in: its daemon named it.
+A folder chosen there is the one folder the window names for a new shell on
+that machine: its daemon listed it. A new pane beside one there is started
+by that pane's number, and the daemon there starts it in the folder that
+pane's shell reported.
 
 ## Prompt patterns
 

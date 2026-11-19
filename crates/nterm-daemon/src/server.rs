@@ -171,6 +171,14 @@ impl Session {
         self.panes.lock().unwrap().get(&id).cloned()
     }
 
+    /// The folder pane `id`'s shell last reported, if there is one on this
+    /// machine: where a shell started beside it starts.
+    fn folder_of(&self, id: PaneId) -> Option<String> {
+        let reported = self.pane(id)?.state.lock().unwrap().terminal.pwd()?;
+        let folder = nterm_session::reported_folder(&reported);
+        std::path::Path::new(&folder).is_dir().then_some(folder)
+    }
+
     fn broadcast(&self, control: Control) {
         let frame = Frame::Control(control).encode();
         for outbox in self.clients.lock().unwrap().values() {
@@ -678,7 +686,8 @@ fn converse(
                     }
                 }
             }
-            Control::Spawn { request, command, cwd, env, size } => {
+            Control::Spawn { request, command, cwd, beside, env, size } => {
+                let cwd = beside.and_then(|pane| session.folder_of(pane)).or(cwd);
                 match session.spawn(command, cwd, env, size) {
                     Ok(pane) => send(Control::Spawned { request, info: pane.info() }),
                     Err(message) => fail(Some(request), message),
