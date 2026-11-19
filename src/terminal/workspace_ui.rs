@@ -46,6 +46,9 @@ pub(crate) fn workspace_picker_options(
 /// How much of the window's height the picker of workspaces takes. Most of
 /// it is the preview, where the selected workspace is drawn small.
 const PICKER_HEIGHT: f32 = 0.75;
+/// How many rows the picker of workspaces shows: twice what others do, as
+/// its groups and their titles share them.
+const PICKER_ROWS: usize = 14;
 /// How long a picker says what it was told to: `nfm_egui`'s notice.
 const PICKER_NOTICE: std::time::Duration = std::time::Duration::from_secs(2);
 /// A picker over rows that each run an action, placed like the workspace
@@ -61,6 +64,7 @@ pub(super) fn entry_picker(entries: Vec<crate::actions::Entry>) -> crate::picker
         preview: Some(Preview::Host),
         preview_visible: true,
         height: Some(PICKER_HEIGHT),
+        result_rows: PICKER_ROWS,
         ..Options::default()
     }
 }
