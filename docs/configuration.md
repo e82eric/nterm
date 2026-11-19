@@ -72,8 +72,8 @@ workspace can be started in. If it cannot be reached, the page says why, and
 the row on the first page goes on saying it. Escape goes back. A workspace is
 of one place: its splits and new panes are made where it is, and
 a pane cannot move to a workspace of another place. The status line says
-which machine the current workspace is on, first, in a block of the theme's
-green: the user its daemon runs as and that machine's own name, as
+which machine the current workspace is on, first, in the theme's
+green, outlined: the user its daemon runs as and that machine's own name, as
 `user@MACHINE`, which the daemon says when the window connects. Those are
 only shown; nothing is checked with them. Until it has said, and for a
 daemon too old to say, the block has the remote's name. The picker's rows

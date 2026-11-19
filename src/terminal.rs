@@ -1019,16 +1019,24 @@ impl TerminalView {
                 ui.close();
             }
         });
-        // Bright, as tmux's session is: it is not to be missed.
+        // Bright, as tmux's session is, so it is not missed: light on the
+        // dark bar as the rest of it is, which reads better than dark on a
+        // bright fill.
         let mut label_left = menu.right() + 6.0;
         if let Some(elsewhere) = elsewhere {
-            let text = painter.layout_no_wrap(elsewhere, font.clone(), palette.background);
+            let text = painter.layout_no_wrap(elsewhere, font.clone(), palette.success);
             let block = egui::Rect::from_min_size(
                 egui::pos2(label_left, chip_top),
                 egui::vec2(text.size().x + 16.0, chip_height),
             );
-            painter.rect_filled(block, 4.0, palette.success);
-            painter.galley(block.center() - text.size() / 2.0, text, palette.background);
+            painter.rect_filled(block, 4.0, egui::Color32::from_white_alpha(14));
+            painter.rect_stroke(
+                block,
+                4.0,
+                egui::Stroke::new(1.0, palette.success.gamma_multiply(0.6)),
+                egui::StrokeKind::Inside,
+            );
+            painter.galley(block.center() - text.size() / 2.0, text, palette.success);
             label_left = block.right() + 6.0;
         }
         let label = painter.layout_no_wrap(
