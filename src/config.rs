@@ -418,8 +418,8 @@ struct RemoteConfig {
     session: Option<String>,
     /// The folders there a workspace can be started in: each folder inside
     /// one of these is listed on the remote's page of the picker of
-    /// workspaces, found by its daemon.
-    new_roots: Vec<String>,
+    /// workspaces, found by its daemon. Without it, the home folder there.
+    new_roots: Option<Vec<String>>,
     /// How many levels of folders inside them. Without it,
     /// `workspaces.new_depth`.
     new_depth: Option<i32>,
@@ -436,7 +436,7 @@ impl RemoteConfig {
             daemon: self.daemon,
             directory: self.directory,
             session: self.session,
-            new_roots: self.new_roots,
+            new_roots: self.new_roots.unwrap_or_else(|| vec![crate::session::HOME_ROOT.into()]),
             new_depth: self.new_depth,
         };
         if remote.new_roots.iter().any(|root| root.trim().is_empty() || root.contains('\0')) {
@@ -1162,9 +1162,10 @@ mod tests {
             crate::terminal::workspace::Layout::HorizontalGrid
         );
         assert_eq!(config.workspaces.appearance.inner_gap, 3.0);
-        // Where a new workspace's directory is picked from: nowhere, unless
-        // roots are given.
-        assert!(config.workspaces.new_roots.is_empty());
+        // Where a new workspace's directory is picked from: the home folder,
+        // unless roots are given, with or without a `workspaces` table.
+        assert_eq!(config.workspaces.new_roots, [std::path::PathBuf::from("~")]);
+        assert_eq!(parse("return {}").unwrap().workspaces.new_roots, [std::path::PathBuf::from("~")]);
         let config =
             parse("return {workspaces={new_roots={'C:/src','G:/src'},inner_gap=3}}").unwrap();
         assert_eq!(
@@ -4042,8 +4043,9 @@ mod tests {
         };
         let vm = named("{ new_roots = { 'C:/src', 'D:/work' }, new_depth = 2 }").unwrap();
         assert_eq!((vm.new_roots, vm.new_depth), (vec!["C:/src".to_owned(), "D:/work".to_owned()], Some(2)));
+        // Without them, the home folder there, which its daemon knows.
         let vm = named("{}").unwrap();
-        assert_eq!((vm.new_roots.len(), vm.new_depth), (0, None));
+        assert_eq!((vm.new_roots, vm.new_depth), (vec!["~".to_owned()], None));
         for bad in ["{ new_roots = { '' } }", "{ new_depth = 0 }"] {
             let error = named(bad).unwrap_err();
             assert!(error.starts_with("remotes.vm.new_"), "{bad}: {error}");

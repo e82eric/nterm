@@ -30,9 +30,6 @@ enum Session {
     },
     Structured {
         snapshot: Arc<StructuredStreamingSnapshot>,
-        /// Which group each row is in, for rows that are found by group
-        /// before by how well they match; see `Grouped`.
-        groups: Option<Arc<[u8]>>,
     },
     /// A command with `columns`, streamed into structured rows.
     StructuredCommand {
@@ -44,7 +41,6 @@ enum Session {
     /// daemon finds more, without either being searched again for the other.
     Folders {
         snapshot: Arc<StructuredStreamingSnapshot>,
-        groups: Option<Arc<[u8]>>,
         store: Arc<FolderRows>,
     },
     FileSystem {
@@ -657,10 +653,9 @@ impl PickerSource {
         let again = Self::rows(&rows, *workspaces);
         match (&mut runtime.session, again) {
             // The folders it lists are left as they are.
-            (
-                Session::Folders { snapshot, groups, .. },
-                Session::Structured { snapshot: rows, groups: of },
-            ) => (*snapshot, *groups) = (rows, of),
+            (Session::Folders { snapshot, .. }, Session::Structured { snapshot: rows }) => {
+                *snapshot = rows
+            }
             (session, again) => *session = again,
         }
         *entries = rows;
@@ -674,10 +669,9 @@ impl PickerSource {
         let Self::CommandPalette { runtime, workspaces: true, .. } = self else {
             return None;
         };
-        let Session::Structured { snapshot, groups } = &runtime.session else { return None };
+        let Session::Structured { snapshot } = &runtime.session else { return None };
         let store = Arc::new(FolderRows { place, ..Default::default() });
-        let (snapshot, groups) = (snapshot.clone(), groups.clone());
-        runtime.session = Session::Folders { snapshot, groups, store: store.clone() };
+        runtime.session = Session::Folders { snapshot: snapshot.clone(), store: store.clone() };
         Some(store)
     }
     /// The sources of a picker that has more than one, which are searched
@@ -690,14 +684,10 @@ impl PickerSource {
         Arc::new(match &self.runtime().session {
             Session::Streaming => Provider::Streaming(self.runtime().store.clone()),
             Session::Document { store } => Provider::Document(store.clone()),
-            Session::Structured { snapshot, groups } => {
-                Provider::Structured(snapshot.clone(), groups.clone())
-            }
+            Session::Structured { snapshot } => Provider::Structured(snapshot.clone()),
             Session::StructuredCommand { store } => Provider::StructuredStream(store.clone()),
             // Its rows; the folders after them are another member.
-            Session::Folders { snapshot, groups, .. } => {
-                Provider::Structured(snapshot.clone(), groups.clone())
-            }
+            Session::Folders { snapshot, .. } => Provider::Structured(snapshot.clone()),
             Session::FileSystem { store, layout, .. } => {
                 Provider::FileSystem(store.clone(), *layout)
             }
@@ -714,6 +704,12 @@ impl PickerSource {
         let schema = StructuredSchema::new(columns.iter().map(|&column| column.to_owned()).collect())
             .expect("valid command palette schema");
         let mut structured = StructuredStreamingStore::new(schema);
+        // What is typed finds a window's own workspaces before the sessions
+        // no window shows, and those before the remotes. The picker shows
+        // each group's title before its rows.
+        if workspaces {
+            structured.set_group_titles(WORKSPACE_GROUPS.map(String::from).to_vec());
+        }
         for entry in entries {
             // A row of workspaces has a cell for each column after its
             // first; any other has its shortcut.
@@ -724,22 +720,21 @@ impl PickerSource {
             };
             let mut record = vec![entry.label.as_str()];
             record.extend(rest.into_iter().chain(std::iter::repeat("")).take(columns.len() - 1));
-            structured
-                .add_record(&csv::StringRecord::from(record))
-                .expect("palette row matches schema");
+            let record = csv::StringRecord::from(record);
+            if workspaces {
+                use crate::actions::AppAction;
+                let group = match entry.action {
+                    AppAction::SelectWorkspaceId(_) => 0,
+                    AppAction::AttachSession(_) => 1,
+                    _ => 2,
+                };
+                structured.add_record_in_group(&record, group)
+            } else {
+                structured.add_record(&record)
+            }
+            .expect("palette row matches schema");
         }
-        // What is typed finds a window's own workspaces before the sessions
-        // no window shows, and those before where a new one can be started.
-        let groups = workspaces.then(|| {
-            use crate::actions::AppAction;
-            let group = |entry: &crate::actions::Entry| match entry.action {
-                AppAction::SelectWorkspaceId(_) => 0,
-                AppAction::AttachSession(_) => 1,
-                _ => 2,
-            };
-            entries.iter().map(group).collect()
-        });
-        Session::Structured { snapshot: structured.snapshot(), groups }
+        Session::Structured { snapshot: structured.snapshot() }
     }
     /// The row a result is of, in a picker whose rows run actions.
     pub(super) fn entry(
@@ -1037,8 +1032,7 @@ pub(super) fn logical_item(rows: &[(u64, TextRow)]) -> Option<(String, SnapshotC
 pub(super) enum Snapshot {
     Streaming(Arc<Items>),
     Document(Arc<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>),
-    /// With the group each row is in, if they are found by group first.
-    Structured(Arc<StructuredStreamingSnapshot>, Option<Arc<[u8]>>),
+    Structured(Arc<StructuredStreamingSnapshot>),
     FileSystem(
         Arc<nfm_file_system::walker::PublishedSnapshot>,
         config::FileLayout,
@@ -1058,38 +1052,23 @@ macro_rules! delegate_snapshot {
         match $self {
             Snapshot::Streaming(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
             Snapshot::Document(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
-            Snapshot::Structured(s, _) => ItemsSource::$method(s.as_ref(), $($arg),*),
+            Snapshot::Structured(s) => ItemsSource::$method(s.as_ref(), $($arg),*),
             Snapshot::FileSystem(s, _) => ItemsSource::$method(s.as_ref(), $($arg),*),
             Snapshot::Folders(s, _) => ItemsSource::$method(s.as_ref(), $($arg),*),
         }
     };
 }
-/// A search of rows that are in groups: the rows found come group by group,
-/// and by how well they match within one. What the rows' own search does
-/// otherwise is left to it.
-struct Grouped<'a> {
-    plan: Box<dyn nfm_search_core::store::SearchPlan + 'a>,
-    groups: &'a [u8],
-}
-impl nfm_search_core::store::SearchPlan for Grouped<'_> {
+/// The titles of the groups of the rows of a picker of workspaces, by the
+/// number of the group: see `PickerSource::rows`.
+const WORKSPACE_GROUPS: [&str; 3] = ["Attached", "Detached", "Remotes"];
+/// What a picker of workspaces calls the folders it lists after its rows.
+const FOLDERS_GROUP: &str = "Folders";
+/// The search of rows that were found and put in order by a search
+/// somewhere else, for what is typed: every row, in the order given.
+struct AsGiven;
+impl nfm_search_core::store::SearchPlan for AsGiven {
     fn fuzzy_query(&self) -> &str {
-        self.plan.fuzzy_query()
-    }
-    fn filters_items(&self) -> bool {
-        self.plan.filters_items()
-    }
-    fn includes(&self, index: usize) -> bool {
-        self.plan.includes(index)
-    }
-    fn compare(&self, left: usize, right: usize) -> std::cmp::Ordering {
-        let group = |index: usize| self.groups.get(index).copied().unwrap_or(u8::MAX);
-        group(left).cmp(&group(right)).then_with(|| self.plan.compare(left, right))
-    }
-    fn has_custom_sort(&self) -> bool {
-        true
-    }
-    fn display_text(&self, index: usize) -> Option<String> {
-        self.plan.display_text(index)
+        ""
     }
 }
 impl ItemsSource for Snapshot {
@@ -1134,10 +1113,29 @@ impl ItemsSource for Snapshot {
         })
     }
     fn create_search_plan(&self, query: &str) -> Box<dyn nfm_search_core::store::SearchPlan + '_> {
-        let plan = delegate_snapshot!(self, create_search_plan, query);
         match self {
-            Snapshot::Structured(_, Some(groups)) => Box::new(Grouped { plan, groups }),
-            _ => plan,
+            // The daemon found them for what is typed. They stay as it gave
+            // them until it gives others: see `FolderRows::set`.
+            Self::Folders(..) => Box::new(AsGiven),
+            _ => delegate_snapshot!(self, create_search_plan, query),
+        }
+    }
+    fn has_groups(&self) -> bool {
+        match self {
+            Self::Folders(..) => true,
+            _ => delegate_snapshot!(self, has_groups),
+        }
+    }
+    fn group(&self, index: usize) -> Option<u32> {
+        match self {
+            Self::Folders(..) => Some(0),
+            _ => delegate_snapshot!(self, group, index),
+        }
+    }
+    fn group_title(&self, group: u32) -> Option<String> {
+        match self {
+            Self::Folders(..) => Some(FOLDERS_GROUP.into()),
+            _ => delegate_snapshot!(self, group_title, group),
         }
     }
     fn header(&self, query: &str) -> Option<String> {
@@ -1222,7 +1220,7 @@ mod file_layout_tests {
 pub(super) enum Provider {
     Streaming(Arc<SnapshotStore<Items>>),
     Document(Arc<SnapshotStore<nfm_egui::styled_document::DocumentItems<SnapshotCellRange>>>),
-    Structured(Arc<StructuredStreamingSnapshot>, Option<Arc<[u8]>>),
+    Structured(Arc<StructuredStreamingSnapshot>),
     StructuredStream(Arc<SnapshotStore<StructuredStreamingSnapshot>>),
     FileSystem(
         Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>,
@@ -1358,12 +1356,8 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
         match self {
             Self::Streaming(s) => s.snapshot().map(|s| Arc::new(Snapshot::Streaming(s))),
             Self::Document(s) => s.snapshot().map(|s| Arc::new(Snapshot::Document(s))),
-            Self::Structured(s, groups) => {
-                Some(Arc::new(Snapshot::Structured(s.clone(), groups.clone())))
-            }
-            Self::StructuredStream(s) => {
-                s.snapshot().map(|s| Arc::new(Snapshot::Structured(s, None)))
-            }
+            Self::Structured(s) => Some(Arc::new(Snapshot::Structured(s.clone()))),
+            Self::StructuredStream(s) => s.snapshot().map(|s| Arc::new(Snapshot::Structured(s))),
             Self::FileSystem(s, layout) => s
                 .snapshot()
                 .map(|s| Arc::new(Snapshot::FileSystem(s, *layout))),
@@ -1374,7 +1368,7 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
         match self {
             Self::Streaming(s) => s.snapshot_version(),
             Self::Document(s) => s.snapshot_version(),
-            Self::Structured(s, _) => s.version(),
+            Self::Structured(s) => s.version(),
             Self::StructuredStream(s) => s.snapshot_version(),
             Self::FileSystem(s, _) => s.snapshot_version(),
             Self::Folders(s) => s.version(),
@@ -1426,10 +1420,14 @@ mod grouped_rows_tests {
         let folders = provider.snapshot().unwrap();
         let output = nfm_search_core::search::search(folders.clone(), "", || false).unwrap();
         assert_eq!(output.results.len(), 3);
-        // What is typed finds among those given, before more are.
+        // They were found for what is typed, by the daemon. They stay as it
+        // gave them, in its order, whatever is typed until it gives others.
         let output = nfm_search_core::search::search(folders.clone(), "gam", || false).unwrap();
         let found: Vec<_> = output.results.iter().map(|result| result.path.clone()).collect();
-        assert_eq!(found, ["C:/src/two/gamma"]);
+        assert_eq!(found, ["C:/src/one/beta/inner", "C:/src/one/beta", "C:/src/two/gamma"]);
+        // They are a group of their own, with its title.
+        assert_eq!(folders.group(1), Some(0));
+        assert_eq!(folders.group_title(0).as_deref(), Some("Folders"));
         // Each is known by a number no row of the picker's own has.
         assert_eq!(folders.item(2).unwrap().node_index, FOLDER_ROWS + 2);
         assert_eq!(rows.folder(2).as_deref(), Some("C:/src/two/gamma"));
@@ -1442,7 +1440,7 @@ mod grouped_rows_tests {
         assert_eq!(rows.folder(2), None);
     }
     #[test]
-    fn a_windows_workspaces_are_found_before_sessions_and_those_before_folders() {
+    fn a_windows_workspaces_are_found_before_sessions_and_those_before_remotes() {
         let row = |cells: [&str; 2], action| Entry {
             id: String::new(),
             label: String::new(),
@@ -1451,20 +1449,27 @@ mod grouped_rows_tests {
             action,
         };
         // In the order that how well each matches would give them.
+        let remote = crate::session::Place::Remote("pub".into());
         let entries = [
-            row(["", "pub"], AppAction::CreateWorkspaceIn(crate::session::Place::Here, "pub".into())),
+            row(["pub", "Enter shows its sessions and folders"], AppAction::PlacePage(remote)),
             row(["a pub of sorts", "detached"], AppAction::AttachSession("a".into())),
             row(["the long way to a p u b", ""], AppAction::SelectWorkspaceId(1)),
         ];
-        let Session::Structured { snapshot, groups } = PickerSource::rows(&entries, true) else {
-            panic!("rows are structured");
+        let rows = |workspaces: bool| -> Arc<Snapshot> {
+            let Session::Structured { snapshot } = PickerSource::rows(&entries, workspaces) else {
+                panic!("rows are structured");
+            };
+            Arc::new(Snapshot::Structured(snapshot))
         };
-        let found = |groups: Option<Arc<[u8]>>| -> Vec<usize> {
-            let snapshot = Arc::new(Snapshot::Structured(snapshot.clone(), groups));
-            let output = nfm_search_core::search::search(snapshot, "pub", || false).unwrap();
-            output.results.iter().map(|result| result.node_index).collect()
-        };
-        assert_eq!(found(None), [0, 1, 2]);
-        assert_eq!(found(groups), [2, 1, 0]);
+        let snapshot = rows(true);
+        let output = nfm_search_core::search::search(snapshot.clone(), "pub", || false).unwrap();
+        let title = |row| snapshot.group(row).and_then(|group| snapshot.group_title(group));
+        let found: Vec<_> =
+            output.results.iter().map(|result| (result.node_index, title(result.node_index))).collect();
+        let titled = |row, title: &str| (row, Some(title.to_owned()));
+        assert_eq!(found, [titled(2, "Attached"), titled(1, "Detached"), titled(0, "Remotes")]);
+        // The rows of a command palette are in no groups.
+        let palette = rows(false);
+        assert!(!palette.has_groups() && palette.group(0).is_none());
     }
 }

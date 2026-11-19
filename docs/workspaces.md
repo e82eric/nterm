@@ -26,27 +26,33 @@ by index. Both appear at the bottom of the workspace, spanning its panes,
 and show each workspace's layout, pane count, and current-workspace marker.
 Enter accepts the selected workspace; Escape dismisses the picker.
 
-The workspace picker lists, in order, this window's workspaces (on any
-machine), the sessions waiting in this machine's daemon, a row for each of
-`remotes`, and then the folders a workspace can be started in:
+The workspace picker lists, in groups and each under its title: Attached,
+this window's workspaces (on any machine); Detached, the sessions waiting in
+this machine's daemon; Remotes, a row for each of `remotes`; and Folders, the
+folders a workspace can be started in:
 
 ```lua
 workspaces = {
-  new_roots = { "C:/src", "D:/work" },  -- the folders inside these
+  new_roots = { "C:/src", "D:/work" },  -- the folders inside these; { "~" } without it
   new_depth = 1,                        -- to this many levels; 1 without it
 }
 ```
 
+`~` is the home folder. A group with nothing that matches what is typed is not
+shown.
+
 The folders are found by this machine's daemon as the picker opens, and the
-best 200 for what is typed are shown; typing more finds the rest. Enter on one
-makes a workspace on this machine, called after the folder, whose first shell
-starts there.
+best 200 for what is typed are shown, in the order the daemon finds them;
+typing more finds the rest. Until the daemon answers what was typed, the
+folders it gave last stay as they are. Enter on one makes a workspace on this
+machine, called after the folder, whose first shell starts there.
 
 Enter on a remote's row connects to it and shows its page: the window's
-workspaces on that machine, the sessions waiting there, `New session on` it,
-and its own folders, from `remotes.NAME.new_roots`, found by its daemon. Enter
-on one of those makes a workspace on that machine, in that folder. Escape goes
-back to the first page. See [Remotes](configuration.md#remotes).
+workspaces on that machine, the sessions waiting there, and its own folders,
+from `remotes.NAME.new_roots` (its home folder without them), found by its
+daemon. Enter on one of those makes a workspace on that machine, in that
+folder. If it cannot be reached, the page says why. Escape goes back to the
+first page. See [Remotes](configuration.md#remotes).
 
 Ctrl+Alt+Shift+W makes a workspace where the current one is, its first shell
 where the active pane is.

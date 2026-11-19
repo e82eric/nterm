@@ -345,6 +345,19 @@ fn place(row: &str) -> Option<(&str, u64)> {
     })
 }
 
+/// `path` with a `~` it starts with, alone or before a separator, taken to
+/// be this machine's home folder.
+fn in_home(path: PathBuf) -> Result<PathBuf, String> {
+    let Some(text) = path.to_str() else { return Ok(path) };
+    let rest = match text.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => rest.trim_start_matches(['/', '\\']),
+        _ => return Ok(path),
+    };
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    let home = PathBuf::from(home.ok_or("there is no home folder to read ~ as")?);
+    Ok(if rest.is_empty() { home } else { home.join(rest) })
+}
+
 /// The pickers there are, each starting with `query` and shown at the
 /// pane's cursor when `position` is `cursor`.
 ///
@@ -358,9 +371,12 @@ fn place(row: &str) -> Option<(&str, u64)> {
 ///   regular expression, is found in: what `rg` prints, which is run once
 ///   and not again as the query changes.
 /// - `items` lists what the program gives after it, and is called `label`.
+///
+/// A path that starts with `~` is in this machine's home folder.
 fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, String> {
     let cwd = params.get("cwd").map(PathBuf::from);
     let whole = |path: PathBuf| -> Result<PathBuf, String> {
+        let path = in_home(path)?;
         if path.is_relative() {
             let cwd = cwd.as_ref().ok_or_else(|| format!("{} is not a whole path", path.display()))?;
             return Ok(cwd.join(path));
@@ -1939,6 +1955,21 @@ impl Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_from_a_tilde_is_in_the_home_folder() {
+        let home = PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap());
+        let read = |path: &str| in_home(PathBuf::from(path)).unwrap();
+        assert_eq!(read("~"), home);
+        assert_eq!(read("~/src"), home.join("src"));
+        assert_eq!(read("~\\src"), home.join("src"));
+        // A tilde that is part of a name is left alone.
+        assert_eq!(read("~src"), PathBuf::from("~src"));
+        assert_eq!(read("C:/src/~"), PathBuf::from("C:/src/~"));
+        // The folders under the home folder are listed.
+        let params: BTreeMap<String, String> = [("roots".to_owned(), "[\"~\"]".to_owned())].into_iter().collect();
+        assert!(define("directories", &params).is_ok());
+    }
 
 
     #[test]

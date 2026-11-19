@@ -69,6 +69,11 @@ pub(crate) fn choose(session: String) {
     *CHOSEN.lock().unwrap() = Some(session);
 }
 
+/// The folder whose folders a daemon lists when it is not told which: its
+/// machine's home folder. It is sent as it is, and each daemon reads it as
+/// its own, so no folder of this machine is sent to another.
+pub(crate) const HOME_ROOT: &str = "~";
+
 /// A daemon on another machine, which `--remote NAME` asks for. The window
 /// reaches it by running `ssh`, whose input and output are the connection:
 /// see `nterm_session::relay`.

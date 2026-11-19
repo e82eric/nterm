@@ -23,12 +23,6 @@ pub(crate) enum AppAction {
     /// Show a session waiting in the session daemon as a workspace. The
     /// name is the daemon's; empty for the shells no session describes.
     AttachSession(crate::session::Held),
-    /// The launch picker's choice of a new session over the waiting ones.
-    NewSession,
-    /// A new workspace whose shells run in that place.
-    NewSessionOn(crate::session::Place),
-    /// Connect to a place, to see what its daemon holds.
-    Connect(crate::session::Place),
     /// Show, in the picker of workspaces, what that place has: its sessions
     /// and the folders one can be started in. It is connected to first.
     PlacePage(crate::session::Place),
@@ -182,9 +176,6 @@ impl AppAction {
                 | Self::EndWorkspaceId(_)
                 | Self::EndSession(_)
                 | Self::AttachSession(_)
-                | Self::NewSession
-                | Self::NewSessionOn(_)
-                | Self::Connect(_)
                 | Self::PlacePage(_)
                 | Self::NewWindow
                 | Self::ReloadConfig

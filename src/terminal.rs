@@ -611,20 +611,6 @@ impl TerminalView {
                     self.show_error("Session could not be shown", error);
                 }
             }
-            // The row of the picker a window without a terminal asks with,
-            // which acts on it itself.
-            AppAction::NewSession => {}
-            AppAction::NewSessionOn(place) => {
-                if let Err(error) = self.create_workspace_on(place, gl) {
-                    self.show_error("Session could not be started", error);
-                }
-            }
-            // Its row gives way to what the place holds, so the picker is
-            // shown again to choose from that.
-            AppAction::Connect(place) => {
-                crate::session::connect(&place);
-                self.open_workspace_picker(ctx);
-            }
             // The page of what a remote has, which fills in once it is
             // connected to.
             AppAction::PlacePage(place) => {

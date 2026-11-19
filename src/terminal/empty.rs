@@ -12,7 +12,8 @@ pub(super) enum Empty {
     /// The session daemon is being reached.
     Connecting,
     /// The window asks what to show, with its picker of workspaces and
-    /// sessions: a session that waits in the daemon, or a new one.
+    /// sessions: a session that waits in the daemon, or a new one in a
+    /// folder.
     Choose,
     /// The daemon could not be reached, or was and has gone.
     Unavailable { lost: bool, reason: String },
@@ -160,9 +161,8 @@ impl TerminalView {
     }
 
     /// The picker has gone. What was chosen is done as in any window; a
-    /// window still without a terminal after that, by the row for
-    /// a new session, by Escape, or because the session could not be shown,
-    /// starts a shell.
+    /// window still without a terminal after that, by Escape or because the
+    /// session could not be shown, starts a shell.
     fn chosen(
         &mut self,
         action: Option<crate::picker::Action>,
@@ -170,12 +170,9 @@ impl TerminalView {
         gl: &glow::Context,
     ) -> Option<Empty> {
         if let Some(crate::picker::Action::Execute(action)) = action {
-            // Connecting shows the picker again, to choose from what the
-            // place holds: the window goes on asking.
-            let asks_again = matches!(
-                action,
-                crate::actions::AppAction::Connect(_) | crate::actions::AppAction::PlacePage(_)
-            );
+            // A remote's page is the picker again, to choose from what the
+            // remote holds: the window goes on asking.
+            let asks_again = matches!(action, crate::actions::AppAction::PlacePage(_));
             self.execute_action(action, false, ctx, gl);
             if asks_again && self.window_picker.is_some() {
                 return Some(Empty::Choose);

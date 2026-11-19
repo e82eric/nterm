@@ -1543,12 +1543,12 @@ impl Bindings {
         workspaces.appearance.validate()?;
         self.workspace_appearance = workspaces.appearance;
         self.default_layout = workspaces.default_layout;
-        // The folders are this machine's. A remote window's shells are not.
+        // The folders are this machine's. A remote window's shells are not:
+        // it lists the folders in the remote's home, which its daemon knows.
         self.new_workspace_roots = match crate::session::remote() {
-            Some(_) => Vec::new(),
+            Some(_) => vec![crate::session::HOME_ROOT.into()],
             None => workspaces.new_roots,
         };
-        // No `workspaces` table at all leaves it unset.
         self.new_workspace_depth = workspaces.new_depth.max(1);
         Ok(self)
     }

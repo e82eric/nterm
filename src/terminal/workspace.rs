@@ -34,12 +34,12 @@ impl Layout {
 }
 /// The config's `workspaces` table: window appearance defaults plus the layout
 /// new workspaces start in.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct Config {
     pub default_layout: Layout,
-    /// The directories whose folders are offered when a workspace is made,
-    /// for its first shell to start in. With none a new workspace starts
-    /// where the active pane is, without asking.
+    /// The directories whose folders the picker of workspaces lists, for a
+    /// new workspace's first shell to start in. Without them, the home
+    /// folder: `~`, which the daemon that lists them reads as its own.
     pub new_roots: Vec<std::path::PathBuf>,
     /// How many levels of folders inside each of `new_roots` are offered:
     /// 1 is the folders directly inside a root, 2 those and the folders
@@ -59,7 +59,7 @@ impl<'de> Deserialize<'de> for Config {
         };
         let new_roots: Vec<String> = match fields.remove("new_roots") {
             Some(roots) => serde_json::from_value(roots).map_err(D::Error::custom)?,
-            None => Vec::new(),
+            None => vec![crate::session::HOME_ROOT.into()],
         };
         if new_roots
             .iter()
@@ -83,6 +83,17 @@ impl<'de> Deserialize<'de> for Config {
             new_depth,
             appearance,
         })
+    }
+}
+/// A config with no `workspaces` table.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            default_layout: Layout::default(),
+            new_roots: vec![crate::session::HOME_ROOT.into()],
+            new_depth: 1,
+            appearance: Appearance::default(),
+        }
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]

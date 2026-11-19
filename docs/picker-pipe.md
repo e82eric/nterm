@@ -108,7 +108,8 @@ in `named`.
 
 `files` and `directories`: `roots` is a JSON list of folders; without it `cwd`
 is the one root. With one root the rows are paths from it; the value returned
-is always the whole path.
+is always the whole path. A path that starts with `~` is in the home folder of
+the daemon's machine.
 
 `history` lists the lines of the file `path` names, the last first and each
 once, joining lines that end in a backtick to the next: PSReadLine's history

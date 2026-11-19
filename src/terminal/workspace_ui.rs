@@ -552,68 +552,21 @@ impl TerminalView {
             entries.retain(|_| on_page.next().unwrap_or(false));
             of.push_str(&format!("{page:?}"));
         }
-        // Under the names, as it has no number.
-        let new = |id: &str, name: &str, action| crate::actions::Entry {
-            id: id.into(),
-            label: String::new(),
-            shortcut: None,
-            cells: vec![name.into()],
-            action,
-        };
-        // What the page's place holds that nothing shows: this machine's on
-        // the first page, a remote's on its own. A place that is not
-        // connected has one row, which connects to it: its sessions take
-        // that row's place once it is. Nothing is connected to until it is
-        // asked for.
+        // The sessions of the page's place that no window shows: this
+        // machine's on the first page, a remote's on its own, once the
+        // window is connected to its daemon. Until it is, there are none.
         use crate::session::{Place, Status};
-        let current = self.current_place();
-        let mut starts = Vec::new();
         let place = page.clone().unwrap_or(Place::Here);
+        let status = crate::session::status(&place);
+        of.push_str(&format!("{status:?}"));
+        if status == Status::Connected
+            && let Some(listing) = crate::session::sessions(&place)
         {
-            let status = crate::session::status(&place);
-            let name = place.name().unwrap_or("this machine").to_owned();
-            of.push_str(&format!("{name}{status:?}"));
-            // On a remote's page, it stays on that page.
-            let connect = match &page {
-                Some(_) => AppAction::PlacePage(place.clone()),
-                None => AppAction::Connect(place.clone()),
-            };
-            let row = |state: &str| crate::actions::Entry {
-                id: format!("place.{name}"),
-                label: String::new(),
-                shortcut: None,
-                cells: vec![name.clone(), state.to_owned()],
-                action: connect.clone(),
-            };
-            match status {
-                Status::Connected => {
-                    if let Some(listing) = crate::session::sessions(&place) {
-                        entries.extend(super::restore::session_rows(&listing));
-                        of.push_str(&super::restore::session_rows_key(&listing));
-                    }
-                }
-                // Shells of this machine that are not kept in a daemon.
-                Status::Off => {}
-                Status::Idle => starts.push(row("not connected: Enter connects")),
-                Status::Connecting => starts.push(row("connecting\u{2026}")),
-                Status::Lost => starts.push(row("connection lost: Enter connects again")),
-                Status::Unavailable(reason) => {
-                    let reason = reason.lines().last().unwrap_or_default().trim();
-                    starts.push(row(&format!("cannot be reached: {reason}")));
-                }
-            }
-            // On the first page a new workspace is made where the current
-            // one is, by the rows below, and this machine has a row of its
-            // own when that is somewhere else. A remote's page has one.
-            let takes = matches!(crate::session::status(&place), Status::Connected | Status::Off);
-            let first = (place != current || !window) && (window || place != crate::session::home());
-            if takes && (page.is_some() || first) {
-                let label = format!("New session on {name}");
-                let action = AppAction::NewSessionOn(place.clone());
-                starts.push(new(&format!("session.new.{name}"), &label, action));
-            }
+            entries.extend(super::restore::session_rows(&listing));
+            of.push_str(&super::restore::session_rows_key(&listing));
         }
         // The first page has a row for each remote, which goes to its page.
+        let mut starts = Vec::new();
         if page.is_none() {
             for remote in crate::session::remotes() {
                 let place = Place::Remote(remote.name.clone());
@@ -637,26 +590,9 @@ impl TerminalView {
                 });
             }
         }
-        // With folders to start one in, the picker goes on to list each it
-        // finds. Without, on the first page, one row makes a new workspace
-        // where the window is.
-        if !self.page_folders().1.is_empty() {
-            of.push_str("folders");
-        } else if page.is_some() {
-            // Its row "New session on" the remote makes one.
-        } else if window {
-            let create = AppAction::Workspace(WorkspaceAction::CreateWorkspace);
-            // It is made where the current one is.
-            let label = match current.name() {
-                Some(place) => format!("New workspace on {place}"),
-                None => "New workspace".into(),
-            };
-            entries.push(new("workspace.new", &label, create));
-        } else {
-            // A window with no terminal starts a shell once its picker has
-            // gone, whatever was chosen: see `chosen`.
-            entries.push(new("session.new", "New session", AppAction::NewSession));
-        }
+        // After them the picker lists the folders a new workspace can be
+        // started in, which the daemon of the page's place finds: see
+        // `open_workspace_picker`.
         entries.extend(starts);
         of.push_str(if window { "window" } else { "launch" });
         (entries, of)
@@ -741,6 +677,18 @@ impl TerminalView {
             .map(|pane| pane.picker_typography(ctx));
         let (rows, of) = self.workspace_picker_rows();
         let folders = self.page_folders();
+        // On a remote's page, why the remote cannot be reached, if it cannot.
+        let failed = self.window_picker_page.as_ref().and_then(|place| {
+            let name = place.name().unwrap_or_default();
+            match crate::session::status(place) {
+                crate::session::Status::Unavailable(reason) => {
+                    let reason = reason.lines().last().unwrap_or_default().trim().to_owned();
+                    Some(format!("{name} cannot be reached: {reason}"))
+                }
+                crate::session::Status::Lost => Some(format!("The connection to {name} was lost")),
+                _ => None,
+            }
+        });
         let builtin = self.picker_bindings.builtin_pickers;
         let padding = self.picker_bindings.cursor_scroll_padding;
         let picker = self.window_picker.as_mut()?;
@@ -773,6 +721,11 @@ impl TerminalView {
                 && at.elapsed() < PICKER_NOTICE
             {
                 picker.notify(ctx, said.clone());
+            }
+            // The rows are of where the connection stands, so this is said
+            // once each time it fails.
+            if let Some(failed) = failed {
+                picker.notify(ctx, failed);
             }
         }
         let action = picker.show_scoped(ctx, content, None, true)?;
@@ -828,16 +781,6 @@ impl TerminalView {
             workspace.name = name;
         }
         self.select_workspace(id)
-    }
-    /// Make a workspace whose shells run in `place`, and go to it.
-    pub(super) fn create_workspace_on(
-        &mut self,
-        place: crate::session::Place,
-        gl: &glow::Context,
-    ) -> Result<(), String> {
-        let options = workspace::CreateOptions { place: Some(place), ..Default::default() };
-        let w = self.workspace_request(Request::Create(options), gl)?;
-        self.select_workspace(w["id"].as_u64().unwrap())
     }
     /// Ask what to call a workspace, starting from what it is called now.
     /// Nothing typed takes its name away.
