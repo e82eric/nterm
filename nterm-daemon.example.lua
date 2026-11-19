@@ -22,8 +22,10 @@
 -- opened the picker, and `keys`, what they ask of `app` being done to the
 -- pane. A picker may be a function of what is at the shell's cursor, a
 -- Command may have columns, and modules load: see the git pickers below.
--- The names files, directories, history and items are the daemon's own.
+-- The name items is the daemon's own: what a program in the shell gives.
+local files = require("nterm.files")
 local git = require("nterm.git")
+local history = require("nterm.history")
 local ripgrep = require("nterm.ripgrep")
 return {
   pickers = {
@@ -66,17 +68,17 @@ return {
         app:send_text("nvim +" .. line .. " '" .. path:gsub("'", "''") .. "'\r")
       end,
     },
-    -- What was typed at a shell, the last first. Opened with the file's
-    -- path as `history`.
-    Typed = {
-      type = "File", path = "{history}", reverse = true,
-      line_continuation = "`", unique = true, sort = "SourceOrder", position = "Cursor",
-    },
-    -- The files under the folder the shell is in, no deeper than four.
-    Near = {
-      type = "FileSystem", max_depth = 4, files_only = true, relative = true,
-      position = "Cursor", preview_visible = false,
-    },
+    -- What was typed at PowerShell, the last first. Opened with the file's
+    -- path as `history`: profile.example.ps1's Alt+Shift+R does.
+    History = history.powershell { position = "Cursor" },
+    -- The files, and the folders, under the folders it is opened with as
+    -- `roots`, or under the one the shell is in: profile.example.ps1's
+    -- Ctrl+Shift+T and Ctrl+Shift+O do.
+    Files = files.files { position = "Cursor" },
+    Directories = files.directories { position = "Cursor" },
+    -- The files under the folder the shell is in, no deeper than four, each
+    -- said from there.
+    Near = files.files { max_depth = 4, relative = true, position = "Cursor" },
     -- Rows written here.
     Servers = {
       type = "Items",

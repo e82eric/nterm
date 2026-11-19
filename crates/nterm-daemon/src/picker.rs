@@ -261,102 +261,62 @@ fn in_home(path: PathBuf) -> Result<PathBuf, String> {
     Ok(if rest.is_empty() { home } else { home.join(rest) })
 }
 
-/// The pickers there are, each starting with `query` and shown at the
-/// pane's cursor when `position` is `cursor`.
-///
-/// - `files` and `directories` list what is under the folders `roots`
-///   names, a JSON array, or under `cwd` with none. `preview` `true` opens
-///   them showing previews.
-/// - `history` lists the lines of the file `path` names, the last first and
-///   each once, with lines that end in a backtick joined to the next: the
-///   file PSReadLine keeps of what was typed.
-/// - `items` lists what the program gives after it, and is called `label`.
-///
-/// A path that starts with `~` is in this machine's home folder.
+/// The one picker the daemon has of its own, `items`: what the program
+/// that asked gives after it, called `label`. It starts with `query`, and is
+/// shown at the pane's cursor when `position` is `cursor`. Any other is the
+/// machine's file's to say: see `configured`.
 fn define(name: &str, params: &BTreeMap<String, String>) -> Result<Definition, String> {
-    let cwd = params.get("cwd").map(PathBuf::from);
-    let whole = |path: PathBuf| -> Result<PathBuf, String> {
-        let path = in_home(path)?;
-        if path.is_relative() {
-            let cwd = cwd.as_ref().ok_or_else(|| format!("{} is not a whole path", path.display()))?;
-            return Ok(cwd.join(path));
-        }
-        Ok(path)
-    };
-    let mut label = String::new();
-    let mut sort = SearchSortMode::Score;
-    let mut preview = None;
-    let lists = match name {
-        "files" | "directories" => {
-            let directories_only = name == "directories";
-            label.push_str(if directories_only { "Directories" } else { "Files" });
-            let mut roots: Vec<PathBuf> = match params.get("roots") {
-                Some(roots) => serde_json::from_str::<Vec<String>>(roots)
-                    .map_err(|error| format!("roots is not a list of folders: {error}"))?
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .collect(),
-                None => Vec::new(),
-            };
-            if roots.is_empty() {
-                roots.push(cwd.clone().ok_or("neither roots nor cwd was given")?);
-            }
-            for root in &mut roots {
-                *root = whole(std::mem::take(root))?;
-                if !root.is_dir() {
-                    return Err(format!("{} is not a folder", root.display()));
-                }
-            }
-            preview = Some(params.get("preview").is_some_and(|preview| preview == "true"));
-            // Under one folder a row says where it is from there; under
-            // several that would not say which.
-            let relative = roots.len() == 1 && !params.contains_key("whole");
-            // How many levels of folders under them: all, unless it says.
-            let max_depth = params.get("max_depth").and_then(|depth| depth.parse::<i32>().ok()).unwrap_or(0).max(0);
-            Lists::Walk(ScanOptions {
-                roots,
-                max_depth,
-                directories_only,
-                files_only: !directories_only,
-                relative,
-            })
-        }
-        "history" => {
-            label.push_str("History");
-            let path = whole(PathBuf::from(params.get("path").ok_or("no path was given")?))?;
-            if !path.is_file() {
-                return Err(format!("{} is not a file", path.display()));
-            }
-            // As they are in the file, not the best match first: the last
-            // typed of what matches is the one most likely wanted.
-            sort = SearchSortMode::SourceOrder;
-            let mut options = FileSourceOptions::new(path);
-            options.reverse = true;
-            options.unique = true;
-            options.line_continuation = Some("`".to_owned());
-            Lists::File(options)
-        }
-        "items" => {
-            let given = params.get("label").map(|label| label.trim()).filter(|label| !label.is_empty());
-            label.extend(given.unwrap_or("Items").chars().take(MOST_LABEL));
-            Lists::Given
-        }
-        _ => return Err(format!("no picker named {name}")),
-    };
+    if name != "items" {
+        return Err(format!("no picker named {name}"));
+    }
+    let given = params.get("label").map(|label| label.trim()).filter(|label| !label.is_empty());
     Ok(Definition {
-        label,
-        lists,
+        label: given.unwrap_or("Items").chars().take(MOST_LABEL).collect(),
+        lists: Lists::Given,
         query: params.get("query").cloned().unwrap_or_default(),
-        sort,
-        preview,
+        sort: SearchSortMode::Score,
+        preview: None,
         at_cursor: params.get("position").is_some_and(|position| position == "cursor"),
+        resolves: None,
+    })
+}
+
+/// The folders under `roots`, no more than `depth` levels down or all of
+/// them with 0, each as its whole path: what a UI asks for to start a
+/// workspace in (see `Control::FoldersAsk`). A root that starts with `~` is
+/// in this machine's home folder.
+fn search_of_folders(roots: &[String], depth: i32) -> Result<Definition, String> {
+    if roots.is_empty() {
+        return Err("no folders to look under were given".into());
+    }
+    let mut whole = Vec::with_capacity(roots.len());
+    for root in roots {
+        let root = in_home(PathBuf::from(root))?;
+        if root.is_relative() || !root.is_dir() {
+            return Err(format!("{} is not a folder", root.display()));
+        }
+        whole.push(root);
+    }
+    Ok(Definition {
+        label: "Directories".into(),
+        lists: Lists::Walk(ScanOptions {
+            roots: whole,
+            max_depth: depth.max(0),
+            directories_only: true,
+            files_only: false,
+            relative: false,
+        }),
+        query: String::new(),
+        sort: SearchSortMode::Score,
+        preview: Some(false),
+        at_cursor: false,
         resolves: None,
     })
 }
 
 /// The names of the pickers the daemon has of its own. The file of the
 /// machine's pickers has none of these names: see `configured`.
-pub(crate) const BUILT_IN: [&str; 4] = ["files", "directories", "history", "items"];
+pub(crate) const BUILT_IN: [&str; 1] = ["items"];
 
 /// What is given for `{name}`, where `text` is that and no more.
 fn given<'a>(text: &'a str, params: &'a BTreeMap<String, String>) -> Result<&'a str, String> {
@@ -1254,29 +1214,17 @@ impl Pickers {
     }
 
     /// The UI `ui` asks for a search of folders over no pane, with its own
-    /// number `ask` for it: see `Control::FoldersAsk`. It is the daemon's
-    /// picker of folders, told to list whole paths, and it ends when the
-    /// UI closes it or goes.
+    /// number `ask` for it: see `Control::FoldersAsk`. It lists whole
+    /// paths, and it ends when the UI closes it or goes.
     pub(crate) fn folders(&self, ui: u64, ui_outbox: &Outbox, ask: u64, roots: &[String], depth: i32) {
-        let refuse = |message: String| {
-            log(format_args!("a search of folders was refused: {message}"));
-            let _ = ui_outbox.send(Frame::Control(Control::PickerRefused { ask, message }).encode());
-        };
-        if roots.is_empty() {
-            return refuse("no folders to look under were given".into());
-        }
-        let params: BTreeMap<String, String> = [
-            ("roots".to_owned(), serde_json::to_string(roots).unwrap_or_default()),
-            ("max_depth".to_owned(), depth.to_string()),
-            ("whole".to_owned(), "true".to_owned()),
-        ]
-        .into_iter()
-        .collect();
-        match define("directories", &params) {
+        match search_of_folders(roots, depth) {
             Ok(definition) => {
                 self.open(definition, Asker::Ui, Some(ask), None, ui, ui_outbox.clone());
             }
-            Err(message) => refuse(message),
+            Err(message) => {
+                log(format_args!("a search of folders was refused: {message}"));
+                let _ = ui_outbox.send(Frame::Control(Control::PickerRefused { ask, message }).encode());
+            }
         }
     }
 
@@ -1831,9 +1779,6 @@ mod tests {
         // A tilde that is part of a name is left alone.
         assert_eq!(read("~src"), PathBuf::from("~src"));
         assert_eq!(read("C:/src/~"), PathBuf::from("C:/src/~"));
-        // The folders under the home folder are listed.
-        let params: BTreeMap<String, String> = [("roots".to_owned(), "[\"~\"]".to_owned())].into_iter().collect();
-        assert!(define("directories", &params).is_ok());
     }
 
     #[test]
@@ -1872,77 +1817,40 @@ mod tests {
         assert_eq!(flow.seen(3), Some((4, "more")));
     }
 
-
     fn params(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
     }
 
     #[test]
-    fn a_picker_is_of_files_or_folders_under_roots_or_the_folder_the_program_is_in() {
+    fn a_ui_searches_folders_under_roots_and_is_given_whole_paths() {
         let here = std::env::temp_dir();
-        let cwd = here.to_string_lossy().into_owned();
-        let scan = |definition: &Definition| match &definition.lists {
-            Lists::Walk(scan) => (scan.roots.clone(), scan.files_only, scan.directories_only, scan.relative),
-            _ => panic!("not a walk"),
-        };
-        let files = define("files", &params(&[("cwd", &cwd), ("query", "ab")])).unwrap();
-        assert_eq!(scan(&files), (vec![here.clone()], true, false, true));
-        assert_eq!((files.label.as_str(), files.query.as_str()), ("Files", "ab"));
-        assert!(matches!(files.sort, SearchSortMode::Score) && !files.at_cursor);
-
-        let roots = serde_json::to_string(&[&cwd, "."]).unwrap();
-        let folders = define("directories", &params(&[("cwd", &cwd), ("roots", &roots)])).unwrap();
-        assert_eq!(scan(&folders), (vec![here.clone(), here.join(".")], false, true, false));
-
-        for (name, given) in [
-            ("themes", params(&[("cwd", &cwd)])),
-            ("files", params(&[])),
-            ("files", params(&[("roots", "[\"relative\"]")])),
-            ("files", params(&[("roots", "not json"), ("cwd", &cwd)])),
-            ("files", params(&[("cwd", "Z:\\no\\such\\folder\\anywhere")])),
-        ] {
-            assert!(define(name, &given).is_err(), "{name} with {given:?} was taken");
+        let root = here.to_string_lossy().into_owned();
+        let folders = search_of_folders(&[root.clone(), "~".into()], 2).unwrap();
+        let Lists::Walk(scan) = &folders.lists else { panic!("not a walk") };
+        let home = in_home(PathBuf::from("~")).unwrap();
+        assert_eq!(scan.roots, [here.clone(), home]);
+        assert_eq!((scan.max_depth, scan.directories_only, scan.files_only, scan.relative), (2, true, false, false));
+        assert_eq!((folders.preview, folders.at_cursor), (Some(false), false));
+        for roots in [vec![], vec![".".to_owned()], vec![r"Z:\no\such\folder\anywhere".to_owned()]] {
+            assert!(search_of_folders(&roots, 0).is_err(), "{roots:?} was taken");
         }
-        // Previews are hidden unless asked for shown.
-        assert_eq!(files.preview, Some(false));
-        assert_eq!(define("files", &params(&[("cwd", &cwd), ("preview", "true")])).unwrap().preview, Some(true));
     }
 
     #[test]
-    fn a_picker_is_of_the_lines_of_a_file_or_of_what_its_program_gives() {
-        let file = std::env::temp_dir().join(format!("nterm-history-{}.txt", std::process::id()));
-        std::fs::write(&file, "one\n").unwrap();
-        let path = file.to_string_lossy().into_owned();
-        let history = define("history", &params(&[("path", &path), ("query", "git"), ("position", "cursor")])).unwrap();
-        assert!(matches!(&history.lists, Lists::File(read) if read.path == file && read.reverse));
-        // In the order of the file, with no previews, where the cursor is.
-        assert!(matches!(history.sort, SearchSortMode::SourceOrder) && history.at_cursor);
-        assert_eq!((history.label.as_str(), history.query.as_str(), history.preview), ("History", "git", None));
-        // A name alone is a file of the folder the program is in.
-        let name = file.file_name().unwrap().to_string_lossy().into_owned();
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let beside = define("history", &params(&[("path", &name), ("cwd", &cwd)])).unwrap();
-        assert!(matches!(&beside.lists, Lists::File(read) if read.path == file && read.reverse));
-        std::fs::remove_file(&file).unwrap();
-        for given in [params(&[]), params(&[("path", &path)]), params(&[("path", &name)]), params(&[("path", &cwd)])] {
-            assert!(define("history", &given).is_err(), "history with {given:?} was taken");
-        }
-
-        let items = define("items", &params(&[])).unwrap();
+    fn the_daemon_has_a_picker_of_what_its_program_gives_and_no_other() {
+        let items = define("items", &params(&[("query", "git"), ("position", "cursor")])).unwrap();
         assert!(matches!(items.lists, Lists::Given) && matches!(items.sort, SearchSortMode::Score));
-        assert_eq!((items.label.as_str(), items.preview, items.at_cursor), ("Items", None, false));
+        assert_eq!((items.label.as_str(), items.query.as_str(), items.preview, items.at_cursor), ("Items", "git", None, true));
         let long = "x".repeat(MOST_LABEL + 10);
         assert_eq!(define("items", &params(&[("label", " Completions ")])).unwrap().label, "Completions");
         assert_eq!(define("items", &params(&[("label", &long)])).unwrap().label.len(), MOST_LABEL);
-    }
-
-    #[test]
-    fn the_daemon_runs_no_program_of_its_own() {
-        // A search of files is the machine's file's to define: the daemon
-        // has none.
+        // Files, folders, the lines of a file and what a program prints are
+        // the machine's file's to say: the daemon has none of its own.
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let asked = define("ripgrep", &params(&[("cwd", &cwd), ("pattern", "fn main")]));
-        assert_eq!(asked.err().as_deref(), Some("no picker named ripgrep"));
+        for name in ["files", "directories", "history", "ripgrep"] {
+            let asked = define(name, &params(&[("cwd", &cwd), ("pattern", "fn main")]));
+            assert_eq!(asked.err(), Some(format!("no picker named {name}")));
+        }
     }
 
     #[test]

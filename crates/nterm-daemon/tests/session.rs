@@ -1203,11 +1203,12 @@ impl Ui {
 #[test]
 fn a_program_is_run_a_picker_of_files_and_given_the_one_chosen() {
     let session = session("pick-files");
+    let _pickers = with_pickers(&session);
     let tree = Tree::new("files");
     let mut ui = Ui::connect(&session);
     let pane = ui.shell();
     let params = serde_json::json!({"cwd": tree.path()});
-    let (asker, picker) = ui.picker(&session, pane, "files", params);
+    let (asker, picker) = ui.picker(&session, pane, "Files", params);
 
     // Everything under the folder, said from there, and not the folders.
     let all = ui.query(picker, 0, "");
@@ -1238,6 +1239,7 @@ fn a_program_is_run_a_picker_of_files_and_given_the_one_chosen() {
 #[test]
 fn a_picker_of_folders_and_the_ways_a_ui_ends_one() {
     let session = session("pick-folders");
+    let _pickers = with_pickers(&session);
     let tree = Tree::new("folders");
     let mut ui = Ui::connect(&session);
     let pane = ui.shell();
@@ -1247,7 +1249,7 @@ fn a_picker_of_folders_and_the_ways_a_ui_ends_one() {
     };
 
     // It starts with the query it was asked for with.
-    let asker = Asker::ask(&session, pane, "directories", params());
+    let asker = Asker::ask(&session, pane, "Directories", params());
     let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
     let Control::PickerOpen { picker, label, query, .. } = opened else { unreachable!() };
     assert_eq!((label.as_str(), query.as_str()), ("Directories", "b"));
@@ -1260,14 +1262,14 @@ fn a_picker_of_folders_and_the_ways_a_ui_ends_one() {
     assert_eq!(asker.result().0, "cancelled");
 
     // Not shown at all.
-    let (asker, picker) = ui.picker(&session, pane, "directories", params());
+    let (asker, picker) = ui.picker(&session, pane, "Directories", params());
     ui.send(Control::PickerClose { picker, refused: Some("busy".into()) });
     let (status, result) = asker.result();
     assert_eq!(status, "error");
     assert_eq!((&result["code"], &result["message"]), (&"refused".into(), &"busy".into()));
 
     // A row it was not sent.
-    let (asker, picker) = ui.picker(&session, pane, "directories", params());
+    let (asker, picker) = ui.picker(&session, pane, "Directories", params());
     let found = ui.query(picker, 0, "");
     ui.send(Control::PickerAccept { picker, serial: found.serial, row: 9999 });
     let (status, result) = asker.result();
@@ -1278,6 +1280,7 @@ fn a_picker_of_folders_and_the_ways_a_ui_ends_one() {
 #[test]
 fn a_picker_ends_when_its_program_or_its_ui_goes() {
     let session = session("pick-ends");
+    let _pickers = with_pickers(&session);
     let tree = Tree::new("ends");
     let mut ui = Ui::connect(&session);
     let pane = ui.shell();
@@ -1287,28 +1290,28 @@ fn a_picker_ends_when_its_program_or_its_ui_goes() {
     };
 
     // The program says it is done with it.
-    let (mut asker, picker) = ui.picker(&session, pane, "files", params());
+    let (mut asker, picker) = ui.picker(&session, pane, "Files", params());
     asker.0.send(b"{\"type\":\"cancel\"}").unwrap();
     closed(&mut ui, picker);
     assert_eq!(asker.result().0, "cancelled");
 
     // The program goes.
-    let (asker, picker) = ui.picker(&session, pane, "files", params());
+    let (asker, picker) = ui.picker(&session, pane, "Files", params());
     drop(asker);
     closed(&mut ui, picker);
 
     // The UI lets go of the pane.
-    let (asker, picker) = ui.picker(&session, pane, "files", params());
+    let (asker, picker) = ui.picker(&session, pane, "Files", params());
     ui.send(Control::Detach { pane });
     closed(&mut ui, picker);
     assert_eq!(asker.result().0, "cancelled");
     ui.show(pane);
 
     // The shell of the pane ends.
-    let (asker, picker) = ui.picker(&session, pane, "files", params());
+    let (asker, picker) = ui.picker(&session, pane, "Files", params());
     let mut other = Ui::connect(&session);
     let second = other.shell();
-    let (theirs, _) = other.picker(&session, second, "files", params());
+    let (theirs, _) = other.picker(&session, second, "Files", params());
     ui.send(Control::Close { pane });
     closed(&mut ui, picker);
     assert_eq!(asker.result().0, "cancelled");
@@ -1323,24 +1326,25 @@ fn a_picker_ends_when_its_program_or_its_ui_goes() {
 #[test]
 fn a_picker_is_refused_for_what_cannot_be_shown_or_is_not_one() {
     let session = session("pick-refuse");
+    let _pickers = with_pickers(&session);
     let tree = Tree::new("refuse");
     let mut ui = Ui::connect(&session);
     let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(200, 24)).pane;
     let params = serde_json::json!({"cwd": tree.path()});
 
-    let nowhere = Asker::ask(&session, pane + 100, "files", params.clone());
+    let nowhere = Asker::ask(&session, pane + 100, "Files", params.clone());
     assert_eq!(nowhere.told()["type"], "refused");
 
     // Nothing shows the pane.
-    let (status, result) = Asker::ask(&session, pane, "files", params.clone()).result();
+    let (status, result) = Asker::ask(&session, pane, "Files", params.clone()).result();
     assert_eq!((status.as_str(), &result["code"]), ("error", &"no_window".into()));
 
     ui.show(pane);
     let missing = tree.0.join("none").to_string_lossy().into_owned();
     for (name, params) in [
         ("themes", params),
-        ("files", serde_json::json!({})),
-        ("files", serde_json::json!({"cwd": missing})),
+        ("Files", serde_json::json!({})),
+        ("Files", serde_json::json!({"cwd": missing})),
     ] {
         let (status, result) = Asker::ask(&session, pane, name, params).result();
         assert_eq!((status.as_str(), &result["code"]), ("error", &"bad_request".into()), "{result}");
@@ -1378,12 +1382,13 @@ impl Ui {
 #[test]
 fn a_ui_is_sent_what_shows_for_a_row_of_a_picker() {
     let session = session("pick-preview");
+    let _pickers = with_pickers(&session);
     let tree = Tree::new("preview");
     let mut ui = Ui::connect(&session);
     let pane = ui.shell();
 
-    // Files: hidden unless asked for shown, and the file as it is.
-    let asker = Asker::ask(&session, pane, "files", serde_json::json!({"cwd": tree.path()}));
+    // Files: hidden, as nterm.files makes them, and the file as it is.
+    let asker = Asker::ask(&session, pane, "Files", serde_json::json!({"cwd": tree.path()}));
     let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
     let Control::PickerOpen { picker, preview, .. } = opened else { unreachable!() };
     assert_eq!(preview, Some(false));
@@ -1414,7 +1419,7 @@ fn a_ui_is_sent_what_shows_for_a_row_of_a_picker() {
     .unwrap();
     ui.send(Control::PickerClose { picker, refused: None });
     assert_eq!(asker.result().0, "cancelled");
-    let (asker, picker) = ui.picker(&session, pane, "files", serde_json::json!({"cwd": tree.path()}));
+    let (asker, picker) = ui.picker(&session, pane, "Files", serde_json::json!({"cwd": tree.path()}));
     let found = ui.query(picker, 0, "top");
     assert_eq!(found.texts(), ["Top.PNG"]);
     ui.send(Control::PickerPreview { picker, request: 7, serial: found.serial, row: found.rows[0].0 });
@@ -1426,11 +1431,11 @@ fn a_ui_is_sent_what_shows_for_a_row_of_a_picker() {
     assert_eq!(asker.result().0, "cancelled");
 
     // Folders: what is in the one selected.
-    let params = serde_json::json!({"cwd": tree.path(), "preview": "true"});
-    let asker = Asker::ask(&session, pane, "directories", params);
+    let params = serde_json::json!({"cwd": tree.path()});
+    let asker = Asker::ask(&session, pane, "Directories", params);
     let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
     let Control::PickerOpen { picker, preview, .. } = opened else { unreachable!() };
-    assert_eq!(preview, Some(true));
+    assert_eq!(preview, Some(false));
     assert_eq!(asker.told()["type"], "opened");
     let found = ui.query(picker, 0, "a");
     let (row, _) = found.rows.iter().find(|(_, text)| text == "a").unwrap().clone();
@@ -1453,6 +1458,7 @@ impl Asker {
 #[test]
 fn a_picker_of_what_was_typed_lists_the_last_first_and_gives_a_command_whole() {
     let session = session("pick-history");
+    let _pickers = with_pickers(&session);
     let tree = Tree::new("history");
     // The second command is of two lines, and the first was typed twice.
     let typed = tree.0.join("history.txt");
@@ -1460,8 +1466,8 @@ fn a_picker_of_what_was_typed_lists_the_last_first_and_gives_a_command_whole() {
     let mut ui = Ui::connect(&session);
     let pane = ui.shell();
 
-    let params = serde_json::json!({"path": typed.to_string_lossy(), "query": "g", "position": "cursor"});
-    let asker = Asker::ask(&session, pane, "history", params);
+    let params = serde_json::json!({"history": typed.to_string_lossy(), "query": "g", "position": "cursor"});
+    let asker = Asker::ask(&session, pane, "History", params);
     let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
     let Control::PickerOpen { picker, label, query, preview, at_cursor, .. } = opened else { unreachable!() };
     // No previews, and where the cursor is.
@@ -1489,7 +1495,7 @@ fn a_picker_of_what_was_typed_lists_the_last_first_and_gives_a_command_whole() {
     assert_eq!(result["selected"][0]["value"], "ls\n  -Force");
 
     // A file there is not is refused, with no picker shown.
-    let asker = Asker::ask(&session, pane, "history", serde_json::json!({"path": tree.0.join("none").to_string_lossy()}));
+    let asker = Asker::ask(&session, pane, "History", serde_json::json!({"history": tree.0.join("none").to_string_lossy()}));
     let (status, result) = asker.result();
     assert_eq!((status.as_str(), &result["code"]), ("error", &"bad_request".into()));
     ui.shutdown();
@@ -1498,6 +1504,7 @@ fn a_picker_of_what_was_typed_lists_the_last_first_and_gives_a_command_whole() {
 #[test]
 fn a_picker_of_rows_its_program_gives_and_what_the_program_is_told_of_one() {
     let session = session("pick-items");
+    let _pickers = with_pickers(&session);
     let mut ui = Ui::connect(&session);
     let pane = ui.shell();
 
@@ -1561,13 +1568,31 @@ fn a_picker_of_rows_its_program_gives_and_what_the_program_is_told_of_one() {
 
     // Rows given a picker that lists something else are answered, not listed.
     let tree = Tree::new("items");
-    let (mut asker, picker) = ui.picker(&session, pane, "files", serde_json::json!({"cwd": tree.path()}));
+    let (mut asker, picker) = ui.picker(&session, pane, "Files", serde_json::json!({"cwd": tree.path()}));
     let ack = asker.say(serde_json::json!({"type": "items", "request_id": "r1", "sequence": 0, "items": [{"text": "x"}]}));
     assert_eq!(ack["type"], "ack");
     assert_eq!(ui.query(picker, 0, "").matched, 4);
     ui.send(Control::PickerClose { picker, refused: None });
     assert_eq!(asker.result().0, "cancelled");
     ui.shutdown();
+}
+
+/// A daemon serving `session` with pickers of files, of folders and of what
+/// was typed, made with the modules that come with nterm as a machine's
+/// file makes them. A row of files or folders is said from the folder
+/// looked under. It ends as any daemon of a test does, when told to.
+fn with_pickers(session: &str) -> (std::process::Child, Tree) {
+    let folder = Tree(std::env::temp_dir().join(format!("nterm-pickers-{session}")));
+    let _ = std::fs::remove_dir_all(&folder.0);
+    std::fs::create_dir_all(&folder.0).unwrap();
+    let text = r#"local files = require("nterm.files")
+        local history = require("nterm.history")
+        return { pickers = {
+          Files = files.files { relative = true },
+          Directories = files.directories { relative = true },
+          History = history.powershell(),
+        } }"#;
+    (daemon_with_file(session, &folder.0, text), folder)
 }
 
 /// A daemon serving `session` whose file of pickers, in `folder`, is
@@ -1671,6 +1696,7 @@ fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
 #[test]
 fn a_ui_asks_for_a_picker_for_itself_and_is_told_what_the_row_it_chose_is() {
     let session = session("pick-asked");
+    let _pickers = with_pickers(&session);
     let tree = Tree::new("asked");
     let mut ui = Ui::connect(&session);
     let pane = ui.shell();
@@ -1680,7 +1706,7 @@ fn a_ui_asks_for_a_picker_for_itself_and_is_told_what_the_row_it_chose_is() {
     let cwd = tree.path();
 
     // No program is in it: the UI asks, and is the one told.
-    ui.send(Control::PickerAsk { ask: 41, pane, picker: "files".into(), params: params(&[("cwd", &cwd), ("query", "gam")]) });
+    ui.send(Control::PickerAsk { ask: 41, pane, picker: "Files".into(), params: params(&[("cwd", &cwd), ("query", "gam")]) });
     let opened = ui.control(|c| matches!(c, Control::PickerOpen { .. }));
     let Control::PickerOpen { picker, pane: Some(over), label, query, ask, .. } = opened else { unreachable!() };
     assert_eq!((over, label.as_str(), query.as_str(), ask), (pane, "Files", "gam", Some(41)));
@@ -1692,7 +1718,7 @@ fn a_ui_asks_for_a_picker_for_itself_and_is_told_what_the_row_it_chose_is() {
     assert_eq!((of, text.as_str(), value, query.as_str()), (picker, "b/gamma.rs".replace('/', "\u{5c}").as_str(), whole, "gam"));
 
     // One it closes is over with nothing more said, and the next is another.
-    ui.send(Control::PickerAsk { ask: 42, pane, picker: "directories".into(), params: params(&[("cwd", &cwd)]) });
+    ui.send(Control::PickerAsk { ask: 42, pane, picker: "Directories".into(), params: params(&[("cwd", &cwd)]) });
     let Control::PickerOpen { picker: second, ask, .. } = ui.control(|c| matches!(c, Control::PickerOpen { .. })) else {
         unreachable!()
     };
@@ -1705,8 +1731,8 @@ fn a_ui_asks_for_a_picker_for_itself_and_is_told_what_the_row_it_chose_is() {
     for (ask, pane, name, given) in [
         (43, pane, "themes", params(&[("cwd", &cwd)])),
         (44, pane, "items", params(&[])),
-        (45, pane, "files", params(&[])),
-        (46, pane + 100, "files", params(&[("cwd", &cwd)])),
+        (45, pane, "Files", params(&[])),
+        (46, pane + 100, "Files", params(&[("cwd", &cwd)])),
     ] {
         ui.send(Control::PickerAsk { ask, pane, picker: name.into(), params: given });
         let refused = ui.control(|c| matches!(c, Control::PickerRefused { .. }));
@@ -1741,7 +1767,7 @@ fn the_pickers_of_the_machines_file_are_opened_by_name_as_the_daemons_own_are() 
           Fixed = { type = "Items", position = "Cursor", initial_query = "t",
                     items = { { text = "One", value = "1" }, { text = "Two", value = "2" } } },
           Here = { type = "FileSystem", files_only = true, relative = true, preview_visible = false },
-          files = { type = "Items" },
+          items = { type = "Items" },
         } }"#,
     );
     let mut command = std::process::Command::new(DAEMON);
@@ -1829,11 +1855,14 @@ fn the_pickers_of_the_machines_file_are_opened_by_name_as_the_daemons_own_are() 
         let Control::PickerRefused { message, .. } = refused else { panic!("{name}: {refused:?}") };
         assert!(message.contains(why), "{name}: {message}");
     }
-    let Control::PickerOpen { picker, label, .. } = ask(&mut ui, "files", params(&[("cwd", &cwd)])) else {
-        panic!("the daemon's own files picker did not open")
+    let asker = Asker::ask(&session, pane, "items", serde_json::json!({"label": "Own"}));
+    let Control::PickerOpen { picker, label, .. } = ui.control(|c| matches!(c, Control::PickerOpen { .. })) else {
+        unreachable!()
     };
-    assert_eq!(label, "Files");
+    assert_eq!(label, "Own", "the daemon's own items picker did not open");
+    assert_eq!(asker.told()["type"], "opened");
     ui.send(Control::PickerClose { picker, refused: None });
+    assert_eq!(asker.result().0, "cancelled");
 
     // The file is read again once it has changed: no restart.
     write(r#"return { pickers = { Fixed = { type = "Items", items = { { text = "Three", value = "3" } } } } }"#);

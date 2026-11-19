@@ -586,7 +586,7 @@ mod tests {
             "bad",
             r#"return { pickers = {
               Good = { type = "Items", items = {} },
-              files = { type = "Items" },
+              items = { type = "Items" },
               Made = function(context) return { type = "Scrollback" } end,
               Asked = { type = "Command", args = {"{program}", "x"} },
               None = { type = "Command", args = {} },
@@ -599,7 +599,7 @@ mod tests {
         let configured = Configured::new(Some(path.clone()));
         assert!(configured.picker("Good").unwrap().is_some());
         for (name, why) in [
-            ("files", "of its own"),
+            ("items", "of its own"),
             ("Made", "type Scrollback"),
             ("Asked", "not one to be given"),
             ("None", "no program"),
@@ -652,11 +652,11 @@ mod tests {
         let path = file("example", &std::fs::read_to_string(root.join("nterm-daemon.example.lua")).unwrap());
         let modules = path.parent().unwrap().join("nterm");
         std::fs::create_dir_all(&modules).unwrap();
-        for module in ["git.lua", "ripgrep.lua"] {
+        for module in ["files.lua", "git.lua", "history.lua", "ripgrep.lua"] {
             std::fs::copy(root.join("lua/nterm").join(module), modules.join(module)).unwrap();
         }
         let configured = Configured::new(Some(path.clone()));
-        for name in ["Commits", "Ripgrep", "Typed", "Near", "Servers", "GitCommits", "GitBranches", "GitStatus"] {
+        for name in ["Commits", "Ripgrep", "History", "Files", "Directories", "Near", "Servers", "GitCommits", "GitBranches", "GitStatus"] {
             assert!(configured.picker(name).unwrap().is_some(), "{name}");
         }
         // The pickers of git have columns, and say what shows for a row.

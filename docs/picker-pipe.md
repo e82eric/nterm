@@ -93,80 +93,86 @@ they would list that window's own files.
 
 ```powershell
 # A file under the current directory; returns its full path.
-Invoke-NtermPicker -DaemonPicker files -Parameters @{ cwd = $PWD.Path }
+Invoke-NtermPicker -DaemonPicker Files -Parameters @{ cwd = $PWD.Path }
 
 # A folder under any of several roots.
-Invoke-NtermPicker -DaemonPicker directories -Parameters @{
+Invoke-NtermPicker -DaemonPicker Directories -Parameters @{
     roots = (ConvertTo-Json -InputObject @('C:\src', 'D:\work') -Compress)
 }
 ```
 
-The daemon has five pickers. For all of them `query` is the text the picker
-opens with, and `position = "cursor"` shows it at the pane's cursor instead of
-in the middle of the pane. The window needs `picker_pipe.enabled`, and nothing
-in `named`.
+The daemon has one picker of its own, `items`. The rest are the pickers of the
+machine's file, `nterm-daemon.lua` (below), and modules that come with nterm
+make the usual ones:
 
-`files` and `directories`: `roots` is a JSON list of folders; without it `cwd`
-is the one root. With one root the rows are paths from it; the value returned
-is always the whole path. A path that starts with `~` is in the home folder of
-the daemon's machine.
+```lua
+-- nterm-daemon.lua
+local files = require("nterm.files")
+local history = require("nterm.history")
+local ripgrep = require("nterm.ripgrep")
+return {
+  pickers = {
+    Files = files.files(),
+    Directories = files.directories(),
+    History = history.powershell(),
+    Ripgrep = ripgrep.search(),
+  },
+}
+```
 
-`history` lists the lines of the file `path` names, the last first and each
-once, joining lines that end in a backtick to the next: PSReadLine's history
-file. What matches stays in that order. The value returned is the command as
-it was typed, on its own lines.
+For all of them `query` is the text the picker opens with, and `position =
+"cursor"` shows it at the pane's cursor instead of in the middle of the pane.
+The window needs `picker_pipe.enabled`, and nothing in `named`.
+
+`files.files` and `files.directories` list the files, or the folders, under
+`roots`, a JSON list of whole paths, or under `cwd` without it. A row and the
+value returned are the whole path; `files.files { relative = true }` shows rows
+from the one folder looked under. `max_depth` is how many levels down to go.
+Each row has a preview, hidden until Ctrl+P shows it, or shown at open with
+`preview_visible = true`. A file shows its first 256 KB as text, coloured by
+its name, a picture (png, jpg, jpeg, gif, bmp, webp, tif, tiff) of up to 10 MiB
+shows as the picture, and a folder shows what is in it. The daemon reads them
+and the window lays them out. The rest of a longer file is not shown yet.
+
+`history.powershell` lists the lines of the file `history` names, the last
+first and each once, joining lines that end in a backtick to the next:
+PSReadLine's history file. What matches stays in that order. The value returned
+is the command as it was typed, on its own lines. It has no previews.
 
 ```powershell
-Invoke-NtermPicker -DaemonPicker history -Parameters @{
-    path = (Get-PSReadLineOption).HistorySavePath
+Invoke-NtermPicker -DaemonPicker History -Parameters @{
+    history = (Get-PSReadLineOption).HistorySavePath
     position = 'cursor'
 }
 ```
 
+`ripgrep.search` runs `rg` once in `cwd` for `pattern`, a regular expression,
+and lists each place it is found as `path:line:column:text`. What is typed in
+the picker narrows those lines; it does not search again. `rg` has to be on the
+`PATH` the daemon was started with. If it cannot be run, or fails having found
+nothing (a pattern it cannot read, say), the picker ends with what it said. A
+row's preview is its file with the line it was found on in the middle, marked.
+A file of more than 256 KB shows as the lines round that one, so line numbers
+shown beside it count from the first line shown, not the file's first. The
+flags rg is run with are `ripgrep.flags`; `ripgrep.search { flags = { ... } }`
+gives others.
+
+```powershell
+Invoke-NtermPicker -DaemonPicker Ripgrep -Parameters @{ cwd = $PWD.Path; pattern = 'fn main' }
+```
+
 `items` lists what is piped in, as the window's own stream picker does, and
-is called `label`. It takes up to 100,000 rows.
+is called `label`. It takes up to 100,000 rows. It has no previews.
 
 ```powershell
 Get-Process | Invoke-NtermPicker -DaemonPicker items -DisplayProperty Name `
     -Parameters @{ label = 'Processes' }
 ```
 
-`history` and `items` have no previews.
-
-The daemon runs no program of its own. A search of files is a picker of the
-machine's file (below), made with the module that comes with nterm:
-
-```lua
--- nterm-daemon.lua
-local ripgrep = require("nterm.ripgrep")
-return { pickers = { Ripgrep = ripgrep.search { preview_visible = false } } }
-```
-
-It runs `rg` once in `cwd` for `pattern`, a regular expression, and lists each
-place it is found as `path:line:column:text`. What is typed in the picker
-narrows those lines; it does not search again. `rg` has to be on the `PATH`
-the daemon was started with. If it cannot be run, or fails having found nothing
-(a pattern it cannot read, say), the picker ends with what it said. A row's
-preview is its file with the line it was found on in the middle, marked. A file
-of more than 256 KB shows as the lines round that one, so line numbers shown
-beside it count from the first line shown, not the file's first. The flags rg
-is run with are `ripgrep.flags`; `ripgrep.search { flags = { ... } }` gives
-others.
-
-```powershell
-Invoke-NtermPicker -DaemonPicker Ripgrep -Parameters @{ cwd = $PWD.Path; pattern = 'fn main' }
-```
-
-Each row of `files` and `directories` has a preview, hidden until Ctrl+P shows it; with `preview = "true"`
-in the parameters it opens shown. A file shows its first 256 KB as text,
-coloured by its name, a picture (png, jpg, jpeg, gif, bmp, webp, tif, tiff) of up to 10 MiB shows as the picture, and a folder shows what is in it. The daemon reads them
-and the window lays them out. The rest of a longer file is not
-shown yet.
-
-`profile.example.ps1` binds these pickers to
-Ctrl+Shift+O and Ctrl+Shift+T (under the current directory) and to Alt+Shift+O
-and Alt+Shift+T (under the roots), history to Alt+Shift+R, and PowerShell's
-completions, through `items`, to Ctrl+Shift+Space.
+`profile.example.ps1` binds `Files` and `Directories` to Ctrl+Shift+T and
+Ctrl+Shift+O (under the current directory) and to Alt+Shift+T and Alt+Shift+O
+(under the roots), `History` to Alt+Shift+R, and PowerShell's completions,
+through `items`, to Ctrl+Shift+Space.
 
 ### Pickers of your own: `nterm-daemon.lua`
 
@@ -298,8 +304,8 @@ Not yet: previews of types
 other than `Dynamic` and `items` that is a
 function are refused. A picker that cannot be one is refused
 when it is opened, saying why, and the file's other pickers still open. The
-names `files`, `directories`, `history` and `items` are the
-daemon's own and cannot be given to a picker of the file.
+name `items` is the daemon's own and cannot be given to a picker of the
+file.
 
 ## npick
 

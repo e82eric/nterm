@@ -1,7 +1,8 @@
 # PowerShell 7.4+. Dot-source this file from your $PROFILE.
 # nterm Lua: allow the ProfileFiles, ProfileDirectories, ProfileRipgrep,
 # ProfileHistory and ProfileCompletions named pickers. See docs/picker-pipe.md or
-# nterm.example.lua.
+# nterm.example.lua. The bindings with Shift ask the session daemon for its
+# Files, Directories and History pickers: see nterm-daemon.example.lua.
 # Outside an nterm pane this file does nothing, so your other bindings stay.
 param([string[]]$PickerRoots = @((Get-Location).Path))
 
@@ -23,7 +24,7 @@ function Invoke-ProfilePathPicker {
         cwd = $PWD.Path
     }
     if ($Daemon) {
-        $name = if ($Directories) { 'directories' } else { 'files' }
+        $name = if ($Directories) { 'Directories' } else { 'Files' }
         return Invoke-NtermPicker -DaemonPicker $name -Parameters $parameters
     }
     $name = if ($Directories) { 'ProfileDirectories' } else { 'ProfileFiles' }
@@ -74,8 +75,8 @@ function Invoke-ProfileHistoryPicker {
     # by the session daemon with -Daemon, on the machine this shell is on,
     # and by nterm without.
     $result = if ($Daemon) {
-        Invoke-NtermPicker -DaemonPicker history -Parameters @{
-            path = $historyPath
+        Invoke-NtermPicker -DaemonPicker History -Parameters @{
+            history = $historyPath
             query = $line
             position = 'cursor'
         }

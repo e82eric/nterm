@@ -436,10 +436,10 @@ action either shows a page on top with `app:push_picker` or closes it with
 `app:close_picker()`. The sample `Grep` picker asks for text and pushes
 `Ripgrep` with it as `pattern`.
 
-`Daemon` is one of the pickers the session daemon has, named by `picker`:
-`files`, `directories` or `history`, or one of that machine's
-`nterm-daemon.lua`, such as `Ripgrep` made with `require("nterm.ripgrep")`
-(see [picker-pipe.md](picker-pipe.md) for what each takes). The daemon lists and
+`Daemon` is one of the pickers of that machine's `nterm-daemon.lua`, named by
+`picker`, such as `Files`, `Directories`, `History` and `Ripgrep` made with the
+modules `nterm.files`, `nterm.history` and `nterm.ripgrep` (see
+[picker-pipe.md](picker-pipe.md) for what each takes). The daemon lists and
 searches where the pane's shell is and the window draws the rows, so it works
 the same in a window on another machine (`--remote`), where the other kinds
 would read that window's own files. The parameters it is opened with are the
