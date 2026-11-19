@@ -152,9 +152,23 @@ function Invoke-NtermPicker {
             }
             throw 'Timed out waiting for nterm picker response.'
         }
+        # Send what goes with the rows. Nothing when it is sent; when the
+        # picker ended first (closed, or a row chosen, before all were sent),
+        # the result the daemon gave before closing the connection, or
+        # cancelled if there is none to read.
+        function Send-PickerRows($message) {
+            try { Send-PickerMessage $message; return }
+            catch {
+                $raw = try { Read-PickerFrame 1000 } catch { $null }
+                $said = if ($null -ne $raw) { try { Read-PickerMessage $raw } catch { $null } }
+                if ($null -ne $said -and $said.type -eq 'result') { return $said }
+                return @{ type='result'; request_id=$requestId; status='cancelled' }
+            }
+        }
         function Flush-PickerItems {
             if ($batch.Count -eq 0 -or $null -ne $result) { return }
-            Send-PickerMessage @{ type='items'; request_id=$requestId; sequence=$sequence; items=@($batch.ToArray()) }
+            $ended = Send-PickerRows @{ type='items'; request_id=$requestId; sequence=$sequence; items=@($batch.ToArray()) }
+            if ($null -ne $ended) { return $ended }
             $reply = Receive-PickerMessage 15
             if ($reply.type -eq 'result') { return $reply }
             if ($reply.type -ne 'ack' -or $reply.sequence -ne $sequence) { throw 'Unexpected picker batch response.' }
@@ -246,8 +260,8 @@ function Invoke-NtermPicker {
                 if ($batch.Count) { $result = Flush-PickerItems; $sequence++ }
                 if ($null -eq $result) {
                     $last = if ($sequence -eq 0) { $null } else { $sequence - 1 }
-                    Send-PickerMessage @{ type='end_items'; request_id=$requestId; last_sequence=$last }
-                    $reply = Receive-PickerMessage 15
+                    $reply = Send-PickerRows @{ type='end_items'; request_id=$requestId; last_sequence=$last }
+                    if ($null -eq $reply) { $reply = Receive-PickerMessage 15 }
                     if ($reply.type -eq 'result') { $result = $reply }
                     elseif ($reply.type -ne 'input_complete') { throw 'Unexpected picker completion response.' }
                 }
