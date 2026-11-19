@@ -1021,24 +1021,25 @@ impl TerminalView {
                 ui.close();
             }
         });
-        // Bright, as tmux's session is, so it is not missed: light on the
-        // dark bar as the rest of it is, which reads better than dark on a
-        // bright fill.
+        // Not to be missed, as tmux's session is: the theme's green tints
+        // the block and outlines it. The name is the bar's own text colour,
+        // light on dark as the rest of it: a theme's green can be too dark
+        // to read text in, and dark text on a bright fill reads worse.
         let mut label_left = menu.right() + 6.0;
         if let Some(elsewhere) = elsewhere {
-            let text = painter.layout_no_wrap(elsewhere, font.clone(), palette.success);
+            let text = painter.layout_no_wrap(elsewhere, font.clone(), palette.text);
             let block = egui::Rect::from_min_size(
                 egui::pos2(label_left, chip_top),
                 egui::vec2(text.size().x + 16.0 * scale, chip_height),
             );
-            painter.rect_filled(block, 4.0, egui::Color32::from_white_alpha(14));
+            painter.rect_filled(block, 4.0, palette.success.gamma_multiply(0.3));
             painter.rect_stroke(
                 block,
                 4.0,
-                egui::Stroke::new(1.0, palette.success.gamma_multiply(0.6)),
+                egui::Stroke::new(1.0, palette.success),
                 egui::StrokeKind::Inside,
             );
-            painter.galley(block.center() - text.size() / 2.0, text, palette.success);
+            painter.galley(block.center() - text.size() / 2.0, text, palette.text);
             label_left = block.right() + 6.0;
         }
         let label = painter.layout_no_wrap(
