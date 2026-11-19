@@ -857,6 +857,38 @@ mod tests {
     }
 
     #[test]
+    fn a_command_shows_as_the_history_module_says() {
+        let path = file(
+            "history",
+            r#"local history = require("nterm.history")
+            return { pickers = {
+              P = history.powershell { preview = history.preview() },
+              Q = history.powershell { preview = history.preview { syntax = "PlainText" } },
+            } }"#,
+        );
+        let folder = path.parent().unwrap();
+        let modules = folder.join("nterm");
+        std::fs::create_dir_all(&modules).unwrap();
+        let module = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lua/nterm/history.lua");
+        std::fs::copy(module, modules.join("history.lua")).unwrap();
+        let command = "Get-ChildItem |\n    Where-Object Length -gt 0";
+        let text = |syntax: &str| Shows::Text {
+            text: command.into(),
+            name: None,
+            extension: None,
+            syntax: Some(syntax.into()),
+            line: None,
+        };
+        // The whole command, all its lines, in its language.
+        let (shown, wanted) = previewer(&path, "P", true);
+        assert_eq!(ask(&shown, &wanted, 1, command, command), Ok(text("PowerShell")));
+        // Another language where the file names one.
+        let (shown, wanted) = previewer(&path, "Q", true);
+        assert_eq!(ask(&shown, &wanted, 1, command, command), Ok(text("PlainText")));
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
     fn the_helpers_are_for_use_in_a_preview_and_a_picker_without_one_has_no_previewer() {
         let path = file(
             "helpers",

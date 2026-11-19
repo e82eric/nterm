@@ -5,7 +5,7 @@
 --   local history = require("nterm.history")
 --   return {
 --     pickers = {
---       History = history.powershell(),
+--       History = history.powershell { preview = history.preview() },
 --     },
 --   }
 --
@@ -46,6 +46,24 @@ end
 -- on the next: the two are one row, and what is chosen is both lines.
 function M.powershell(options)
   return picker(options, "`")
+end
+
+-- What shows for a row: the command, all its lines, in the colours of its
+-- language. npicker colours it, so no program is run for it.
+--
+-- Options: syntax (the language, "PowerShell"; the names are bat's, and
+-- "PlainText" is none), theme (the colours, where the window uses it: a
+-- window drawing a daemon's picker uses its own).
+function M.preview(options)
+  options = options or {}
+  local syntax = options.syntax or "PowerShell"
+  local theme = options.theme
+  return {
+    type = "Dynamic",
+    resolve = function(item)
+      return { type = "Text", text = item.value, syntax = syntax, theme = theme }
+    end,
+  }
 end
 
 return M

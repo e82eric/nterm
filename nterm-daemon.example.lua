@@ -69,8 +69,9 @@ return {
       end,
     },
     -- What was typed at PowerShell, the last first. Opened with the file's
-    -- path as `history`: profile.example.ps1's Alt+Shift+R does.
-    History = history.powershell { position = "Cursor" },
+    -- path as `history`: profile.example.ps1's Alt+Shift+R does. The
+    -- preview is the whole command, coloured as PowerShell.
+    History = history.powershell { position = "Cursor", preview = history.preview() },
     -- The files, and the folders, under the folders it is opened with as
     -- `roots`, or under the one the shell is in: profile.example.ps1's
     -- Ctrl+Shift+T and Ctrl+Shift+O do.
