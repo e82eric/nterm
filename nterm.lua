@@ -2,6 +2,7 @@
 -- the executable. Only the first available file is loaded.
 local snippets_path = (os.getenv("USERPROFILE") or os.getenv("HOME")) .. "/.wtd/.wt.json"
 local claude = require("nterm.claude")
+local snippets = require("nterm.snippets")
 return {
   -- Local picker IPC is opt-in. See docs/picker-pipe.md and Invoke-NtermPicker.ps1.
   picker_pipe = {
@@ -10,47 +11,8 @@ return {
     named = {},
   },
   actions = {
-    SaveSnippet = {
-      label = "Save selection as snippet",
-      action = function(app)
-        local selection = app:get_selection_text()
-        if selection == "" then
-          app:show_toast("Save snippet", "Select some text first.", 3000)
-          return
-        end
-        local file, read_error = io.open(snippets_path, "rb")
-        if not file then
-          app:show_toast("Could not save snippet", "Unable to read snippets file: " .. tostring(read_error), 5000)
-          return
-        end
-        local content = file:read("*a")
-        file:close()
-        local parsed, data = pcall(nterm.json_parse, content)
-        if not parsed or type(data) ~= "table" then
-          app:show_toast("Could not save snippet", "Unable to parse snippets JSON: " .. tostring(data), 5000)
-          return
-        end
-        if type(data.snippets) ~= "table" then data.snippets = {} end
-        table.insert(data.snippets, { input = selection })
-        local encoded, json = pcall(nterm.json_encode_pretty, data)
-        if not encoded then
-          app:show_toast("Could not save snippet", "Unable to encode snippets JSON: " .. tostring(json), 5000)
-          return
-        end
-        local output, open_error = io.open(snippets_path, "wb")
-        if not output then
-          app:show_toast("Could not save snippet", "Unable to write snippets file: " .. tostring(open_error), 5000)
-          return
-        end
-        local saved, save_error = output:write(json .. "\n")
-        output:close()
-        if not saved then
-          app:show_toast("Could not save snippet", "Unable to write snippets file: " .. tostring(save_error), 5000)
-          return
-        end
-        app:show_toast("Snippet saved", selection, 2000)
-      end,
-    },
+    -- The selection kept in the snippets file; see lua/nterm/snippets.lua.
+    SaveSnippet = { label = "Save selection as snippet", action = snippets.save { path = snippets_path } },
   },
   font = {
     -- family = "JetBrains Mono", -- Uncomment and choose an installed font.
@@ -178,6 +140,9 @@ return {
     -- Enter types one at the shell's cursor.
     Suggest = claude.suggest { page = "Suggestions" },
     Suggestions = claude.suggestions(),
+    -- The snippets SaveSnippet keeps, filtered by the word before the cursor;
+    -- Enter types one in place of that word.
+    Snippets = snippets.picker { path = snippets_path },
   },
   keys = {
     { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
@@ -202,5 +167,6 @@ return {
     { key = "j", mods = "CTRL|SHIFT", picker = "Grep" },
     { key = "a", mods = "CTRL|SHIFT", picker = "Ask" },
     { key = "u", mods = "CTRL|SHIFT", picker = "Suggest" },
+    { key = "b", mods = "CTRL|SHIFT", picker = "Snippets" },
   },
 }

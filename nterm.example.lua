@@ -3,8 +3,8 @@
 -- configurable ffmpeg/ffprobe commands. Help/history command previews require pwsh with
 -- -CommandWithArgs (history also uses bat). Text search requires rg; ProfileHistory
 -- reads the PSReadLine history file directly, newest first.
--- Snippets use GHOSTTY_SNIPPETS_FILE or ~/ghostty-snippets.json, with initial JSON:
--- {"snippets": []}. SaveSnippet writes to that file.
+-- Snippets use GHOSTTY_SNIPPETS_FILE or ~/ghostty-snippets.json; SaveSnippet
+-- writes to that file, and makes it if it is not there.
 -- CodexSuggestions invokes codex exec and ClaudeSuggestions invokes claude --print
 -- with Haiku; both send the current terminal context.
 -- profile.example.ps1 uses the Profile* named pickers and streamed requests.
@@ -12,6 +12,7 @@
 -- Config lookup: --lua-config=PATH, then ~/nterm.lua, then nterm.lua beside
 -- the executable. Only the first available file is loaded.
 local clipboard = require("nterm.clipboard")
+local snippets = require("nterm.snippets")
 local snippets_path = os.getenv("GHOSTTY_SNIPPETS_FILE")
   or ((os.getenv("USERPROFILE") or os.getenv("HOME") or ".") .. "/ghostty-snippets.json")
 
@@ -251,47 +252,8 @@ return {
     -- (another, in a --remote window), and its path pasted: for Claude Code
     -- there. In the command palette; see lua/nterm/clipboard.lua.
     PasteImage = { label = "Paste picture from clipboard", action = clipboard.paste_image() },
-    SaveSnippet = {
-      label = "Save selection as snippet",
-      action = function(app)
-        local selection = app:get_selection_text()
-        if selection == "" then
-          app:show_toast("Save snippet", "Select some text first.", 3000)
-          return
-        end
-        local file, read_error = io.open(snippets_path, "rb")
-        if not file then
-          app:show_toast("Could not save snippet", "Unable to read snippets file: " .. tostring(read_error), 5000)
-          return
-        end
-        local content = file:read("*a")
-        file:close()
-        local parsed, data = pcall(nterm.json_parse, content)
-        if not parsed or type(data) ~= "table" then
-          app:show_toast("Could not save snippet", "Unable to parse snippets JSON: " .. tostring(data), 5000)
-          return
-        end
-        if type(data.snippets) ~= "table" then data.snippets = {} end
-        table.insert(data.snippets, { input = selection })
-        local encoded, json = pcall(nterm.json_encode_pretty, data)
-        if not encoded then
-          app:show_toast("Could not save snippet", "Unable to encode snippets JSON: " .. tostring(json), 5000)
-          return
-        end
-        local output, open_error = io.open(snippets_path, "wb")
-        if not output then
-          app:show_toast("Could not save snippet", "Unable to write snippets file: " .. tostring(open_error), 5000)
-          return
-        end
-        local saved, save_error = output:write(json .. "\n")
-        output:close()
-        if not saved then
-          app:show_toast("Could not save snippet", "Unable to write snippets file: " .. tostring(save_error), 5000)
-          return
-        end
-        app:show_toast("Snippet saved", selection, 2000)
-      end,
-    },
+    -- The selection kept in the snippets file; see lua/nterm/snippets.lua.
+    SaveSnippet = { label = "Save selection as snippet", action = snippets.save { path = snippets_path } },
   },
   terminal = {
     scrollback_limit = 100000000, -- Bytes; zero disables scrollback.
@@ -434,32 +396,7 @@ return {
         "--no-session-persistence", prompt,
       }
     end),
-    Snippets = function(context)
-      local input = context.line_before_cursor:match("^PS [^>]*>%s?(.*)$")
-        or context.line_before_cursor
-      local word = input:match("(%S+)$") or ""
-      return {
-        type = "Items",
-        initial_query = word,
-        position = "Cursor",
-        items = function()
-          local file = assert(io.open(snippets_path, "rb"))
-          local content = file:read("*a")
-          file:close()
-          local data = nterm.json_parse(content)
-          local items = {}
-          for _, snippet in ipairs(data.snippets or {}) do
-            if type(snippet.input) == "string" then
-              items[#items + 1] = { text = snippet.input, value = snippet.input }
-            end
-          end
-          return items
-        end,
-        action = function(app, item)
-          app:replace_prompt(item.value, utf8.len(word) or 0, 0)
-        end,
-      }
-    end,
+    Snippets = snippets.picker { path = snippets_path },
   },
   -- Quick selects over custom regexes instead of words. Typing a label runs
   -- `action` (Navigate, the default, enters copy mode at the match; Copy and

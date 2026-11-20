@@ -1517,14 +1517,93 @@ mod tests {
             matches!(&commands[0], crate::lua_callbacks::Command::ShowToast { message, .. } if message.contains("Unable to parse"))
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "invalid JSON");
+        // A file that is not there is made, with the one snippet.
         std::fs::remove_file(&path).unwrap();
-        let commands = callback.call_action("keep selection".into()).unwrap();
-        assert_eq!(commands.len(), 1);
+        let commands = callback.call_action("first one".into()).unwrap();
         assert!(
-            matches!(&commands[0], crate::lua_callbacks::Command::ShowToast { message, .. } if message.contains("Unable to read"))
+            matches!(&commands[..], [crate::lua_callbacks::Command::ShowToast { title, .. }] if title == "Snippet saved"),
+            "{commands:?}"
         );
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, serde_json::json!({ "snippets": [{ "input": "first one" }] }));
+        std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&directory).unwrap();
+
+        // A folder that is not there is not made: that is said.
+        let commands = callback.call_action("keep selection".into()).unwrap();
+        assert!(
+            matches!(&commands[..], [crate::lua_callbacks::Command::ShowToast { message, .. }] if message.contains("Unable to write")),
+            "{commands:?}"
+        );
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn bundled_snippets_module_lists_the_file_and_types_one_for_the_word() {
+        let directory = std::env::temp_dir().join(format!("nterm-snippets-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("snippets.json");
+        std::fs::write(
+            &path,
+            r#"{"snippets":[{"input":"git status"},{"name":"no input"},"odd",{"input":"cargo test -p nterm"}]}"#,
+        )
+        .unwrap();
+        let config = parse(&format!(
+            r#"
+            local snippets = require('nterm.snippets')
+            local path = {path}
+            -- The word before the cursor, after a PowerShell prompt or none.
+            assert(snippets.word('PS C:\\src> cargo te') == 'te')
+            assert(snippets.word('PS C:\\src> ') == '')
+            assert(snippets.word('$ git st') == 'st')
+            -- Only what has text to type is a snippet.
+            local inputs = assert(snippets.inputs(path))
+            assert(#inputs == 2 and inputs[1] == 'git status' and inputs[2] == 'cargo test -p nterm')
+            -- A file not there holds none.
+            assert(#assert(snippets.inputs(path .. '.missing')) == 0)
+            assert(not pcall(snippets.picker), 'the picker needs path')
+            assert(not pcall(snippets.save, {{}}), 'save needs path')
+            return {{ pickers = {{
+              Snippets = snippets.picker {{ path = path }},
+              Elsewhere = snippets.picker {{ path = path, position = 'Center' }},
+            }} }}
+            "#,
+            path = serde_json::to_string(&path.to_string_lossy()).unwrap()
+        ))
+        .unwrap();
+        let bindings = compile(config);
+        let options = bindings
+            .named("Snippets")
+            .unwrap()
+            .resolve(&PickerContext {
+                line_before_cursor: "PS C:\\src> cargo te".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(options.params["query"], "te");
+        let crate::picker::config::Source::Items(items) = &options.source else { panic!("not items") };
+        let provider = items.provider.clone().unwrap();
+        let listed: Vec<_> = provider.read().unwrap().into_iter().map(|item| item.value).collect();
+        assert_eq!(listed, ["git status", "cargo test -p nterm"]);
+        // Read each time it opens: a snippet saved since is there.
+        std::fs::write(&path, r#"{"snippets":[{"input":"new"}]}"#).unwrap();
+        assert_eq!(provider.read().unwrap()[0].value, "new");
+        // Enter types the snippet in place of the word.
+        let commands = options
+            .callback
+            .unwrap()
+            .call("cargo test -p nterm", "cargo test -p nterm", false, None, None, &Default::default())
+            .unwrap();
+        assert!(
+            matches!(&commands[..], [crate::lua_callbacks::Command::ReplacePrompt { text, before: 2, after: 0 }] if text == "cargo test -p nterm"),
+            "{commands:?}"
+        );
+        // A file that cannot be parsed is said when the picker reads it.
+        std::fs::write(&path, "not json").unwrap();
+        let error = provider.read().unwrap_err();
+        assert!(error.to_string().contains("Unable to parse"), "{error}");
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(bindings.named("Elsewhere").is_some());
     }
 
     #[test]
