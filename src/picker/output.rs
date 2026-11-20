@@ -225,14 +225,7 @@ impl Lines {
     }
 }
 
-/// The name in an argument that is `{name}`: letters, digits and `_` between
-/// the braces. Anything else in braces is an argument as written, such as a
-/// JSON object.
-fn parameter_name(arg: &str) -> Option<&str> {
-    let name = arg.strip_prefix('{')?.strip_suffix('}')?;
-    let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    named.then_some(name)
-}
+use config::parameter_name;
 
 /// The program to run: `args` with each argument that is `{name}` replaced by
 /// the parameter of that name, in `cwd`, or the `cwd` parameter if there is

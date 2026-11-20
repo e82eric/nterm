@@ -1264,6 +1264,15 @@ pub(crate) struct Options {
 /// selection where it started: taking what is offered, not choosing a row.
 pub(crate) type AppAccept = std::rc::Rc<dyn Fn(Option<String>) -> crate::actions::AppAction>;
 
+/// The name in an argument that is `{name}`: letters, digits and `_` between
+/// the braces. Anything else in braces is an argument as written, such as a
+/// JSON object.
+pub(crate) fn parameter_name(arg: &str) -> Option<&str> {
+    let name = arg.strip_prefix('{')?.strip_suffix('}')?;
+    let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    named.then_some(name)
+}
+
 /// What a prompt does with the text typed.
 #[derive(Clone)]
 pub(crate) enum PromptAction {
@@ -1890,9 +1899,7 @@ impl Bindings {
                     Source::Themes | Source::ErrorLog => true,
                     Source::Items(items) => !items.values.is_empty() || items.provider.is_some(),
                     Source::Command(command) => command.args.iter().all(|arg| {
-                        arg.strip_prefix('{')
-                            .and_then(|arg| arg.strip_suffix('}'))
-                            .is_none_or(|name| options.params.contains_key(name))
+                        parameter_name(arg).is_none_or(|name| options.params.contains_key(name))
                     }),
                     Source::TextFile(file) => file
                         .path

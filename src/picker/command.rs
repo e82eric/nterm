@@ -1,6 +1,6 @@
 //! Ghostty config/request adapter for NFM's streaming command source.
 use crate::ghostty_ffi::SnapshotCellRange;
-use crate::picker::config::{CommandColumns, CommandOptions, TextFileOptions};
+use crate::picker::config::{CommandColumns, CommandOptions, TextFileOptions, parameter_name};
 pub(crate) use nfm_picker_sources::records::StreamValues;
 use nfm_search_core::{
     snapshot_store::SnapshotStore,
@@ -20,7 +20,7 @@ fn resolve(
     let mut args = Vec::with_capacity(options.args.len());
     for arg in &options.args {
         let resolved =
-            if let Some(name) = arg.strip_prefix('{').and_then(|arg| arg.strip_suffix('}')) {
+            if let Some(name) = parameter_name(arg) {
                 params
                     .get(name)
                     .ok_or_else(|| format!("missing command picker parameter {name:?}"))?
@@ -545,6 +545,16 @@ mod tests {
         assert_eq!(args, ["--", "a{2} | b"]);
         assert_eq!(cwd.as_deref(), Some("C:\\source"));
         assert!(resolve(&options, &BTreeMap::new()).is_err());
+
+        // Braces around what is not a name are an argument as written, as
+        // claude's --settings JSON is.
+        let options = CommandOptions {
+            args: vec!["claude".into(), r#"{"disableAllHooks":true}"#.into(), "{}".into(), "{request}".into()],
+            ..options
+        };
+        let params = BTreeMap::from([("request".into(), "list files".into())]);
+        let (_, args, _) = resolve(&options, &params).unwrap();
+        assert_eq!(args, [r#"{"disableAllHooks":true}"#, "{}", "list files"]);
     }
 
     #[test]
