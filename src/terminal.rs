@@ -1005,14 +1005,22 @@ impl TerminalView {
                 ui.close();
             }
         });
-        // The machine comes first in the label, in its own colours: no
-        // colour of its own reads as well as the bar's text does.
+        // The machine comes first in the label, in the accent colour. While a
+        // mode or key table fills the chip, it takes the chip's text colour,
+        // as the accent would not show on the fill.
         let shown = table.clone().unwrap_or_else(|| status.label.to_owned());
-        let shown = match elsewhere {
-            Some(elsewhere) => format!("{elsewhere} \u{b7} {shown}"),
-            None => shown,
-        };
-        let label = painter.layout_no_wrap(shown, font.clone(), chip_text);
+        let mut job = egui::text::LayoutJob::default();
+        if let Some(elsewhere) = elsewhere {
+            let machine = if table.is_some() || mode_active {
+                chip_text
+            } else {
+                palette.accent
+            };
+            job.append(&elsewhere, 0.0, egui::TextFormat::simple(font.clone(), machine));
+            job.append(" \u{b7} ", 0.0, egui::TextFormat::simple(font.clone(), chip_text));
+        }
+        job.append(&shown, 0.0, egui::TextFormat::simple(font.clone(), chip_text));
+        let label = painter.layout_job(job);
         let label_rect = egui::Rect::from_min_size(
             egui::pos2(menu.right() + 6.0, chip_top),
             egui::vec2(label.size().x + 16.0 * scale, chip_height),
