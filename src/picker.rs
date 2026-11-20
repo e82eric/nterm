@@ -162,8 +162,9 @@ impl Picker {
         Ok(())
     }
     /// Give a picker of workspaces or sessions its rows again, keeping what
-    /// is typed in it. Rows that are what it has are left alone, with the
-    /// selection; returns whether they were not.
+    /// is typed in it and where the selection is in the list, whatever row
+    /// comes to be there. Rows that are what it has are left alone; returns
+    /// whether they were not.
     pub(crate) fn set_entries(
         &mut self,
         ctx: &egui::Context,
@@ -174,8 +175,7 @@ impl Picker {
         }
         if self.source.members().is_some() {
             // Its rows are one member of it. The folders after them are
-            // another, which is left as it is: found no further again, and
-            // with the selection if that is on one of them.
+            // another, which is left as it is: found no further again.
             self.shared.replace_member(ctx, 0, self.source.provider());
             return true;
         }
@@ -183,19 +183,15 @@ impl Picker {
         self.shared.replace_source(ctx, self.source.provider(), query);
         true
     }
-    /// Have a picker of workspaces list, after its rows, the folders given
-    /// to what this returns, each lot in place of the last.
+    /// Have a picker of workspaces list, after its rows, the folders of
+    /// `place` given to what this returns, each lot in place of the last.
+    /// It has had a member for them from the start, so nothing else in it
+    /// changes.
     pub(crate) fn list_folders(
         &mut self,
-        ctx: &egui::Context,
         place: crate::session::Place,
     ) -> Option<Arc<source::FolderRows>> {
-        let folders = self.source.list_folders(place)?;
-        if let Some(members) = self.source.members() {
-            let query = self.shared.query().to_owned();
-            self.shared.replace_sources(ctx, members, query);
-        }
-        Some(folders)
+        self.source.list_folders(place)
     }
     /// What is typed in it.
     pub(crate) fn typed(&self) -> &str {
@@ -330,31 +326,36 @@ impl Picker {
         let result_rows = options.result_rows;
         let label = options.label.unwrap_or_else(|| source.label());
         let accept_on_click = label == "GHOSTTY THEMES";
-        let mut shared = nfm_egui::Picker::new(
-            ("nterm-picker", session_id),
-            &ctx,
-            source.provider(),
-            nfm_egui::PickerConfig {
-                title: label.into(),
-                initial_query: initial_query.clone(),
-                result_rows,
-                accept_on_click,
-                preview_rows: options.preview.as_ref().map_or(12, |p| match p {
-                    config::Preview::Scrollback { rows, .. } => *rows,
-                    _ => 12,
-                }),
-                preview_visible: options.preview_visible,
-                preview_line_numbers: line_numbers,
-                sort: options.sort.mode(),
-                ..Default::default()
-            },
-        );
+        let config = nfm_egui::PickerConfig {
+            title: label.into(),
+            initial_query: initial_query.clone(),
+            result_rows,
+            accept_on_click,
+            preview_rows: options.preview.as_ref().map_or(12, |p| match p {
+                config::Preview::Scrollback { rows, .. } => *rows,
+                _ => 12,
+            }),
+            preview_visible: options.preview_visible,
+            preview_line_numbers: line_numbers,
+            sort: options.sort.mode(),
+            ..Default::default()
+        };
+        // A picker of more than one source, as of workspaces and the
+        // folders after them, is made of them all.
+        let id = ("nterm-picker", session_id);
+        let mut shared = match source.members() {
+            Some(members) => nfm_egui::Picker::new_union(id, &ctx, members, config),
+            None => nfm_egui::Picker::new(id, &ctx, source.provider(), config),
+        };
         if let Some(mut previous) = previous {
             // NFM's source replacement retains presented rows and rejects stale
             // selections. Recreate the control if its immutable settings differ.
             if previous.sort == sort && previous.accept_on_click == accept_on_click {
                 std::mem::swap(&mut shared, &mut previous.shared);
-                shared.replace_source(&ctx, source.provider(), initial_query);
+                match source.members() {
+                    Some(members) => shared.replace_sources(&ctx, members, initial_query),
+                    None => shared.replace_source(&ctx, source.provider(), initial_query),
+                }
                 shared.set_presentation(result_rows, preview_rows, options.preview_visible);
                 shared.set_preview_line_numbers(line_numbers);
                 shared.set_external_preview(false);

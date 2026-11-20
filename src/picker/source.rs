@@ -39,9 +39,12 @@ enum Session {
     /// them. They are two members of the one picker: the rows are given
     /// again whenever the workspaces change, and the folders whenever a
     /// daemon finds more, without either being searched again for the other.
+    /// It is made so, with no folders, and `list_folders` says which place's
+    /// it lists: whose machine a workspace started in one is made on.
     Folders {
         snapshot: Arc<StructuredStreamingSnapshot>,
         store: Arc<FolderRows>,
+        place: Option<crate::session::Place>,
     },
     FileSystem {
         store: Arc<nfm_file_system::walker_search_store::FileSystemSearchStore>,
@@ -69,8 +72,6 @@ const FOLDER_ROWS: usize = 1 << 40;
 /// one before.
 #[derive(Default)]
 pub(crate) struct FolderRows {
-    /// The place they are folders of, where a workspace in one is made.
-    place: crate::session::Place,
     /// The folders, and how many times they have been given.
     rows: std::sync::Mutex<(Option<Arc<Items>>, u64)>,
     done: AtomicBool,
@@ -342,10 +343,16 @@ impl PickerSource {
             crate::picker::config::Source::Themes | crate::picker::config::Source::ErrorLog => {
                 unreachable!("theme source must be resolved before starting")
             }
-            crate::picker::config::Source::CommandPalette(entries)
-            | crate::picker::config::Source::Workspaces(entries) => {
-                Self::rows(entries, matches!(options.source, config::Source::Workspaces(_)))
-            }
+            crate::picker::config::Source::CommandPalette(entries) => Self::rows(entries, false),
+            // Its rows and the folders after them, from the start: given
+            // more of either, it is searched again with nothing else
+            // replaced, so the selection stays where it is.
+            crate::picker::config::Source::Workspaces(entries) => match Self::rows(entries, true) {
+                Session::Structured { snapshot } => {
+                    Session::Folders { snapshot, store: Default::default(), place: None }
+                }
+                rows => rows,
+            },
             crate::picker::config::Source::Scrollback { .. } => Session::Document {
                 store: Arc::new(SnapshotStore::new_append_only()),
             },
@@ -661,18 +668,16 @@ impl PickerSource {
         *entries = rows;
         true
     }
-    /// Have a picker of workspaces list folders after its rows: those that
-    /// are given to what this returns, which a daemon finds. Whoever shows
-    /// the rows has then to be given the picker's `members`. None when it
-    /// is not such a picker.
-    pub(super) fn list_folders(&mut self, place: crate::session::Place) -> Option<Arc<FolderRows>> {
+    /// Have a picker of workspaces list the folders of `place` after its
+    /// rows: those that are given to what this returns, which a daemon
+    /// finds. None when it is not such a picker.
+    pub(super) fn list_folders(&mut self, at: crate::session::Place) -> Option<Arc<FolderRows>> {
         let Self::CommandPalette { runtime, workspaces: true, .. } = self else {
             return None;
         };
-        let Session::Structured { snapshot } = &runtime.session else { return None };
-        let store = Arc::new(FolderRows { place, ..Default::default() });
-        runtime.session = Session::Folders { snapshot: snapshot.clone(), store: store.clone() };
-        Some(store)
+        let Session::Folders { store, place, .. } = &mut runtime.session else { return None };
+        *place = Some(at);
+        Some(store.clone())
     }
     /// The sources of a picker that has more than one, which are searched
     /// apart and shown as one list: its rows, then the folders it lists.
@@ -748,9 +753,9 @@ impl PickerSource {
         }
         // A folder the picker lists after its rows, by where it is among
         // those found.
-        let Session::Folders { store, .. } = &runtime.session else { return None };
+        let Session::Folders { store, place, .. } = &runtime.session else { return None };
         let folder = store.folder(result.node_index.checked_sub(FOLDER_ROWS)?)?;
-        Some(Cow::Owned(folder_entry(store.place.clone(), folder)))
+        Some(Cow::Owned(folder_entry(place.clone()?, folder)))
     }
     pub(super) fn accepted_value(&self, result: &SearchResult) -> String {
         let value = match self {
@@ -1409,6 +1414,50 @@ impl SearchSnapshotProvider<Snapshot> for Provider {
 mod grouped_rows_tests {
     use super::*;
     use crate::actions::{AppAction, Entry};
+    #[test]
+    fn a_picker_of_workspaces_has_its_folders_from_the_start_and_lists_those_of_a_place() {
+        let rows = vec![Entry {
+            id: "one".into(),
+            label: String::new(),
+            shortcut: None,
+            cells: vec!["one".into(), "detached".into()],
+            action: AppAction::AttachSession("one".into()),
+        }];
+        let mut options =
+            config::Options { source: config::Source::Workspaces(rows), ..Default::default() };
+        let patterns = crate::config::prompts::Patterns::default();
+        let ctx = egui::Context::default();
+        let (mut source, _) =
+            PickerSource::start(std::ptr::null_mut(), None, 0, ctx, &mut options, &patterns);
+        // Its rows and its folders are two members from the start.
+        let members = source.members().expect("a picker of workspaces has members");
+        assert_eq!(members.len(), 2);
+        assert!(!members[1].is_done());
+        // None are looked for in a place with no roots: it has all it lists.
+        let place = crate::session::Place::Remote("vm".into());
+        let folders = source.list_folders(place.clone()).expect("it lists folders");
+        folders.set(&[], true);
+        assert!(members[1].is_done());
+        // Telling it the place again makes it no other picker.
+        assert_eq!(source.members().unwrap().len(), 2);
+        // Those it is given are folders of the place it was told.
+        folders.set(&["/home/me/src".into()], true);
+        let row = SearchResult { node_index: FOLDER_ROWS, score: 0, path: String::new() };
+        let entry = source.entry(&row).expect("a folder's row");
+        assert!(
+            matches!(&entry.action, AppAction::CreateWorkspaceIn(at, path)
+                if *at == place && path == "/home/me/src"),
+            "{:?}",
+            entry.action
+        );
+        // A command palette is of its rows alone.
+        let mut options =
+            config::Options { source: config::Source::CommandPalette(vec![]), ..Default::default() };
+        let ctx = egui::Context::default();
+        let (mut palette, _) =
+            PickerSource::start(std::ptr::null_mut(), None, 0, ctx, &mut options, &patterns);
+        assert!(palette.members().is_none() && palette.list_folders(place).is_none());
+    }
     #[test]
     fn the_folders_a_picker_of_workspaces_lists_are_rows_past_its_own() {
         let rows = Arc::new(FolderRows::default());

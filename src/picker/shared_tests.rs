@@ -2337,3 +2337,78 @@ fn preview_line_numbers_apply_when_a_picker_opens_or_is_replaced() {
         nfm_egui::PreviewLineNumbers::Off
     );
 }
+
+/// The rows of a picker of workspaces: sessions no window shows, then a
+/// remote whose row says where its connection stands.
+fn workspace_rows(remote: &str) -> Vec<crate::actions::Entry> {
+    use crate::actions::{AppAction, Entry};
+    let row = |id: &str, cells: &[&str], action| Entry {
+        id: id.into(),
+        label: String::new(),
+        shortcut: None,
+        cells: cells.iter().map(|cell| cell.to_string()).collect(),
+        action,
+    };
+    let session = |name: &str| {
+        row(name, &[name, "detached"], AppAction::AttachSession(name.into()))
+    };
+    let place = crate::session::Place::Remote("vm".into());
+    vec![
+        session("one"),
+        session("two"),
+        session("three"),
+        row("place.vm", &["vm", remote], AppAction::PlacePage(place)),
+    ]
+}
+fn workspace_picker(ctx: &egui::Context, rows: Vec<crate::actions::Entry>) -> Picker {
+    Picker::start(
+        std::ptr::null_mut(),
+        None,
+        true,
+        0,
+        ctx.clone(),
+        config::Options {
+            source: config::Source::Workspaces(rows),
+            sort: config::Sort::Score,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn a_picker_of_workspaces_keeps_where_its_selection_is_as_a_remote_connects() {
+    let ctx = egui::Context::default();
+    let mut picker = workspace_picker(&ctx, workspace_rows("connecting\u{2026}"));
+    let folders = picker.list_folders(crate::session::Place::Here).expect("it lists folders");
+    folders.set(&["C:/src/a".into(), "C:/src/b".into()], true);
+    let first = wait_selection(&ctx, &mut picker);
+    // Down the list, which is up or down on screen as the query is.
+    let to_third = |picker: &mut Picker, key| {
+        for _ in 0..2 {
+            frame(&ctx, picker, vec![self::key(key, egui::Modifiers::NONE)]);
+        }
+        picker.shared.selection().unwrap()
+    };
+    let mut selected = to_third(&mut picker, egui::Key::ArrowDown);
+    if selected.index == first.index {
+        selected = to_third(&mut picker, egui::Key::ArrowUp);
+    }
+    assert_eq!((selected.member, selected.text.contains("three")), (0, true));
+    // The remote connects, and its row says so: the rows are given again.
+    assert!(picker.set_entries(&ctx, workspace_rows("connected")));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let now = loop {
+        frame(&ctx, &mut picker, vec![]);
+        // Shown once the selection is of the rows as they were searched again.
+        if let Some(now) = picker.shared.selection()
+            && !std::ptr::addr_eq(Arc::as_ptr(&now.snapshot), Arc::as_ptr(&selected.snapshot))
+        {
+            break now;
+        }
+        assert!(Instant::now() < deadline, "the rows given again were not shown");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    // The selection is where it was, on the same row.
+    assert_eq!((now.member, now.index), (selected.member, selected.index));
+}
+

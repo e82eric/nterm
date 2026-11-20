@@ -517,7 +517,8 @@ impl TerminalView {
     /// a new one. With them, what they are rows of: an open picker is given
     /// its rows again when that changes, and not for a waiting shell's new
     /// title or directory, which its row shows as they were. Rows given
-    /// again take the selection back to the first.
+    /// again leave the selection where it is in the list, whatever row
+    /// comes to be there.
     pub(super) fn workspace_picker_rows(&self) -> (Vec<crate::actions::Entry>, String) {
         let window = self.has_panes();
         let options = workspace_picker_options(&self.workspaces, self.current);
@@ -625,10 +626,13 @@ impl TerminalView {
         // After those rows, the folders a new one can be started in, which
         // the daemon of the page's place finds: see `show_window_picker`.
         let (place, roots, _) = self.page_folders();
-        if !roots.is_empty()
-            && let Some(picker) = self.window_picker.as_mut()
-        {
-            self.window_folders = picker.list_folders(ctx, place).map(|rows| (rows, None));
+        if let Some(folders) = self.window_picker.as_mut().and_then(|picker| picker.list_folders(place)) {
+            if roots.is_empty() {
+                // None are looked for, so it has all it will list.
+                folders.set(&[], true);
+            } else {
+                self.window_folders = Some((folders, None));
+            }
         }
         // One opened again as a window empties says what emptied it.
         if let (Some(picker), Some((said, at))) = (self.window_picker.as_mut(), &self.picker_said)
