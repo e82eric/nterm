@@ -4285,6 +4285,95 @@ mod tests {
     }
 
     #[test]
+    fn bundled_claude_module_asks_with_the_terminal_rows_and_types_a_suggestion() {
+        use crate::lua_callbacks::Command;
+        let config = parse(
+            r#"
+            local claude = require('nterm.claude')
+            -- What is asked has the rows in it, and nothing extra without them.
+            assert(claude.question('why?', '') == 'why?')
+            assert(claude.question('why?', 'a\nb') == 'Recent terminal output:\na\nb\n\nQuestion: why?')
+            local request = claude.request('list big files', 'PS C:\\src> dir', 3)
+            assert(request:find('Suggest exactly 3 shell commands that do this:\nlist big files\n', 1, true) == 1, request)
+            assert(request:find('Terminal output:\nPS C:\\src> dir', 1, true), request)
+            assert(not claude.request('x', ''):find('Terminal output', 1, true))
+            assert(claude.request('x', ''):find('exactly 10 ', 1, true))
+
+            -- Claude's stream: pieces of text, an error said, the rest nothing.
+            assert(claude.answer_line('{"type":"stream_event","event":{"delta":{"text":"Hi"}}}') == 'Hi')
+            assert(claude.answer_line('{"type":"stream_event","event":{}}') == nil)
+            assert(claude.answer_line('{"type":"result","is_error":true,"result":"no"}') == '\n\nError: no\n')
+            assert(claude.answer_line('{"type":"system"}') == nil)
+            assert(claude.answer_line('not json') == 'not json\n')
+
+            -- The pages: the parameter is the last argument, after the flags.
+            local answer = claude.answer { model = 'm', flags = { '--x' } }
+            assert(answer.args[1] == 'claude' and answer.args[#answer.args] == '{question}')
+            assert(answer.args[#answer.args - 1] == '--x' and answer.args[#answer.args - 2] == 'm')
+            local suggestions = claude.suggestions { program = 'c', position = 'Center' }
+            assert(suggestions.args[1] == 'c' and suggestions.args[#suggestions.args] == '{request}')
+            assert(suggestions.args[#suggestions.args - 1] == claude.suggestions_model)
+            assert(suggestions.position == 'Center' and suggestions.sort == 'SourceOrder')
+            assert(not pcall(claude.ask), 'a prompt needs its page')
+
+            return { pickers = {
+              Ask = claude.ask { page = 'Answer' },
+              Answer = claude.answer(),
+              Suggest = claude.suggest { page = 'Suggestions', count = 4 },
+              Suggestions = claude.suggestions(),
+            } }
+            "#,
+        )
+        .unwrap();
+        let bindings = compile(config);
+        let context = PickerContext {
+            line_before_cursor: "PS C:\\src> git".into(),
+            recent_lines: vec!["PS C:\\src> cargo test".into(), "error[E0308]".into()],
+            ..Default::default()
+        };
+        let enter = |name: &str, value: &str| {
+            let callback = match bindings.named(name).unwrap().open(&context).unwrap() {
+                crate::picker::config::PageOptions::Prompt(options) => {
+                    let crate::picker::config::PromptAction::Lua(callback) = options.action else {
+                        panic!("{name}: not a Lua action")
+                    };
+                    callback
+                }
+                crate::picker::config::PageOptions::Picker(options) => options.callback.unwrap(),
+                crate::picker::config::PageOptions::Output(_) => panic!("{name}: an output page"),
+            };
+            callback.call(value, value, false, None, None, &Default::default()).unwrap()
+        };
+
+        // Each prompt pushes its page, with the rows in what it is asked.
+        let commands = enter("Ask", "what failed?");
+        let [Command::PushPicker { name, params }] = &commands[..] else { panic!("{commands:?}") };
+        assert_eq!(name, "Answer");
+        assert_eq!(
+            params["question"],
+            "Recent terminal output:\nPS C:\\src> cargo test\nerror[E0308]\n\nQuestion: what failed?"
+        );
+        let commands = enter("Suggest", "undo the last commit");
+        let [Command::PushPicker { name, params }] = &commands[..] else { panic!("{commands:?}") };
+        assert_eq!(name, "Suggestions");
+        let request = &params["request"];
+        assert!(request.starts_with("Suggest exactly 4 shell commands that do this:\nundo the last commit\n"), "{request}");
+        assert!(request.ends_with("Terminal output:\nPS C:\\src> cargo test\nerror[E0308]"), "{request}");
+
+        // Nothing typed asks nothing.
+        assert!(enter("Ask", "").is_empty());
+        assert!(enter("Suggest", "").is_empty());
+
+        // A suggestion is typed at the cursor; what is there stays.
+        let commands = enter("Suggestions", "git reset --soft HEAD~1");
+        assert!(
+            matches!(&commands[..], [Command::ReplacePrompt { text, before: 0, after: 0 }] if text == "git reset --soft HEAD~1"),
+            "{commands:?}"
+        );
+        assert!(bindings.named("Answer").is_some());
+    }
+
+    #[test]
     fn bundled_git_module_quotes_and_parses_and_builds_pickers() {
         let config = parse(
             r#"

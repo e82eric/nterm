@@ -1,6 +1,7 @@
 -- Config lookup: --lua-config=PATH, then ~/nterm.lua, then nterm.lua beside
 -- the executable. Only the first available file is loaded.
 local snippets_path = (os.getenv("USERPROFILE") or os.getenv("HOME")) .. "/.wtd/.wt.json"
+local claude = require("nterm.claude")
 return {
   -- Local picker IPC is opt-in. See docs/picker-pipe.md and Invoke-NtermPicker.ps1.
   picker_pipe = {
@@ -169,34 +170,14 @@ return {
       end,
     },
     -- Asks for a question, then shows Claude's answer as a page on top, as it
-    -- is written. Escape there stops Claude and comes back here.
-    Ask = {
-      type = "Argument",
-      prompt = "Ask:",
-      placeholder = "<question>  Ask Claude",
-      action = function(app, item)
-        if item.value == "" then return end
-        app:push_picker("Answer", { question = item.value })
-      end,
-    },
-    -- Claude prints one JSON object per line; `line` takes the answer's text
-    -- out of each, and the page lays it out as markdown.
-    Answer = {
-      type = "Output",
-      format = "Markdown",
-      args = { "claude", "-p", "--output-format", "stream-json",
-               "--include-partial-messages", "--verbose", "{question}" },
-      line = function(line)
-        local ok, event = pcall(nterm.json_parse, line)
-        if not ok or type(event) ~= "table" then return line .. "\n" end
-        if event.type == "stream_event" then
-          local delta = event.event and event.event.delta
-          return delta and delta.text
-        elseif event.type == "result" and event.is_error then
-          return "\n\nError: " .. tostring(event.result) .. "\n"
-        end
-      end,
-    },
+    -- is written. Escape there stops Claude and comes back here. The last
+    -- rows of the terminal go with the question, so it can be about them.
+    Ask = claude.ask { page = "Answer" },
+    Answer = claude.answer(),
+    -- Asks what you want done, then shows commands from Claude that do it;
+    -- Enter types one at the shell's cursor.
+    Suggest = claude.suggest { page = "Suggestions" },
+    Suggestions = claude.suggestions(),
   },
   keys = {
     { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
@@ -220,5 +201,6 @@ return {
     { key = "k", mods = "CTRL|SHIFT", picker = "CodexSuggestions" },
     { key = "j", mods = "CTRL|SHIFT", picker = "Grep" },
     { key = "a", mods = "CTRL|SHIFT", picker = "Ask" },
+    { key = "u", mods = "CTRL|SHIFT", picker = "Suggest" },
   },
 }
