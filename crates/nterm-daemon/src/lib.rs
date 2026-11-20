@@ -3,19 +3,19 @@
 
 pub mod vt;
 
+/// A shell under a pseudoconsole on Windows, under a pseudoterminal
+/// elsewhere: the two have the same face.
 #[cfg(windows)]
 mod conpty;
-#[cfg(windows)]
-pub mod log;
-#[cfg(windows)]
+#[cfg(unix)]
+mod pty;
+#[cfg(unix)]
+use pty as conpty;
+
 mod configured;
-#[cfg(windows)]
 mod files;
-#[cfg(windows)]
+pub mod log;
 mod picker;
-#[cfg(windows)]
 mod previewing;
-#[cfg(windows)]
 pub mod relay;
-#[cfg(windows)]
 pub mod server;

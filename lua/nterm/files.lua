@@ -192,11 +192,16 @@ function M.preview(options)
       local path = item.value
       local at = whole(path, params.cwd)
       local extension = (path:match("%.([^./\\]+)$") or ""):lower()
-      -- A folder cannot be opened as a file: one that opens is not one.
+      -- A folder cannot be opened as a file on Windows. On Linux it can,
+      -- and then cannot be read: an empty file is read, as nothing.
       local probe = io.open(at, "rb")
       local listed
       if probe then
+        local _, unreadable = probe:read(0)
         probe:close()
+        if unreadable then
+          listed = folder(at)
+        end
       else
         listed = folder(at)
       end

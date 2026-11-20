@@ -15,7 +15,6 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     mem::ManuallyDrop,
-    os::windows::io::{AsRawHandle, FromRawHandle},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -46,10 +45,8 @@ fn relay(session: &str, from: &str, say: &(impl Fn(Arguments<'_>) + Sync)) -> io
     // The handles themselves, not `io::stdout()`, which holds back what
     // follows the last line end until it sees another. Never closed: they
     // are the process's.
-    let mut output =
-        ManuallyDrop::new(unsafe { File::from_raw_handle(io::stdout().as_raw_handle()) });
-    let mut input =
-        ManuallyDrop::new(unsafe { File::from_raw_handle(io::stdin().as_raw_handle()) });
+    let mut output = ManuallyDrop::new(standard(StandardHandle::Output));
+    let mut input = ManuallyDrop::new(standard(StandardHandle::Input));
 
     // What comes before this line is not the daemon's: a login banner, say.
     output.write_all(format!("{MARKER}\n").as_bytes())?;
@@ -161,4 +158,31 @@ impl Traffic {
             ago(&self.last_output),
         ));
     }
+}
+
+enum StandardHandle {
+    Input,
+    Output,
+}
+
+/// The process's own standard input or output, as a file: to be wrapped in
+/// `ManuallyDrop`, as it is never to be closed.
+#[cfg(windows)]
+fn standard(which: StandardHandle) -> File {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    let handle = match which {
+        StandardHandle::Input => io::stdin().as_raw_handle(),
+        StandardHandle::Output => io::stdout().as_raw_handle(),
+    };
+    unsafe { File::from_raw_handle(handle) }
+}
+
+#[cfg(unix)]
+fn standard(which: StandardHandle) -> File {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = match which {
+        StandardHandle::Input => io::stdin().as_raw_fd(),
+        StandardHandle::Output => io::stdout().as_raw_fd(),
+    };
+    unsafe { File::from_raw_fd(fd) }
 }

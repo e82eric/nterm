@@ -268,7 +268,13 @@ impl Session {
         // A profile loads code from the share folder, so its path is only
         // ever this daemon's own: one a UI names, from wherever, is dropped.
         let ours = [DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE, SHARE_VARIABLE];
-        env.retain(|(key, _)| !ours.iter().any(|ours| key.eq_ignore_ascii_case(ours)));
+        env.retain(|(key, _)| !ours.iter().any(|ours| same_variable(key, ours)));
+        // A terminal's program is told what terminal it is in. Ghostty's
+        // own name needs its terminfo, which the machine may not have.
+        #[cfg(unix)]
+        if !env.iter().any(|(key, _)| key == "TERM") {
+            env.extend(terminal_variables());
+        }
         if let Some(share) = crate::configured::installed().into_iter().find(|share| share.is_dir()) {
             env.push((SHARE_VARIABLE.into(), share.to_string_lossy().into_owned()));
         }
@@ -280,7 +286,7 @@ impl Session {
         // With none given it is the user's own, not the daemon's, which is
         // where the daemon keeps its log. A window on another machine gives
         // none: it knows no directory of this one.
-        let cwd = cwd.or_else(|| std::env::var("USERPROFILE").ok());
+        let cwd = cwd.or_else(|| std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok());
         let spawned = conpty::spawn(&command, cwd.as_deref(), &env, size.cols, size.rows)
             .map_err(|error| error.to_string())?;
         let conpty::Spawned { console, output, input, process } = spawned;
@@ -411,6 +417,42 @@ impl Session {
         }
         std::process::exit(0);
     }
+}
+
+/// Whether two environment variable names are one: regardless of case on
+/// Windows, exactly elsewhere.
+fn same_variable(a: &str, b: &str) -> bool {
+    if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b }
+}
+
+/// `TERM` and what goes with it, for a shell that was given none.
+/// `xterm-ghostty` where its terminfo is: installed beside the daemon
+/// (`share/terminfo`, which `TERMINFO` then names) or on the machine.
+/// Otherwise `xterm-256color`, which every machine has and which Ghostty's
+/// terminal answers to.
+#[cfg(unix)]
+fn terminal_variables() -> Vec<(String, String)> {
+    const ENTRY: &str = "x/xterm-ghostty";
+    let beside = crate::configured::installed()
+        .into_iter()
+        .filter_map(|share| share.parent().map(|share| share.join("terminfo")))
+        .find(|terminfo| terminfo.join(ENTRY).is_file());
+    let home = std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".terminfo"));
+    let system = ["/usr/share/terminfo", "/lib/terminfo", "/etc/terminfo"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .chain(home)
+        .any(|terminfo| terminfo.join(ENTRY).is_file());
+    let mut variables = vec![("COLORTERM".to_owned(), "truecolor".to_owned())];
+    match (beside, system) {
+        (_, true) => variables.push(("TERM".into(), "xterm-ghostty".into())),
+        (Some(terminfo), false) => {
+            variables.push(("TERM".into(), "xterm-ghostty".into()));
+            variables.push(("TERMINFO".into(), terminfo.to_string_lossy().into_owned()));
+        }
+        (None, false) => variables.push(("TERM".into(), "xterm-256color".into())),
+    }
+    variables
 }
 
 /// Serve the session until told to shut down or left idle.
@@ -579,6 +621,22 @@ fn either(name: &str, other: &str) -> String {
     std::env::var(name).or_else(|_| std::env::var(other)).unwrap_or_default()
 }
 
+/// This machine's name: `COMPUTERNAME` on Windows; elsewhere the system's
+/// host name, which a shell does not export.
+fn machine() -> String {
+    #[cfg(unix)]
+    {
+        let mut name = [0u8; 256];
+        if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } == 0 {
+            let end = name.iter().position(|&byte| byte == 0).unwrap_or(name.len());
+            if end > 0 {
+                return String::from_utf8_lossy(&name[..end]).into_owned();
+            }
+        }
+    }
+    either("COMPUTERNAME", "HOSTNAME")
+}
+
 fn converse(
     session: &Arc<Session>,
     connection: &Connection,
@@ -615,7 +673,7 @@ fn converse(
         pid: std::process::id(),
         session: session.name.clone(),
         files: true,
-        machine: either("COMPUTERNAME", "HOSTNAME"),
+        machine: machine(),
         user: either("USERNAME", "USER"),
     });
     if protocol != PROTOCOL_VERSION {

@@ -6,7 +6,6 @@
 //! `nterm-daemon --relay [--session NAME]` is not a daemon but a way to one:
 //! see `relay`.
 
-#[cfg(windows)]
 fn main() {
     use nterm_daemon::{log, server};
     use std::time::Duration;
@@ -44,6 +43,12 @@ fn main() {
         return;
     }
 
+    // Started from a terminal or an SSH session, the daemon outlives it:
+    // its hangup is not the daemon's. Its shells set it back.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
     log::open(&session);
     // Not the directory of whichever UI happened to start the daemon, which
     // would be held open for as long as the daemon runs.
@@ -60,17 +65,10 @@ fn main() {
     }
 }
 
-#[cfg(windows)]
 fn usage() -> ! {
     eprintln!(
         "usage: nterm-daemon [--session NAME] [--idle-seconds N] [--lua-config FILE]\n       \
          nterm-daemon --relay [--session NAME]"
     );
     std::process::exit(2);
-}
-
-#[cfg(not(windows))]
-fn main() {
-    eprintln!("nterm-daemon: only Windows is supported so far");
-    std::process::exit(1);
 }

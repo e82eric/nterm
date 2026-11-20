@@ -554,6 +554,27 @@ pub(crate) fn helpers(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set("nterm", nterm)
 }
 
+/// The programs a test's Lua runs, written for `cmd.exe`, as they are
+/// written for `sh` where there is no `cmd.exe`: the same output and ends.
+#[cfg(test)]
+fn portable(lua: &str) -> String {
+    if cfg!(windows) {
+        return lua.to_owned();
+    }
+    // Longest first: the last is the start of others.
+    [
+        (r#""cmd.exe", "/c", "echo", "one & echo two""#, r#""sh", "-c", "echo \"$0\"", "one & echo two""#),
+        (r#""cmd.exe", "/c", "echo", "from a program""#, r#""sh", "-c", "echo from a program""#),
+        (r#""cmd.exe", "/c", "echo broken 1>&2 & exit 3""#, r#""sh", "-c", "echo broken 1>&2; exit 3""#),
+        (r#""cmd.exe", "/c", "echo fine & exit 3""#, r#""sh", "-c", "echo fine; exit 3""#),
+        (r#""cmd.exe", "/c", "ping -n 30 127.0.0.1 > nul""#, r#""sh", "-c", "sleep 30""#),
+        (r#""cmd.exe", "/c", "cd""#, r#""sh", "-c", "pwd""#),
+        (r#""cmd.exe", "/c", "echo""#, r#""sh", "-c", "echo""#),
+    ]
+    .into_iter()
+    .fold(lua.to_owned(), |lua, (windows, unix)| lua.replace(windows, unix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,7 +585,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join(crate::configured::FILE);
-        std::fs::write(&path, text).unwrap();
+        std::fs::write(&path, portable(text)).unwrap();
         path
     }
     fn previewer(path: &Path, name: &str, files: bool) -> (Previewer, Arc<AtomicU64>) {
@@ -754,10 +775,12 @@ mod tests {
         // A file shows whole, at the line found, under the file's name.
         std::fs::create_dir_all(folder.join("src")).unwrap();
         std::fs::write(folder.join("src").join("short.rs"), "one\ntwo\nthree\n").unwrap();
-        let (text, name, line) = at(shows(r"src\short.rs:2:1:two"));
+        // As ripgrep writes it: with this machine's separator.
+        let sep = std::path::MAIN_SEPARATOR;
+        let (text, name, line) = at(shows(&format!("src{sep}short.rs:2:1:two")));
         assert_eq!((text.as_str(), name.as_deref(), line), ("one\ntwo\nthree\n", Some("short.rs"), Some(2)));
         // A line it does not have is not marked. A whole path is its own.
-        assert_eq!(at(shows(r"src\short.rs:4:1:four")).2, None);
+        assert_eq!(at(shows(&format!("src{sep}short.rs:4:1:four"))).2, None);
         let whole = format!("{}:3:1:three", folder.join("src").join("short.rs").display());
         assert_eq!(at(shows(&whole)).2, Some(3));
 
@@ -912,7 +935,7 @@ mod acting_tests {
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join(crate::configured::FILE);
-        std::fs::write(&path, text).unwrap();
+        std::fs::write(&path, super::portable(text)).unwrap();
         let params = [("cwd".to_owned(), folder.to_string_lossy().into_owned())].into_iter().collect();
         (Previewer::new(&path, "P", params, false, Arc::default()).unwrap(), folder)
     }

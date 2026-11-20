@@ -246,7 +246,7 @@ impl Shown {
         entries.sort_by(|a, b| (a.0, a.1.to_lowercase()).cmp(&(b.0, b.1.to_lowercase())));
         let lines: Vec<String> = entries
             .into_iter()
-            .map(|(file, name)| if file { name } else { format!("{name}\\") })
+            .map(|(file, name)| if file { name } else { format!("{name}{}", std::path::MAIN_SEPARATOR) })
             .collect();
         let text = if lines.is_empty() { "Empty folder".to_owned() } else { lines.join("\n") };
         Ok(Self { text, truncated, ..Default::default() })
@@ -1889,7 +1889,7 @@ mod tests {
 
         // Folders first, then files, neither by the case of its name.
         let folder = Shown::of(&root);
-        assert_eq!(folder.text, "sub\\\nA.txt\nb.rs\ndata.bin\nlong.log");
+        assert_eq!(folder.text, format!("sub{}\nA.txt\nb.rs\ndata.bin\nlong.log", std::path::MAIN_SEPARATOR));
         assert_eq!((&folder.name, folder.truncated), (&None, false));
         assert_eq!(Shown::of(&root.join("sub")).text, "Empty folder");
 

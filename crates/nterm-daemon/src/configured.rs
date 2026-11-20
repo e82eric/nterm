@@ -392,7 +392,10 @@ fn modules(lua: &Lua, config: &Path) -> mlua::Result<()> {
         .filter_map(|folder| folder.to_str())
         // `;` is between the places, and `?` stands for the module's name.
         .filter(|folder| !folder.contains([';', '?']))
-        .flat_map(|folder| [format!("{folder}\\?.lua"), format!("{folder}\\?\\init.lua")])
+        .flat_map(|folder| {
+            let sep = std::path::MAIN_SEPARATOR;
+            [format!("{folder}{sep}?.lua"), format!("{folder}{sep}?{sep}init.lua")]
+        })
         .collect();
     let package: mlua::Table = lua.globals().get("package")?;
     package.set("path", path.join(";"))?;
@@ -550,7 +553,7 @@ mod tests {
         let path = file(
             "read",
             r#"
-            local home = os.getenv("USERPROFILE") or "none"
+            local home = os.getenv("USERPROFILE") or os.getenv("HOME") or "none"
             return { pickers = {
               Commits = { type = "Command", args = {"git", "log", "--oneline", "{count}"}, cwd = home,
                           success_exit_codes = {0, 1}, unique = true, sort = "SourceOrder", position = "Cursor",
@@ -577,7 +580,7 @@ mod tests {
         );
         let Lists::Command { args, cwd, success_exit_codes, unique, .. } = commits.lists else { panic!() };
         assert_eq!(args, ["git", "log", "--oneline", "{count}"]);
-        assert_eq!((cwd, success_exit_codes, unique), (std::env::var("USERPROFILE").ok(), Some(vec![0, 1]), Some(true)));
+        assert_eq!((cwd, success_exit_codes, unique), (std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok(), Some(vec![0, 1]), Some(true)));
         let typed = configured.picker("Typed").unwrap().unwrap();
         assert!(matches!(typed.lists, Lists::File { reverse: true, unique: Some(true), .. }));
         assert_eq!(typed.presentation, Presentation::default());
