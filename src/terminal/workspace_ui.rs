@@ -623,6 +623,11 @@ impl TerminalView {
             &self.picker_bindings.prompt_patterns,
             None,
         )));
+        // Drawn once its rows or folders are found. What is found before
+        // this is drawn by the frame asked for below.
+        if let Some(picker) = &self.window_picker {
+            picker.bind_search_wake(self.proxy.clone(), self.window.id);
+        }
         // After those rows, the folders a new one can be started in, which
         // the daemon of the page's place finds: see `show_window_picker`.
         let (place, roots, _) = self.page_folders();

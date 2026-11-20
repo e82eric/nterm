@@ -197,6 +197,19 @@ impl Picker {
     pub(crate) fn typed(&self) -> &str {
         self.shared.query()
     }
+    /// Have the window it is shown in drawn whenever one of its searches
+    /// has found something. They run on threads of their own, where asking
+    /// the egui context for a repaint reaches no window (see
+    /// `session::set_ui`), so what was found would wait for the next key.
+    pub(crate) fn bind_search_wake(
+        &self,
+        proxy: egui_winit::winit::event_loop::EventLoopProxy<crate::app::UserEvent>,
+        window_id: egui_winit::winit::window::WindowId,
+    ) {
+        self.shared.set_search_wake_callback(Arc::new(move |_| {
+            let _ = proxy.send_event(crate::app::UserEvent::PickerWake { window_id });
+        }));
+    }
     pub(crate) fn bind_pipe_search_wake(
         &self,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<crate::app::UserEvent>,
