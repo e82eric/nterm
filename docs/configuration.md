@@ -122,6 +122,25 @@ that machine: its daemon listed it. A new pane beside one there is started
 by that pane's number, and the daemon there starts it in the folder that
 pane's shell reported.
 
+When a connection is lost, each end says what it saw, in
+`%LOCALAPPDATA%\nterm` on its machine. Each line starts with the time (Unix
+seconds) and the process:
+
+- `window-SESSION.log`, beside the window: each connection to a daemon made,
+  refused, lost or closed, and how long it lasted. A lost one says when the
+  daemon was last heard from and what `ssh` said as it ended, such as
+  `client_loop: send disconnect: Connection reset`. The window's message
+  shows the last lines `ssh` said.
+- `relay-SESSION.log`, on the remote: each relay `ssh` started, with both
+  ends of the SSH connection, which side ended it, how long it ran and how
+  much went each way. A relay with no line for its end was stopped or
+  crashed.
+- `daemon-SESSION.log`, beside each daemon: each client, and why it went.
+
+Each of these is kept to a size: the window's and the relay's to 1 MB, the
+daemon's to 100 MB, with the file before it kept as `NAME.old.log`. They say
+where and when, never what is typed or shown.
+
 ## Prompt patterns
 
 `prompt_patterns` configures prompt detection for copy-mode command navigation,

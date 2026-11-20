@@ -37,7 +37,7 @@ use std::{
     io,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
@@ -48,6 +48,45 @@ use std::{
 /// tenth of a second, so this is only how long a daemon that is stuck holds
 /// the window.
 const SNAPSHOT_WAIT: Duration = Duration::from_secs(1);
+
+/// How long the window's log gets: it says a few lines for each connection.
+const LOG_LIMIT: u64 = 1 << 20;
+/// How long a lost connection's `ssh` gets to say why, as it goes.
+const SAID_WAIT: Duration = Duration::from_secs(1);
+/// How many of the last lines `ssh` said a lost connection's message shows.
+const SAID_LINES: usize = 3;
+
+/// Add a line to `window-SESSION.log`: how this window's connections to
+/// daemons began and ended, for when one was lost.
+fn log(message: std::fmt::Arguments<'_>) {
+    let session = CHOSEN.lock().unwrap().clone().unwrap_or_else(|| DEFAULT_SESSION.to_owned());
+    nterm_session::log::append(&format!("window-{session}.log"), LOG_LIMIT, message);
+}
+
+/// What a log line calls `place`: this machine, or a remote and where it is.
+fn place_logged(place: &Place) -> String {
+    match place.remote() {
+        Some(remote) => format!("{} ({})", remote.name, remote.address),
+        None => place.name().map_or("this machine".to_owned(), str::to_owned),
+    }
+}
+
+/// What an error of the connection says: in words, for a stream that ended
+/// partway through a message, which `io` calls failing to fill a buffer.
+fn connection_error(error: &io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof => "the connection ended".to_owned(),
+        _ => error.to_string(),
+    }
+}
+
+/// What a lost connection's message says of what `ssh` said: its last
+/// lines, which are where it says why.
+fn said_shown(said: &str) -> Option<String> {
+    let lines: Vec<&str> = said.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    let last = &lines[lines.len().saturating_sub(SAID_LINES)..];
+    (!last.is_empty()).then(|| last.join("\n"))
+}
 
 /// How long a launch waits for the connection before it goes on without.
 
@@ -549,10 +588,15 @@ pub(crate) fn connect(place: &Place) {
     let connect = move || {
         let client = connecting;
         let number = CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        let place = place_logged(&client.place);
+        log(format_args!("connection {number} to {place}: connecting"));
+        let began = std::time::Instant::now();
         client.set(match open(number, &client) {
             Ok(daemon) => Conn::Connected(daemon),
             Err(error) => {
-                let error = error.to_string();
+                let error = connection_error(&error);
+                let after = nterm_session::log::duration(began.elapsed());
+                log(format_args!("connection {number} to {place}: failed after {after}: {error}"));
                 report("Session daemon unavailable", &error);
                 Conn::Unavailable(error)
             }
@@ -601,6 +645,12 @@ pub(crate) fn flush() {
     let deadline = std::time::Instant::now() + FLUSH_WAIT;
     for client in clients {
         let Some(daemon) = daemon(&client.place) else { continue };
+        log(format_args!(
+            "connection {} to {}: closed after {}, as nterm is leaving",
+            daemon.number,
+            place_logged(&client.place),
+            nterm_session::log::duration(daemon.connected.elapsed()),
+        ));
         let (done, written) = mpsc::channel();
         if daemon.queue(Out::Flush(done)) {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -691,6 +741,10 @@ struct Daemon {
     /// What the daemon was last told.
     settings: Mutex<TerminalSettings>,
     gone: AtomicBool,
+    /// When the connection was made, and when the daemon was last heard
+    /// from, in milliseconds after: for the log, when it is lost.
+    connected: std::time::Instant,
+    heard: AtomicU64,
 }
 
 impl Daemon {
@@ -735,6 +789,7 @@ fn target() -> io::Result<(String, std::path::PathBuf)> {
 /// Make connection `number`: find or start the daemon, greet it, and ask
 /// what it holds. Runs on the connecting thread.
 fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
+    let began = std::time::Instant::now();
     let (session, program) = target()?;
     let other = |message: String| io::Error::other(message);
     // A daemon from another build cannot be trusted to speak the same
@@ -763,7 +818,7 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             ghostty: GHOSTTY_REVISION.to_owned(),
         })
         .write(&mut writer)?;
-        let Frame::Control(Control::Welcome { protocol, ghostty, files, machine, user, .. }) =
+        let Frame::Control(Control::Welcome { protocol, ghostty, files, machine, user, pid, .. }) =
             Frame::read(&mut reader)?
         else {
             return Err(other("the daemon did not answer the greeting".into()));
@@ -801,6 +856,19 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
                  protocol {PROTOCOL_VERSION}, ghostty {GHOSTTY_REVISION})"
             )));
         }
+        let how = if connection.relayed() {
+            format!("through ssh (pid {})", connection.peer_pid())
+        } else {
+            "at the pipe".to_owned()
+        };
+        let who = who(&user, &machine);
+        log(format_args!(
+            "connection {number} to {}: connected {how} after {}, daemon pid {pid}{}, \
+             protocol {protocol}, ghostty {ghostty}",
+            place_logged(&client.place),
+            nterm_session::log::duration(began.elapsed()),
+            who.as_deref().map(|who| format!(" as {who}")).unwrap_or_default(),
+        ));
         let (outbox, queued) = mpsc::channel();
         let daemon = Arc::new(Daemon {
             number,
@@ -818,12 +886,14 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             folders: Mutex::default(),
             folder_searches: Mutex::default(),
             files,
-            who: who(&user, &machine),
+            who,
             kept: Mutex::default(),
             sessions: Mutex::new(Arc::new(Listing { sessions, daemon: number, place: client.place.clone() })),
             next_request: AtomicU32::new(1),
             settings: Mutex::default(),
             gone: AtomicBool::new(false),
+            connected: std::time::Instant::now(),
+            heard: AtomicU64::new(0),
         });
         let writing = daemon.clone();
         std::thread::Builder::new()
@@ -1207,6 +1277,7 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
             Ok(frame) => frame,
             Err(error) => break error,
         };
+        daemon.heard.store(daemon.connected.elapsed().as_millis() as u64, Ordering::Relaxed);
         match frame {
             Frame::Output { pane, bytes } => {
                 if let Some(link) = daemon.pane(pane) {
@@ -1474,6 +1545,28 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
     daemon.gone.store(true, Ordering::Release);
     *daemon.outbox.lock().unwrap() = None;
     daemon.connection.close();
+    // Through ssh, why: what it says as it goes, once its input is closed.
+    let said = daemon.connection.said(SAID_WAIT).unwrap_or_default();
+    let error = connection_error(&error);
+    let connected = daemon.connected.elapsed();
+    let heard = connected.saturating_sub(Duration::from_millis(daemon.heard.load(Ordering::Relaxed)));
+    log(format_args!(
+        "connection {} to {}: lost after {}, last heard from the daemon {} before: {error}{}",
+        daemon.number,
+        place_logged(&daemon.client.place),
+        nterm_session::log::duration(connected),
+        nterm_session::log::duration(heard),
+        if said.is_empty() {
+            String::new()
+        } else {
+            let lines: Vec<&str> = said.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+            format!("; ssh said: {}", lines.join(" | "))
+        },
+    ));
+    let error = match said_shown(&said) {
+        Some(said) => format!("{error}\n\nssh said:\n{said}"),
+        None => error,
+    };
     daemon.snapshots.lock().unwrap().clear();
     daemon.looking.lock().unwrap().clear();
     let programs: Vec<u32> = daemon.programs.lock().unwrap().keys().copied().collect();
@@ -2175,6 +2268,21 @@ mod tests {
     pub(super) static TARGET: Mutex<Option<(String, std::path::PathBuf)>> = Mutex::new(None);
 
     const WAIT: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn a_lost_connection_shows_the_last_lines_ssh_said() {
+        assert_eq!(said_shown(""), None);
+        assert_eq!(said_shown("\r\n  \r\n"), None);
+        assert_eq!(
+            said_shown("Connection to vm closed by remote host.\r\n").as_deref(),
+            Some("Connection to vm closed by remote host.")
+        );
+        let said = "Warning: one\r\n\r\ntwo\r\nthree\r\nclient_loop: send disconnect: Connection reset\r\n";
+        assert_eq!(
+            said_shown(said).as_deref(),
+            Some("two\nthree\nclient_loop: send disconnect: Connection reset")
+        );
+    }
 
     #[test]
     fn a_remote_is_reached_by_an_ssh_that_asks_and_forwards_nothing() {

@@ -504,19 +504,26 @@ pub fn run(options: Options) -> io::Result<()> {
 
 fn serve(session: &Arc<Session>, connection: Connection) {
     let id = session.next_client.fetch_add(1, Ordering::Relaxed);
+    let began = std::time::Instant::now();
     let (outbox, queued) = mpsc::channel::<Vec<u8>>();
+    // Why the writer closed the connection, when it did: the reader then
+    // fails only because of that.
+    let closed = Arc::new(Mutex::new(None::<String>));
     let writer = {
         let connection = connection.clone();
+        let closed = closed.clone();
         std::thread::spawn(move || {
             let Ok(mut writer) = connection.writer() else { return };
             for frame in queued {
                 if frame == CLOSE {
                     // Asked for: what came before it has been written.
+                    *closed.lock().unwrap() = Some("the daemon closed the connection".into());
                     connection.close();
                     break;
                 }
-                if writer.write_all(&frame).is_err() {
+                if let Err(error) = writer.write_all(&frame) {
                     // Wake the reading side; this UI is gone.
+                    *closed.lock().unwrap() = Some(format!("writing to it failed: {error}"));
                     connection.close();
                     break;
                 }
@@ -525,10 +532,18 @@ fn serve(session: &Arc<Session>, connection: Connection) {
     };
 
     let result = converse(session, &connection, id, &outbox);
+    let why = match (closed.lock().unwrap().take(), result) {
+        (Some(closed), _) => closed,
+        (None, Ok(())) => "it closed the connection".to_owned(),
+        (None, Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+            format!("what it sent could not be read: {error}")
+        }
+        (None, Err(error)) => format!("reading from it failed: {error}"),
+    };
     log(format_args!(
-        "client {id} (pid {}) gone: {}",
+        "client {id} (pid {}) gone after {}: {why}",
         connection.peer_pid(),
-        result.err().map_or("closed".to_owned(), |error| error.to_string())
+        crate::log::duration(began.elapsed()),
     ));
 
     let last = {

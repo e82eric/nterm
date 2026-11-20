@@ -15,7 +15,7 @@ use std::{
     process::{ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -31,6 +31,10 @@ const READY: Duration = Duration::from_secs(30);
 const LEAVING: Duration = Duration::from_secs(2);
 /// No line before the marker is worth more than this.
 const LONGEST_LINE: usize = 4096;
+/// How much of the child's error output is kept.
+const MOST_SAID: usize = 1 << 16;
+/// How long a child that has gone gets to finish its error output.
+const HEARD_OUT: Duration = Duration::from_secs(1);
 
 /// From `windows-sys`'s `CREATE_NO_WINDOW`: no console window for the child.
 const NO_WINDOW: u32 = 0x0800_0000;
@@ -43,11 +47,35 @@ pub(crate) struct Child {
     writing: AtomicBool,
     input: Mutex<Option<ChildStdin>>,
     output: Mutex<Option<ChildStdout>>,
+    /// What the child has written to its error output, up to `MOST_SAID`:
+    /// `ssh`'s explanations, and the relay's.
+    said: Arc<Mutex<Vec<u8>>>,
+    /// How much of `said` was there when the connection was ready.
+    said_before: AtomicUsize,
+    /// Reads the error output until the child closes it.
+    listener: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Child {
     pub(crate) fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// What the child wrote to its error output: all of it, or only what
+    /// came once the connection was ready. Waits up to `wait` for the child
+    /// to close it, as `ssh` explains an end as it goes.
+    pub(crate) fn said(&self, wait: Duration, since_ready: bool) -> String {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let finished = self.listener.lock().unwrap().as_ref().is_none_or(|l| l.is_finished());
+            if finished || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let said = self.said.lock().unwrap();
+        let from = if since_ready { self.said_before.load(Ordering::Acquire) } else { 0 };
+        String::from_utf8_lossy(&said[from.min(said.len())..]).trim().to_owned()
     }
 
     /// End the connection: no more is written, and reads end once the child
@@ -203,7 +231,7 @@ pub fn connect(command: &mut Command) -> io::Result<crate::pipe::Connection> {
         let mut chunk = [0u8; 1024];
         while let Ok(read @ 1..) = errors.read(&mut chunk) {
             let mut said = saying.lock().unwrap();
-            if said.len() < 1 << 16 {
+            if said.len() < MOST_SAID {
                 said.extend_from_slice(&chunk[..read]);
             }
         }
@@ -215,6 +243,9 @@ pub fn connect(command: &mut Command) -> io::Result<crate::pipe::Connection> {
         writing: AtomicBool::new(false),
         input: Mutex::new(input),
         output: Mutex::new(None),
+        said,
+        said_before: AtomicUsize::new(0),
+        listener: Mutex::new(Some(listener)),
     });
 
     // A relay that never answers must not hold the caller for ever.
@@ -232,8 +263,7 @@ pub fn connect(command: &mut Command) -> io::Result<crate::pipe::Connection> {
     let failed = |why: String| {
         // The child is gone or going; hear it out.
         child.close();
-        let _ = listener.join();
-        let said = String::from_utf8_lossy(&said.lock().unwrap()).trim().to_owned();
+        let said = child.said(LEAVING + HEARD_OUT, false);
         io::Error::other(if said.is_empty() { why } else { format!("{why}: {said}") })
     };
     loop {
@@ -256,6 +286,54 @@ pub fn connect(command: &mut Command) -> io::Result<crate::pipe::Connection> {
         }
     }
     ready.store(true, Ordering::Release);
+    // What was said before this is from setting up: a banner, a warning.
+    let before = child.said.lock().unwrap().len();
+    child.said_before.store(before, Ordering::Release);
     *child.output.lock().unwrap() = Some(output);
     Ok(crate::pipe::Connection::through(child))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A relay that says something as it starts and something else as it
+    /// ends, as `ssh` does, with time between for each to be heard.
+    fn relay(test: &str, script: &str) -> Command {
+        let folder = std::env::temp_dir().join(format!("nterm-relay-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("relay.cmd");
+        std::fs::write(&path, script).unwrap();
+        let mut command = Command::new("cmd.exe");
+        command.arg("/d").arg("/c").arg(path);
+        command
+    }
+
+    #[test]
+    fn what_a_relay_says_once_ready_is_kept_for_when_it_ends() {
+        let mut command = relay(
+            "said",
+            "@>&2 echo Warning: setting up\r\n\
+             @ping -n 2 127.0.0.1 >nul\r\n\
+             @echo nterm-relay 1\r\n\
+             @ping -n 2 127.0.0.1 >nul\r\n\
+             @>&2 echo Connection reset by peer\r\n",
+        );
+        let connection = connect(&mut command).expect("ready");
+        let mut reader = connection.reader().unwrap();
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        // Only what came after it was ready: why it ended, not how it began.
+        let said = connection.said(Duration::from_secs(5)).unwrap();
+        assert_eq!(said, "Connection reset by peer");
+    }
+
+    #[test]
+    fn a_relay_that_ends_before_it_is_ready_says_why_in_its_error() {
+        let mut command = relay("early", "@>&2 echo Permission denied (publickey).\r\n");
+        let Err(error) = connect(&mut command) else { panic!("connected") };
+        let error = error.to_string();
+        assert!(error.starts_with("the relay ended before it was ready"), "{error}");
+        assert!(error.ends_with("Permission denied (publickey)."), "{error}");
+    }
 }

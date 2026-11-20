@@ -431,6 +431,28 @@ fn a_ui_through_a_relay() {
         assert!(Instant::now() < deadline, "the relay outlived its UI");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // The relay said how it began and how it ended, in its own log. Through
+    // ssh, the process here is ssh, and the relay is on the other side.
+    if std::env::var_os("NTERM_TEST_RELAY_VIA").is_none() {
+        let relayed = std::fs::read_to_string(
+            nterm_daemon::log::directory().join(format!("relay-{session}.log")),
+        )
+        .unwrap_or_default();
+        let lines: Vec<&str> = relayed.lines().filter(|line| line.contains(&format!(" {relay} "))).collect();
+        assert_eq!(lines.len(), 2, "{relayed}");
+        assert!(
+            lines[0].ends_with(&format!("relaying to daemon pid {pid}; started the session's daemon")),
+            "{relayed}"
+        );
+        assert!(lines[1].contains(": ended after "), "{relayed}");
+        assert!(lines[1].contains(": its input ended: the SSH session closed it; "), "{relayed}");
+        assert!(lines[1].contains(" in, ") && lines[1].contains(" out; last input "), "{relayed}");
+        // And the daemon, why the relay was gone.
+        let gone = format!("(pid {relay}) gone after ");
+        let log = logged(&session, "that the relay went", |log| log.contains(&gone));
+        let line = log.lines().find(|line| line.contains(&gone)).unwrap();
+        assert!(line.ends_with(": it closed the connection"), "{line}");
+    }
 
     // At the pipe, the same daemon still has the pane.
     let mut ui = Ui::over(pipe::connect(&session).expect("the daemon is still there"));

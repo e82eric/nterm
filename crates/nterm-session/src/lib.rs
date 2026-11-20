@@ -4,6 +4,7 @@
 //! The daemon owns every shell and a headless terminal for each. The UI is a
 //! client that can go away and come back.
 
+pub mod log;
 pub mod protocol;
 
 #[cfg(windows)]

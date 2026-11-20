@@ -84,6 +84,16 @@ impl Connection {
         matches!(self.0, Link::Relay(_))
     }
 
+    /// What a relay's program has written to its error output since the
+    /// connection was ready: for `ssh`, why the connection ended. Waits up
+    /// to `wait` for it to finish saying it. Nothing for a pipe.
+    pub fn said(&self, wait: Duration) -> Option<String> {
+        match &self.0 {
+            Link::Pipe(_) => None,
+            Link::Relay(relay) => Some(relay.said(wait, true)),
+        }
+    }
+
     /// A relay has one reader and one writer; a pipe as many as are asked for.
     pub fn reader(&self) -> io::Result<Reader> {
         Ok(Reader(match &self.0 {
@@ -386,9 +396,14 @@ pub fn connect(session: &str) -> io::Result<Connection> {
 /// process group, and outside any job this process is in when the job allows
 /// it, so that it outlives the UI.
 pub fn connect_or_start(session: &str, daemon: &Path) -> io::Result<Connection> {
+    connect_or_start_saying(session, daemon).map(|(connection, _)| connection)
+}
+
+/// `connect_or_start`, and whether the daemon had to be started.
+pub fn connect_or_start_saying(session: &str, daemon: &Path) -> io::Result<(Connection, bool)> {
     match connect(session) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        other => return other,
+        other => return other.map(|connection| (connection, false)),
     }
     start(session, daemon)?;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -397,7 +412,7 @@ pub fn connect_or_start(session: &str, daemon: &Path) -> io::Result<Connection> 
             Err(error) if error.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            other => return other,
+            other => return other.map(|connection| (connection, true)),
         }
     }
 }
