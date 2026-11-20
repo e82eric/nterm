@@ -1884,6 +1884,15 @@ impl TerminalPane {
                         self.show_error("Could not open picker", why);
                     }
                 }
+                // Said each time, as the program did not ask first.
+                Event::ClipboardRead => {
+                    self.toasts.push(
+                        "Clipboard read".into(),
+                        "A program in this pane read the clipboard.".into(),
+                        3000,
+                    );
+                    ctx.request_repaint();
+                }
                 Event::Shown(shown) => {
                     let refused = if !bindings.pipe_policy.enabled {
                         Some("picker pipe is disabled in Lua configuration")

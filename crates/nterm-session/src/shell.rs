@@ -22,6 +22,9 @@ pub const PANE_VARIABLE: &str = "NTERM_PANE";
 /// The daemon's pipe, whole, for a client that is a script and would
 /// otherwise have to work the name out. See `Invoke-NtermPicker.ps1`.
 pub const PIPE_VARIABLE: &str = "NTERM_DAEMON_PIPE";
+/// The daemon's own program, whole, for a shell to run its client commands
+/// with (`clipboard paste`) wherever `PATH` does not have it.
+pub const PROGRAM_VARIABLE: &str = "NTERM_DAEMON_PROGRAM";
 /// The folder installed with the daemon (`share\nterm`: the Lua modules and
 /// the PowerShell module), for a profile on the daemon's machine to load
 /// from. Only the daemon sets it, and only when the folder is there.

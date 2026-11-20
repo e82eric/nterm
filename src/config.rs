@@ -401,6 +401,18 @@ struct TerminalConfig {
     /// No longer used: every shell runs in the session daemon. Still read,
     /// so a configuration that sets it says so instead of failing to load.
     session_daemon: Option<bool>,
+    /// Whether a program in a shell of this machine may read its clipboard
+    /// (`nterm-daemon clipboard paste`). Without it, allowed. A remote's
+    /// shells have their own: `remotes.NAME.clipboard_read`.
+    clipboard_read: Option<Access>,
+}
+
+/// What a setting that lets something be done, or not, says.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Access {
+    Allow,
+    Deny,
 }
 
 /// One of `remotes`: a machine whose nterm daemon a window can use.
@@ -424,6 +436,9 @@ struct RemoteConfig {
     /// How many levels of folders inside them. Without it,
     /// `workspaces.new_depth`.
     new_depth: Option<i32>,
+    /// Whether a program in a shell there may read this machine's
+    /// clipboard. Without it, denied.
+    clipboard_read: Option<Access>,
 }
 
 impl RemoteConfig {
@@ -439,6 +454,7 @@ impl RemoteConfig {
             session: self.session,
             new_roots: self.new_roots.unwrap_or_else(|| vec![crate::session::HOME_ROOT.into()]),
             new_depth: self.new_depth,
+            clipboard_read: self.clipboard_read == Some(Access::Allow),
         };
         if remote.new_roots.iter().any(|root| root.trim().is_empty() || root.contains('\0')) {
             return Err(format!("remotes.{name}.new_roots must contain nonempty paths"));
@@ -1036,6 +1052,7 @@ pub(crate) fn prepare_with_reload(
                         crate::session::set_remote(known);
                     }
                     crate::session::set_remotes(remotes);
+                    crate::session::set_clipboard_read(config.terminal.clipboard_read != Some(Access::Deny));
                     Ok((
                         config.ghostty_args()?,
                         crate::picker::config::Bindings::compile_with_actions(
@@ -1415,6 +1432,17 @@ mod tests {
             assert!(args.iter().any(|arg| arg == "--font-size=18"), "{args:?}");
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clipboard_read_is_allow_or_deny() {
+        let read = |value: &str| parse(&format!("return {{ terminal = {{ clipboard_read = {value} }} }}"));
+        assert_eq!(read("'allow'").unwrap().terminal.clipboard_read, Some(Access::Allow));
+        assert_eq!(read("'deny'").unwrap().terminal.clipboard_read, Some(Access::Deny));
+        assert_eq!(parse("return {}").unwrap().terminal.clipboard_read, None);
+        for bad in ["'Allow'", "'ask'", "true"] {
+            assert!(read(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -4189,6 +4217,14 @@ mod tests {
             assert!(error.starts_with("remotes.vm.new_"), "{bad}: {error}");
         }
         assert!(parse("return { remotes = { vm = { new_roots = 'C:/src' } } }").is_err());
+
+        // Whether its shells may read this machine's clipboard: not unless
+        // it says so.
+        assert!(!named("{}").unwrap().clipboard_read);
+        assert!(!named("{ clipboard_read = 'deny' }").unwrap().clipboard_read);
+        assert!(named("{ clipboard_read = 'allow' }").unwrap().clipboard_read);
+        assert!(parse("return { remotes = { vm = { clipboard_read = true } } }").is_err());
+        assert!(parse("return { remotes = { vm = { clipboard_read = 'ask' } } }").is_err());
 
         // On the command line, refused before anything is asked of ssh.
         for bad in [

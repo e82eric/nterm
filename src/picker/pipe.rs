@@ -104,6 +104,12 @@ pub(crate) enum Message {
     Received {
         request_id: String,
     },
+    /// Not a picker: the text on the clipboard of the machine the window is
+    /// on, answered with a `result` whose `text` it is. A conversation's
+    /// only message. See `session::read_clipboard`.
+    ClipboardRead {
+        request_id: String,
+    },
 }
 
 pub(crate) enum Event {
@@ -125,6 +131,8 @@ pub(crate) enum Event {
     /// The session daemon will not run the picker the pane asked it for
     /// with the number `ask`.
     Refused { ask: u64, message: String },
+    /// A program in the pane's shell was given the clipboard's text.
+    ClipboardRead,
 }
 
 pub(crate) struct Session {

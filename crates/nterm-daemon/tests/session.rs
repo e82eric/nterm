@@ -1059,6 +1059,54 @@ fn a_program_is_refused_for_no_pane_or_with_no_ui() {
 }
 
 #[test]
+fn a_shell_pastes_the_clipboard_of_the_ui_showing_its_pane() {
+    let session = session("clipboard");
+    let mut ui = Ui::connect(&session);
+    let pane = ui.shell();
+    // The daemon's own program, which the shell is told of, as an editor
+    // there runs it.
+    let paste = os!(
+        "\"%NTERM_DAEMON_PROGRAM%\" clipboard paste --lf && echo :ok || echo :failed\r",
+        "\"$NTERM_DAEMON_PROGRAM\" clipboard paste --lf && echo :ok || echo :failed\r",
+    );
+    let ask = |ui: &mut Ui| {
+        ui.input(pane, paste);
+        let Control::ShellOpen { channel, pane: opened } =
+            ui.control(|c| matches!(c, Control::ShellOpen { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(opened, pane);
+        let (said, asked) = ui.said();
+        assert_eq!(said, channel);
+        let asked: serde_json::Value = serde_json::from_str(&asked).unwrap();
+        assert_eq!(asked, serde_json::json!({"type": "clipboard_read", "request_id": "clipboard"}));
+        channel
+    };
+
+    // The text the UI gives is printed as it is, and nothing after it.
+    let channel = ask(&mut ui);
+    ui.say(channel, r#"{"type":"result","request_id":"clipboard","status":"ok","text":"from-the-window"}"#);
+    ui.send(Control::ShellClosed { channel });
+    ui.sees("from-the-window:ok");
+
+    // Refused: said why, and failed.
+    let channel = ask(&mut ui);
+    let refused = r#"{"type":"result","request_id":"clipboard","status":"error","code":"denied","message":"not here"}"#;
+    ui.say(channel, refused);
+    ui.send(Control::ShellClosed { channel });
+    ui.sees("nterm-daemon clipboard paste: not here");
+    // A line of its own: the command typed has it too.
+    ui.until_text("the paste failing", |text| text.lines().any(|line| line.trim() == ":failed"));
+
+    // A UI that ends it without a word, as one from before this does.
+    let channel = ask(&mut ui);
+    ui.send(Control::ShellClosed { channel });
+    ui.sees("it may be older than this daemon");
+    ui.shutdown();
+}
+
+#[test]
 fn uis_are_told_of_the_sessions_as_they_change() {
     let session = session("sessions");
     let mut ui = Ui::connect(&session);

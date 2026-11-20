@@ -16,7 +16,7 @@ use crate::{
 use nterm_session::{
     GHOSTTY_REVISION,
     pipe::{Connection, Listener},
-    shell::{DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE, SHARE_VARIABLE},
+    shell::{DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE, PROGRAM_VARIABLE, SHARE_VARIABLE},
     protocol::{
         Control, Frame, PROTOCOL_VERSION, PaneId, PaneInfo, SessionInfo, Size, TerminalSettings,
     },
@@ -267,7 +267,7 @@ impl Session {
         }
         // A profile loads code from the share folder, so its path is only
         // ever this daemon's own: one a UI names, from wherever, is dropped.
-        let ours = [DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE, SHARE_VARIABLE];
+        let ours = [DAEMON_VARIABLE, PANE_VARIABLE, PIPE_VARIABLE, PROGRAM_VARIABLE, SHARE_VARIABLE];
         env.retain(|(key, _)| !ours.iter().any(|ours| same_variable(key, ours)));
         // A terminal's program is told what terminal it is in. Ghostty's
         // own name needs its terminfo, which the machine may not have.
@@ -280,6 +280,9 @@ impl Session {
         }
         if let Ok(pipe) = nterm_session::pipe::name(&self.name) {
             env.push((PIPE_VARIABLE.into(), pipe));
+        }
+        if let Ok(program) = std::env::current_exe() {
+            env.push((PROGRAM_VARIABLE.into(), program.to_string_lossy().into_owned()));
         }
         env.push((DAEMON_VARIABLE.into(), self.name.clone()));
         env.push((PANE_VARIABLE.into(), id.to_string()));

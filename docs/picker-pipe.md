@@ -591,7 +591,15 @@ NTERM_DAEMON=<the daemon's name>
 NTERM_PANE=<the daemon's number for the pane>
 NTERM_DAEMON_PIPE=\\.\pipe\nterm-session-<account>-<name>    (Windows)
 NTERM_DAEMON_PIPE=/tmp/nterm-<uid>/<name>                     (Linux)
+NTERM_DAEMON_PROGRAM=<the daemon's own program, whole>
 ```
+
+The same conversation, with `{"type":"clipboard_read","request_id":"…"}` as
+its one message, asks for the text on the window's clipboard; see
+`nterm-daemon clipboard paste` in [configuration](configuration.md#pasting-the-clipboard).
+The answer is a `result` whose `status` is `ok` with the `text`, or `error`
+with a `code` (`denied`, `unavailable`, `result_limit`) and a `message`. A
+window showing a pane of another machine's daemon takes this and no other.
 
 These are not persisted or set globally. Shell descendants inherit them. None
 is a secret: the pipe decides who may connect, not knowledge of its name.

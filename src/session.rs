@@ -137,6 +137,9 @@ pub(crate) struct Remote {
     /// levels inside them; this machine's number of levels without it.
     pub(crate) new_roots: Vec<String>,
     pub(crate) new_depth: Option<i32>,
+    /// Whether a program in a shell there may read this machine's clipboard:
+    /// see `read_clipboard`. Not without the configuration saying so.
+    pub(crate) clipboard_read: bool,
 }
 
 /// What a new shell on another machine is started with when its remote
@@ -243,6 +246,34 @@ pub(crate) struct Held {
 impl From<&str> for Held {
     fn from(id: &str) -> Self {
         Held { place: Place::Here, id: id.to_owned() }
+    }
+}
+
+/// Whether a program in a shell of this machine may read its clipboard:
+/// `terminal.clipboard_read`. A remote's says it for the shells there.
+static CLIPBOARD_READ: AtomicBool = AtomicBool::new(true);
+
+/// Called with `terminal.clipboard_read` before the first pane is made.
+pub(crate) fn set_clipboard_read(allowed: bool) {
+    CLIPBOARD_READ.store(allowed, Ordering::Relaxed);
+}
+
+/// Whether a program in a shell of `place` may read the clipboard here, and
+/// if not, the setting that would let it.
+fn clipboard_read(place: &Place) -> Result<(), String> {
+    clipboard_read_of(place, CLIPBOARD_READ.load(Ordering::Relaxed), place.remote())
+}
+
+/// As `clipboard_read`, with this machine's setting `here`, and what is
+/// known of the remote `place` is, if it is one.
+fn clipboard_read_of(place: &Place, here: bool, remote: Option<Remote>) -> Result<(), String> {
+    match place {
+        Place::Here if here => Ok(()),
+        Place::Here => Err("terminal.clipboard_read is \"deny\"".into()),
+        Place::Remote(name) => match remote {
+            Some(remote) if remote.clipboard_read => Ok(()),
+            _ => Err(format!("remotes.{name}.clipboard_read is not \"allow\"")),
+        },
     }
 }
 
@@ -899,6 +930,12 @@ struct Program {
     link: Arc<Link>,
     /// What it asked, once it has.
     request: Option<Request>,
+    /// Whether it is on another machine, whose daemon the connection is
+    /// relayed to. It may only ask for the clipboard: a picker it asked for
+    /// would run here, on this machine's files, with this machine's programs.
+    relayed: bool,
+    /// Whether it asked for the clipboard. That is all it asks.
+    reading: bool,
 }
 
 impl Daemon {
@@ -917,17 +954,54 @@ impl Daemon {
     }
 }
 
+/// What a program's message is to the window.
+#[derive(Debug, PartialEq)]
+enum Said {
+    /// The first of the conversation, asking for the clipboard's text.
+    Clipboard { request_id: String },
+    /// One of a picker's: see `Request`.
+    Picker,
+    /// One it may not send: the conversation is ended.
+    Broken,
+}
+
+/// What `bytes` is, from a program that is `relayed` or not, that has asked
+/// for the clipboard (`reading`) or has asked for a picker (`asked`).
+fn what_was_said(bytes: &[u8], relayed: bool, reading: bool, asked: bool) -> Said {
+    if reading {
+        // That was all it could ask.
+        return Said::Broken;
+    }
+    if !asked
+        && let Ok(crate::picker::pipe::Message::ClipboardRead { request_id }) = crate::picker::pipe::parse(bytes)
+    {
+        let fits = !request_id.is_empty() && request_id.len() <= 128;
+        return if fits { Said::Clipboard { request_id } } else { Said::Broken };
+    }
+    // A picker it asked for would run here, on this machine's files.
+    if relayed { Said::Broken } else { Said::Picker }
+}
+
 /// A message from a program in a shell.
 fn said(daemon: &Arc<Daemon>, channel: u32, bytes: &[u8]) {
     let mut programs = daemon.programs.lock().unwrap();
     let Some(program) = programs.get_mut(&channel) else { return };
-    let event = match &mut program.request {
-        Some(request) => request.accept(bytes),
-        None => Request::open(bytes).map(|(request, event, replies)| {
-            program.request = Some(request);
-            answer(daemon.clone(), channel, replies);
-            Some(event)
-        }),
+    let event = match what_was_said(bytes, program.relayed, program.reading, program.request.is_some()) {
+        Said::Clipboard { request_id } => {
+            program.reading = true;
+            let link = program.link.clone();
+            drop(programs);
+            return read_clipboard(daemon.clone(), channel, link, request_id);
+        }
+        Said::Broken => Err(relay::Broken),
+        Said::Picker => match &mut program.request {
+            Some(request) => request.accept(bytes),
+            None => Request::open(bytes).map(|(request, event, replies)| {
+                program.request = Some(request);
+                answer(daemon.clone(), channel, replies);
+                Some(event)
+            }),
+        },
     };
     match event {
         Ok(Some(event)) => {
@@ -939,6 +1013,62 @@ fn said(daemon: &Arc<Daemon>, channel: u32, bytes: &[u8]) {
             drop(programs);
             daemon.end_program(channel, true);
         }
+    }
+}
+
+/// The most of the clipboard's text a program is given: what its answer
+/// can hold, as JSON, with room for the rest of the answer.
+const CLIPBOARD_LIMIT: usize = crate::picker::pipe::MAX_FRAME - 1024;
+
+/// Answer a program in `link`'s shell that asked for the clipboard's text,
+/// as `nterm-daemon clipboard paste` does: from a thread of its own, as the
+/// clipboard can be slow to open. Whether it may is the configuration's, by
+/// where its shell runs. The pane says when it was given it.
+fn read_clipboard(daemon: Arc<Daemon>, channel: u32, link: Arc<Link>, request_id: String) {
+    let ending = daemon.clone();
+    let read = move || {
+        let allowed = clipboard_read(&daemon.client.place);
+        let text = || {
+            let clip = crate::clipboard::read(crate::clipboard::Kinds { text: true, ..Default::default() })?;
+            // A clipboard of something else, or of nothing, has no text.
+            Ok(clip.text.unwrap_or_default())
+        };
+        let (reply, given) = clipboard_reply(&request_id, allowed, text);
+        if given {
+            let _ = link.requests.0.send(Event::ClipboardRead);
+            link.wake_pane();
+        }
+        if let Ok(bytes) = serde_json::to_vec(&reply) {
+            daemon.send(Frame::Shell { channel, bytes });
+        }
+        daemon.end_program(channel, true);
+    };
+    if std::thread::Builder::new().name("clipboard read".into()).spawn(read).is_err() {
+        // Unanswered: the program is told the conversation is over.
+        ending.end_program(channel, true);
+    }
+}
+
+/// The answer to request `request_id` for the clipboard, and whether it
+/// gives the clipboard's text. `text` is asked for that only when `allowed`.
+fn clipboard_reply(
+    request_id: &str,
+    allowed: Result<(), String>,
+    text: impl FnOnce() -> Result<String, String>,
+) -> (serde_json::Value, bool) {
+    let failed = |code: &str, message: String| {
+        let reply = serde_json::json!({"type":"result","request_id":request_id,"status":"error","code":code,"message":message});
+        (reply, false)
+    };
+    if let Err(setting) = allowed {
+        return failed("denied", format!("reading the clipboard is not allowed: {setting}"));
+    }
+    match text() {
+        Err(why) => failed("unavailable", why),
+        Ok(text) if serde_json::to_string(&text).map_or(true, |json| json.len() > CLIPBOARD_LIMIT) => {
+            failed("result_limit", format!("the clipboard's text is over {CLIPBOARD_LIMIT} bytes"))
+        }
+        Ok(text) => (serde_json::json!({"type":"result","request_id":request_id,"status":"ok","text":text}), true),
     }
 }
 
@@ -1298,15 +1428,13 @@ fn read(daemon: &Arc<Daemon>, mut reader: impl io::Read) {
                 }
             }
             Frame::Control(Control::ShellOpen { channel, pane }) => match daemon.pane(pane) {
-                // A program on another machine would have a picker run here,
-                // on this machine's files, with this machine's programs.
-                Some(_) if daemon.connection.relayed() => {
-                    daemon.control(Control::ShellClosed { channel });
-                }
+                // One on another machine may only ask for the clipboard; see
+                // `said`.
                 Some(link) => {
                     link.programs.fetch_add(1, Ordering::AcqRel);
                     link.wake_pane();
-                    let program = Program { link, request: None };
+                    let relayed = daemon.connection.relayed();
+                    let program = Program { link, request: None, relayed, reading: false };
                     daemon.programs.lock().unwrap().insert(channel, program);
                 }
                 // The pane went as the program came.
@@ -2232,6 +2360,62 @@ mod tests {
     pub(super) static TARGET: Mutex<Option<(String, std::path::PathBuf)>> = Mutex::new(None);
 
     const WAIT: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn the_clipboard_is_read_here_unless_denied_and_for_a_remote_only_when_allowed() {
+        assert_eq!(clipboard_read_of(&Place::Here, true, None), Ok(()));
+        let denied = clipboard_read_of(&Place::Here, false, None).unwrap_err();
+        assert!(denied.contains("terminal.clipboard_read"), "{denied}");
+
+        // This machine's setting says nothing of another's shells.
+        let vm = Place::Remote("vm".into());
+        let remote = |allowed| Some(Remote { name: "vm".into(), clipboard_read: allowed, ..Remote::default() });
+        assert_eq!(clipboard_read_of(&vm, false, remote(true)), Ok(()));
+        let denied = clipboard_read_of(&vm, true, remote(false)).unwrap_err();
+        assert!(denied.contains("remotes.vm.clipboard_read"), "{denied}");
+        // Nor is one the configuration does not know.
+        assert!(clipboard_read_of(&vm, true, None).is_err());
+    }
+
+    #[test]
+    fn a_program_asks_for_the_clipboard_once_and_one_on_another_machine_only_that() {
+        let clipboard = br#"{"type":"clipboard_read","request_id":"c"}"#;
+        let picker = br#"{"type":"open","request_id":"p","request":{"kind":"stream","options":{}}}"#;
+        let asked = Said::Clipboard { request_id: "c".into() };
+        // First, from here or from another machine.
+        assert_eq!(what_was_said(clipboard, false, false, false), asked);
+        assert_eq!(what_was_said(clipboard, true, false, false), asked);
+        // A picker, from here only.
+        assert_eq!(what_was_said(picker, false, false, false), Said::Picker);
+        assert_eq!(what_was_said(picker, true, false, false), Said::Broken);
+        // Nothing after the clipboard, and no clipboard partway through a
+        // picker: what the picker makes of it is its own.
+        assert_eq!(what_was_said(clipboard, false, true, false), Said::Broken);
+        assert_eq!(what_was_said(picker, false, true, false), Said::Broken);
+        assert_eq!(what_was_said(clipboard, false, false, true), Said::Picker);
+        // A request's number as a picker's must be.
+        let long = format!(r#"{{"type":"clipboard_read","request_id":"{}"}}"#, "x".repeat(129));
+        assert_eq!(what_was_said(long.as_bytes(), false, false, false), Said::Broken);
+        assert_eq!(what_was_said(br#"{"type":"clipboard_read","request_id":""}"#, false, false, false), Said::Broken);
+    }
+
+    #[test]
+    fn the_clipboard_is_answered_with_its_text_or_why_not() {
+        let (reply, given) = clipboard_reply("c", Ok(()), || Ok("a\r\nb".into()));
+        assert_eq!(reply, serde_json::json!({"type":"result","request_id":"c","status":"ok","text":"a\r\nb"}));
+        assert!(given);
+        // Denied: the clipboard is not even opened.
+        let (reply, given) = clipboard_reply("c", Err("the setting".into()), || panic!("read when denied"));
+        assert_eq!((reply["status"].as_str(), reply["code"].as_str(), given), (Some("error"), Some("denied"), false));
+        assert!(reply["message"].as_str().unwrap().ends_with("the setting"));
+        let (reply, given) = clipboard_reply("c", Ok(()), || Err("held".into()));
+        assert_eq!((reply["code"].as_str(), reply["message"].as_str(), given), (Some("unavailable"), Some("held"), false));
+        // More than an answer holds.
+        let (reply, given) = clipboard_reply("c", Ok(()), || Ok("x".repeat(CLIPBOARD_LIMIT)));
+        assert_eq!((reply["code"].as_str(), given), (Some("result_limit"), false));
+        let (reply, _) = clipboard_reply("c", Ok(()), || Ok("x".repeat(CLIPBOARD_LIMIT - 2)));
+        assert_eq!(reply["status"], "ok");
+    }
 
     #[test]
     fn a_lost_connection_shows_the_last_lines_ssh_said() {

@@ -5,10 +5,18 @@
 //!
 //! `nterm-daemon --relay [--session NAME]` is not a daemon but a way to one:
 //! see `relay`.
+//!
+//! `nterm-daemon clipboard paste [--lf]` is not a daemon either, but a
+//! program for a pane's shell: it prints the text on the clipboard of the
+//! window showing the pane. See `clipboard`.
 
 fn main() {
     use nterm_daemon::{log, server};
     use std::time::Duration;
+
+    if std::env::args().nth(1).as_deref() == Some("clipboard") {
+        clipboard(std::env::args().skip(2).collect());
+    }
 
     let mut session = nterm_session::DEFAULT_SESSION.to_owned();
     let mut idle = Duration::from_secs(10);
@@ -65,10 +73,37 @@ fn main() {
     }
 }
 
+/// `clipboard paste [--lf]`: the text, as it is, on standard output; with
+/// `--lf`, its line ends as `\n`. Exits 1, saying why, when there is none
+/// to give.
+fn clipboard(args: Vec<String>) -> ! {
+    use std::io::Write;
+    let lf = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["paste"] => false,
+        ["paste", "--lf"] => true,
+        _ => usage(),
+    };
+    match nterm_daemon::clipboard::paste() {
+        Ok(text) => {
+            let text = if lf { nterm_daemon::clipboard::lf(&text) } else { text };
+            let mut out = std::io::stdout().lock();
+            if out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_err() {
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!("nterm-daemon clipboard paste: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: nterm-daemon [--session NAME] [--idle-seconds N] [--lua-config FILE]\n       \
-         nterm-daemon --relay [--session NAME]"
+         nterm-daemon --relay [--session NAME]\n       \
+         nterm-daemon clipboard paste [--lf]"
     );
     std::process::exit(2);
 }

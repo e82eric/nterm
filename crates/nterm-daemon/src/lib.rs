@@ -12,6 +12,7 @@ mod pty;
 #[cfg(unix)]
 use pty as conpty;
 
+pub mod clipboard;
 mod configured;
 mod files;
 pub mod log;

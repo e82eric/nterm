@@ -104,6 +104,9 @@ stay, and its row offers to connect again: its shells are still there.
   Without it, `{ "~" }`: the home folder there, which its daemon reads `~` as.
   `new_depth` is how many levels inside them; without it,
   `workspaces.new_depth`.
+- `clipboard_read` is `"allow"` or `"deny"`: whether a program in a shell
+  there may read this machine's clipboard, as an editor's paste does (see
+  [Pasting the clipboard](#pasting-the-clipboard)). Without it, `"deny"`.
 
 A name that `remotes` does not have is taken as an address:
 `nterm --remote me@host`.
@@ -114,7 +117,8 @@ known: connect once by hand (`ssh me@host`) and accept it. A machine whose key
 has changed is refused. Nothing is forwarded.
 
 A remote window shows and types, and that is all the other machine has of
-this one. A new shell is given the daemon's environment and the home
+this one, and its clipboard if its `clipboard_read` is `"allow"`. A new
+shell is given the daemon's environment and the home
 directory there, not this machine's. Pickers that a program in the shell asks
 for (`npick`) are refused, as they would run here; your own key bindings'
 pickers still open, and are about this machine. The workspace picker lists
@@ -402,6 +406,64 @@ app:send_file(bytes, { extension = "png" }, function(app, path, why) end)
 
 A file is sent in one piece, so on a slow connection what is typed after it
 waits until it has gone.
+
+## Pasting the clipboard
+
+A program in a pane's shell can be given the text on the clipboard of the
+machine the window is on, even when the shell runs on another machine (a
+`--remote` window). This is how an editor there pastes what you copied here:
+
+```sh
+nterm-daemon clipboard paste        # the text, as it is
+nterm-daemon clipboard paste --lf   # with Windows' line ends made \n
+```
+
+It asks the window showing the pane, through the session daemon that runs
+the shell, so it works only in a shell the daemon runs: not in one reached
+by typing `ssh` in a pane. The shell is told the daemon's program as
+`NTERM_DAEMON_PROGRAM`, for when `nterm-daemon` is not on its `PATH`. It
+prints the text and exits 0, or says why not and exits 1: reading is not
+allowed, no window shows the pane, the clipboard could not be opened, or its
+text is over a megabyte. A clipboard holding no text gives nothing.
+
+Whether a program may is the window's configuration's, by where the shell
+runs, and takes effect when the window starts:
+
+```lua
+return {
+  terminal = { clipboard_read = "allow" },              -- this machine's shells
+  remotes = { vm = { clipboard_read = "allow" } },      -- the shells on vm
+}
+```
+
+`terminal.clipboard_read` is `"allow"` without it, and each remote's
+`"deny"`: any program running as you there could read the clipboard, without
+your asking. The pane shows a note each time the clipboard is read. Only a
+program running on the shell's machine as the daemon's user can ask; text a
+program prints cannot.
+
+For Neovim, where the shell runs:
+
+```lua
+local nterm = vim.env.NTERM_DAEMON_PROGRAM
+if nterm then
+  local function paste()
+    local done = vim.system({ nterm, "clipboard", "paste", "--lf" }, { text = true }):wait()
+    if done.code ~= 0 then
+      vim.notify(vim.trim(done.stderr), vim.log.levels.WARN)
+      return {}
+    end
+    return vim.split(done.stdout, "\n")
+  end
+  vim.g.clipboard = {
+    name = "nterm",
+    copy = { ["+"] = require("vim.ui.clipboard.osc52").copy("+"), ["*"] = require("vim.ui.clipboard.osc52").copy("+") },
+    paste = { ["+"] = paste, ["*"] = paste },
+  }
+end
+```
+
+Copying still goes by OSC 52, which the window takes from any program.
 
 ## Messages and error history
 
