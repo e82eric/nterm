@@ -408,11 +408,32 @@ struct TerminalConfig {
 }
 
 /// What a setting that lets something be done, or not, says.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Access {
     Allow,
     Deny,
+}
+
+/// Read by hand, so that anything else is refused saying what it may be:
+/// a derived enum says only "bad enum value", even of `true`.
+impl<'de> Deserialize<'de> for Access {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Access;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("clipboard_read to be \"allow\" or \"deny\"")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Access, E> {
+                match value {
+                    "allow" => Ok(Access::Allow),
+                    "deny" => Ok(Access::Deny),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(value), &self)),
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 /// One of `remotes`: a machine whose nterm daemon a window can use.
@@ -1440,8 +1461,10 @@ mod tests {
         assert_eq!(read("'allow'").unwrap().terminal.clipboard_read, Some(Access::Allow));
         assert_eq!(read("'deny'").unwrap().terminal.clipboard_read, Some(Access::Deny));
         assert_eq!(parse("return {}").unwrap().terminal.clipboard_read, None);
-        for bad in ["'Allow'", "'ask'", "true"] {
-            assert!(read(bad).is_err(), "{bad}");
+        // Refused saying what it may be.
+        for bad in ["'Allow'", "'ask'", "true", "1"] {
+            let error = read(bad).err().unwrap_or_else(|| panic!("{bad} was taken"));
+            assert!(error.contains(r#"clipboard_read to be "allow" or "deny""#), "{bad}: {error}");
         }
     }
 
