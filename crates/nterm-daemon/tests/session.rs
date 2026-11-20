@@ -1,5 +1,7 @@
 //! Drives the real daemon binary over its pipe, as a UI would.
-#![cfg(windows)]
+//!
+//! What is typed in a pane, and the programs a picker runs, are written for
+//! `cmd.exe` on Windows and for `sh` elsewhere: see `os!`.
 
 use nterm_daemon::vt::Terminal;
 use nterm_session::{
@@ -24,6 +26,47 @@ fn size(cols: u16, rows: u16) -> Size {
     Size { cols, rows, cell_width: 9, cell_height: 18 }
 }
 
+/// The one of two that is for this platform: for `cmd.exe`, or for `sh`.
+macro_rules! os {
+    ($windows:expr, $unix:expr $(,)?) => {
+        if cfg!(windows) { $windows } else { $unix }
+    };
+}
+
+/// What a test's panes run: a shell whose prompt is `> `, that runs what it
+/// is typed and shows what it runs.
+const SHELL: &str = os!("cmd.exe /d /q /k prompt $G$S", "PS1='> ' exec /bin/sh");
+
+/// A path under a folder as this platform writes it, given with `/`.
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// Enough of this process's environment for a shell to run its programs.
+fn program_env() -> Vec<(String, String)> {
+    os!(&["SystemRoot", "PATH"][..], &["PATH"][..])
+        .iter()
+        .map(|name| ((*name).to_owned(), std::env::var(name).unwrap()))
+        .collect()
+}
+
+/// The programs a file of pickers runs, written for `cmd.exe`, as they are
+/// run where there is none: the same output.
+fn lua_programs(text: &str) -> String {
+    if cfg!(windows) {
+        return text.to_owned();
+    }
+    [
+        (r#""cmd.exe", "/c", "echo", "{word}""#, r#""echo", "{word}""#),
+        (r#""cmd.exe", "/c", "echo", params.word"#, r#""echo", params.word"#),
+        (r#""cmd.exe", "/c", "ping -n 30 127.0.0.1 > nul""#, r#""sleep", "30""#),
+        (r#""cmd.exe", "/c", "type", "rows.txt""#, r#""cat", "rows.txt""#),
+        (r#""cmd.exe", "/c", "ver""#, r#""uname""#),
+    ]
+    .into_iter()
+    .fold(text.to_owned(), |text, (windows, unix)| text.replace(windows, unix))
+}
+
 /// With `NTERM_TEST_RELAY=1`, every UI in every test here reaches its daemon
 /// through a relay, so the whole suite says whether a relay carries all that
 /// the pipe does. Without it, one test does (`a_ui_through_a_relay`).
@@ -45,15 +88,19 @@ fn relay_command(session: &str) -> std::process::Command {
         relay.args(["--relay", "--session", session]);
         return relay;
     };
-    // The other sign-in has neither this one's directory nor its PATH, on
-    // which the daemon finds the terminal library.
-    let libraries = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../out/bin");
-    let libraries = libraries.canonicalize().expect("out/bin");
-    let libraries = libraries.to_str().unwrap().trim_start_matches(r"\\?\");
     let mut relay = std::process::Command::new(program);
-    relay.args(via).arg(format!(
-        "set \"PATH={libraries};%PATH%\" && \"{DAEMON}\" --relay --session {session}"
-    ));
+    if cfg!(windows) {
+        // The other sign-in has neither this one's directory nor its PATH,
+        // on which the daemon finds the terminal library.
+        let libraries = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../out/bin");
+        let libraries = libraries.canonicalize().expect("out/bin");
+        let libraries = libraries.to_str().unwrap().trim_start_matches(r"\\?\");
+        relay.args(via).arg(format!(
+            "set \"PATH={libraries};%PATH%\" && \"{DAEMON}\" --relay --session {session}"
+        ));
+    } else {
+        relay.args(via).arg(format!("'{DAEMON}' --relay --session {session}"));
+    }
     relay
 }
 
@@ -101,7 +148,11 @@ fn each_conpty(test: &str, run: impl Fn(&str)) {
             run(&shipped);
             assert!(daemon.wait().unwrap().success());
         }
-        None => eprintln!("{test}: out/bin/conpty.dll is not built; ran with the system's only"),
+        None if cfg!(windows) => {
+            eprintln!("{test}: out/bin/conpty.dll is not built; ran with the system's only")
+        }
+        // A pseudoterminal is the only one.
+        None => {}
     }
 }
 
@@ -331,8 +382,14 @@ fn lifecycle(session: &str) {
     };
     assert!(files, "the daemon says it keeps files");
     // And where it is: this machine, as this user, here or through a relay.
-    assert_eq!(machine, std::env::var("COMPUTERNAME").unwrap());
-    assert_eq!(user, std::env::var("USERNAME").unwrap());
+    if cfg!(windows) {
+        assert_eq!(machine, std::env::var("COMPUTERNAME").unwrap());
+        assert_eq!(user, std::env::var("USERNAME").unwrap());
+    } else {
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        assert_eq!(machine, host.trim());
+        assert_eq!(user, std::env::var("USER").unwrap());
+    }
     assert_eq!((protocol, ghostty.as_str(), named.as_str()), (PROTOCOL_VERSION, GHOSTTY_REVISION, session.as_str()));
     // Through a relay the peer is the relay, which is not the daemon.
     assert_eq!(pid == ui.connection.peer_pid(), !ui.connection.relayed());
@@ -340,7 +397,7 @@ fn lifecycle(session: &str) {
     ui.send(Control::Settings {
         settings: TerminalSettings { scrollback_bytes: Some(1 << 26), ..Default::default() },
     });
-    let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+    let pane = ui.spawn(SHELL, size(80, 24));
     assert_ne!(pane.pid, 0);
     assert_ne!(pane.creation_time, 0);
     assert_eq!(pane.exited, None);
@@ -356,14 +413,23 @@ fn lifecycle(session: &str) {
     ui.send(Control::Resize { pane: pane.pane, size: size(100, 30) });
     ui.frame(|frame| matches!(frame, Frame::Resized { .. }));
     assert_eq!(ui.mirror.as_mut().unwrap().grid(), (100, 30));
-    ui.input(pane.pane, "mode con\r");
+    ui.input(pane.pane, os!("mode con\r", "stty size\r"));
     ui.until_text("the new width", |text| {
-        text.lines().any(|line| line.contains("Columns:") && line.trim_end().ends_with("100"))
+        text.lines().any(|line| {
+            let line = line.trim_end();
+            os!(line.contains("Columns:") && line.ends_with("100"), line == "30 100")
+        })
     });
     assert_eq!(ui.panes()[0].size, size(100, 30));
 
     // Leave. The shell keeps running and keeps being parsed.
-    ui.input(pane.pane, "for /l %i in (1,1,300) do @echo while-away-%i\r");
+    ui.input(
+        pane.pane,
+        os!(
+            "for /l %i in (1,1,300) do @echo while-away-%i\r",
+            "i=1; while [ $i -le 300 ]; do echo while-away-$i; i=$((i+1)); done\r",
+        ),
+    );
     ui.connection.close();
     drop(ui);
 
@@ -414,7 +480,7 @@ fn a_ui_through_a_relay() {
     let pid = daemon_pid(&ui);
     assert_ne!(pid, ui.connection.peer_pid(), "the peer is the relay");
 
-    let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+    let pane = ui.spawn(SHELL, size(80, 24));
     ui.send(Control::Attach { request: 0, pane: pane.pane, size: size(80, 24) });
     ui.frame(|frame| matches!(frame, Frame::Screen { .. }));
     ui.input(pane.pane, "echo through-the-relay\r");
@@ -489,11 +555,17 @@ fn a_file_sent_is_kept_and_its_path_said() {
 
 /// Whether a process is still running.
 fn running(pid: u32) -> bool {
-    let list = std::process::Command::new("tasklist")
-        .args(["/fi", &format!("PID eq {pid}"), "/fo", "csv", "/nh"])
-        .output()
-        .expect("tasklist");
-    String::from_utf8_lossy(&list.stdout).contains(&format!("\"{pid}\""))
+    if cfg!(windows) {
+        let list = std::process::Command::new("tasklist")
+            .args(["/fi", &format!("PID eq {pid}"), "/fo", "csv", "/nh"])
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&list.stdout).contains(&format!("\"{pid}\""))
+    } else {
+        // One that has ended and not yet been waited for is not running.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|stat| stat.rsplit_once(") ").is_some_and(|(_, rest)| !rest.starts_with('Z')))
+    }
 }
 
 /// A relay to a daemon that cannot be started says why and ends.
@@ -521,10 +593,12 @@ fn query(session: &str) {
     let script = "$e=[char]27; [Console]::Write(\"$e[6n\"); \
                   do { $k=[Console]::ReadKey($true) } until ($k.KeyChar -eq 'R' -or $k.Key -eq 'F3'); \
                   [Console]::WriteLine('answered'); exit 3";
-    let pane = ui.spawn(
-        &format!("powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"{}\"", script.replace('"', "\\\"")),
-        size(80, 24),
+    // Under a pseudoterminal: the answer, `ESC [ 1 ; 1 R`, is six bytes.
+    let command = os!(
+        format!("powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"{}\"", script.replace('"', "\\\"")),
+        "stty raw -echo; printf '\\033[6n'; head -c 6 > /dev/null; stty sane; echo answered; exit 3".to_owned(),
     );
+    let pane = ui.spawn(&command, size(80, 24));
     let exited = ui.control(|c| matches!(c, Control::Exited { .. }));
     assert_eq!(exited, Control::Exited { pane: pane.pane, code: 3 });
     let text = ui.snapshot(pane.pane).text();
@@ -539,7 +613,7 @@ fn a_pane_goes_from_one_ui_to_another() {
     let mut second = Ui::connect(&session);
     assert_eq!(daemon_pid(&first), daemon_pid(&second));
 
-    let pane = first.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+    let pane = first.spawn(SHELL, size(80, 24));
     first.send(Control::Attach { request: 0, pane: pane.pane, size: size(80, 24) });
     first.frame(|frame| matches!(frame, Frame::Screen { .. }));
     first.input(pane.pane, "echo seen-by-first\r");
@@ -576,23 +650,33 @@ fn errors_are_reported_and_the_daemon_carries_on() {
         env: vec![],
         size: size(80, 24),
     });
-    let error = ui.control(|c| matches!(c, Control::Error { .. }));
-    assert!(matches!(error, Control::Error { request: Some(9), .. }), "{error:?}");
+    if cfg!(windows) {
+        let error = ui.control(|c| matches!(c, Control::Error { .. }));
+        assert!(matches!(error, Control::Error { request: Some(9), .. }), "{error:?}");
+    } else {
+        // A command line is run by `sh`, which starts, and says why it ends.
+        let Control::Spawned { info, .. } = ui.control(|c| matches!(c, Control::Spawned { .. })) else {
+            unreachable!()
+        };
+        let exited = ui.control(|c| matches!(c, Control::Exited { .. }));
+        assert_eq!(exited, Control::Exited { pane: info.pane, code: 127 });
+        let text = ui.snapshot(info.pane).text();
+        assert!(text.contains("not found"), "{text}");
+        ui.send(Control::Close { pane: info.pane });
+    }
     ui.send(Control::Snapshot { request: 10, pane: 999 });
     let error = ui.control(|c| matches!(c, Control::Error { .. }));
     assert!(matches!(error, Control::Error { request: Some(10), .. }), "{error:?}");
 
     // The environment and directory the UI names are the shell's.
+    let mut env = program_env();
+    env.push(("NTERM_TEST_VALUE".into(), "from-the-ui".into()));
     ui.send(Control::Spawn {
         request: 11,
-        command: "cmd.exe /d /q /c echo %NTERM_TEST_VALUE% in %CD%".into(),
-        cwd: Some(r"C:\Windows".into()),
+        command: os!("cmd.exe /d /q /c echo %NTERM_TEST_VALUE% in %CD%", "echo $NTERM_TEST_VALUE in $(pwd)").into(),
+        cwd: Some(os!(r"C:\Windows", "/usr").into()),
         beside: None,
-        env: vec![
-            ("NTERM_TEST_VALUE".into(), "from-the-ui".into()),
-            ("SystemRoot".into(), std::env::var("SystemRoot").unwrap()),
-            ("PATH".into(), std::env::var("PATH").unwrap()),
-        ],
+        env,
         size: size(80, 24),
     });
     let Control::Spawned { info, .. } = ui.control(|c| matches!(c, Control::Spawned { .. })) else {
@@ -600,7 +684,7 @@ fn errors_are_reported_and_the_daemon_carries_on() {
     };
     ui.control(|c| matches!(c, Control::Exited { .. }));
     let text = ui.snapshot(info.pane).text();
-    assert!(text.contains(r"from-the-ui in C:\Windows"), "{text}");
+    assert!(text.contains(os!(r"from-the-ui in C:\Windows", "from-the-ui in /usr")), "{text}");
     ui.shutdown();
 }
 
@@ -611,17 +695,18 @@ fn the_share_folder_is_never_one_the_ui_names() {
     // has no share folder beside or above it, so the shell has none.
     let session = session("share");
     let mut ui = Ui::connect(&session);
+    // Names differ only in case on Windows; elsewhere only the one is it.
+    let mut env = program_env();
+    env.push(("NTERM_SHARE".into(), r"C:\from-the-ui".into()));
+    if cfg!(windows) {
+        env.push(("nterm_share".into(), r"C:\from-the-ui-too".into()));
+    }
     ui.send(Control::Spawn {
         request: 1,
-        command: "cmd.exe /d /q /c echo [%NTERM_SHARE%]".into(),
+        command: os!("cmd.exe /d /q /c echo [%NTERM_SHARE%]", "echo [$NTERM_SHARE]").into(),
         cwd: None,
         beside: None,
-        env: vec![
-            ("NTERM_SHARE".into(), r"C:\from-the-ui".into()),
-            ("nterm_share".into(), r"C:\from-the-ui-too".into()),
-            ("SystemRoot".into(), std::env::var("SystemRoot").unwrap()),
-            ("PATH".into(), std::env::var("PATH").unwrap()),
-        ],
+        env,
         size: size(80, 24),
     });
     let Control::Spawned { info, .. } = ui.control(|c| matches!(c, Control::Spawned { .. })) else {
@@ -629,7 +714,7 @@ fn the_share_folder_is_never_one_the_ui_names() {
     };
     ui.control(|c| matches!(c, Control::Exited { .. }));
     let text = ui.snapshot(info.pane).text();
-    assert!(text.contains("[%NTERM_SHARE%]"), "{text}");
+    assert!(text.contains(os!("[%NTERM_SHARE%]", "[]")), "{text}");
     assert!(!text.contains("from-the-ui"), "{text}");
     ui.shutdown();
 }
@@ -638,14 +723,16 @@ fn the_share_folder_is_never_one_the_ui_names() {
 fn a_shell_started_beside_a_pane_starts_in_the_folder_that_pane_reported() {
     let session = session("beside");
     let mut ui = Ui::connect(&session);
-    let env = || {
-        ["SystemRoot", "PATH"].map(|name| (name.to_owned(), std::env::var(name).unwrap())).to_vec()
-    };
-    // A shell whose prompt reports a folder, as a profile's would.
+    let env = program_env;
+    // A shell whose prompt reports a folder, as a profile's would; on Unix
+    // one that reports it once and waits.
     let reporting = |ui: &mut Ui, request, folder: &str| {
         ui.send(Control::Spawn {
             request,
-            command: format!("cmd.exe /d /q /k prompt $E]7;file://localhost/{folder}$E\\$G"),
+            command: os!(
+                format!("cmd.exe /d /q /k prompt $E]7;file://localhost/{folder}$E\\$G"),
+                format!("printf '\\033]7;file://localhost{folder}\\033\\\\'; exec sleep 60"),
+            ),
             cwd: None,
             beside: None,
             env: env(),
@@ -656,8 +743,8 @@ fn a_shell_started_beside_a_pane_starts_in_the_folder_that_pane_reported() {
         };
         info.pane
     };
-    let there = reporting(&mut ui, 1, "C:/Windows/System32");
-    let gone = reporting(&mut ui, 2, "C:/no-such-folder-nterm");
+    let there = reporting(&mut ui, 1, os!("C:/Windows/System32", "/usr/share"));
+    let gone = reporting(&mut ui, 2, os!("C:/no-such-folder-nterm", "/no-such-folder-nterm"));
     let deadline = Instant::now() + WAIT;
     while !ui.panes().iter().filter(|p| p.pane == there || p.pane == gone).all(|p| p.pwd.is_some()) {
         assert!(Instant::now() < deadline, "the shells never reported their folders");
@@ -665,15 +752,13 @@ fn a_shell_started_beside_a_pane_starts_in_the_folder_that_pane_reported() {
     }
     // Beside a pane, in its folder; beside one whose folder is not here, or
     // one there is not, in the folder named.
-    for (request, beside, wanted) in [
-        (3, there, r"in C:\Windows\System32"),
-        (4, gone, r"in C:\Windows"),
-        (5, 999, r"in C:\Windows"),
-    ] {
+    let (named, inside) = os!((r"C:\Windows", r"C:\Windows\System32"), ("/usr", "/usr/share"));
+    for (request, beside, wanted) in [(3, there, inside), (4, gone, named), (5, 999, named)] {
+        let wanted = format!("in {wanted}");
         ui.send(Control::Spawn {
             request,
-            command: "cmd.exe /d /q /c echo in %CD%".into(),
-            cwd: Some(r"C:\Windows".into()),
+            command: os!("cmd.exe /d /q /c echo in %CD%", "echo in $(pwd)").into(),
+            cwd: Some(named.into()),
             beside: Some(beside),
             env: env(),
             size: size(80, 24),
@@ -686,7 +771,7 @@ fn a_shell_started_beside_a_pane_starts_in_the_folder_that_pane_reported() {
         ui.control(|c| matches!(c, Control::Exited { pane, .. } if *pane == info.pane));
         let text = ui.snapshot(info.pane).text();
         let line = text.lines().find(|line| line.starts_with("in ")).unwrap_or_default().trim_end();
-        assert!(line.eq_ignore_ascii_case(wanted), "beside {beside}: {text}");
+        assert!(line.eq_ignore_ascii_case(&wanted), "beside {beside}: {text}");
     }
     ui.shutdown();
 }
@@ -732,7 +817,7 @@ fn an_attach_is_answered_and_refused_when_the_pane_is_shown() {
     let session = session("exclusive");
     let mut first = Ui::connect(&session);
     let mut second = Ui::connect(&session);
-    let pane = first.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+    let pane = first.spawn(SHELL, size(80, 24));
     let answer = |ui: &mut Ui| {
         ui.control(|c| matches!(c, Control::Attached { .. } | Control::Error { .. }))
     };
@@ -775,7 +860,7 @@ fn a_look_is_sent_the_screen_and_takes_nothing() {
     let session = session("look");
     let mut first = Ui::connect(&session);
     let mut second = Ui::connect(&session);
-    let pane = first.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+    let pane = first.spawn(SHELL, size(80, 24));
 
     // The screen comes, and again when asked again.
     for _ in 0..2 {
@@ -825,9 +910,12 @@ fn a_program_in_a_shell() {
 
 impl Ui {
     /// A shell in a new pane, shown by this UI.
+    /// A pane of `SHELL`, shown, at its prompt: what is typed after it is
+    /// read by the shell, and shows after the prompt.
     fn shell(&mut self) -> PaneId {
-        let pane = self.spawn("cmd.exe /d /q /k prompt $G$S", size(200, 24)).pane;
+        let pane = self.spawn(SHELL, size(200, 24)).pane;
         self.show(pane);
+        self.until_text("the prompt", |text| text.trim_end().ends_with('>'));
         pane
     }
 
@@ -839,9 +927,9 @@ impl Ui {
     /// Start the program in the pane's shell.
     fn run_program(&mut self, pane: PaneId) {
         let this = std::env::current_exe().unwrap();
-        let line = format!(
-            "set {PROGRAM}=1&\"{}\" --exact a_program_in_a_shell --nocapture\r",
-            this.display()
+        let line = os!(
+            format!("set {PROGRAM}=1&\"{}\" --exact a_program_in_a_shell --nocapture\r", this.display()),
+            format!("{PROGRAM}=1 '{}' --exact a_program_in_a_shell --nocapture\r", this.display()),
         );
         self.input(pane, &line);
     }
@@ -888,7 +976,13 @@ fn a_program_and_the_ui_showing_its_pane_talk_until_either_is_done() {
     let pane = ui.shell();
 
     // The shell is told where it is.
-    ui.input(pane, "echo at:%NTERM_DAEMON%:%NTERM_PANE%:%NTERM_DAEMON_PIPE%\r");
+    ui.input(
+        pane,
+        os!(
+            "echo at:%NTERM_DAEMON%:%NTERM_PANE%:%NTERM_DAEMON_PIPE%\r",
+            "echo at:$NTERM_DAEMON:$NTERM_PANE:$NTERM_DAEMON_PIPE\r",
+        ),
+    );
     ui.sees(&format!("at:{session}:{pane}:{}", pipe::name(&session).unwrap()));
 
     // Both ways, and the UI is done first: the program is told.
@@ -924,7 +1018,7 @@ fn a_program_is_told_when_the_ui_leaves_its_pane() {
     ui.sees("was:closed");
 
     // The UI goes altogether.
-    ui.input(pane, "cls\r");
+    ui.input(pane, os!("cls\r", "printf '\\033[3J\\033[H\\033[2J'\r"));
     ui.until_text("a cleared screen", |screen| !screen.contains("was:closed"));
     ui.program(pane);
     // The pipe closes with the last handle to it.
@@ -948,7 +1042,7 @@ fn a_program_is_refused_for_no_pane_or_with_no_ui() {
     use nterm_session::shell::{Event, Program};
     let session = session("relay-refuse");
     let mut ui = Ui::connect(&session);
-    let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(200, 24)).pane;
+    let pane = ui.spawn(SHELL, size(200, 24)).pane;
 
     let nowhere = Program::connect(&session, pane + 100).unwrap();
     assert!(matches!(nowhere.receive(WAIT), Some(Event::Refused(_))));
@@ -971,7 +1065,7 @@ fn uis_are_told_of_the_sessions_as_they_change() {
     assert!(ui.sessions("none at first", |_| true).is_empty());
 
     // Shells in no session are given as one with no name.
-    let shell = "cmd.exe /d /q /k prompt $G$S";
+    let shell = SHELL;
     let (a, b) = (ui.spawn(shell, size(80, 24)).pane, ui.spawn(shell, size(80, 24)).pane);
     let told = ui.sessions("two strays", |told| told.len() == 1 && told[0].panes.len() == 2);
     assert_eq!((told[0].id.as_str(), told[0].layout.as_str()), ("", ""));
@@ -1009,7 +1103,7 @@ fn uis_are_told_of_the_sessions_as_they_change() {
 
     // A shell nothing shows changes its title: nothing was asked of the
     // daemon, and the UIs are told.
-    ui.input(b, "title later\r");
+    ui.input(b, os!("title later\r", "printf '\\033]0;later\\007'\r"));
     other.sessions("the title", |told| {
         let titled = |pane: &PaneInfo| pane.title.as_deref().is_some_and(|title| title.contains("later"));
         told[0].panes.iter().any(titled)
@@ -1034,15 +1128,19 @@ fn a_copy_resized_in_order_stays_the_same_as_the_daemon() {
 fn ordered_resizes(name: &str) {
     let session = session(name);
     let mut ui = Ui::connect(&session);
-    let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(80, 24));
+    let pane = ui.spawn(SHELL, size(80, 24));
     ui.send(Control::Attach { request: 0, pane: pane.pane, size: size(80, 24) });
     ui.frame(|frame| matches!(frame, Frame::Screen { .. }));
     // More than a screen of lines, some of them longer than the screen is
     // wide, so there is history and there are wrapped lines.
     ui.input(
         pane.pane,
-        "for /l %i in (1,1,60) do @echo line-%i-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
-         bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-%i\r",
+        os!(
+            "for /l %i in (1,1,60) do @echo line-%i-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-%i\r",
+            "i=1; while [ $i -le 60 ]; do echo line-$i-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-$i; i=$((i+1)); done\r",
+        ),
     );
     ui.until_text("the lines", |text| text.contains("b-60\n"));
     ui.input(pane.pane, "echo settled\r");
@@ -1104,6 +1202,8 @@ fn logged(session: &str, what: &str, wanted: impl Fn(&str) -> bool) -> String {
     }
 }
 
+/// Of a pseudoconsole's host, a process of its own on Windows only.
+#[cfg(windows)]
 #[test]
 fn a_pseudoconsole_that_goes_on_its_own_is_logged() {
     each_conpty("console-gone", |session| {
@@ -1268,12 +1368,12 @@ fn a_program_is_run_a_picker_of_files_and_given_the_one_chosen() {
 
     // Everything under the folder, said from there, and not the folders.
     let all = ui.query(picker, 0, "");
-    assert_eq!(all.texts(), ["a\\alpha.txt", "a\\beta.txt", "b\\gamma.rs", "top.md"]);
+    assert_eq!(all.texts(), [native("a/alpha.txt"), native("a/beta.txt"), native("b/gamma.rs"), "top.md".into()]);
     assert_eq!(all.matched, 4);
 
     let some = ui.query(picker, 1, "gam");
     assert_eq!((some.query.as_str(), some.matched_against.as_str()), ("gam", "gam"));
-    assert_eq!(some.texts(), ["b\\gamma.rs"]);
+    assert_eq!(some.texts(), [native("b/gamma.rs")]);
 
     // The UI says only which row; the program is given what it is.
     let (row, _) = some.rows[0];
@@ -1281,7 +1381,7 @@ fn a_program_is_run_a_picker_of_files_and_given_the_one_chosen() {
     let (status, result) = asker.result();
     assert_eq!(status, "accepted");
     assert_eq!(result["query"], "gam");
-    assert_eq!(result["selected"][0]["text"], "b\\gamma.rs");
+    assert_eq!(result["selected"][0]["text"], native("b/gamma.rs"));
     let whole = tree.0.join("b").join("gamma.rs");
     assert_eq!(result["selected"][0]["value"], whole.to_string_lossy().as_ref());
     // The conversation is over, and the daemon closed it.
@@ -1385,7 +1485,7 @@ fn a_picker_is_refused_for_what_cannot_be_shown_or_is_not_one() {
     let _pickers = with_pickers(&session);
     let tree = Tree::new("refuse");
     let mut ui = Ui::connect(&session);
-    let pane = ui.spawn("cmd.exe /d /q /k prompt $G$S", size(200, 24)).pane;
+    let pane = ui.spawn(SHELL, size(200, 24)).pane;
     let params = serde_json::json!({"cwd": tree.path()});
 
     let nowhere = Asker::ask(&session, pane + 100, "Files", params.clone());
@@ -1415,8 +1515,12 @@ fn a_client_that_comes_and_goes_before_it_is_waited_for_does_not_stop_the_next()
     let session = session("came-and-went");
     let mut listener = pipe::Listener::bind(&session).unwrap();
     drop(pipe::connect(&session).unwrap());
-    let refused = listener.accept().err().expect("the client that went was not one");
-    assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    let first = listener.accept();
+    if cfg!(windows) {
+        let refused = first.err().expect("the client that went was not one");
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+    // On Unix it is taken, and its connection is already over.
     let client = std::thread::spawn({
         let session = session.clone();
         move || pipe::connect(&session).map(drop)
@@ -1462,7 +1566,7 @@ fn a_ui_is_sent_what_shows_for_a_row_of_a_picker() {
     let shown = ui.preview(picker, 2, found.serial, 9999);
     let Control::PickerPreviewed { error, .. } = shown else { unreachable!() };
     assert!(error.is_some());
-    assert_eq!(ui.query(picker, 1, "alp").texts(), ["a\\alpha.txt"]);
+    assert_eq!(ui.query(picker, 1, "alp").texts(), [native("a/alpha.txt")]);
 
     // A picture is sent as the file it is, and not as text. It is made
     // after the picker opened: what is listed is found again by asking.
@@ -1672,14 +1776,17 @@ fn a_picker_of_the_machines_file_takes_the_rows_its_program_gives_and_shows_what
     assert_eq!(asker.result().1["selected"][0]["value"], "-Path");
 
     // Get-Help of the parameter, of the command it was opened with: what it
-    // says of one, with or without the help text downloaded.
-    let (mut asker, picker) = ui.picker(&session, pane, "Help", params);
-    asker.say(rows);
-    asker.say(serde_json::json!({"type": "end_items", "request_id": "r1"}));
-    let (text, error) = shows(&mut ui, picker, 1, "path");
-    assert!(error.is_none() && text.contains("-Path <string[]>") && text.contains("Required?"), "{text} {error:?}");
-    ui.send(Control::PickerClose { picker, refused: None });
-    assert_eq!(asker.result().0, "cancelled");
+    // says of one, with or without the help text downloaded. It is run by
+    // pwsh.exe, which is of Windows here.
+    if cfg!(windows) {
+        let (mut asker, picker) = ui.picker(&session, pane, "Help", params);
+        asker.say(rows);
+        asker.say(serde_json::json!({"type": "end_items", "request_id": "r1"}));
+        let (text, error) = shows(&mut ui, picker, 1, "path");
+        assert!(error.is_none() && text.contains("-Path <string[]>") && text.contains("Required?"), "{text} {error:?}");
+        ui.send(Control::PickerClose { picker, refused: None });
+        assert_eq!(asker.result().0, "cancelled");
+    }
     ui.shutdown();
 }
 
@@ -1767,14 +1874,14 @@ fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
     let params = serde_json::json!({"cwd": tree.path(), "pattern": "ALPHA|gamma"});
     let (asker, picker) = ui.picker(&session, pane, "Ripgrep", params);
     let all = ui.query(picker, 0, "");
-    assert_eq!(all.texts(), ["a\\alpha.txt:1:3:a/alpha.txt", "b\\gamma.rs:1:3:b/gamma.rs"]);
+    assert_eq!(all.texts(), [native("a/alpha.txt") + ":1:3:a/alpha.txt", native("b/gamma.rs") + ":1:3:b/gamma.rs"]);
     // What is typed narrows what was found: the search is not run again.
     let some = ui.query(picker, 1, "rs");
-    assert_eq!(some.texts(), ["b\\gamma.rs:1:3:b/gamma.rs"]);
+    assert_eq!(some.texts(), [native("b/gamma.rs") + ":1:3:b/gamma.rs"]);
     ui.send(Control::PickerAccept { picker, serial: some.serial, row: some.rows[0].0 });
     let (status, result) = asker.result();
     assert_eq!(status, "accepted");
-    assert_eq!(result["selected"][0]["value"], "b\\gamma.rs:1:3:b/gamma.rs");
+    assert_eq!(result["selected"][0]["value"], native("b/gamma.rs") + ":1:3:b/gamma.rs");
 
     // A row shows its file, at the line it was found on. One more line is
     // put before what was found, so that it is not the first.
@@ -1782,7 +1889,7 @@ fn a_picker_of_the_lines_a_search_finds_and_one_whose_search_fails() {
     let params = serde_json::json!({"cwd": tree.path(), "pattern": "gamma", "preview": "true"});
     let (asker, picker) = ui.picker(&session, pane, "Ripgrep", params);
     let found = ui.query(picker, 0, "");
-    assert_eq!(found.texts(), [r"b\gamma.rs:2:3:b/gamma.rs"]);
+    assert_eq!(found.texts(), [native("b/gamma.rs") + ":2:3:b/gamma.rs"]);
     let shown = ui.preview(picker, 1, found.serial, found.rows[0].0);
     let Control::PickerPreviewed { text, name, line, error, .. } = shown else { unreachable!() };
     assert_eq!((text.as_str(), name.as_deref(), line, error), ("// first\nb/gamma.rs\n", Some("gamma.rs"), Some(2), None));
@@ -1821,7 +1928,7 @@ fn a_ui_asks_for_a_picker_for_itself_and_is_told_what_the_row_it_chose_is() {
     let chosen = ui.control(|c| matches!(c, Control::PickerChosen { .. }));
     let Control::PickerChosen { picker: of, text, value, query } = chosen else { unreachable!() };
     let whole = tree.0.join("b").join("gamma.rs").to_string_lossy().into_owned();
-    assert_eq!((of, text.as_str(), value, query.as_str()), (picker, "b/gamma.rs".replace('/', "\u{5c}").as_str(), whole, "gam"));
+    assert_eq!((of, text.as_str(), value, query.as_str()), (picker, native("b/gamma.rs").as_str(), whole, "gam"));
 
     // One it closes is over with nothing more said, and the next is another.
     ui.send(Control::PickerAsk { ask: 42, pane, picker: "Directories".into(), params: params(&[("cwd", &cwd)]) });
@@ -1867,14 +1974,14 @@ fn the_pickers_of_the_machines_file_are_opened_by_name_as_the_daemons_own_are() 
         }
     };
     write(
-        r#"return { pickers = {
+        &lua_programs(r#"return { pickers = {
           Said = { type = "Command", args = { "cmd.exe", "/c", "echo", "{word}" }, sort = "SourceOrder" },
           Typed = { type = "File", path = "{history}", reverse = true, unique = true },
           Fixed = { type = "Items", position = "Cursor", initial_query = "t",
                     items = { { text = "One", value = "1" }, { text = "Two", value = "2" } } },
           Here = { type = "FileSystem", files_only = true, relative = true, preview_visible = false },
           items = { type = "Items" },
-        } }"#,
+        } }"#),
     );
     let mut command = std::process::Command::new(DAEMON);
     command.args(["--session", &session, "--lua-config"]).arg(&file).env_remove("NTERM_CONPTY_DLL");
@@ -1995,7 +2102,7 @@ fn a_function_of_the_machines_file_says_what_shows_for_a_row() {
     let file = tree.0.join("nterm-daemon.lua");
     std::fs::write(
         &file,
-        r#"local shows = { type = "Dynamic", resolve = function(item, params)
+        lua_programs(r#"local shows = { type = "Dynamic", resolve = function(item, params)
           if item.value == "text" then
             local file = assert(io.open(params.cwd .. "/b/gamma.rs", "rb"))
             local text = file:read("a")
@@ -2023,7 +2130,7 @@ fn a_function_of_the_machines_file_says_what_shows_for_a_row() {
           Hidden = { type = "Items", items = rows, preview = shows, preview_visible = false },
           Here = { type = "FileSystem", files_only = true, relative = true,
                    preview = { type = "Dynamic", resolve = function(item) return { type = "Text", text = "is " .. item.path } end } },
-        } }"#,
+        } }"#),
     )
     .unwrap();
     let mut command = std::process::Command::new(DAEMON);
@@ -2381,11 +2488,11 @@ fn a_picker_of_the_machines_file_with_columns_shows_them_lined_up_under_their_na
     let file = tree.0.join("nterm-daemon.lua");
     std::fs::write(
         &file,
-        r#"return { pickers = {
+        lua_programs(r#"return { pickers = {
           Table = { type = "Command", sort = "Source", args = { "cmd.exe", "/c", "type", "rows.txt" },
                     columns = { "Hash", "Date", "Subject" } },
           Both = { type = "Command", args = { "cmd.exe", "/c", "ver" }, columns = { "A" }, unique = true },
-        } }"#,
+        } }"#),
     )
     .unwrap();
     let mut command = std::process::Command::new(DAEMON);
@@ -2461,7 +2568,7 @@ fn a_ui_is_given_a_search_of_folders_over_no_pane() {
     let opened = ask(&mut ui, 8, vec![root.clone()], 2);
     let Control::PickerOpen { picker, .. } = opened else { panic!("{opened:?}") };
     let found = ui.query(picker, 0, "inner");
-    assert_eq!(found.texts(), [whole("one").to_owned() + "\\inner"]);
+    assert_eq!(found.texts(), [whole("one") + std::path::MAIN_SEPARATOR_STR + "inner"]);
     // A third level is not listed, whatever else of the path matches.
     assert!(ui.query(picker, 1, "deepest").texts().iter().all(|folder| !folder.ends_with("deepest")));
     ui.send(Control::PickerClose { picker, refused: None });
