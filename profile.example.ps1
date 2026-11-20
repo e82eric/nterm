@@ -4,7 +4,8 @@
 # nterm Lua: allow the ProfileFiles, ProfileDirectories, ProfileRipgrep,
 # ProfileHistory and ProfileCompletions named pickers. See docs/picker-pipe.md or
 # nterm.example.lua. The bindings with Shift ask the session daemon for its
-# Files, Directories and History pickers: see nterm-daemon.example.lua.
+# Files, Directories and History pickers, which it has by default: see
+# lua/nterm/daemon.lua.
 # Outside an nterm pane this file does nothing, so your other bindings stay.
 param([string[]]$PickerRoots = @((Get-Location).Path))
 
@@ -49,7 +50,7 @@ Set-PSReadLineKeyHandler -Chord Ctrl+Shift+g -ScriptBlock { Set-NtermLineFromRip
 
 # PowerShell's tab completions: in the window's ProfileCompletions, whose
 # preview shows Get-Help, or with Shift in nterm-daemon.lua's Completions,
-# whose preview is PowerShell's tooltip (nterm-daemon.example.lua has it).
+# whose preview is PowerShell's tooltip (a default of the daemon).
 Set-PSReadLineKeyHandler -Chord 'Ctrl+@', 'Ctrl+Spacebar' -ScriptBlock { Complete-NtermLine -Picker ProfileCompletions }
 Set-PSReadLineKeyHandler -Chord Ctrl+Shift+Spacebar -ScriptBlock { Complete-NtermLine -DaemonPicker Completions }
 

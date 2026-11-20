@@ -7,7 +7,8 @@
 # Usage: deploy-daemon.sh [--skip-build] [PREFIX]
 #   PREFIX defaults to ~/.local, and gets
 #     bin/nterm-daemon, bin/npick
-#     share/nterm/lua      the modules nterm-daemon.lua can require
+#     share/nterm/lua      the modules nterm-daemon.lua can require, and the
+#                          default nterm-daemon.lua, used without one of yours
 #     share/nterm/bash     nterm.bash, for ~/.bashrc (see there)
 #     share/terminfo       xterm-ghostty, which the daemon's shells are given
 #

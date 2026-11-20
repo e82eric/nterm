@@ -348,7 +348,8 @@ return {
     -- the same in a window on another machine (--remote). The shell has to
     -- report its directory (OSC 7; see profile.example.ps1). Ripgrep is
     -- the picker of that machine's nterm-daemon.lua, made with
-    -- require("nterm.ripgrep"): see nterm-daemon.example.lua.
+    -- require("nterm.ripgrep"), which it has by default: see
+    -- lua/nterm/daemon.lua.
     Grep = {
       type = "Argument", prompt = "Grep:",
       action = function(app, item) app:push_picker("Ripgrep", { pattern = item.value }) end,

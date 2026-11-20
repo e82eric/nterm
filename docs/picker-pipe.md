@@ -203,10 +203,20 @@ through `Completions`, to Ctrl+Shift+Space.
 
 The daemon also runs the pickers of a file on its own machine,
 `nterm-daemon.lua`. It looks for `~/nterm-daemon.lua`, then for
-`nterm-daemon.lua` beside `nterm-daemon.exe`, and uses the first there is
+`nterm-daemon.lua` beside the daemon program, then for the default installed
+with it in `share/nterm/lua`, and uses the first there is
 (`nterm-daemon --lua-config FILE` names one in their place). The file is read
 when a picker of it is first asked for and again whenever it has changed, so
-there is nothing to restart. `nterm-daemon.example.lua` is one to start from.
+there is nothing to restart.
+
+The default is `require("nterm.daemon").defaults()`: `Files`, `Directories`,
+`Near`, `Ripgrep`, `Commits` and the `Git ...` pickers of `nterm.git` on every
+machine, and `History` and `Completions` of PowerShell on Windows. They work
+the same on Windows and Linux, so one file serves every machine: what they
+type at the prompt (going to a folder, opening a match in nvim, the git
+commands) is PowerShell on Windows and bash on Linux. A file of your own
+starts from them and changes what it likes; `nterm-daemon.example.lua` is one
+to start from.
 
 A picker there is written as one in `nterm.lua` is, under `pickers`, and is
 opened by its name as the daemon's own are:
@@ -321,7 +331,7 @@ given. `columns` do not go with `line_continuation` or `unique`.
 
 Modules load as in `nterm.lua`: `require("nterm.git")` gives the pickers of
 git that are installed with nterm (`share\nterm\lua`, beside the daemon), so
-`GitCommits = git.commits {}` in the daemon's file is that picker run where
+`["Git commits"] = git.commits()` in the daemon's file is that picker run where
 the shell is.
 
 Whether a picker of the file opens showing its preview is the file's to say

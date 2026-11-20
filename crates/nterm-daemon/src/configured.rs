@@ -5,7 +5,9 @@
 //! in a shell, says which picker and gives it text, and no more.
 //!
 //! The file is read when a picker of it is first asked for, and again when
-//! it has changed since.
+//! it has changed since. Without one of the user's, the daemon reads the
+//! default installed with it, `share/nterm/lua/nterm-daemon.lua`, which is
+//! `require("nterm.daemon").defaults()`.
 
 use mlua::{Lua, LuaSerdeExt};
 use nterm_session::protocol::PickerBinding;
@@ -15,7 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
-/// The file's name, in the user's own folder or beside the daemon.
+/// The file's name, in the user's own folder, beside the daemon, or in
+/// what is installed with it.
 pub const FILE: &str = "nterm-daemon.lua";
 /// How long the file may take to say what its pickers are.
 const MOST_TIME: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 5000 });
@@ -197,14 +200,15 @@ impl Configured {
     }
 
     /// The first there is of: the file named, the one in the user's own
-    /// folder, the one beside the daemon.
+    /// folder, the one beside the daemon, the default installed with it.
     fn path(&self) -> Option<PathBuf> {
         if let Some(named) = &self.named {
             return Some(named.clone());
         }
         let own = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
         let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
-        [own, beside].into_iter().flatten().map(|folder| folder.join(FILE)).find(|path| path.is_file())
+        let installed = installed().into_iter().map(|share| share.join("lua"));
+        [own, beside].into_iter().flatten().chain(installed).map(|folder| folder.join(FILE)).find(|path| path.is_file())
     }
 
     /// The file last read.
@@ -593,6 +597,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// The repository's `lua` folder, which is `share/nterm/lua` once installed.
+    fn repository_lua() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lua")
+    }
+
+    #[test]
+    fn the_default_file_has_the_pickers_the_samples_ask_for_on_this_system() {
+        let configured = Configured::new(Some(repository_lua().join(FILE)));
+        // Some are functions of what is at the shell's cursor, as a pane says.
+        let prompt = if cfg!(windows) { "PS C:\\src> git" } else { "me@here:~/src$ git" };
+        let context = || serde_json::json!({ "line": prompt, "line_before_cursor": prompt, "line_after_cursor": "" });
+        for name in ["Files", "Directories", "Near", "Ripgrep", "Commits", "Git commits", "Git branches", "Git status", "Git cherry-pick", "Git cherry-pick commits", "Git stashes", "Git reflog", "Git file history", "Git file history commits", "Git fixup", "Git tags"] {
+            let picker = configured.picker_for(name, &context).unwrap_or_else(|why| panic!("{name}: {why}"));
+            assert!(picker.is_some(), "{name}");
+        }
+        // PowerShell's history and completions are Windows's alone.
+        for name in ["History", "Completions"] {
+            assert_eq!(configured.picker(name).unwrap().is_some(), cfg!(windows), "{name}");
+        }
+        assert!(matches!(
+            configured.picker("Directories").unwrap().unwrap().lists,
+            Lists::FileSystem { directories_only: true, .. }
+        ));
+    }
+
+    #[test]
+    fn what_the_defaults_type_is_for_this_systems_shell() {
+        let lua = repository_lua();
+        let path = file(
+            "typed",
+            &format!(
+                r#"package.path = [[{}]] .. package.path
+                local daemon = require("nterm.daemon")
+                return {{ pickers = {{ Typed = {{ type = "Items", items = {{
+                  {{ text = daemon.go_to("it's here"), value = daemon.edit("a b", 7) }},
+                  {{ text = daemon.edit("x", 1, "vim"), value = tostring(daemon.windows) }},
+                  {{ text = "prompts", value = table.concat((function()
+                    local found = {{}}
+                    for _, row in ipairs({{ "PS C:\\src> junk", "c1\\scratch\\demo> junk", "12:34>junk", "me@host:~/src$ junk", "src/demo$ junk", "junk" }}) do
+                      local typed = row:find(daemon.prompt) and row:gsub(daemon.prompt, "", 1) or "-"
+                      found[#found + 1] = typed
+                    end
+                    return found
+                  end)(), " ") }},
+                }} }} }} }}"#,
+                lua.join("?.lua;").display()
+            ),
+        );
+        let configured = Configured::new(Some(path.clone()));
+        let Lists::Items { items: Some(items), .. } = configured.picker("Typed").unwrap().unwrap().lists else { panic!() };
+        let (go, edit) = if cfg!(windows) {
+            ("Set-Location -LiteralPath 'it''s here'\r", "nvim +7 'a b'\r")
+        } else {
+            ("cd -- 'it'\\''s here'\r", "nvim +7 'a b'\r")
+        };
+        assert_eq!(items[0], Item { text: go.into(), value: edit.into() });
+        // PowerShell's quoting always quotes; bash's leaves a plain name bare.
+        let plain = if cfg!(windows) { "vim +1 'x'\r" } else { "vim +1 x\r" };
+        assert_eq!(items[1], Item { text: plain.into(), value: cfg!(windows).to_string() });
+        // What the prompt pattern leaves of each row: what was typed, or "-"
+        // where it does not match. It is read on the cursor's row alone, so
+        // a long prompt's second row matches too.
+        let typed = if cfg!(windows) { "junk junk junk - - -" } else { "- - - junk junk -" };
+        assert_eq!(items[2].value, typed);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn a_picker_that_cannot_be_one_says_why_and_the_rest_are_still_pickers() {
         let path = file(
@@ -665,15 +736,18 @@ mod tests {
         let path = file("example", &std::fs::read_to_string(root.join("nterm-daemon.example.lua")).unwrap());
         let modules = path.parent().unwrap().join("nterm");
         std::fs::create_dir_all(&modules).unwrap();
-        for module in ["completions.lua", "files.lua", "git.lua", "history.lua", "ripgrep.lua"] {
+        for module in ["completions.lua", "daemon.lua", "files.lua", "git.lua", "history.lua", "ripgrep.lua"] {
             std::fs::copy(root.join("lua/nterm").join(module), modules.join(module)).unwrap();
         }
         let configured = Configured::new(Some(path.clone()));
-        for name in ["Commits", "Ripgrep", "History", "Completions", "Files", "Directories", "Near", "Servers", "GitCommits", "GitBranches", "GitStatus"] {
+        for name in ["Commits", "Ripgrep", "Files", "Directories", "Near", "Sources", "Servers", "Git commits"] {
             assert!(configured.picker(name).unwrap().is_some(), "{name}");
         }
+        // Its own Commits is in place of the default's.
+        let Lists::Command { args, .. } = configured.picker("Commits").unwrap().unwrap().lists else { panic!() };
+        assert_eq!(args[..2], ["git", "log"]);
         // The pickers of git have columns, and say what shows for a row.
-        let commits = configured.picker("GitCommits").unwrap().unwrap();
+        let commits = configured.picker("Git commits").unwrap().unwrap();
         let Lists::Command { columns, .. } = &commits.lists else { panic!("not a command") };
         assert_eq!(columns.as_ref().map(Vec::len), Some(5));
         assert!(commits.preview && commits.action);
