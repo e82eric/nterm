@@ -24,8 +24,8 @@ $conptyDll = $conpty.Dll
 $conptyHost = $conpty.Host
 
 # Ghostty loads conpty.dll and its matching OpenConsole.exe beside the app.
-# nterm starts the session daemon from beside itself; without it, shells run
-# in the UI and end with it.
+# nterm starts the session daemon from beside itself, and every pane's shell
+# runs in it.
 $files = @('ghostty.dll', 'nterm.exe', 'nterm-daemon.exe', 'conpty.dll', 'OpenConsole.exe')
 $fileSources = @{
     'ghostty.dll' = Join-Path $source 'ghostty.dll'
