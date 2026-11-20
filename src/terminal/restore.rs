@@ -180,10 +180,21 @@ pub(super) fn called(
     (name, running.into_iter().flatten().collect::<Vec<_>>().join(" / "))
 }
 
+/// What a row calls a workspace or a session whose shells are on `place`:
+/// its name, then `@` and the machine's when that is another, where the
+/// name is read and found.
+pub(super) fn at_place(name: &str, place: &crate::session::Place) -> String {
+    match place.name() {
+        Some(place) => format!("{name}@{place}"),
+        None => name.to_owned(),
+    }
+}
+
 /// A picker's rows for the sessions the daemon holds that nothing is
 /// showing. Their cells are those of a workspace's row after its number,
-/// which a session has none of: its name or what runs in it, that it is
-/// detached, its layout, how many panes, and what runs and where.
+/// which a session has none of: its name or what runs in it and the machine
+/// it is on, that it is detached, its layout, how many panes, and what runs
+/// and where.
 pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::actions::Entry> {
     let row = |session: &SessionInfo| {
         let panes = takeable(session);
@@ -199,11 +210,6 @@ pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::acti
         let (name, running) = called(session_name(session), &titles, place.as_ref());
         let kind = if session.id.is_empty() { "Shells in no session: " } else { "" };
         let held = crate::session::Held { place: listing.place.clone(), id: session.id.clone() };
-        // A session of another machine says which.
-        let state = match listing.place.name() {
-            Some(place) => format!("detached on {place}"),
-            None => "detached".into(),
-        };
         Some(crate::actions::Entry {
             id: match listing.place.name() {
                 Some(place) => format!("session@{place}.{}", session.id),
@@ -212,8 +218,9 @@ pub(super) fn session_rows(listing: &crate::session::Listing) -> Vec<crate::acti
             label: String::new(),
             shortcut: None,
             cells: vec![
-                format!("{kind}{name}"),
-                state,
+                // A session of another machine says which.
+                at_place(&format!("{kind}{name}"), &listing.place),
+                "detached".into(),
                 saved.layout.tag().to_owned(),
                 counted(saved.panes.len(), saved.floats.iter().map(|float| float.all().len())),
                 running,
@@ -750,6 +757,10 @@ mod tests {
         // Its name, that nothing shows it, its layout, one tiled pane, and
         // what runs there.
         assert_eq!(rows[0].cells, ["build", "detached", "T", "1", "cmd.exe"]);
+        // One of another machine says which after its name.
+        let mut remote = crate::session::Listing::of(listing.sessions.clone());
+        remote.place = crate::session::Place::Remote("vm".into());
+        assert_eq!(session_rows(&remote)[0].cells[..2], ["build@vm", "detached"]);
         // A name is read from a layout this build cannot lay out.
         let other = format!(r#"{{"version":{},"name":"later"}}"#, VERSION + 1);
         let listing = crate::session::Listing::of(vec![session("a", other, &[pane(1, false, None)])]);

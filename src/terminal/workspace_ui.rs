@@ -29,10 +29,10 @@ pub(crate) fn workspace_picker_options(
                     shortcut: None,
                     // Name, state, layout and panes. What runs, and what to
                     // call one without a name, is for whoever has its panes
-                    // to say.
+                    // to say. A workspace of the window has no state.
                     cells: vec![
-                        w.name.clone().unwrap_or_default(),
-                        if w.id == current { "current" } else { "" }.to_owned(),
+                        row_name(&w.name.clone().unwrap_or_default(), w.id == current, &w.place),
+                        String::new(),
                         w.layout.tag().to_owned(),
                         w.panes.len().to_string(),
                     ],
@@ -42,6 +42,13 @@ pub(crate) fn workspace_picker_options(
         ),
         ..Options::default()
     }
+}
+/// What a workspace's row calls it: `*` before the name of the window's
+/// current one, and `@` and the machine its shells are on when that is
+/// another. Both are where the eye reads the name.
+fn row_name(name: &str, current: bool, place: &crate::session::Place) -> String {
+    let name = super::restore::at_place(name, place);
+    if current { format!("*{name}") } else { name }
 }
 /// How much of the window's height the picker of workspaces takes. Most of
 /// it is the preview, where the selected workspace is drawn small.
@@ -531,14 +538,11 @@ impl TerminalView {
             let floats = workspace.floats.ids().iter().filter_map(|id| self.floating.get(*id));
             let floats = floats.map(|float| float.panes.len());
             entry.cells[3] = super::restore::counted(workspace.panes.len(), floats);
-            // One whose shells are on another machine says which.
-            if let Some(place) = workspace.place.name() {
-                entry.cells[1] = format!("{} on {place}", entry.cells[1]).trim_start().to_owned();
-            }
         }
-        // So far all a workspace's row says is the user's doing. What its
-        // shells call themselves and where they are is left out of what the
-        // rows are of, as for a session: see `session_rows_key`.
+        // So far all a workspace's row says is the user's doing, with which
+        // is current and where its shells are. What they call themselves
+        // and where they are in their machine is left out of what the rows
+        // are of, as for a session: see `session_rows_key`.
         let mut of: String =
             entries.iter().map(|row| format!("{:?}{:?}", row.label, row.cells)).collect();
         for (entry, workspace) in entries.iter_mut().zip(&self.workspaces) {
@@ -547,7 +551,7 @@ impl TerminalView {
             let places: Vec<String> = panes.filter_map(|pane| pane.pwd()).collect();
             let (name, running) =
                 super::restore::called(workspace.name.clone(), &titles, places.first());
-            entry.cells[0] = name;
+            entry.cells[0] = row_name(&name, workspace.id == self.current, &workspace.place);
             entry.cells.push(running);
         }
         // A remote's page has the window's workspaces that are on it.
@@ -2315,6 +2319,16 @@ impl TerminalView {
 #[cfg(test)]
 mod tests {
     use super::WorkspaceAction;
+
+    #[test]
+    fn a_workspace_row_names_the_current_one_and_where_its_shells_are() {
+        use crate::session::Place;
+        let vm = Place::Remote("vm".into());
+        assert_eq!(super::row_name("nterm-plexer3", true, &vm), "*nterm-plexer3@vm");
+        assert_eq!(super::row_name("nterm-plexer3", false, &vm), "nterm-plexer3@vm");
+        assert_eq!(super::row_name("notes", true, &Place::Here), "*notes");
+        assert_eq!(super::row_name("notes", false, &Place::Here), "notes");
+    }
 
     #[test]
     fn workspace_action_names_round_trip() {

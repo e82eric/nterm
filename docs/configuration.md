@@ -70,7 +70,7 @@ remotes = {
 
 Each has a row in the workspace picker, and nothing is connected to until its
 row is chosen. Choosing `vm` connects and shows its page: the sessions
-waiting there, each marked `detached on vm`, and the folders there a
+waiting there, each called by its name and `@vm`, and the folders there a
 workspace can be started in. If it cannot be reached, the page says why, and
 the row on the first page goes on saying it. Escape goes back. A workspace is
 of one place: its splits and new panes are made where it is, and

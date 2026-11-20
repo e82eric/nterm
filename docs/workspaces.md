@@ -24,7 +24,10 @@ windows remain open. Closing a native window releases all its terminals.
 The workspace picker and move-pane destination picker use NFM with fuzzy search
 by index. Both appear at the bottom of the workspace, spanning its panes,
 and show each workspace's layout, pane count, and current-workspace marker.
-Enter accepts the selected workspace; Escape dismisses the picker.
+The current workspace's name has `*` before it, and a workspace or session
+whose shells are on a remote has `@` and the remote's name after it, as
+`*nterm-plexer3@vm`. Enter accepts the selected workspace; Escape dismisses
+the picker.
 
 The workspace picker lists, in groups and each under its title: Attached,
 this window's workspaces (on any machine); Detached, the sessions waiting in
