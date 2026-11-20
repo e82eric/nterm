@@ -16,9 +16,9 @@ path = "src/main.rs"
 [dependencies]
 nterm-session = { path = "../nterm-session" }
 # What a picker the daemon runs lists and is searched with; see `picker`.
-nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
-nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
-nfm-picker-sources = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
+nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
+nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
+nfm-picker-sources = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
 crossbeam-channel = "0.5.15"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
@@ -29,7 +29,7 @@ png = "0.18"
 csv = "1.3"
 mlua = { version = "0.9.9", features = ["lua54", "vendored", "serialize"] }
 # The programs a preview of that file runs.
-nfm-preview-command = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
+nfm-preview-command = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

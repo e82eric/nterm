@@ -38,13 +38,13 @@ hmac = "0.12"
 sha2 = "0.10"
 mlua = { version = "0.9.9", features = ["lua54", "vendored", "serialize"] }
 serde = { version = "1", features = ["derive"] }
-nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
-nfm-picker-sources = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
-nfm-egui = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
-nfm-preview-file = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
-nfm-preview-command = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
-nfm-output = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
-nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "cd93a41fae17ddadda1d7aea53f28e5faff93d6f" }
+nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
+nfm-picker-sources = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
+nfm-egui = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
+nfm-preview-file = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
+nfm-preview-command = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
+nfm-output = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
+nfm_file_system = { git = "https://github.com/e82eric/npicker", rev = "001ebb5e1807aac26423e1a19f0b6c9f2f09e031" }
 csv = "1.3"
 # What `app:clipboard` reads: text, files, and pictures, sent on as PNGs.
 arboard = { version = "3.6", default-features = false, features = ["image-data"] }
