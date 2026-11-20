@@ -33,9 +33,6 @@ unicode-segmentation = "1.13"
 unicode-width = "0.2.2"
 crossbeam-channel = "0.5"
 serde_json = "1"
-getrandom = "0.3"
-hmac = "0.12"
-sha2 = "0.10"
 mlua = { version = "0.9.9", features = ["lua54", "vendored", "serialize"] }
 serde = { version = "1", features = ["derive"] }
 nfm_search_core = { git = "https://github.com/e82eric/npicker", rev = "1660a6ad7802e443e2c282d19aaa9282d86f3499" }

@@ -78,6 +78,18 @@ installs to `~/.local/opt/nterm` (or the folder given as its argument),
 and writes `~/.local/share/applications/nterm.desktop`. Pass
 `--skip-build` to install the existing build. Running instances are unaffected.
 
+Every pane's shell runs in `nterm-daemon`, which both scripts put beside
+`nterm`; the window starts it when it is not running. A window replaces a
+running daemon from another build only once that daemon has no shells: until
+then the window says the daemon is from another build and cannot use it. For
+the
+bash bindings (the folder a pane is in, and Ctrl+Space completion), add this
+to `~/.bashrc`:
+
+```sh
+[[ -n $NTERM_SHARE && -r $NTERM_SHARE/bash/nterm.bash ]] && . "$NTERM_SHARE/bash/nterm.bash"
+```
+
 ## Preview VT library
 
 Preview parsing uses NFM's `nfm-preview-vt` crate and the standalone VT library

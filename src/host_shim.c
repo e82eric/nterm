@@ -30,15 +30,13 @@ struct NtermHost {
 };
 
 // What a terminal is created with. `command` and `cwd` may be null, for
-// the configured ones. `backend` is null for a terminal that runs its own
-// shell.
+// the configured ones. `backend` makes the surface a mirror of a shell in
+// the session daemon.
 typedef struct {
     void *userdata;
     void *window;
     const void *driver;
     double scale;
-    const char *picker_endpoint;
-    const char *picker_token;
     const char *command;
     const char *cwd;
     const ghostty_host_backend_s *backend;
@@ -333,12 +331,6 @@ NtermHost *nterm_host_create(
     options.userdata = asked->userdata;
     options.command = asked->command;
     options.working_directory = asked->cwd;
-    ghostty_env_var_s token_env[] = {
-        { .key = "NTERM_PICKER_ENDPOINT", .value = asked->picker_endpoint },
-        { .key = "NTERM_PICKER_TOKEN", .value = asked->picker_token },
-    };
-    options.env_vars = token_env;
-    options.env_var_count = 2;
     options.host_backend = asked->backend;
     ghostty_clear_error();
     host->app = app;

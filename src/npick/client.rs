@@ -1,22 +1,10 @@
-//! The client side of the picker IPC protocol (docs/picker-pipe.md): connect,
-//! authenticate, open one picker, stream items and return its result.
-//!
-//! Included by the `npick` binary and by the Unix server's tests, so it only
-//! uses `super::protocol`, nterm_session, serde_json, crossbeam-channel and
-//! getrandom.
-#[cfg(unix)]
-use super::protocol::{MAX_FRAME, hex, proof};
+//! The client side of the picker protocol (docs/picker-pipe.md): reach the
+//! session daemon that runs this shell, open one picker, stream items and
+//! return its result.
 use serde_json::{Value, json};
-#[cfg(unix)]
-use std::{
-    io::{ErrorKind, Read},
-    os::unix::net::UnixStream,
-    time::Instant,
-};
 use std::{io::Write, time::Duration};
 
 /// The most one message may hold.
-#[cfg(windows)]
 const MAX_FRAME: usize = 1024 * 1024;
 
 /// One streamed candidate: what the picker shows and what it returns.
@@ -41,131 +29,10 @@ const MAX_BATCH_ITEMS: usize = 1024;
 const MAX_BATCH_BYTES: usize = MAX_FRAME / 4;
 const POLL: Duration = Duration::from_millis(50);
 
-/// On Unix the shell is a session daemon's, or the window's own: whichever
-/// its environment names. Elsewhere it is always a daemon's.
-#[cfg(unix)]
-pub(crate) enum Connection {
-    Pane(Pane),
-    Daemon(Daemon),
-}
-#[cfg(unix)]
-impl Connection {
-    fn send(&mut self, value: &Value) -> Result<(), String> {
-        match self {
-            Self::Pane(pane) => pane.send(value),
-            Self::Daemon(daemon) => daemon.send(value),
-        }
-    }
-    fn poll(&mut self) -> Result<Option<Value>, String> {
-        match self {
-            Self::Pane(pane) => pane.poll(),
-            Self::Daemon(daemon) => daemon.poll(),
-        }
-    }
-    fn received(&mut self) {
-        match self {
-            Self::Pane(pane) => pane.received(),
-            Self::Daemon(daemon) => daemon.received(),
-        }
-    }
-}
-#[cfg(windows)]
+/// The connection a picker is opened over: always the session daemon's.
 pub(crate) use Daemon as Connection;
 
-/// The pane of a window that runs the shell itself, over its socket.
-#[cfg(unix)]
-pub(crate) struct Pane {
-    stream: UnixStream,
-    buffer: Vec<u8>,
-}
-#[cfg(unix)]
-impl Pane {
-    fn send(&mut self, value: &Value) -> Result<(), String> {
-        let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
-        if bytes.len() > MAX_FRAME {
-            return Err("request exceeds the 1 MiB frame limit".into());
-        }
-        let mut frame = (bytes.len() as u32).to_le_bytes().to_vec();
-        frame.extend_from_slice(&bytes);
-        self.stream
-            .write_all(&frame)
-            .map_err(|e| format!("connection lost: {e}"))
-    }
-    /// The next complete message, or `None` if none arrives within `POLL`.
-    fn poll(&mut self) -> Result<Option<Value>, String> {
-        loop {
-            if self.buffer.len() >= 4 {
-                let len = u32::from_le_bytes(self.buffer[..4].try_into().unwrap()) as usize;
-                if len == 0 || len > MAX_FRAME {
-                    return Err("invalid frame from terminal".into());
-                }
-                if self.buffer.len() >= 4 + len {
-                    let value = serde_json::from_slice(&self.buffer[4..4 + len])
-                        .map_err(|e| format!("invalid message from terminal: {e}"))?;
-                    self.buffer.drain(..4 + len);
-                    return Ok(Some(value));
-                }
-            }
-            let mut chunk = [0; 64 * 1024];
-            match self.stream.read(&mut chunk) {
-                Ok(0) => return Err("the terminal closed the connection".into()),
-                Ok(count) => self.buffer.extend_from_slice(&chunk[..count]),
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                {
-                    return Ok(None);
-                }
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(format!("connection lost: {error}")),
-            }
-        }
-    }
-    /// Wait up to `timeout` for the next message.
-    /// Confirm the result, so the pane's pipe is not closed under it.
-    fn received(&mut self) {
-        let _ = self.send(&json!({"type":"received","request_id":REQUEST_ID}));
-        if let Ok(idle) = self.recv(Duration::from_secs(5))
-            && idle["type"] == "idle"
-        {
-            let _ = self.send(&json!({"type":"received","request_id":REQUEST_ID}));
-        }
-    }
-    fn recv(&mut self, timeout: Duration) -> Result<Value, String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(value) = self.poll()? {
-                return Ok(value);
-            }
-            if Instant::now() >= deadline {
-                return Err("timed out waiting for the terminal".into());
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn nonce() -> Result<String, String> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|e| format!("unable to generate a nonce: {e}"))?;
-    Ok(hex(&bytes))
-}
-
-/// To the pane this shell runs in, which its environment names: by its
-/// session daemon, or else the window's socket, `NTERM_PICKER_ENDPOINT`,
-/// with which it authenticates (the path is part of the HMAC transcript).
-#[cfg(unix)]
-pub(crate) fn connect() -> Result<Connection, String> {
-    if let Some(daemon) = daemon() {
-        return daemon.map(Connection::Daemon);
-    }
-    let variable = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    let endpoint = variable("NTERM_PICKER_ENDPOINT")
-        .ok_or("not running in an nterm pane (neither NTERM_DAEMON nor NTERM_PICKER_ENDPOINT is set)")?;
-    let token = variable("NTERM_PICKER_TOKEN").ok_or("NTERM_PICKER_TOKEN is not set")?;
-    connect_to(&endpoint, &token).map(Connection::Pane)
-}
-
-#[cfg(windows)]
+/// To the pane this shell runs in, through the session daemon that runs it.
 pub(crate) fn connect() -> Result<Connection, String> {
     daemon().ok_or("not running in an nterm pane whose shell the session daemon runs")?
 }
@@ -175,10 +42,7 @@ pub(crate) fn connect() -> Result<Connection, String> {
 pub(crate) fn connect_daemon() -> Result<Connection, String> {
     let program = nterm_session::shell::Program::pick_from_environment()
         .ok_or("not running in an nterm pane whose shell a session daemon runs (NTERM_DAEMON is not set)")?;
-    let daemon = program.map(Daemon).map_err(|error| format!("unable to reach the session daemon: {error}"))?;
-    #[cfg(unix)]
-    let daemon = Connection::Daemon(daemon);
-    Ok(daemon)
+    program.map(Daemon).map_err(|error| format!("unable to reach the session daemon: {error}"))
 }
 
 /// The session daemon runs this shell and knows which pane shows it. It
@@ -213,52 +77,6 @@ impl Daemon {
     }
     /// The daemon keeps the result until it is read; nothing to confirm.
     fn received(&mut self) {}
-}
-
-#[cfg(unix)]
-fn connect_to(endpoint: &str, token: &str) -> Result<Pane, String> {
-    let stream = UnixStream::connect(endpoint)
-        .map_err(|e| format!("unable to connect to {endpoint}: {e}"))?;
-    stream
-        .set_read_timeout(Some(POLL))
-        .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(5))))
-        .map_err(|e| e.to_string())?;
-    let mut connection = Pane {
-        stream,
-        buffer: Vec::new(),
-    };
-    let challenge = connection.recv(Duration::from_secs(5))?;
-    let server_nonce = match (&challenge["type"], &challenge["nonce"]) {
-        (Value::String(kind), Value::String(nonce)) if kind == "challenge" => nonce.clone(),
-        _ => return Err("unexpected handshake from terminal".into()),
-    };
-    let client_nonce = nonce()?;
-    connection.send(&json!({
-        "type": "authenticate",
-        "version": 1,
-        "client_nonce": client_nonce,
-        "proof": hex(&proof(token, endpoint, &server_nonce, &client_nonce, "client")),
-    }))?;
-    let ready = connection.recv(Duration::from_secs(5))?;
-    match ready["type"].as_str() {
-        Some("ready") => {}
-        Some("error") => {
-            let _ = connection.send(&json!({"type":"received","request_id":ready["request_id"]}));
-            return Err(error_message(&ready));
-        }
-        _ => return Err("authentication failed; check NTERM_PICKER_TOKEN".into()),
-    }
-    let expected = hex(&proof(
-        token,
-        endpoint,
-        &server_nonce,
-        &client_nonce,
-        "server",
-    ));
-    if ready["proof"].as_str() != Some(expected.as_str()) {
-        return Err("the terminal failed to prove it knows the token".into());
-    }
-    Ok(connection)
 }
 
 fn error_message(value: &Value) -> String {

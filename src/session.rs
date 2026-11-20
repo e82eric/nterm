@@ -1,9 +1,9 @@
 //! The UI's end of the session daemon.
 //!
-//! With `terminal.session_daemon` on, a pane's shell runs in the daemon. The
-//! pane's surface has no process of its own: it is a mirror that is given the
-//! daemon's screen and then the shell's output, and that sends back only what
-//! the user did. The daemon's terminal answers the program's queries.
+//! Every pane's shell runs in a session daemon, on this machine or a remote.
+//! The pane's surface has no process of its own: it is a mirror that is given
+//! the daemon's screen and then the shell's output, and that sends back only
+//! what the user did. The daemon's terminal answers the program's queries.
 //!
 //! One connection serves every pane. It is made by a thread of its own, and
 //! can be made again after it fails or is lost. While it lasts, one thread
@@ -96,14 +96,11 @@ const FLUSH_WAIT: Duration = Duration::from_secs(2);
 /// Input typed before the shell exists is kept, up to this much.
 const QUEUED_INPUT_MAX: usize = 1 << 16;
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
-
 /// The daemon session named on the command line, if one was.
 static CHOSEN: Mutex<Option<String>> = Mutex::new(None);
 
 /// `--session NAME`: use the daemon of that name, not the default one. The
-/// shells of one session are not seen from another. Naming one asks for the
-/// daemon, whatever the configuration says.
+/// shells of one session are not seen from another.
 pub(crate) fn choose(session: String) {
     *CHOSEN.lock().unwrap() = Some(session);
 }
@@ -480,28 +477,6 @@ impl Drop for Folders {
     }
 }
 
-/// Called with the configuration before the first pane is made.
-pub(crate) fn configure(enabled: bool) {
-    ENABLED.store(enabled, Ordering::Release);
-}
-
-/// `NTERM_SESSION_DAEMON=1` or `0` overrides the configuration. A remote
-/// has nowhere else to run a shell.
-fn enabled(place: &Place) -> bool {
-    #[cfg(test)]
-    if tests::TARGET.lock().unwrap().is_some() {
-        return true;
-    }
-    if *place != Place::Here {
-        return true;
-    }
-    match std::env::var("NTERM_SESSION_DAEMON").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => ENABLED.load(Ordering::Acquire) || CHOSEN.lock().unwrap().is_some(),
-    }
-}
-
 fn report(summary: &str, details: &str) {
     crate::error_log::error("session", summary, details);
 }
@@ -575,9 +550,6 @@ pub(crate) fn set_ui(wake: impl Fn() + Send + 'static) {
 /// once; the UI is woken when it has succeeded or failed. After a failure or
 /// a loss this tries again.
 pub(crate) fn connect(place: &Place) {
-    if !enabled(place) {
-        return;
-    }
     let client = client(place);
     {
         let mut state = client.state.lock().unwrap();
@@ -616,8 +588,6 @@ pub(crate) fn connect(place: &Place) {
 /// Where the connection to the daemon stands, for a window to show.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Status {
-    /// Shells are not kept in a daemon: each pane runs its own.
-    Off,
     /// `connect` has not been called.
     Idle,
     Connecting,
@@ -629,9 +599,6 @@ pub(crate) enum Status {
 }
 
 pub(crate) fn status(place: &Place) -> Status {
-    if !enabled(place) {
-        return Status::Off;
-    }
     match &*client(place).state.lock().unwrap() {
         Conn::Idle => Status::Idle,
         Conn::Connecting => Status::Connecting,
@@ -679,9 +646,6 @@ fn who(user: &str, machine: &str) -> Option<String> {
 
 /// The connection to `place`, while there is one.
 fn daemon(place: &Place) -> Option<Arc<Daemon>> {
-    if !enabled(place) {
-        return None;
-    }
     match &*client(place).state.lock().unwrap() {
         Conn::Connected(daemon) => Some(daemon.clone()),
         _ => None,
@@ -1740,7 +1704,7 @@ impl Link {
         place: &Place,
         there: Option<String>,
         beside: Option<PaneId>,
-    ) -> Result<Option<Arc<Link>>, String> {
+    ) -> Result<Arc<Link>, String> {
         let daemon = daemon(place);
         let want = match (start, &daemon) {
             (Start::Shell, _) => Want::Spawn(None),
@@ -1763,10 +1727,7 @@ impl Link {
             }
         };
         let Some(daemon) = daemon else {
-            return match enabled(place) {
-                true => Err("the session daemon cannot be reached".into()),
-                false => Ok(None),
-            };
+            return Err("the session daemon cannot be reached".into());
         };
         let link = Arc::new(Link {
             daemon,
@@ -1785,7 +1746,7 @@ impl Link {
             there,
             beside,
         });
-        Ok(Some(link))
+        Ok(link)
     }
 
     /// What the surface is created with: the callbacks that make it this

@@ -398,9 +398,9 @@ struct FontConfig {
 struct TerminalConfig {
     scrollback_limit: Option<u64>,
     command: Option<String>,
-    /// Run shells in the session daemon, so they outlive the UI. Read once,
-    /// at startup.
-    session_daemon: bool,
+    /// No longer used: every shell runs in the session daemon. Still read,
+    /// so a configuration that sets it says so instead of failing to load.
+    session_daemon: Option<bool>,
 }
 
 /// One of `remotes`: a machine whose nterm daemon a window can use.
@@ -1017,7 +1017,11 @@ pub(crate) fn prepare_with_reload(
             reload_path = Some(path.clone());
             let (options, bindings, padding, overrides) = AppConfig::parse(&source, &path)
                 .and_then(|mut config| {
-                    crate::session::configure(config.terminal.session_daemon);
+                    if config.terminal.session_daemon.is_some() {
+                        issues.push(
+                            "terminal.session_daemon is no longer used: every pane's shell runs in the session daemon. Remove it from the configuration.".into(),
+                        );
+                    }
                     // Before the rest is made, which differs for a remote.
                     let mut remotes = Vec::new();
                     for (name, known) in std::mem::take(&mut config.remotes) {
@@ -1390,6 +1394,25 @@ mod tests {
             assert!(padding.is_none());
             assert!(overrides.global.accent.is_none());
             assert!(overrides.themes.is_empty());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn session_daemon_is_reported_as_no_longer_used_and_the_rest_still_loads() {
+        let path = std::env::temp_dir().join(format!("nterm-session-daemon-{}.lua", std::process::id()));
+        for value in ["true", "false"] {
+            let source = format!("return {{ terminal = {{ session_daemon = {value} }}, font = {{ size = 18 }} }}");
+            std::fs::write(&path, source).unwrap();
+            let mut issues = Vec::new();
+            let (args, ..) = super::prepare(
+                vec!["ghostty".into(), format!("--lua-config={}", path.display())],
+                &mut issues,
+            )
+            .unwrap();
+            assert_eq!(issues.len(), 1, "{issues:?}");
+            assert!(issues[0].contains("terminal.session_daemon is no longer used"), "{issues:?}");
+            assert!(args.iter().any(|arg| arg == "--font-size=18"), "{args:?}");
         }
         std::fs::remove_file(path).unwrap();
     }

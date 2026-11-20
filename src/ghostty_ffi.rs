@@ -30,16 +30,14 @@ unsafe extern "C" {
 pub(crate) struct App(c_void);
 
 /// The shim's `NtermHostOptions`: what a terminal is created with.
-/// `command` and `cwd` may be null, for the configured ones; `backend` is
-/// null for a terminal that runs its own shell.
+/// `command` and `cwd` may be null, for the configured ones; `backend` makes
+/// the surface a mirror of a shell in the session daemon.
 #[repr(C)]
 pub(crate) struct HostOptions {
     pub(crate) userdata: *mut c_void,
     pub(crate) window: *mut c_void,
     pub(crate) driver: *const c_void,
     pub(crate) scale: f64,
-    pub(crate) picker_endpoint: *const c_char,
-    pub(crate) picker_token: *const c_char,
     pub(crate) command: *const c_char,
     pub(crate) cwd: *const c_char,
     pub(crate) backend: *const HostBackend,

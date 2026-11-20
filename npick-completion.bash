@@ -263,6 +263,6 @@ __npick_complete() {
     READLINE_POINT=$((__npick_start + ${#choice}))
 }
 
-if [[ $- == *i* && ( -n ${NTERM_DAEMON-} || -n ${NTERM_PICKER_ENDPOINT-} ) ]] && command -v npick >/dev/null; then
+if [[ $- == *i* && -n ${NTERM_DAEMON-} ]] && command -v npick >/dev/null; then
     bind -x '"\C-@": __npick_complete'
 fi

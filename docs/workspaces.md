@@ -386,10 +386,11 @@ take IDs unless a method explicitly accepts an options table.
 ## Windows
 
 Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> to open another terminal in
-a new window within the same process. Each window has its own shell, terminal
+a new window within the same process. Each window has its own panes, terminal
 view, floating pane, and UI state. Windows share the native Ghostty app and its
 configuration; theme and font changes apply to all windows. Closing a window
-closes its terminals, and the app exits after the last window closes.
+leaves its shells running in the session daemon, and the app exits after the
+last window closes.
 
 `MovePaneToNewWindow` (unbound by default; also in the command palette) moves
 the visible float, or else the focused tiled pane, into a new window. The shell

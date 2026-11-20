@@ -1,20 +1,5 @@
 use serde::Deserialize;
 
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn new_token() -> Result<String, crate::native_error::FatalError> {
-    token_with_random(getrandom::fill)
-}
-
-#[cfg_attr(not(unix), allow(dead_code))]
-fn token_with_random(
-    fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
-) -> Result<String, crate::native_error::FatalError> {
-    use crate::native_error::FatalResult;
-    let mut bytes = [0u8; 32];
-    fill(&mut bytes).fatal("generate a secure picker pipe token")?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Item {
@@ -59,24 +44,6 @@ pub(crate) fn validate_items(items: &[Item]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn tokens_are_random_and_printable() {
-        let first = new_token().unwrap();
-        assert_eq!(first.len(), 64);
-        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_ne!(first, new_token().unwrap());
-    }
-    #[test]
-    fn randomness_failure_returns_error_without_a_fallback_token() {
-        let error = super::token_with_random(|bytes| {
-            bytes[0] = 42;
-            Err(getrandom::Error::UNSUPPORTED)
-        })
-        .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("generate a secure picker pipe token"));
-        assert!(message.contains(&getrandom::Error::UNSUPPORTED.to_string()));
-    }
     #[test]
     fn parses_item_list_with_separate_display_and_insert_text() {
         let parsed = items(&std::collections::BTreeMap::from([(

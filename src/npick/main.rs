@@ -8,12 +8,6 @@
 //! Exits 0 with the selected value on stdout, 130 when cancelled, and 2 on
 //! errors, so `sel=$(npick ...) || return` works in scripts.
 
-// Shared with the terminal's server; verify_proof is only used there.
-#[cfg(unix)]
-#[allow(dead_code)]
-#[path = "../picker/pipe/protocol.rs"]
-mod protocol;
-
 mod client;
 
 fn main() {

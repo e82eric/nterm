@@ -583,7 +583,7 @@ impl TerminalView {
                 of.push_str(&format!("{}{status:?}", remote.name));
                 let state = match status {
                     Status::Connected => "connected".to_owned(),
-                    Status::Off | Status::Idle => "not connected".to_owned(),
+                    Status::Idle => "not connected".to_owned(),
                     Status::Connecting => "connecting\u{2026}".to_owned(),
                     Status::Lost => "connection lost".to_owned(),
                     Status::Unavailable(reason) => {

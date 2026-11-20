@@ -97,7 +97,6 @@ impl TerminalView {
                 }
                 Status::Unavailable(reason) => Some(Empty::Unavailable { lost: false, reason }),
                 Status::Lost => Some(Empty::Unavailable { lost: true, reason: String::new() }),
-                Status::Off => self.first_shell(gl),
                 Status::Connected => {
                     // Ask what to show: a session that waits, or a new one.
                     self.open_workspace_picker(&ctx);

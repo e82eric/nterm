@@ -1,5 +1,6 @@
-//! Transport-independent picker IPC schema and request lifecycle.
-//! An authenticated connection serves sequential requests; no request replay.
+//! The picker protocol's schema and request lifecycle. A program in a shell
+//! reaches its pane through the session daemon that runs the shell; see
+//! `relay`.
 use crossbeam_channel::{Receiver, Sender};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -8,19 +9,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-// Shared with the npick client binary, so it depends only on hmac and sha2.
-#[cfg_attr(not(unix), allow(dead_code))]
-mod protocol;
 pub(crate) mod relay;
-pub(crate) use protocol::MAX_FRAME;
-#[cfg(any(unix, test))]
-pub(crate) use protocol::{hex, proof, verify_proof};
 
-#[cfg(unix)]
-mod unix;
-#[cfg(unix)]
-pub(crate) use unix::Service;
-
+/// Frames are at most this many JSON bytes.
+pub(crate) const MAX_FRAME: usize = 1024 * 1024;
 pub(crate) const MAX_ITEM: usize = 64 * 1024;
 pub(crate) const MAX_ITEMS: usize = 1_000_000;
 pub(crate) const MAX_STORAGE: usize = 256 * 1024 * 1024;
@@ -93,13 +85,6 @@ pub(crate) struct Item {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Message {
-    /// Only a pane's own pipe is proved to; the session daemon checks who asks.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    Authenticate {
-        version: u32,
-        client_nonce: String,
-        proof: String,
-    },
     Open {
         request_id: String,
         request: Open,
@@ -310,17 +295,6 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Message, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn authentication_is_bound_to_endpoint_nonce_and_role() {
-        let p = hex(&proof("token", "endpoint", "server", "client", "client"));
-        assert!(verify_proof("token", "endpoint", "server", "client", &p));
-        assert!(!verify_proof("token", "other", "server", "client", &p));
-        assert!(!verify_proof("token", "endpoint", "new", "client", &p));
-        assert_ne!(
-            p,
-            hex(&proof("token", "endpoint", "server", "client", "server"))
-        );
-    }
     #[test]
     fn schema_rejects_duplicate_unknown_and_oversized_fields() {
         for s in [

@@ -7,7 +7,7 @@
 #
 # The daemon names its share folder to its shells as NTERM_SHARE. Outside a
 # pane of nterm it does nothing.
-[[ $- == *i* && ( -n ${NTERM_DAEMON-} || -n ${NTERM_PICKER_ENDPOINT-} ) ]] || return 0
+[[ $- == *i* && -n ${NTERM_DAEMON-} ]] || return 0
 
 # The folder the shell is in (OSC 7), before each prompt: pickers start there,
 # and so does a new pane beside this one. The path is sent as it is.

@@ -103,10 +103,6 @@ impl nfm_egui::copy_controller::CopyNavigationDocument for SnapshotNavigationDoc
 }
 
 struct WakeState {
-    /// The pane's own pipe, where its shell is its own. A shell in the
-    /// session daemon is reached through the daemon.
-    #[cfg(unix)]
-    pipe: Option<crate::picker::pipe::Service>,
     /// Whether the configuration lets programs in the shell open pickers.
     pipe_enabled: AtomicBool,
     context: egui::Context,
@@ -123,16 +119,6 @@ struct WakeState {
 }
 
 impl WakeState {
-    fn picker_environment(&self) -> (std::ffi::CString, std::ffi::CString) {
-        #[cfg(unix)]
-        if let Some(pipe) = &self.pipe {
-            return (
-                std::ffi::CString::new(pipe.endpoint.clone()).unwrap(),
-                std::ffi::CString::new(pipe.token.clone()).unwrap(),
-            );
-        }
-        (std::ffi::CString::default(), std::ffi::CString::default())
-    }
     fn window_id(&self) -> egui_winit::winit::window::WindowId {
         self.window_id.load(Ordering::Acquire).into()
     }
@@ -246,11 +232,12 @@ pub(crate) struct SpawnOptions {
 }
 
 /// `spawn` for a shell where `place` is, beside `pane`: started in the
-/// folder `pane`'s shell is in, unless `spawn` names one. A shell in a daemon
-/// is started by its pane's number, and that daemon looks the folder up: a
+/// folder `pane`'s shell is in, unless `spawn` names one. The shell is
+/// started by its pane's number, and that daemon looks the folder up: a
 /// window names no folder for a shell on another machine, and has not seen
-/// one a shell it has just taken over reports until it next does. A shell of
-/// the window's own starts in what it last reported, on this machine.
+/// one a shell it has just taken over reports until it next does. A pane
+/// whose shell has not started yet has no number, and the new shell starts in
+/// what that pane last reported, on this machine.
 pub(super) fn beside(
     pane: Option<&TerminalPane>,
     mut spawn: SpawnOptions,
@@ -347,9 +334,8 @@ pub(super) struct TerminalPane {
     pub(super) workspace_bounds: Option<egui::Rect>,
     host: *mut Host,
     wake: Box<WakeState>,
-    /// Set when the shell runs in the session daemon and this surface
-    /// mirrors it.
-    session: Option<Arc<crate::session::Link>>,
+    /// The shell in the session daemon that this surface mirrors.
+    session: Arc<crate::session::Link>,
     /// Copy mode was opened by the wheel, and scrolling back down to the end
     /// leaves it.
     wheel_copy: bool,
@@ -472,7 +458,7 @@ impl TerminalPane {
     fn new(
         host: *mut Host,
         wake: Box<WakeState>,
-        session: Option<Arc<crate::session::Link>>,
+        session: Arc<crate::session::Link>,
         gl: &glow::Context,
     ) -> Self {
         let painter = Arc::new(egui::mutex::Mutex::new(TerminalPainter::new(gl)));
@@ -546,14 +532,12 @@ impl TerminalPane {
 
     /// Whether this pane only looks at a pane of the session daemon.
     pub(super) fn looks(&self) -> bool {
-        self.session.as_ref().is_some_and(|session| session.looks())
+        self.session.looks()
     }
 
     /// Ask the daemon for the screen of the pane looked at again.
     pub(super) fn look_again(&self) {
-        if let Some(session) = &self.session {
-            session.look_again();
-        }
+        self.session.look_again();
     }
 
     /// Of the pane's pixels at its last layout, those that are not cells:
@@ -572,29 +556,24 @@ impl TerminalPane {
         Some((extra, cell))
     }
 
-    /// Where this pane's shell runs. One with a shell of its own is here.
+    /// Where this pane's shell runs.
     pub(super) fn place(&self) -> crate::session::Place {
-        self.session.as_ref().map(|session| session.place()).unwrap_or_default()
+        self.session.place()
     }
 
     /// The session daemon's pane this one shows, once known.
     pub(super) fn session_pane(&self) -> Option<u32> {
-        self.session.as_ref().and_then(|session| session.pane_id())
+        self.session.pane_id()
     }
 
     /// The window is closing around this pane: leave its shell running in
-    /// the session daemon, for the next nterm to show. A pane with its own
-    /// shell has nowhere to leave it.
+    /// the session daemon, for the next nterm to show.
     pub(super) fn keep_shell(&mut self) {
         self.end = crate::session::End::Keep;
     }
 
     pub(super) fn destroy(&mut self) {
         self.pages.apply(Outcome::Close);
-        #[cfg(unix)]
-        {
-            self.wake.pipe.take();
-        }
         self.cancel_quick_select();
         self.close_search();
         self.close_copy_mode();
@@ -602,11 +581,8 @@ impl TerminalPane {
         // Stop the daemon feeding the surface before it goes. The surface's
         // callbacks borrow this pane's reference to the link, so that is
         // let go only once the surface can make no more of them.
-        if let Some(session) = &self.session {
-            session.detach(self.end);
-        }
+        self.session.detach(self.end);
         unsafe { ghostty_ffi::nterm_host_destroy(self.host) };
-        self.session = None;
         self.host = std::ptr::null_mut();
     }
 
@@ -664,11 +640,10 @@ impl TerminalPane {
         true
     }
 
-    /// A pane in the session daemon starts its shell once its size has
-    /// settled; see `session::Link::layout`.
+    /// The pane starts its shell once its size has settled; see
+    /// `session::Link::layout`.
     fn layout_session(&self) {
-        let Some(session) = &self.session else { return };
-        if session.layout(unsafe { ghostty_ffi::nterm_host_surface_size(self.host) }) {
+        if self.session.layout(unsafe { ghostty_ffi::nterm_host_surface_size(self.host) }) {
             // Come back even if nothing else asks for a frame.
             self.wake.context.request_repaint();
         }
@@ -776,7 +751,7 @@ impl TerminalPane {
         // A daemon pane's surface keeps no history, so the wheel has none to
         // scroll. Wheel-up opens copy mode on the daemon's instead, and the
         // scroll below moves that.
-        let wheel = self.session.as_ref().map_or(0.0, |_| wheel_over(ui, rect));
+        let wheel = wheel_over(ui, rect);
         if wheel > 0.0
             && !self.copying()
             && unsafe { ghostty_ffi::nterm_host_wheel_wants_history(self.host) }
@@ -827,18 +802,11 @@ pub(crate) fn wake_from_session(wake: *mut c_void) {
     let _ = state.proxy.send_event(UserEvent::PickerWake { window_id: state.window_id() });
 }
 
-/// The pipe `npick` reaches a pane through, when the pane runs its own
-/// shell. A shell in the session daemon is reached through the daemon.
-#[cfg(unix)]
-fn picker_service(ctx: &egui::Context) -> Result<crate::picker::pipe::Service, String> {
-    crate::picker::pipe::Service::new(ctx.clone())
-}
-
 impl TerminalPane {
     /// Creates a terminal of `app` in `window`. The window decides whether
     /// it is tiled or floating.
     ///
-    /// With the session daemon, the link is made first, because the surface
+    /// The link is made first, because the surface
     /// is created with its callbacks; then the surface; then the link is
     /// told the surface. A failure in between drops the link.
     pub(super) fn create(
@@ -851,8 +819,6 @@ impl TerminalPane {
     ) -> Result<Self, crate::native_error::FatalError> {
         use crate::native_error::FatalError;
         let mut wake = Box::new(WakeState {
-            #[cfg(unix)]
-            pipe: None,
             pipe_enabled: AtomicBool::new(false),
             context: ctx.clone(),
             proxy,
@@ -879,26 +845,15 @@ impl TerminalPane {
         let place = options.place.clone().unwrap_or_else(crate::session::home);
         let session = crate::session::Link::prepare(userdata, &options.start, &place, options.there.clone(), options.beside)
             .map_err(|e| FatalError::new("show a running shell", e))?;
-        // A shell of the pane's own is reached by a pipe of the pane's own.
-        #[cfg(unix)]
-        if session.is_none() {
-            let pipe = picker_service(ctx)
-                .map_err(|e| FatalError::new("create secure picker pipe", e))?;
-            pipe.bind_window(wake.proxy.clone(), wake.window_id());
-            wake.pipe = Some(pipe);
-        }
-        let (picker_endpoint, picker_token) = wake.picker_environment();
-        let backend = session.as_ref().map(|session| session.backend());
+        let backend = session.backend();
         let asked = ghostty_ffi::HostOptions {
             userdata,
             window: window.native,
             driver: gl.driver(),
             scale: ctx.pixels_per_point() as f64,
-            picker_endpoint: picker_endpoint.as_ptr(),
-            picker_token: picker_token.as_ptr(),
             command: command.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
             cwd: cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-            backend: backend.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+            backend: &backend,
         };
         let mut error_buffer = [0 as c_char; 2048];
         let host = unsafe {
@@ -914,9 +869,7 @@ impl TerminalPane {
                 unsafe { std::ffi::CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
             return Err(FatalError::new("create a terminal", detail));
         }
-        if let Some(session) = &session {
-            session.attach(host);
-        }
+        session.attach(host);
         Ok(Self::new(host, wake, session, gl))
     }
 
@@ -927,10 +880,6 @@ impl TerminalPane {
         self.wake
             .window_id
             .store(window_id.into(), Ordering::Release);
-        #[cfg(unix)]
-        if let Some(pipe) = &self.wake.pipe {
-            pipe.bind_window(self.wake.proxy.clone(), window_id);
-        }
         if let Some(picker) = self.pages.top().and_then(crate::picker::Page::picker) {
             picker.bind_pipe_search_wake(self.wake.proxy.clone(), window_id);
         }
@@ -947,12 +896,8 @@ impl TerminalPane {
     /// Whether the pane's command has been started. One in the session
     /// daemon has once the daemon has numbered its pane, which it does on
     /// starting the command; one that could not be started closes instead.
-    /// A pane with a shell of its own cannot say, and is taken to have.
     pub(super) fn shell_started(&self) -> bool {
-        match &self.session {
-            Some(session) => session.pane_id().is_some(),
-            None => true,
-        }
+        self.session.pane_id().is_some()
     }
     pub(super) fn set_corner_radius(&self, radius: f32) {
         self.painter.lock().set_corner_radius(radius);
@@ -1295,11 +1240,11 @@ impl TerminalPane {
                     .or_insert_with(|| context.copy_line_before_cursor.clone());
             }
             let cwd = params.contains_key("cwd");
-            let Some(ask) = self.session.as_ref().and_then(|session| session.ask_picker(name, params))
+            let Some(ask) = self.session.ask_picker(name, params)
             else {
                 self.show_error(
                     "Could not open picker",
-                    "The pane's shell is not one a session daemon runs".into(),
+                    "The pane's shell has not started yet".into(),
                 );
                 return false;
             };
@@ -1395,7 +1340,7 @@ impl TerminalPane {
                 generation
             } else {
                 let mut generation = 0;
-                if !begin_snapshot(host, self.session.as_deref(), &mut generation) {
+                if !begin_snapshot(host, &self.session, &mut generation) {
                     self.show_error(
                         "Picker unavailable",
                         "Unable to create the scrollback snapshot".into(),
@@ -1648,7 +1593,7 @@ impl TerminalPane {
         match result {
             Ok(commands) => {
                 for command in commands {
-                    let Some(command) = self.later.ask(command, self.session.as_ref(), ctx) else {
+                    let Some(command) = self.later.ask(command, Some(&self.session), ctx) else {
                         continue;
                     };
                     match command {
@@ -1760,32 +1705,18 @@ impl TerminalPane {
     /// Whether a program in the shell is connected to the pane, or `None`
     /// when the configuration lets none open pickers.
     fn program_status(&self) -> Option<bool> {
-        #[cfg(unix)]
-        if let Some(pipe) = &self.wake.pipe {
-            return Some(pipe.connected()).filter(|_| pipe.enabled());
-        }
-        let session = self.session.as_ref()?;
-        Some(session.has_program()).filter(|_| self.wake.pipe_enabled.load(Ordering::Acquire))
+        Some(self.session.has_program()).filter(|_| self.wake.pipe_enabled.load(Ordering::Acquire))
     }
-    /// What a program in the shell asks next: through the pane's own pipe,
-    /// or through the session daemon.
+    /// What a program in the shell asks next, through the session daemon.
     #[cfg(any(windows, unix))]
     fn next_request(&self) -> Option<crate::picker::pipe::Event> {
-        #[cfg(unix)]
-        if let Some(pipe) = &self.wake.pipe {
-            return pipe.events.try_recv().ok();
-        }
-        self.session.as_ref()?.request()
+        self.session.request()
     }
     /// Applies the configured pipe policy. The window calls this when the pane
     /// is created and when configuration reloads.
     #[cfg(any(windows, unix))]
     pub(super) fn set_pipe_policy(&self, policy: &crate::picker::pipe::Policy) {
         self.wake.pipe_enabled.store(policy.enabled, Ordering::Release);
-        #[cfg(unix)]
-        if let Some(pipe) = &self.wake.pipe {
-            pipe.set_policy(policy);
-        }
     }
     #[cfg(any(windows, unix))]
     pub(super) fn handle_pipe_requests(
@@ -1832,7 +1763,7 @@ impl TerminalPane {
                         params.entry("cwd".into()).or_insert(pwd);
                     }
                     let given = params.clone();
-                    match self.session.as_ref().and_then(|session| session.ask_picker(name, params)) {
+                    match self.session.ask_picker(name, params) {
                         Some(ask) => {
                             self.asked = Some(Asked {
                                 ask,
@@ -1844,7 +1775,7 @@ impl TerminalPane {
                         }
                         None => self.show_error(
                             "Could not open picker",
-                            "The pane's shell is not one a session daemon runs".into(),
+                            "The pane's shell has not started yet".into(),
                         ),
                     }
                 }
@@ -2183,7 +2114,7 @@ impl TerminalPane {
                 let mut navigated = false;
                 let mut sent = false;
                 for command in commands {
-                    let Some(command) = self.later.ask(command, self.session.as_ref(), ctx) else {
+                    let Some(command) = self.later.ask(command, Some(&self.session), ctx) else {
                         continue;
                     };
                     match command {
@@ -2350,7 +2281,7 @@ impl TerminalPane {
             generation
         } else {
             let mut generation = 0;
-            if !begin_snapshot(host, self.session.as_deref(), &mut generation) {
+            if !begin_snapshot(host, &self.session, &mut generation) {
                 self.show_error(
                     "Quick select unavailable",
                     "Unable to create the terminal snapshot".into(),
@@ -2738,7 +2669,7 @@ impl TerminalPane {
         self.pending_search_snapshot = None;
         let host = self.search_host();
         let mut snapshot_generation = 0;
-        if !begin_snapshot(host, self.session.as_deref(), &mut snapshot_generation) {
+        if !begin_snapshot(host, &self.session, &mut snapshot_generation) {
             self.close_search();
             self.show_error(
                 "Search unavailable",
@@ -2786,7 +2717,7 @@ impl TerminalPane {
     fn open_copy_mode(&mut self) {
         self.close_search();
         let mut generation = 0;
-        if !begin_snapshot(self.host, self.session.as_deref(), &mut generation) {
+        if !begin_snapshot(self.host, &self.session, &mut generation) {
             self.show_error(
                 "Copy mode failed",
                 "Could not capture the terminal contents. Try again.".into(),
@@ -3173,7 +3104,7 @@ impl TerminalPane {
         let mut generation = self.copy_mode.generation.unwrap_or_default();
         let temporary = self.copy_mode.generation.is_none();
         if temporary
-            && !begin_snapshot(self.host, self.session.as_deref(), &mut generation)
+            && !begin_snapshot(self.host, &self.session, &mut generation)
         {
             return Vec::new();
         }
@@ -4266,11 +4197,11 @@ fn wheel_over(ui: &egui::Ui, rect: egui::Rect) -> f32 {
 /// own terminal would pass a bare screen off as the whole history.
 fn begin_snapshot(
     host: *mut Host,
-    session: Option<&crate::session::Link>,
+    session: &crate::session::Link,
     generation: &mut u64,
 ) -> bool {
-    match session.map(crate::session::Link::snapshot) {
-        Some(Ok(Some(bytes))) => unsafe {
+    match session.snapshot() {
+        Ok(Some(bytes)) => unsafe {
             ghostty_ffi::nterm_host_snapshot_begin_from(
                 host,
                 bytes.as_ptr(),
@@ -4278,9 +4209,9 @@ fn begin_snapshot(
                 generation,
             )
         },
-        Some(Err(())) => false,
-        // Its own shell, or a daemon shell that has not started yet.
-        Some(Ok(None)) | None => unsafe {
+        Err(()) => false,
+        // A shell that has not started yet.
+        Ok(None) => unsafe {
             ghostty_ffi::nterm_host_snapshot_begin(host, generation)
         },
     }

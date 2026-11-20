@@ -56,7 +56,6 @@ impl ShellApp {
     fn new(
         app: Rc<GhosttyApp>,
         egui_ctx: &egui::Context,
-        gl: &glow::Context,
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
         window: crate::graphics::PaneWindow,
         command_label: String,
@@ -69,7 +68,6 @@ impl ShellApp {
             terminal: TerminalView::new(
                 app,
                 egui_ctx,
-                gl,
                 proxy,
                 window,
                 command_label,
@@ -522,7 +520,6 @@ impl winit::application::ApplicationHandler<UserEvent> for NativeApp {
             window.shell = Some(ShellApp::new(
                 ghostty,
                 &window.egui.egui_ctx,
-                &window.gl,
                 self.proxy.clone(),
                 window.surface.pane_window(),
                 command_label,

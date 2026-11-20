@@ -161,7 +161,6 @@ impl TerminalView {
     pub(crate) fn new(
         app: std::rc::Rc<GhosttyApp>,
         egui_ctx: &egui::Context,
-        gl: &glow::Context,
         proxy: egui_winit::winit::event_loop::EventLoopProxy<UserEvent>,
         window: crate::graphics::PaneWindow,
         command_label: String,
@@ -171,28 +170,13 @@ impl TerminalView {
         reload_source: crate::config::ReloadSource,
     ) -> Result<Self, crate::native_error::FatalError> {
         issues.extend(app.take_config_issues());
-        // With shells kept in the session daemon the window starts with no
-        // terminal: what it shows first depends on what the daemon holds,
-        // and the daemon is reached while the window is already up.
-        let pane = if crate::session::status(&crate::session::home()) == crate::session::Status::Off {
-            let pane = TerminalPane::create(
-                &app,
-                egui_ctx,
-                gl,
-                proxy.clone(),
-                window,
-                &pane::SpawnOptions::default(),
-            )?;
-            #[cfg(any(windows, unix))]
-            pane.set_pipe_policy(&picker_bindings.pipe_policy);
-            Some(pane)
-        } else {
-            crate::session::connect(&crate::session::home());
-            None
-        };
+        // The window starts with no terminal: what it shows first depends on
+        // what the session daemon holds, and the daemon is reached while the
+        // window is already up.
+        crate::session::connect(&crate::session::home());
         let mut view = Self::with_pane(
             app,
-            pane,
+            None,
             egui_ctx,
             proxy,
             window,

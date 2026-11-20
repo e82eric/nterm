@@ -1,10 +1,9 @@
 # Opening pickers from the shell
 
 Shells open allowlisted named pickers through the session daemon that runs
-them (Windows) or through the pane's Unix socket (Linux). `npick`, installed
-beside `nterm`, is the client on both; see [npick](#npick). For PowerShell
-there is also a script that starts no program: `Invoke-NtermPicker.ps1`, which
-requires PowerShell 7.3+.
+them. `npick`, installed beside `nterm`, is the client on Windows and Linux;
+see [npick](#npick). For PowerShell there is also a script that starts no
+program: `Invoke-NtermPicker.ps1`, which requires PowerShell 7.3+.
 The same pipe can start a command in a new pane: see
 [Open a pane beside this one](#open-a-pane-beside-this-one).
 Pipe access is disabled by default. Add this to your returned Lua table, restart
@@ -338,8 +337,7 @@ file.
 ## npick
 
 With `picker_pipe` enabled as above, `npick` opens pickers from the shell
-running in a pane and prints the selected value. On Windows the pane's shell
-must be one the session daemon runs:
+running in a pane and prints the selected value:
 
 ```sh
 npick files                        # a named picker from nterm.lua
@@ -361,7 +359,7 @@ __npick_file() {
   READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}$file${READLINE_LINE:READLINE_POINT}"
   READLINE_POINT=$((READLINE_POINT + ${#file}))
 }
-[[ -n $NTERM_PICKER_ENDPOINT ]] && bind -x '"\C-t": __npick_file'
+[[ -n $NTERM_DAEMON ]] && bind -x '"\C-t": __npick_file'
 ```
 
 [npick-completion.bash](../npick-completion.bash) is the bash counterpart of the
@@ -415,11 +413,9 @@ that asked does not need focus, and an open overlay does not make it `busy`.
 
 ## Picker pipe, protocol version 1
 
-The picker's messages are the same on both systems; how they travel differs.
-On Windows a client connects to the session daemon's pipe and the daemon
+A client connects to the session daemon that runs its shell, and the daemon
 passes its messages to the window showing the pane; see
-[Windows transport](#windows-transport). On Linux each pane has a Unix-domain
-socket of its own; see [Linux transport](#linux-transport).
+[Transport](#transport).
 
 ### Enable and test
 
@@ -576,21 +572,22 @@ Set-PSReadLineKeyHandler -Chord Alt+f -ScriptBlock {
 Selections are returned as data; this binding quotes a path for PowerShell.
 The helper does not evaluate returned strings or run acceptance callbacks.
 
-### Windows transport
+### Transport
 
 The session daemon runs the pane's shell and sets in its environment:
 
 ```
 NTERM_DAEMON=<the daemon's name>
 NTERM_PANE=<the daemon's number for the pane>
-NTERM_DAEMON_PIPE=\\.\pipe\nterm-session-<account>-<name>
+NTERM_DAEMON_PIPE=\\.\pipe\nterm-session-<account>-<name>    (Windows)
+NTERM_DAEMON_PIPE=/tmp/nterm-<uid>/<name>                     (Linux)
 ```
 
 These are not persisted or set globally. Shell descendants inherit them. None
 is a secret: the pipe decides who may connect, not knowledge of its name.
 
-A client opens the daemon's pipe, the one the windows themselves use, and
-speaks the daemon's framing: a `u32 little-endian length`, then a kind byte,
+A client opens the daemon's pipe (a Unix socket on Linux), the one the
+windows themselves use, and speaks the daemon's framing: a `u32 little-endian length`, then a kind byte,
 then for every kind but a control message a `u32` number, then the payload.
 
 1. The client sends a control message (kind 0) whose payload is
@@ -611,47 +608,10 @@ One connection is one request. There is no handshake, token or proof, and no
 closing the connection ends the request. A second request for a pane that has
 one open returns `busy`.
 
-A shell that the daemon does not run has no way to open a picker on Windows.
-
-### Linux wire format and authentication
-
-Each frame is `u32 little-endian length` followed by that many UTF-8 JSON bytes.
-Maximum frame size is 1 MiB. Read/write call boundaries are not frame boundaries.
-Unknown fields, duplicate JSON keys (including nested objects), unsupported
-versions, invalid IDs, and invalid message ordering are rejected.
-
-The pane's shell launch environment contains:
-
-```
-NTERM_PICKER_ENDPOINT=<the socket's absolute path>
-NTERM_PICKER_TOKEN=<random 256-bit token encoded as hex>
-```
-
-These variables are not persisted or set globally. Shell descendants inherit
-them. The token is the UTF-8 hex string used as the HMAC key, not decoded bytes.
-
-Handshake:
-
-1. Server sends `{"type":"challenge","version":1,"nonce":"<64 hex chars>"}`.
-2. Client sends `authenticate` with `version`, `client_nonce`, and `proof`.
-3. Server verifies the client proof.
-4. Server sends `ready` with `version`, server `proof`, capability policy, limits,
-   `persistent:true` to advertise sequential connection reuse. The client
-   falls back to closing after each request when this field is absent.
-5. Client verifies the server proof before sending a picker request.
-
-Each proof uses HMAC-SHA256 over five fields, each encoded as a little-endian
-u32 byte length followed by UTF-8 bytes: `nterm-picker/1`, endpoint basename,
-server nonce, client nonce, and role (`client` or `server`). There are five
-fields total. Different roles prevent reflection. Fresh challenges prevent
-replaying authentication proofs. Proof comparisons are constant-time for valid
-lengths. Tokens and proofs must not be logged.
-
 ### Requests
 
-Only one request is active at a time per connection. On Linux later requests
-may reuse an authenticated connection, and current capabilities are checked
-again for every open. Request IDs are nonempty strings up to 128 bytes.
+Only one request is active at a time per connection. Request IDs are
+nonempty strings up to 128 bytes.
 
 
 ```json
@@ -684,9 +644,8 @@ the result returns the client's item ID and value, as for a stream.
 `npick --stdin NAME` sends it with the lines of stdin.
 
 Server sends `opened` after UI creation, or a terminal error result. Another
-active overlay returns `busy`. On Linux there is one connection slot per pane;
-another client waits at most five seconds to connect and fails if it remains
-occupied. There is no request queue or automatic request replay.
+active overlay returns `busy`. There is no request queue or automatic request
+replay.
 
 ### Streaming and results
 
@@ -735,67 +694,28 @@ wins. Client disconnect, malformed messages, and pane closure cancel the owned
 picker. Command reader cancellation is requested when the picker is dropped;
 this cannot reverse command side effects already performed.
 
-On Windows the request is over with its result, and the rest of this section
-is Linux alone. After any terminal result, the client sends:
-
-```json
-{"type":"received","request_id":"r1"}
-```
-
-The server waits up to five seconds for this receipt, draining outstanding input
-for that request. It then drops the request state and sends:
-
-```json
-{"type":"idle","request_id":"r1"}
-```
-
-The client acknowledges `idle` with another `received` for the same request ID
-before reusing the connection. An invalid/missing acknowledgment disconnects.
-Delivery is still not guaranteed across crashes, timeouts, or connection loss.
+The request is over with its result.
 
 Errors are terminal results with `status:"error"`, `code`, and `message` when a
-valid request is available. Authentication/security/framing failures disconnect
-without echoing request content. The handshake has a five-second deadline;
-UI acknowledgments have ten-second deadlines; partial payloads and
-blocked writes have five-second deadlines. Waiting for user selection has no
-deadline, and idle authenticated connections have no idle timeout. Cancellation
-is read concurrently with response delivery. On Linux a Lua reload that revokes
-the active request capability cancels that request, and disabling the pipe or
-exit of the pane shell closes idle connections; pane closure stops the service.
-On Windows a reload refuses later requests and leaves one that is open; exit of
-the pane's shell, and the window leaving the pane, end it.
-
-### Linux transport
-
-Each pane listens on `$XDG_RUNTIME_DIR/nterm/<pid>/pane-<id>.sock`, or a
-`nterm-<uid>` directory under the temporary directory when no runtime
-directory is set. Both directories must be owned by the user and mode `0700`;
-the socket is `0600`. On startup, directories of terminals that are no longer
-running are removed; closing a pane removes its socket.
-
-The kernel reports the connecting process's user (`SO_PEERCRED`); connections
-from other users are closed before the challenge. Processes of the same user
-can read each other's environment (including the token) and memory, so the
-token is not a boundary between them.
-
-`npick` is the client, with the same options on Windows:
-
-```sh
-npick files                       # a named picker; prints the selected value
-npick root_cd                     # params: npick NAME KEY=VALUE...
-fd -t f | npick --query src       # stream lines from stdin
-ps -eo pid,comm | npick -d ' ' --value 1
-compgen -c | npick --stdin completions   # stdin into a named Items picker
-```
-
-Named requests add the caller's directory as `params.cwd` unless given. It
-exits 0 with the value on stdout, 130 when cancelled, and 2 on errors.
-`npick --help` lists all options.
+valid request is available. Framing failures disconnect without echoing
+request content. UI acknowledgments have ten-second deadlines; partial
+payloads and blocked writes have five-second deadlines. Waiting for user selection has no
+deadline. Cancellation is read concurrently with response delivery. A reload
+refuses later requests and leaves one that is open; exit of the pane's shell,
+and the window leaving the pane, end it.
 
 ### Security controls and remaining risks
 
-On Windows a picker request is admitted by the session daemon's pipe, as a
+A picker request is admitted by the session daemon's pipe or socket, as a
 window is, and by the Lua policy.
+
+- On Linux the socket is in `/tmp/nterm-<uid>` (or the same under
+  `$NTERM_TMPDIR`), a folder made with mode 0700 and refused if another
+  account owns it, others can open it, or it is a link. The daemon checks the
+  peer credentials of each connection and closes one from another account
+  before reading it. Root has a daemon of its own.
+
+On Windows:
 
 - The pipe's access list grants read and write to the account alone, from
   any of its sign-ins, and its integrity label denies reads and writes from

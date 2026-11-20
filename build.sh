@@ -19,14 +19,19 @@ fi
 (cd "$ghostty" && zig build host-lib -Dapp-runtime=none -Doptimize="${1:-ReleaseFast}" --prefix "$prefix")
 
 # .cargo/config.toml points the build scripts at ghostty/ and out/lib; the
-# VT library name differs from the Windows default.
+# VT library name differs from the Windows default. The session daemon, which
+# runs every pane's shell, is a default member of the workspace.
 NFM_GHOSTTY_VT_LIB_NAME=ghostty-vt cargo build --release --manifest-path "$root/Cargo.toml"
 
 mkdir -p "$prefix/bin"
-install -m 755 "$root/target/release/nterm" "$root/target/release/npick" "$prefix/bin/"
+install -m 755 "$root/target/release/nterm" "$root/target/release/nterm-daemon" \
+    "$root/target/release/npick" "$prefix/bin/"
 # Lua modules a config can require, e.g. require("nterm.git").
 mkdir -p "$prefix/share/nterm"
 rm -rf "$prefix/share/nterm/lua"
 cp -R "$root/lua" "$prefix/share/nterm/"
+# What a bash shell in a pane sources from ~/.bashrc: see bash/nterm.bash.
+mkdir -p "$prefix/share/nterm/bash"
+install -m 644 "$root/bash/nterm.bash" "$root/npick-completion.bash" "$prefix/share/nterm/bash/"
 
 echo "Built $prefix/bin/nterm"
