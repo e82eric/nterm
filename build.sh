@@ -22,6 +22,7 @@ fi
 # VT library name differs from the Windows default.
 NFM_GHOSTTY_VT_LIB_NAME=ghostty-vt cargo build --release --manifest-path "$root/Cargo.toml"
 
+mkdir -p "$prefix/bin"
 install -m 755 "$root/target/release/nterm" "$root/target/release/npick" "$prefix/bin/"
 # Lua modules a config can require, e.g. require("nterm.git").
 mkdir -p "$prefix/share/nterm"
