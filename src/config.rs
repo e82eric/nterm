@@ -549,6 +549,14 @@ impl FloatingPadding {
 }
 
 impl AppConfig {
+    /// Whether a program in a shell may read the clipboard: in one of this
+    /// machine's, and in one of each remote's, by its name.
+    fn clipboard_reads(&self) -> (bool, std::collections::BTreeMap<String, bool>) {
+        let here = self.terminal.clipboard_read != Some(Access::Deny);
+        let remotes = self.remotes.iter().map(|(name, remote)| (name.clone(), remote.clipboard_read == Some(Access::Allow)));
+        (here, remotes.collect())
+    }
+
     fn parse(source: &str, path: &Path) -> Result<Self, String> {
         let lua = std::rc::Rc::new(Lua::new());
         crate::preview_worker::install_ui_api(&lua).map_err(|e| e.to_string())?;
@@ -907,6 +915,9 @@ impl ReloadSource {
         let load = || {
             let config = AppConfig::parse(&source, &path)?;
             config.ghostty_args()?;
+            let (here, remotes) = config.clipboard_reads();
+            // From the next request on, as the rest takes effect now.
+            crate::session::reload_clipboard_read(here, &remotes);
             Ok(ReloadedConfig {
                 font_family: if self.cli_font_family {
                     None
@@ -1461,6 +1472,15 @@ mod tests {
         assert_eq!(read("'allow'").unwrap().terminal.clipboard_read, Some(Access::Allow));
         assert_eq!(read("'deny'").unwrap().terminal.clipboard_read, Some(Access::Deny));
         assert_eq!(parse("return {}").unwrap().terminal.clipboard_read, None);
+
+        // What a reload applies: here unless denied, a remote only if allowed.
+        let reads = |source: &str| parse(source).unwrap().clipboard_reads();
+        assert_eq!(reads("return {}"), (true, Default::default()));
+        let (here, remotes) = reads(
+            "return { terminal = { clipboard_read = 'deny' }, remotes = { a = { clipboard_read = 'allow' }, b = {}, c = { clipboard_read = 'deny' } } }",
+        );
+        assert!(!here);
+        assert_eq!(remotes, [("a".into(), true), ("b".into(), false), ("c".into(), false)].into());
         // Refused saying what it may be.
         for bad in ["'Allow'", "'ask'", "true", "1"] {
             let error = read(bad).err().unwrap_or_else(|| panic!("{bad} was taken"));

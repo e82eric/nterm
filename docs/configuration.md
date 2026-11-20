@@ -427,7 +427,7 @@ allowed, no window shows the pane, the clipboard could not be opened, or its
 text is over a megabyte. A clipboard holding no text gives nothing.
 
 Whether a program may is the window's configuration's, by where the shell
-runs, and takes effect when the window starts:
+runs. Reloading the configuration applies it to the next request:
 
 ```lua
 return {

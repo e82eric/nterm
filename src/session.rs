@@ -258,6 +258,19 @@ pub(crate) fn set_clipboard_read(allowed: bool) {
     CLIPBOARD_READ.store(allowed, Ordering::Relaxed);
 }
 
+/// The configuration was reloaded: what it says of reading the clipboard,
+/// here (`here`) and on each remote (`remotes`, by name; a remote it does not
+/// name may not), holds from the next request. Nothing else of the remotes
+/// changes, as nothing else of them is reloaded.
+pub(crate) fn reload_clipboard_read(here: bool, remotes: &std::collections::BTreeMap<String, bool>) {
+    set_clipboard_read(here);
+    let allowed = |remote: &mut Remote| remote.clipboard_read = remotes.get(&remote.name).copied().unwrap_or(false);
+    REMOTES.lock().unwrap().iter_mut().for_each(allowed);
+    if let Some(remote) = REMOTE.lock().unwrap().as_mut() {
+        allowed(remote);
+    }
+}
+
 /// Whether a program in a shell of `place` may read the clipboard here, and
 /// if not, the setting that would let it.
 fn clipboard_read(place: &Place) -> Result<(), String> {
