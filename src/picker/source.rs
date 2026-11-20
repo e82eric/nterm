@@ -1456,7 +1456,7 @@ mod grouped_rows_tests {
         // In the order that how well each matches would give them.
         let remote = crate::session::Place::Remote("pub".into());
         let entries = [
-            row(["pub", "Enter shows its sessions and folders"], AppAction::PlacePage(remote)),
+            row(["pub", "connected"], AppAction::PlacePage(remote)),
             row(["a pub of sorts", "detached"], AppAction::AttachSession("a".into())),
             row(["the long way to a p u b", ""], AppAction::SelectWorkspaceId(1)),
         ];

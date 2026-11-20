@@ -577,10 +577,10 @@ impl TerminalView {
                 let status = crate::session::status(&place);
                 of.push_str(&format!("{}{status:?}", remote.name));
                 let state = match status {
-                    Status::Connected => "Enter shows its sessions and folders".to_owned(),
-                    Status::Off | Status::Idle => "not connected: Enter connects".to_owned(),
+                    Status::Connected => "connected".to_owned(),
+                    Status::Off | Status::Idle => "not connected".to_owned(),
                     Status::Connecting => "connecting\u{2026}".to_owned(),
-                    Status::Lost => "connection lost: Enter connects again".to_owned(),
+                    Status::Lost => "connection lost".to_owned(),
                     Status::Unavailable(reason) => {
                         format!("cannot be reached: {}", reason.lines().last().unwrap_or_default().trim())
                     }
