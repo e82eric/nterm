@@ -1,4 +1,4 @@
-//! Logs: lines in files under `%LOCALAPPDATA%\nterm`, each file kept to a
+//! Logs: lines in files under `directory()`, each file kept to a
 //! size. A full file is kept as the one before (`x.log` as `x.old.log`), in
 //! place of the one before it, so a log takes twice its limit at most.
 //!
@@ -13,12 +13,19 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-/// Where logs go: `%LOCALAPPDATA%\nterm`, or the temp directory.
+/// Where logs go: `%LOCALAPPDATA%\nterm` on Windows; elsewhere
+/// `$XDG_STATE_HOME/nterm`, which is `~/.local/state/nterm` unless set. The
+/// temp directory when there is neither.
 pub fn directory() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("nterm")
+    let state = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_STATE_HOME")
+            .filter(|folder| !folder.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+    };
+    state.unwrap_or_else(std::env::temp_dir).join("nterm")
 }
 
 /// A line as it is written, with its end.

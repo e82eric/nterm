@@ -1563,6 +1563,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "csv",
+ "libc",
  "mlua",
  "nfm-picker-sources",
  "nfm-preview-command",
@@ -1580,6 +1581,7 @@ dependencies = [
 name = "nterm-session"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",

@@ -11,7 +11,6 @@
 
 use std::{
     io::{self, Read, Write},
-    os::windows::process::CommandExt,
     process::{ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -37,6 +36,7 @@ const MOST_SAID: usize = 1 << 16;
 const HEARD_OUT: Duration = Duration::from_secs(1);
 
 /// From `windows-sys`'s `CREATE_NO_WINDOW`: no console window for the child.
+#[cfg(windows)]
 const NO_WINDOW: u32 = 0x0800_0000;
 
 pub(crate) struct Child {
@@ -215,12 +215,13 @@ fn line(output: &mut ChildStdout) -> io::Result<Option<String>> {
 /// The error for a relay that ends first carries what it wrote to its error
 /// output, which is where `ssh` and the relay explain themselves.
 pub fn connect(command: &mut Command) -> io::Result<crate::pipe::Connection> {
-    let mut process = command
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(NO_WINDOW)
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(command, NO_WINDOW);
+    let mut process = command.spawn()?;
     let input = process.stdin.take();
     let mut output = process.stdout.take().expect("piped");
     let mut errors = process.stderr.take().expect("piped");
@@ -297,28 +298,50 @@ pub fn connect(command: &mut Command) -> io::Result<crate::pipe::Connection> {
 mod tests {
     use super::*;
 
-    /// A relay that says something as it starts and something else as it
-    /// ends, as `ssh` does, with time between for each to be heard.
+    /// A relay that runs `script`: `cmd` on Windows, `sh` elsewhere.
     fn relay(test: &str, script: &str) -> Command {
         let folder = std::env::temp_dir().join(format!("nterm-relay-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
-        let path = folder.join("relay.cmd");
-        std::fs::write(&path, script).unwrap();
-        let mut command = Command::new("cmd.exe");
-        command.arg("/d").arg("/c").arg(path);
-        command
+        if cfg!(windows) {
+            let path = folder.join("relay.cmd");
+            std::fs::write(&path, script).unwrap();
+            let mut command = Command::new("cmd.exe");
+            command.arg("/d").arg("/c").arg(path);
+            command
+        } else {
+            let path = folder.join("relay.sh");
+            std::fs::write(&path, script).unwrap();
+            let mut command = Command::new("sh");
+            command.arg(path);
+            command
+        }
     }
+
+    /// One that says something as it starts and something else as it
+    /// ends, as `ssh` does, with time between for each to be heard.
+    const SAYS_BOTH: &str = if cfg!(windows) {
+        "@>&2 echo Warning: setting up\r\n\
+         @ping -n 2 127.0.0.1 >nul\r\n\
+         @echo nterm-relay 1\r\n\
+         @ping -n 2 127.0.0.1 >nul\r\n\
+         @>&2 echo Connection reset by peer\r\n"
+    } else {
+        "echo Warning: setting up >&2\n\
+         sleep 1\n\
+         echo nterm-relay 1\n\
+         sleep 1\n\
+         echo Connection reset by peer >&2\n"
+    };
+
+    const REFUSED: &str = if cfg!(windows) {
+        "@>&2 echo Permission denied (publickey).\r\n"
+    } else {
+        "echo 'Permission denied (publickey).' >&2\n"
+    };
 
     #[test]
     fn what_a_relay_says_once_ready_is_kept_for_when_it_ends() {
-        let mut command = relay(
-            "said",
-            "@>&2 echo Warning: setting up\r\n\
-             @ping -n 2 127.0.0.1 >nul\r\n\
-             @echo nterm-relay 1\r\n\
-             @ping -n 2 127.0.0.1 >nul\r\n\
-             @>&2 echo Connection reset by peer\r\n",
-        );
+        let mut command = relay("said", SAYS_BOTH);
         let connection = connect(&mut command).expect("ready");
         let mut reader = connection.reader().unwrap();
         let mut rest = Vec::new();
@@ -330,7 +353,7 @@ mod tests {
 
     #[test]
     fn a_relay_that_ends_before_it_is_ready_says_why_in_its_error() {
-        let mut command = relay("early", "@>&2 echo Permission denied (publickey).\r\n");
+        let mut command = relay("early", REFUSED);
         let Err(error) = connect(&mut command) else { panic!("connected") };
         let error = error.to_string();
         assert!(error.starts_with("the relay ended before it was ready"), "{error}");
