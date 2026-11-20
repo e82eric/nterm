@@ -10,9 +10,13 @@
 [[ $- == *i* && -n ${NTERM_DAEMON-} ]] || return 0
 
 # The folder the shell is in (OSC 7), before each prompt: pickers start there,
-# and so does a new pane beside this one. The path is sent as it is.
+# and so does a new pane beside this one. The path is sent as it is. The host
+# is localhost, as the PowerShell module's is: a window takes the folder only
+# from its own machine, and a pane's folder is always one of the machine its
+# daemon is on, which is where pickers use it, so a remote's must not be
+# refused for its host name.
 __nterm_report_pwd() {
-    printf '\e]7;kitty-shell-cwd://%s%s\a' "${HOSTNAME:-localhost}" "$PWD"
+    printf '\e]7;kitty-shell-cwd://localhost%s\a' "$PWD"
 }
 case ";${PROMPT_COMMAND-};" in
     *";__nterm_report_pwd;"*) ;;
