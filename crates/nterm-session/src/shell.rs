@@ -49,9 +49,22 @@ impl Program {
     /// For the shell this process was started from. `None` when it is not
     /// in a pane whose shell the daemon runs.
     pub fn from_environment() -> Option<io::Result<Self>> {
+        let (session, pane) = Self::environment()?;
+        Some(Self::connect(&session, pane))
+    }
+
+    /// As `from_environment`, for a picker the daemon runs: see `pick`.
+    pub fn pick_from_environment() -> Option<io::Result<Self>> {
+        let (session, pane) = Self::environment()?;
+        Some(Self::pick(&session, pane))
+    }
+
+    /// The daemon and the pane this process's shell is in, as its
+    /// environment says.
+    fn environment() -> Option<(String, PaneId)> {
         let session = std::env::var(DAEMON_VARIABLE).ok().filter(|v| !v.is_empty())?;
         let pane = std::env::var(PANE_VARIABLE).ok()?.parse().ok()?;
-        Some(Self::connect(&session, pane))
+        Some((session, pane))
     }
 
     pub fn connect(session: &str, pane: PaneId) -> io::Result<Self> {

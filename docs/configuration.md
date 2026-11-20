@@ -88,12 +88,15 @@ stay, and its row offers to connect again: its shells are still there.
 
 - `address` is what `ssh` is given: `user@host`, or a `Host` of your ssh
   configuration. Without it, the remote's name is used.
-- `command` is what a new shell there is started with. Without it, `cmd.exe`.
+- `command` is what a new shell there is started with. Without it, that
+  machine's own: `cmd.exe` on Windows, the account's login shell on Linux.
   `terminal.command` is this machine's and is not used.
 - `daemon` is where `nterm-daemon` is there. Without it, it is found by name,
-  so its folder must be on that account's `PATH`.
-- `directory` is where a new shell there starts. Without it, the home
-  directory.
+  so its folder must be on that account's `PATH`: on Linux the `PATH` of an
+  ssh that runs a command, which may not have `~/.local/bin`
+  (`deploy-daemon.sh` installs there), so name it.
+- `directory` is where a new shell there starts, in which `~` is the home
+  folder there. Without it, the home directory.
 - `session` is which daemon there, for a machine that runs several. Without
   it, the one called `default`.
 - `new_roots` are folders there: each folder inside one is listed on the

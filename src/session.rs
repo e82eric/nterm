@@ -143,8 +143,9 @@ pub(crate) struct Remote {
 }
 
 /// What a new shell on another machine is started with when its remote
-/// names nothing.
-const REMOTE_COMMAND: &str = "cmd.exe";
+/// names nothing: nothing, which its daemon takes as that machine's own
+/// shell, `cmd.exe` on Windows and the user's login shell elsewhere.
+const REMOTE_COMMAND: &str = "";
 
 impl Remote {
     /// What is wrong with it, if anything. Each part ends up on a command
@@ -167,8 +168,10 @@ impl Remote {
         if self.session.as_deref().is_some_and(|session| !nterm_session::is_session_name(session)) {
             return Err(format!("session: {}", nterm_session::SESSION_NAME_RULE));
         }
-        if self.daemon.as_deref().is_some_and(|daemon| !plain(daemon) || daemon.contains('"')) {
-            return Err("daemon must be the path of a program, without quotes".into());
+        // In double quotes on the command line there, which a Unix shell
+        // reads `$` and `` ` `` in, and `\` before them.
+        if self.daemon.as_deref().is_some_and(|daemon| !plain(daemon) || daemon.contains(['"', '$', '`'])) {
+            return Err("daemon must be the path of a program, without quotes, $ or `".into());
         }
         Ok(())
     }
@@ -2348,6 +2351,8 @@ mod tests {
             remote("host", None, Some("")),
             remote("host", None, Some("d.exe\" & calc & \"")),
             remote("host", None, Some("d.exe\ncalc")),
+            remote("host", None, Some("/home/$(calc)/nterm-daemon")),
+            remote("host", None, Some("/home/`calc`/nterm-daemon")),
         ] {
             assert!(bad.check().is_err(), "{bad:?}");
         }

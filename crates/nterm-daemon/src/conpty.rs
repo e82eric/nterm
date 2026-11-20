@@ -219,9 +219,18 @@ pub fn spawn(
     cols: u16,
     rows: u16,
 ) -> io::Result<Spawned> {
-    if command.trim().is_empty() || command.contains('\0') {
+    if command.contains('\0') {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no command"));
     }
+    // None is this machine's own shell, as a pseudoterminal's is the login
+    // shell: what the window asks for on a machine whose shell it does not know.
+    let shell;
+    let command = if command.trim().is_empty() {
+        shell = std::env::var("ComSpec").ok().filter(|shell| !shell.trim().is_empty());
+        shell.as_deref().unwrap_or("cmd.exe")
+    } else {
+        command
+    };
     let api = api();
     let (input_read, input_write) = pipe()?;
     let (output_read, output_write) = pipe()?;

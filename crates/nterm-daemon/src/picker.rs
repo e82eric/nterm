@@ -255,7 +255,7 @@ impl Shown {
 
 /// `path` with a `~` it starts with, alone or before a separator, taken to
 /// be this machine's home folder.
-fn in_home(path: PathBuf) -> Result<PathBuf, String> {
+pub(crate) fn in_home(path: PathBuf) -> Result<PathBuf, String> {
     let Some(text) = path.to_str() else { return Ok(path) };
     let rest = match text.strip_prefix('~') {
         Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => rest.trim_start_matches(['/', '\\']),

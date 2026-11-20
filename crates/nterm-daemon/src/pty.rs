@@ -308,10 +308,12 @@ pub fn spawn(
         Ok(shell)
     };
     let cwd = cwd.filter(|cwd| !cwd.is_empty());
+    let home = std::env::var("HOME").ok().filter(|home| Path::new(home).is_dir());
     let child = match build(cwd)?.spawn() {
         Ok(child) => child,
-        // A directory that has gone away should not cost the user the shell.
-        Err(_) if cwd.is_some_and(|cwd| !Path::new(cwd).is_dir()) => build(None)?
+        // A directory that has gone away should not cost the user the shell:
+        // it starts at home instead.
+        Err(_) if cwd.is_some_and(|cwd| !Path::new(cwd).is_dir()) => build(home.as_deref())?
             .spawn()
             .map_err(|error| io::Error::new(error.kind(), format!("cannot start {command:?}: {error}")))?,
         Err(error) => {

@@ -287,6 +287,11 @@ impl Session {
         // where the daemon keeps its log. A window on another machine gives
         // none: it knows no directory of this one.
         let cwd = cwd.or_else(|| std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok());
+        // `~` is this machine's home folder, as a remote's directory says it.
+        let cwd = cwd.map(|cwd| match crate::picker::in_home(cwd.clone().into()) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => cwd,
+        });
         let spawned = conpty::spawn(&command, cwd.as_deref(), &env, size.cols, size.rows)
             .map_err(|error| error.to_string())?;
         let conpty::Spawned { console, output, input, process } = spawned;
@@ -457,7 +462,8 @@ fn terminal_variables() -> Vec<(String, String)> {
 
 /// Serve the session until told to shut down or left idle.
 pub fn run(options: Options) -> io::Result<()> {
-    let mut listener = Listener::bind(&options.session)?;    let (sessions_changed, changes) = mpsc::channel();
+    let mut listener = Listener::bind(&options.session)?;
+    let (sessions_changed, changes) = mpsc::channel();
     let session = Arc::new(Session {
         sessions: Mutex::default(),
         sessions_changed,

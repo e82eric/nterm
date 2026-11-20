@@ -37,6 +37,7 @@ Usage: npick [OPTIONS] NAME [KEY=VALUE...]
        COMMAND | npick [OPTIONS]
        COMMAND | npick --stdin [OPTIONS] NAME [KEY=VALUE...]
        npick --pane [--focus] [--cwd DIR] [COMMAND [ARG...]]
+       npick --daemon [-q TEXT] [--stdin] NAME [KEY=VALUE...]
 
 Opens a picker in the nterm pane this shell runs in and prints the
 selected value. NAME opens a picker from nterm.lua; it must be listed in
@@ -49,6 +50,13 @@ one, in the same workspace or float, and the pane's id is printed
 (picker_pipe.allow_panes must be true). The pane closes when COMMAND
 ends. Without COMMAND it runs the shell. Everything after COMMAND is its
 arguments.
+
+With --daemon the session daemon that runs this shell runs the picker:
+NAME is one of the pickers of the nterm-daemon.lua of this machine, or
+items, whose rows are stdin's lines (with --stdin). It lists and searches
+here, and the window only shows it, so it works the same in a window on
+another machine. KEY=VALUE are the picker's parameters; cwd is this
+directory unless one is given.
 
 Options:
   -q, --query TEXT       initial query
@@ -63,6 +71,7 @@ Options:
       --pane             run COMMAND in a new pane instead of picking
       --focus            with --pane, give the new pane focus
       --cwd DIR          with --pane, where COMMAND starts (default: here)
+      --daemon           the session daemon runs the picker NAME
   -h, --help             show this help
 
 Exit status: 0 selected, 130 cancelled, 2 error.";
@@ -86,6 +95,8 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         pub(crate) cwd: Option<String>,
         /// With `pane`, the command and its arguments.
         pub(crate) command: Vec<String>,
+        /// The picker is the daemon's, not the window's.
+        pub(crate) daemon: bool,
     }
 
     fn field(option: &str, value: Option<String>) -> Result<usize, String> {
@@ -136,6 +147,7 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
                 "--stdin" => parsed.stdin = true,
                 "--pane" => parsed.pane = true,
                 "--focus" => parsed.focus = true,
+                "--daemon" => parsed.daemon = true,
                 "--cwd" => parsed.cwd = Some(value().ok_or("--cwd needs a directory")?),
                 "--preview" => parsed.preview = Some(value().ok_or("--preview needs a value")?),
                 "--" => {
@@ -160,6 +172,9 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         }
         if parsed.pane && (parsed.stdin || parsed.json || parsed.query.is_some()) {
             return Err("--pane takes only --focus, --cwd and a command".into());
+        }
+        if parsed.daemon && (parsed.pane || parsed.name.is_none()) {
+            return Err("--daemon needs a picker NAME, and does not go with --pane".into());
         }
         Ok(parsed)
     }
@@ -294,14 +309,24 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
         json!({"kind": "stream", "options": options})
     }
 
+    /// What opens the picker, beside the message's type and number: the
+    /// window's request, or the daemon's picker and its parameters.
+    pub(crate) fn opening(args: &Args) -> Value {
+        let request = request(args);
+        if args.daemon {
+            return json!({"picker": request["name"], "params": request["params"]});
+        }
+        json!({"request": request})
+    }
+
     pub(super) fn main(args: Vec<String>) -> Result<i32, String> {
         let args = parse(args)?;
         if args.help {
             println!("{USAGE}");
             return Ok(0);
         }
-        let connection = client::connect()?;
-        let request = request(&args);
+        let connection = if args.daemon { client::connect_daemon()? } else { client::connect()? };
+        let opening = opening(&args);
         let items = if args.pane || (args.name.is_some() && !args.stdin) {
             None
         } else {
@@ -312,7 +337,7 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
             }
             Some(read_stdin(args)?)
         };
-        match client::run(connection, request, items)? {
+        match client::run(connection, opening, items)? {
             Outcome::Accepted(value) => {
                 let mut stdout = std::io::stdout().lock();
                 let _ = match value {
@@ -425,6 +450,21 @@ Exit status: 0 selected, 130 cancelled, 2 error.";
             assert!(request_of(&["--pane"]).get("command").is_none());
             assert_eq!(quoted(r#"a "b" c\"#), r#""a \"b\" c\\""#);
             for list in [&["--focus", "files"][..], &["--pane", "--stdin", "x"]] {
+                assert!(parse(list.iter().map(|s| s.to_string()).collect()).is_err());
+            }
+        }
+
+        #[test]
+        fn the_daemon_is_asked_for_its_picker_by_name_with_its_parameters() {
+            let asked = opening(&args(&["--daemon", "-q", "src", "Files", "roots=/tmp"]));
+            assert_eq!(asked["picker"], "Files");
+            assert_eq!(asked["params"]["roots"], "/tmp");
+            assert_eq!(asked["params"]["query"], "src");
+            let cwd = std::env::current_dir().unwrap();
+            assert_eq!(asked["params"]["cwd"], cwd.to_str().unwrap());
+            assert!(asked.get("request").is_none());
+            assert_eq!(opening(&args(&["Files"]))["request"]["kind"], "named");
+            for list in [&["--daemon"][..], &["--daemon", "--pane", "x"]] {
                 assert!(parse(list.iter().map(|s| s.to_string()).collect()).is_err());
             }
         }

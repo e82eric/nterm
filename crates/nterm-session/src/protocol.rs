@@ -81,8 +81,10 @@ pub struct Size {
 pub struct PaneInfo {
     pub pane: PaneId,
     pub pid: u32,
-    /// Windows creation FILETIME of the shell, which with the pid identifies
-    /// it for as long as the machine is up.
+    /// When the shell started, as its machine counts it: a FILETIME on
+    /// Windows, clock ticks since the machine started on Linux. With the pid
+    /// it identifies the shell for as long as the machine is up. Only ever
+    /// compared with another of the same machine's.
     pub creation_time: u64,
     pub command: String,
     pub size: Size,

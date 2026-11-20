@@ -3,7 +3,8 @@
 # Ctrl+Space binding. Ctrl+Space lists what Tab would complete for the word at
 # the cursor in an nterm picker; Enter replaces that word.
 #
-# Source it from ~/.bashrc. It binds Ctrl+Space only in nterm panes,
+# Source it from ~/.bashrc, or source bash/nterm.bash, which does. It binds
+# Ctrl+Space only in nterm panes (a session daemon's, or the window's own),
 # where npick can reach the terminal. Uses bash-completion when it is loaded.
 
 # Split the current command, up to the cursor, into words the way readline does
@@ -241,8 +242,15 @@ __npick_complete() {
         1) choice=${__npick_items[0]#*$'\t'} ;;
         *)
             __npick_redraw_line
-            choice=$(printf '%s\n' "${__npick_items[@]}" |
-                npick --display 1 --value 2 --position Cursor)
+            # A session daemon's shell has the daemon list them, which works
+            # in a window on another machine too; the window's own, the window.
+            if [[ -n ${NTERM_DAEMON-} ]]; then
+                choice=$(printf '%s\n' "${__npick_items[@]}" |
+                    npick --daemon --stdin --display 1 --value 2 items label=Completions position=cursor)
+            else
+                choice=$(printf '%s\n' "${__npick_items[@]}" |
+                    npick --display 1 --value 2 --position Cursor)
+            fi
             local status=$?
             # Clear our copy so bash's redraw starts from an empty line.
             printf '\r\e[K' >/dev/tty
@@ -255,6 +263,6 @@ __npick_complete() {
     READLINE_POINT=$((__npick_start + ${#choice}))
 }
 
-if [[ $- == *i* && -n $NTERM_PICKER_ENDPOINT ]] && command -v npick >/dev/null; then
+if [[ $- == *i* && ( -n ${NTERM_DAEMON-} || -n ${NTERM_PICKER_ENDPOINT-} ) ]] && command -v npick >/dev/null; then
     bind -x '"\C-@": __npick_complete'
 fi

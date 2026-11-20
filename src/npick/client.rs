@@ -2,7 +2,8 @@
 //! authenticate, open one picker, stream items and return its result.
 //!
 //! Included by the `npick` binary and by the Unix server's tests, so it only
-//! uses `super::protocol`, serde_json, crossbeam-channel and getrandom.
+//! uses `super::protocol`, nterm_session, serde_json, crossbeam-channel and
+//! getrandom.
 #[cfg(unix)]
 use super::protocol::{MAX_FRAME, hex, proof};
 use serde_json::{Value, json};
@@ -40,13 +41,45 @@ const MAX_BATCH_ITEMS: usize = 1024;
 const MAX_BATCH_BYTES: usize = MAX_FRAME / 4;
 const POLL: Duration = Duration::from_millis(50);
 
+/// On Unix the shell is a session daemon's, or the window's own: whichever
+/// its environment names. Elsewhere it is always a daemon's.
 #[cfg(unix)]
-pub(crate) struct Connection {
+pub(crate) enum Connection {
+    Pane(Pane),
+    Daemon(Daemon),
+}
+#[cfg(unix)]
+impl Connection {
+    fn send(&mut self, value: &Value) -> Result<(), String> {
+        match self {
+            Self::Pane(pane) => pane.send(value),
+            Self::Daemon(daemon) => daemon.send(value),
+        }
+    }
+    fn poll(&mut self) -> Result<Option<Value>, String> {
+        match self {
+            Self::Pane(pane) => pane.poll(),
+            Self::Daemon(daemon) => daemon.poll(),
+        }
+    }
+    fn received(&mut self) {
+        match self {
+            Self::Pane(pane) => pane.received(),
+            Self::Daemon(daemon) => daemon.received(),
+        }
+    }
+}
+#[cfg(windows)]
+pub(crate) use Daemon as Connection;
+
+/// The pane of a window that runs the shell itself, over its socket.
+#[cfg(unix)]
+pub(crate) struct Pane {
     stream: UnixStream,
     buffer: Vec<u8>,
 }
 #[cfg(unix)]
-impl Connection {
+impl Pane {
     fn send(&mut self, value: &Value) -> Result<(), String> {
         let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
         if bytes.len() > MAX_FRAME {
@@ -117,33 +150,48 @@ fn nonce() -> Result<String, String> {
     Ok(hex(&bytes))
 }
 
-/// Connect and authenticate. `endpoint` is the socket path from
-/// NTERM_PICKER_ENDPOINT, which is also part of the HMAC transcript.
-/// To the pane this shell runs in, which its environment names.
+/// To the pane this shell runs in, which its environment names: by its
+/// session daemon, or else the window's socket, `NTERM_PICKER_ENDPOINT`,
+/// with which it authenticates (the path is part of the HMAC transcript).
 #[cfg(unix)]
 pub(crate) fn connect() -> Result<Connection, String> {
+    if let Some(daemon) = daemon() {
+        return daemon.map(Connection::Daemon);
+    }
     let variable = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let endpoint = variable("NTERM_PICKER_ENDPOINT")
-        .ok_or("not running in an nterm pane (NTERM_PICKER_ENDPOINT is not set)")?;
+        .ok_or("not running in an nterm pane (neither NTERM_DAEMON nor NTERM_PICKER_ENDPOINT is set)")?;
     let token = variable("NTERM_PICKER_TOKEN").ok_or("NTERM_PICKER_TOKEN is not set")?;
-    connect_to(&endpoint, &token)
+    connect_to(&endpoint, &token).map(Connection::Pane)
+}
+
+#[cfg(windows)]
+pub(crate) fn connect() -> Result<Connection, String> {
+    daemon().ok_or("not running in an nterm pane whose shell the session daemon runs")?
+}
+
+/// To the session daemon that runs this shell, for a picker it runs itself:
+/// see `nterm_session::shell::Program::pick`.
+pub(crate) fn connect_daemon() -> Result<Connection, String> {
+    let program = nterm_session::shell::Program::pick_from_environment()
+        .ok_or("not running in an nterm pane whose shell a session daemon runs (NTERM_DAEMON is not set)")?;
+    let daemon = program.map(Daemon).map_err(|error| format!("unable to reach the session daemon: {error}"))?;
+    #[cfg(unix)]
+    let daemon = Connection::Daemon(daemon);
+    Ok(daemon)
 }
 
 /// The session daemon runs this shell and knows which pane shows it. It
 /// has checked who is asking, so there is nothing to prove to the pane.
-#[cfg(windows)]
-pub(crate) struct Connection(nterm_session::shell::Program);
+pub(crate) struct Daemon(nterm_session::shell::Program);
 
-#[cfg(windows)]
-pub(crate) fn connect() -> Result<Connection, String> {
-    nterm_session::shell::Program::from_environment()
-        .ok_or("not running in an nterm pane whose shell the session daemon runs")?
-        .map(Connection)
-        .map_err(|error| format!("unable to reach the session daemon: {error}"))
+/// The daemon whose shell this is, if the environment names one.
+fn daemon() -> Option<Result<Daemon, String>> {
+    let program = nterm_session::shell::Program::from_environment()?;
+    Some(program.map(Daemon).map_err(|error| format!("unable to reach the session daemon: {error}")))
 }
 
-#[cfg(windows)]
-impl Connection {
+impl Daemon {
     fn send(&mut self, value: &Value) -> Result<(), String> {
         let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
         if bytes.len() > MAX_FRAME {
@@ -168,14 +216,14 @@ impl Connection {
 }
 
 #[cfg(unix)]
-fn connect_to(endpoint: &str, token: &str) -> Result<Connection, String> {
+fn connect_to(endpoint: &str, token: &str) -> Result<Pane, String> {
     let stream = UnixStream::connect(endpoint)
         .map_err(|e| format!("unable to connect to {endpoint}: {e}"))?;
     stream
         .set_read_timeout(Some(POLL))
         .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(5))))
         .map_err(|e| e.to_string())?;
-    let mut connection = Connection {
+    let mut connection = Pane {
         stream,
         buffer: Vec::new(),
     };
@@ -268,14 +316,20 @@ fn next_batch(items: &crossbeam_channel::Receiver<Item>, next_id: &mut u64) -> O
     Some(batch)
 }
 
-/// Open `request` (the `request` object of an `open` message) and wait for
-/// its result. Stream requests send `items` until the channel closes.
+/// Open a picker with `opening`, the fields of an `open` message beside its
+/// type and number (`request` for the window, `picker` and `params` for the
+/// daemon), and wait for its result. A picker of streamed rows is sent
+/// `items` until the channel closes.
 pub(crate) fn run(
     mut connection: Connection,
-    request: Value,
+    opening: Value,
     items: Option<crossbeam_channel::Receiver<Item>>,
 ) -> Result<Outcome, String> {
-    connection.send(&json!({"type":"open","request_id":REQUEST_ID,"request":request}))?;
+    let mut open = json!({"type":"open","request_id":REQUEST_ID});
+    if let (Value::Object(open), Value::Object(opening)) = (&mut open, opening) {
+        open.extend(opening);
+    }
+    connection.send(&open)?;
     let mut opened = false;
     let mut in_flight = false;
     let mut ended = items.is_none();
