@@ -438,9 +438,8 @@ return {
 
 `terminal.clipboard_read` is `"allow"` without it, and each remote's
 `"deny"`: any program running as you there could read the clipboard, without
-your asking. The pane shows a note each time the clipboard is read. Only a
-program running on the shell's machine as the daemon's user can ask; text a
-program prints cannot.
+your asking. Only a program running on the shell's machine as the daemon's
+user can ask; text a program prints cannot.
 
 For Neovim, where the shell runs:
 

@@ -131,8 +131,6 @@ pub(crate) enum Event {
     /// The session daemon will not run the picker the pane asked it for
     /// with the number `ask`.
     Refused { ask: u64, message: String },
-    /// A program in the pane's shell was given the clipboard's text.
-    ClipboardRead,
 }
 
 pub(crate) struct Session {

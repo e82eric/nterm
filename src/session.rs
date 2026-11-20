@@ -1002,9 +1002,8 @@ fn said(daemon: &Arc<Daemon>, channel: u32, bytes: &[u8]) {
     let event = match what_was_said(bytes, program.relayed, program.reading, program.request.is_some()) {
         Said::Clipboard { request_id } => {
             program.reading = true;
-            let link = program.link.clone();
             drop(programs);
-            return read_clipboard(daemon.clone(), channel, link, request_id);
+            return read_clipboard(daemon.clone(), channel, request_id);
         }
         Said::Broken => Err(relay::Broken),
         Said::Picker => match &mut program.request {
@@ -1036,8 +1035,8 @@ const CLIPBOARD_LIMIT: usize = crate::picker::pipe::MAX_FRAME - 1024;
 /// Answer a program in `link`'s shell that asked for the clipboard's text,
 /// as `nterm-daemon clipboard paste` does: from a thread of its own, as the
 /// clipboard can be slow to open. Whether it may is the configuration's, by
-/// where its shell runs. The pane says when it was given it.
-fn read_clipboard(daemon: Arc<Daemon>, channel: u32, link: Arc<Link>, request_id: String) {
+/// where its shell runs.
+fn read_clipboard(daemon: Arc<Daemon>, channel: u32, request_id: String) {
     let ending = daemon.clone();
     let read = move || {
         let allowed = clipboard_read(&daemon.client.place);
@@ -1046,11 +1045,7 @@ fn read_clipboard(daemon: Arc<Daemon>, channel: u32, link: Arc<Link>, request_id
             // A clipboard of something else, or of nothing, has no text.
             Ok(clip.text.unwrap_or_default())
         };
-        let (reply, given) = clipboard_reply(&request_id, allowed, text);
-        if given {
-            let _ = link.requests.0.send(Event::ClipboardRead);
-            link.wake_pane();
-        }
+        let reply = clipboard_reply(&request_id, allowed, text);
         if let Ok(bytes) = serde_json::to_vec(&reply) {
             daemon.send(Frame::Shell { channel, bytes });
         }
@@ -1062,16 +1057,15 @@ fn read_clipboard(daemon: Arc<Daemon>, channel: u32, link: Arc<Link>, request_id
     }
 }
 
-/// The answer to request `request_id` for the clipboard, and whether it
-/// gives the clipboard's text. `text` is asked for that only when `allowed`.
+/// The answer to request `request_id` for the clipboard. `text` is asked
+/// for the clipboard's text only when `allowed`.
 fn clipboard_reply(
     request_id: &str,
     allowed: Result<(), String>,
     text: impl FnOnce() -> Result<String, String>,
-) -> (serde_json::Value, bool) {
+) -> serde_json::Value {
     let failed = |code: &str, message: String| {
-        let reply = serde_json::json!({"type":"result","request_id":request_id,"status":"error","code":code,"message":message});
-        (reply, false)
+        serde_json::json!({"type":"result","request_id":request_id,"status":"error","code":code,"message":message})
     };
     if let Err(setting) = allowed {
         return failed("denied", format!("reading the clipboard is not allowed: {setting}"));
@@ -1081,7 +1075,7 @@ fn clipboard_reply(
         Ok(text) if serde_json::to_string(&text).map_or(true, |json| json.len() > CLIPBOARD_LIMIT) => {
             failed("result_limit", format!("the clipboard's text is over {CLIPBOARD_LIMIT} bytes"))
         }
-        Ok(text) => (serde_json::json!({"type":"result","request_id":request_id,"status":"ok","text":text}), true),
+        Ok(text) => serde_json::json!({"type":"result","request_id":request_id,"status":"ok","text":text}),
     }
 }
 
@@ -2414,19 +2408,18 @@ mod tests {
 
     #[test]
     fn the_clipboard_is_answered_with_its_text_or_why_not() {
-        let (reply, given) = clipboard_reply("c", Ok(()), || Ok("a\r\nb".into()));
+        let reply = clipboard_reply("c", Ok(()), || Ok("a\r\nb".into()));
         assert_eq!(reply, serde_json::json!({"type":"result","request_id":"c","status":"ok","text":"a\r\nb"}));
-        assert!(given);
         // Denied: the clipboard is not even opened.
-        let (reply, given) = clipboard_reply("c", Err("the setting".into()), || panic!("read when denied"));
-        assert_eq!((reply["status"].as_str(), reply["code"].as_str(), given), (Some("error"), Some("denied"), false));
+        let reply = clipboard_reply("c", Err("the setting".into()), || panic!("read when denied"));
+        assert_eq!((reply["status"].as_str(), reply["code"].as_str()), (Some("error"), Some("denied")));
         assert!(reply["message"].as_str().unwrap().ends_with("the setting"));
-        let (reply, given) = clipboard_reply("c", Ok(()), || Err("held".into()));
-        assert_eq!((reply["code"].as_str(), reply["message"].as_str(), given), (Some("unavailable"), Some("held"), false));
+        let reply = clipboard_reply("c", Ok(()), || Err("held".into()));
+        assert_eq!((reply["code"].as_str(), reply["message"].as_str()), (Some("unavailable"), Some("held")));
         // More than an answer holds.
-        let (reply, given) = clipboard_reply("c", Ok(()), || Ok("x".repeat(CLIPBOARD_LIMIT)));
-        assert_eq!((reply["code"].as_str(), given), (Some("result_limit"), false));
-        let (reply, _) = clipboard_reply("c", Ok(()), || Ok("x".repeat(CLIPBOARD_LIMIT - 2)));
+        let reply = clipboard_reply("c", Ok(()), || Ok("x".repeat(CLIPBOARD_LIMIT)));
+        assert_eq!(reply["code"].as_str(), Some("result_limit"));
+        let reply = clipboard_reply("c", Ok(()), || Ok("x".repeat(CLIPBOARD_LIMIT - 2)));
         assert_eq!(reply["status"], "ok");
     }
 
