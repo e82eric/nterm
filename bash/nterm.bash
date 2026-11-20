@@ -19,8 +19,14 @@ case ";${PROMPT_COMMAND-};" in
     *) PROMPT_COMMAND="__nterm_report_pwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
 esac
 
-# Ctrl+Space: what Tab would complete for the word at the cursor, in a picker.
+# npick is installed beside this (PREFIX/bin, this being PREFIX/share/nterm/bash).
+# ~/.profile may read ~/.bashrc before it puts ~/.local/bin on the PATH.
 __nterm_here=${BASH_SOURCE[0]%/*}
+if ! command -v npick >/dev/null && [[ -x $__nterm_here/../../../bin/npick ]]; then
+    PATH=$(cd "$__nterm_here/../../../bin" && pwd):$PATH
+fi
+
+# Ctrl+Space: what Tab would complete for the word at the cursor, in a picker.
 if [[ -r $__nterm_here/npick-completion.bash ]]; then
     # shellcheck source=../npick-completion.bash
     . "$__nterm_here/npick-completion.bash"
