@@ -1657,6 +1657,10 @@ mod tests {
             assert(#assert(snippets.inputs(path .. '.missing')) == 0)
             assert(not pcall(snippets.picker), 'the picker needs path')
             assert(not pcall(snippets.save, {{}}), 'save needs path')
+            -- A snippet of lines: one row, and the preview has the lines.
+            assert(snippets.row('a {{\r\n  b\n}}') == 'a {{ \u{{21B5}}   b \u{{21B5}} }}')
+            local shown = snippets.preview().resolve({{ value = 'a {{\r\n  b\r}}' }})
+            assert(shown.type == 'Text' and shown.text == 'a {{\n  b\n}}' and shown.syntax == 'PowerShell')
             return {{ pickers = {{
               Snippets = snippets.picker {{ path = path }},
               Elsewhere = snippets.picker {{ path = path, position = 'Center' }},
@@ -1682,6 +1686,14 @@ mod tests {
         // Read each time it opens: a snippet saved since is there.
         std::fs::write(&path, r#"{"snippets":[{"input":"new"}]}"#).unwrap();
         assert_eq!(provider.read().unwrap()[0].value, "new");
+        // Lines are one row; what is typed is the snippet as it was saved.
+        std::fs::write(&path, r#"{"snippets":[{"input":"Get-Command {\r\n $_\n}"}]}"#).unwrap();
+        let lines = provider.read().unwrap().remove(0);
+        assert_eq!(lines.text, "Get-Command { \u{21B5}  $_ \u{21B5} }");
+        assert_eq!(lines.value, "Get-Command {\r\n $_\n}");
+        // The preview is there, and hidden until it is asked for.
+        assert!(options.preview.is_some());
+        assert!(!options.preview_visible);
         // Enter types the snippet in place of the word.
         let commands = options
             .callback

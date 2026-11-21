@@ -18,6 +18,10 @@
 --     },
 --   }
 --
+-- A snippet may have lines. Its row shows it on one, each line end as a
+-- mark, and the preview shows it as it is typed; the preview is hidden until
+-- it is asked for (preview_visible = true opens the picker showing it).
+--
 -- Options of both: path, the file (needed). The picker also takes word (in
 -- place of M.word) and the fields any picker has, which are passed on as
 -- they are: position, preview_visible, sort, preview, action, keys.
@@ -118,6 +122,30 @@ function M.word(line_before_cursor)
   return input:match("(%S+)$") or ""
 end
 
+-- What a row shows in place of a line end.
+M.line_end = " \u{21B5} "
+
+-- A snippet as its row shows it: on one line.
+function M.row(input)
+  return (input:gsub("\r\n", "\n"):gsub("[\r\n]", M.line_end))
+end
+
+-- The preview: the snippet on its own lines, as it is typed. Options: syntax
+-- (the language, "PowerShell"; the names are bat's, and "PlainText" is
+-- none) and theme (the colours).
+function M.preview(options)
+  options = options or {}
+  local syntax = options.syntax or "PowerShell"
+  local theme = options.theme
+  return {
+    type = "Dynamic",
+    resolve = function(item)
+      local text = item.value:gsub("\r\n", "\n"):gsub("\r", "\n")
+      return { type = "Text", text = text, syntax = syntax, theme = theme }
+    end,
+  }
+end
+
 local passed = { "position", "preview_visible", "sort", "preview", "action", "keys" }
 
 -- The picker of the file's snippets, read each time it opens. It opens
@@ -132,11 +160,13 @@ function M.picker(options)
       type = "Items",
       initial_query = word,
       position = "Cursor",
+      preview = M.preview(),
+      preview_visible = false,
       items = function()
         local inputs = assert(M.inputs(path))
         local items = {}
         for _, input in ipairs(inputs) do
-          items[#items + 1] = { text = input, value = input }
+          items[#items + 1] = { text = M.row(input), value = input }
         end
         return items
       end,
