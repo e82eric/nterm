@@ -202,7 +202,11 @@ impl Ui {
             mirror: None,
             sessions: None,
         };
-        ui.send(Control::Hello { protocol: PROTOCOL_VERSION, ghostty: GHOSTTY_REVISION.into() });
+        ui.send(Control::Hello {
+            protocol: PROTOCOL_VERSION,
+            ghostty: GHOSTTY_REVISION.into(),
+            snapshot: nterm_daemon::vt::snapshot_version(),
+        });
         ui.welcome = ui.control(|control| matches!(control, Control::Welcome { .. }));
         ui
     }
@@ -376,10 +380,15 @@ fn spawn_type_resize_disconnect_reconnect_snapshot() {
 fn lifecycle(session: &str) {
     let session = session.to_owned();
     let mut ui = Ui::connect(&session);
-    let Control::Welcome { protocol, ghostty, pid, session: named, files, machine, user } = ui.welcome.clone()
+    let Control::Welcome { protocol, ghostty, snapshot, pid, session: named, files, machine, user } =
+        ui.welcome.clone()
     else {
         panic!("no welcome");
     };
+    // The version at the start of the snapshots it sends.
+    let mut terminal = Terminal::new(size(80, 24), &TerminalSettings::default()).unwrap();
+    assert_eq!(terminal.snapshot()[8..10], snapshot.to_le_bytes());
+    assert_ne!(snapshot, 0);
     assert!(files, "the daemon says it keeps files");
     // And where it is: this machine, as this user, here or through a relay.
     if cfg!(windows) {

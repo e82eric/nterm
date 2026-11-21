@@ -167,7 +167,14 @@ pub struct PickerRow {
 pub enum Control {
     // UI to daemon.
     /// First message on a connection.
-    Hello { protocol: u32, ghostty: String },
+    /// `snapshot` is the version of ghostty's snapshot format the UI reads,
+    /// and `ghostty` the revision it was built from, which is only logged.
+    Hello {
+        protocol: u32,
+        ghostty: String,
+        #[serde(default)]
+        snapshot: u16,
+    },
     /// Applies to panes made afterwards and to every pane that exists.
     Settings { settings: TerminalSettings },
     Spawn {
@@ -283,7 +290,14 @@ pub enum Control {
     // Daemon to UI.
     Welcome {
         protocol: u32,
+        /// The ghostty revision the daemon was built from. Nothing is
+        /// checked with it.
         ghostty: String,
+        /// The version of ghostty's snapshot format the daemon writes. A UI
+        /// uses only a daemon whose version is its own. A daemon from
+        /// before it leaves this out: 0, which is no version.
+        #[serde(default)]
+        snapshot: u16,
         pid: u32,
         session: String,
         /// Whether the daemon keeps files a UI sends it: see `Frame::File`.
@@ -656,7 +670,9 @@ mod tests {
         round_trip(Frame::File { request: 3, extension: "png".into(), bytes: vec![137, 80, 0, 255] });
         round_trip(Frame::File { request: 4, extension: String::new(), bytes: vec![] });
         round_trip(Control::FileKept { request: 3, path: r"C:\a\b.png".into() }.into());
-        round_trip(Control::Hello { protocol: PROTOCOL_VERSION, ghostty: "abc".into() }.into());
+        round_trip(
+            Control::Hello { protocol: PROTOCOL_VERSION, ghostty: "abc".into(), snapshot: 1 }.into(),
+        );
         round_trip(
             Control::Spawn {
                 request: 1,
@@ -709,11 +725,15 @@ mod tests {
         let welcome = br#"{"type":"welcome","protocol":16,"ghostty":"g","pid":1,"session":"s"}"#;
         let mut body = vec![KIND_CONTROL];
         body.extend_from_slice(welcome);
-        let Frame::Control(Control::Welcome { files, machine, user, .. }) = Frame::decode(&body).unwrap() else {
+        let Frame::Control(Control::Welcome { files, machine, user, snapshot, .. }) =
+            Frame::decode(&body).unwrap()
+        else {
             panic!("not a welcome");
         };
         // Nor does it say where it is.
         assert!(!files && machine.is_empty() && user.is_empty());
+        // Nor what snapshots it writes, and no library's version is 0.
+        assert_eq!(snapshot, 0);
     }
 
     #[test]

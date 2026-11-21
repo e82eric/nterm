@@ -803,9 +803,11 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
     let began = std::time::Instant::now();
     let (session, program) = target()?;
     let other = |message: String| io::Error::other(message);
-    // A daemon from another build cannot be trusted to speak the same
-    // snapshot format. One with no panes is replaced; one with panes is left
-    // alone and not used.
+    // A daemon is used when it speaks this build's protocol and its library
+    // writes the snapshot format this build's reads. Which ghostty revision
+    // either was built from does not matter. A daemon that differs and has
+    // no panes is replaced; one with panes is left alone and not used.
+    let reads = unsafe { ghostty_ffi::ghostty_snapshot_format_version() };
     let remote = match &client.place {
         Place::Here => None,
         place => Some(place.remote().ok_or_else(|| other("that remote is not known".into()))?),
@@ -827,10 +829,19 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
         Frame::Control(Control::Hello {
             protocol: PROTOCOL_VERSION,
             ghostty: GHOSTTY_REVISION.to_owned(),
+            snapshot: reads,
         })
         .write(&mut writer)?;
-        let Frame::Control(Control::Welcome { protocol, ghostty, files, machine, user, pid, .. }) =
-            Frame::read(&mut reader)?
+        let Frame::Control(Control::Welcome {
+            protocol,
+            ghostty,
+            snapshot,
+            files,
+            machine,
+            user,
+            pid,
+            ..
+        }) = Frame::read(&mut reader)?
         else {
             return Err(other("the daemon did not answer the greeting".into()));
         };
@@ -842,15 +853,15 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
                 _ => {}
             }
         };
-        if protocol != PROTOCOL_VERSION || ghostty != GHOSTTY_REVISION {
+        if protocol != PROTOCOL_VERSION || snapshot != reads {
             let panes: usize = sessions.iter().map(|session| session.panes.len()).sum();
             // Another machine's daemon is its own build's, and the one that
             // took its place would be too.
             if let Some(remote) = &remote {
                 return Err(other(format!(
-                    "the nterm on {} is another build (protocol {protocol}, ghostty \
-                     {ghostty}; this build has protocol {PROTOCOL_VERSION}, ghostty \
-                     {GHOSTTY_REVISION})",
+                    "the nterm on {} is another build (protocol {protocol}, snapshot \
+                     format {snapshot}; this build has protocol {PROTOCOL_VERSION}, \
+                     snapshot format {reads})",
                     remote.name
                 )));
             }
@@ -863,8 +874,8 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
             }
             return Err(other(format!(
                 "a daemon from another build is running with {panes} panes \
-                 (protocol {protocol}, ghostty {ghostty}; this build has \
-                 protocol {PROTOCOL_VERSION}, ghostty {GHOSTTY_REVISION})"
+                 (protocol {protocol}, snapshot format {snapshot}; this build \
+                 has protocol {PROTOCOL_VERSION}, snapshot format {reads})"
             )));
         }
         let how = if connection.relayed() {
@@ -875,7 +886,7 @@ fn open(number: u64, client: &Arc<Client>) -> io::Result<Arc<Daemon>> {
         let who = who(&user, &machine);
         log(format_args!(
             "connection {number} to {}: connected {how} after {}, daemon pid {pid}{}, \
-             protocol {protocol}, ghostty {ghostty}",
+             protocol {protocol}, snapshot format {snapshot}, ghostty {ghostty}",
             place_logged(&client.place),
             nterm_session::log::duration(began.elapsed()),
             who.as_deref().map(|who| format!(" as {who}")).unwrap_or_default(),

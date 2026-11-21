@@ -481,9 +481,10 @@ pub fn run(options: Options) -> io::Result<()> {
         pickers: Pickers::new(options.pickers.clone()),
     });
     log(format_args!(
-        "serving session {:?}, pid {}, ghostty {GHOSTTY_REVISION}, conpty {}",
+        "serving session {:?}, pid {}, snapshot format {}, ghostty {GHOSTTY_REVISION}, conpty {}",
         session.name,
         std::process::id(),
+        crate::vt::snapshot_version(),
         conpty::source()
     ));
 
@@ -672,13 +673,14 @@ fn converse(
     if let Frame::Control(Control::Pick { pane }) = first {
         return pick(session, connection, &mut reader, pane, outbox);
     }
-    let Frame::Control(Control::Hello { protocol, ghostty }) = first else {
+    let Frame::Control(Control::Hello { protocol, ghostty, snapshot }) = first else {
         fail(None, "expected hello".into());
         return Err(io::Error::new(io::ErrorKind::InvalidData, "no hello"));
     };
     send(Control::Welcome {
         protocol: PROTOCOL_VERSION,
         ghostty: GHOSTTY_REVISION.to_owned(),
+        snapshot: crate::vt::snapshot_version(),
         pid: std::process::id(),
         session: session.name.clone(),
         files: true,
@@ -690,7 +692,7 @@ fn converse(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "protocol version"));
     }
     log(format_args!(
-        "client {id} (pid {}) connected, ghostty {ghostty}",
+        "client {id} (pid {}) connected, snapshot format {snapshot}, ghostty {ghostty}",
         connection.peer_pid()
     ));
     session.clients.lock().unwrap().insert(id, outbox.clone());

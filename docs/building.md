@@ -79,10 +79,12 @@ and writes `~/.local/share/applications/nterm.desktop`. Pass
 `--skip-build` to install the existing build. Running instances are unaffected.
 
 Every pane's shell runs in `nterm-daemon`, which both scripts put beside
-`nterm`; the window starts it when it is not running. A window replaces a
-running daemon from another build only once that daemon has no shells: until
-then the window says the daemon is from another build and cannot use it. For
-the
+`nterm`; the window starts it when it is not running. A window uses a running
+daemon from another build when the two speak the same protocol and their
+ghostty libraries use the same snapshot format, whichever ghostty commit each
+was built from. Otherwise it replaces that daemon only once it has no shells:
+until then the window says the daemon is from another build and cannot use
+it. For the
 bash bindings (the folder a pane is in, and Ctrl+Space completion), add this
 to `~/.bashrc`:
 

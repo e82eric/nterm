@@ -439,6 +439,9 @@ unsafe extern "C" {
     pub(crate) fn nterm_host_output(host: *mut Host, bytes: *const u8, len: usize);
     pub(crate) fn nterm_host_resized(host: *mut Host, cols: u16, rows: u16);
     pub(crate) fn nterm_host_resync(host: *mut Host, snapshot: *const u8, len: usize);
+    /// The version of the snapshot format the library reads: what a
+    /// daemon's must be for its snapshots to be passed to the library.
+    pub(crate) fn ghostty_snapshot_format_version() -> u16;
     pub(crate) fn nterm_window_attach(window: *mut c_void);
     pub(crate) fn nterm_window_detach(window: *mut c_void);
     pub(crate) fn nterm_host_resize(host: *mut Host, width: u32, height: u32, scale: f64);

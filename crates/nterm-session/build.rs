@@ -1,6 +1,7 @@
 //! Records the ghostty revision this build parses and encodes with. The two
-//! ends of a session compare it, because the snapshot format is only stable
-//! within one revision.
+//! ends of a session tell it to each other and log it. What decides whether
+//! they can work together is the snapshot format version each one's library
+//! reports, not this.
 use std::{path::PathBuf, process::Command};
 
 fn main() {

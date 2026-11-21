@@ -130,11 +130,24 @@ unsafe extern "C" {
     fn ghostty_formatter_format(formatter: *mut c_void, writer: Writer) -> i32;
     fn ghostty_formatter_free(formatter: *mut c_void);
     fn ghostty_sys_set(option: i32, value: *const c_void) -> i32;
+    fn ghostty_build_info(data: i32, out: *mut c_void) -> i32;
     fn ghostty_alloc(allocator: *const c_void, len: usize) -> *mut u8;
     fn ghostty_free(allocator: *const c_void, ptr: *mut u8, len: usize);
 }
 
 const SYS_OPT_DECODE_PNG: i32 = 2;
+const BUILD_INFO_SNAPSHOT_VERSION: i32 = 20;
+
+/// The version of the snapshot format this build's library writes: the
+/// number after the magic at the start of every snapshot. A UI can use the
+/// daemon's snapshots when its own library's is the same.
+pub fn snapshot_version() -> u16 {
+    let mut version = 0u16;
+    let result =
+        unsafe { ghostty_build_info(BUILD_INFO_SNAPSHOT_VERSION, (&raw mut version).cast()) };
+    assert_eq!(result, 0, "ghostty_build_info failed");
+    version
+}
 
 /// GhosttySysImage: 8-bit RGBA, row by row from the top left.
 #[repr(C)]

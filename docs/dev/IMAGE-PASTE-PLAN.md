@@ -475,8 +475,8 @@ Tests
    (Ctrl+Shift+P). The path appears at the prompt; open the file and look.
 5. Repeat in a local window, with text on the clipboard, with an empty
    clipboard, and against a daemon built before this change (expect the
-   "older than this window" message at once). An old daemon must be built
-   from the same ghostty revision, or the window refuses it for that first.
+   "older than this window" message at once). An old daemon must use the
+   same snapshot format, or the window refuses it for that first.
 6. The `SendFile` picker and `PasteFiles` from "The Lua API", with a file of
    a few MB, and two files copied in Explorer.
 7. Finally in `claude` in that pane: the picture attaches.
