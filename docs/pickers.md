@@ -17,7 +17,7 @@ use the shortcuts below; theme selection is also available in the command palett
 | `words` | Unique whitespace-delimited scrollback words (`\S+`); Enter pastes the word without submitting it. | Bottom, preview hidden; no default shortcut ([nterm.lua](../nterm.lua) binds Ctrl+Shift+P, [nterm.example.lua](../nterm.example.lua) Ctrl+Shift+.). |
 | `themes` | Installed user and bundled Ghostty themes; Enter applies the selected theme for the session. | Cursor, score sorting, preview hidden; choose **Choose theme** in the palette. |
 | `command_palette` | Application actions and configured pickers; Enter dispatches the selected action. | Center, workspace scope, preview hidden; Ctrl+Shift+P. |
-| `prompts` | Commands entered at prompts, found by OSC 133 marks and [prompt patterns](configuration.md#prompt-patterns); Enter enters copy mode at the selected command. | Bottom, scrollback preview visible; no default shortcut ([nterm.example.lua](../nterm.example.lua) binds Ctrl+Shift+Z). |
+| `prompts` | Commands entered at prompts, found by OSC 133 marks and [prompt patterns](configuration.md#prompt-patterns); Enter enters copy mode at the selected command. | Bottom, scrollback preview visible; no default shortcut ([nterm.example.lua](../nterm.example.lua) binds a picker of its own like it, `command_history`, to Ctrl+Shift+Z). |
 
 The line-split picker is a contextual built-in: Ctrl+B opens it for the selected
 scrollback result or copy mode cursor row. Its `line_break` settings control
@@ -116,7 +116,8 @@ prompt is a candidate. Soft-wrapped rows are split individually.
 ## Command palette
 
 The command palette is a named picker with `type = "CommandPalette"`. The default
-bindings and [nterm.example.lua](../nterm.example.lua) bind it to **Ctrl+Shift+P**;
+bindings bind it to **Ctrl+Shift+P**, which
+[nterm.example.lua](../nterm.example.lua) leaves as it is;
 [nterm.lua](../nterm.lua) uses **Ctrl+Shift+Space**. Type to filter actions,
 use the arrow keys to select one, and press Enter to run it. Escape closes the
 palette and preserves the terminal's current copy mode and cursor.
@@ -939,18 +940,19 @@ terminal snapshots, and cancellation leaves existing copy mode intact.
 
 ## Codex suggestions
 
-The samples define `CodexSuggestions`: [nterm.lua](../nterm.lua) binds it to
-**Ctrl+Shift+K** and [nterm.example.lua](../nterm.example.lua) to **Ctrl+Shift+A**. It uses the last `#` in the text before the cursor to identify
+[nterm.lua](../nterm.lua) defines `CodexSuggestions` and binds it to
+**Ctrl+Shift+K**. It uses the last `#` in the text before the cursor to identify
 editable input, sends that row and recent terminal context to `codex exec`, and
 streams ten suggestions into a cursor-positioned picker. Enter replaces the input
 before the cursor with the selected suggestion; it does not execute the command.
 The model and CLI arguments are configured in the Lua factory.
 
-[nterm.example.lua](../nterm.example.lua) also defines `ClaudeSuggestions`
-(**Ctrl+Shift+L**), which sends the same prompt to Claude Haiku with
-`claude --print --model claude-haiku-5-5 --tools ""`. Both pickers come from
-its `command_suggestions(label, args)` helper, where `args` turns the prompt
-into the command line to run.
+[nterm.example.lua](../nterm.example.lua) asks Claude instead, with the
+`nterm.claude` module (see `lua/nterm/claude.lua`): `Suggest`
+(**Ctrl+Shift+U**) asks in a prompt of its own what you want done, with no
+`#`, and lists commands from Claude Haiku that do it, and `Ask`
+(**Ctrl+Shift+A**) shows Claude's answer to a question as it is written. Both
+send the recent terminal rows with what is asked.
 
 Picker factories receive `context.recent_lines`: up to ten recent nonblank terminal
 rows, in chronological order, read from at most the last 256 snapshot rows.

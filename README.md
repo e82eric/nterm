@@ -98,9 +98,10 @@ keys.
     mode.
   - The `ic` and `ac` text objects: `yic` / `vic` copy or select a command's
     output, and `yac` / `vac` include its prompt.
-  - The built-in `prompts` picker, which [nterm.example.lua](nterm.example.lua)
-    binds to Ctrl+Shift+Z. It lists the commands entered at every prompt with a
-    scrollback preview, and Enter opens copy mode at the chosen one.
+  - The built-in `prompts` picker. It lists the commands entered at every
+    prompt with a scrollback preview, and Enter opens copy mode at the chosen
+    one. [nterm.example.lua](nterm.example.lua) binds a picker of its own
+    like it, `command_history`, to Ctrl+Shift+Z.
 
   Marks are exact, but only shells configured to print them send them. Patterns
   cover programs that don't: the defaults match PowerShell, CDB and WinDbg
@@ -153,25 +154,29 @@ restarting.
 #### Example: fzf-style shell pickers
 
 [profile.example.ps1](profile.example.ps1) binds PSReadLine keys that open
-named pickers from [nterm.example.lua](nterm.example.lua) through the
-[shell pipe](docs/picker-pipe.md), then edit the command line with the result:
+the pickers of [nterm-daemon.example.lua](nterm-daemon.example.lua) through
+the [shell pipe](docs/picker-pipe.md), then edit the command line with the
+result. The session daemon runs them on the machine the shell is on, so they
+work the same in a workspace on another machine:
 
 | Key | Picker | Result |
 | --- | --- | --- |
 | Ctrl+O | Directories under the current directory | Runs `Set-Location` to the chosen directory |
 | Ctrl+T | Files under the current directory, with a preview | Inserts the quoted path at the cursor |
 | Alt+R | PowerShell history, newest first, filtered by the current line | Replaces the line with the chosen command |
-| Ctrl+Shift+G | `rg` matches for the current line, previewed at the matching line | Replaces the line with `nvim +LINE 'PATH'` |
 
-Alt+O and Alt+T do the same as Ctrl+O and Ctrl+T over the roots passed to the
-profile, and Ctrl+Space picks from PowerShell's tab completions, with
-`Get-Help` as the preview. To use them as they are, start nterm with
-`nterm.example.lua` and dot-source the profile from your `$PROFILE`:
-`. C:\path\to\nterm\profile.example.ps1`.
+Ctrl+Space picks from PowerShell's tab completions, with `Get-Help` as the
+preview, and the profile turns on the prompt marks. Text search is
+a key of [nterm.example.lua](nterm.example.lua) itself: Ctrl+Shift+G asks for
+text, shows `rg`'s matches for it, and Enter opens the chosen one in `nvim`
+at its line. To use them as they are, start nterm with `nterm.example.lua`,
+copy `nterm-daemon.example.lua` to `~/nterm-daemon.lua`, and dot-source the
+profile from your `$PROFILE`: `. C:\path\to\nterm\profile.example.ps1`.
 
 <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/fzf.gif" width="800" alt="Captioned fzf-style pickers demo: Ctrl+O changes to src\terminal, Ctrl+T inserts the path of workspace.rs after showing its preview, Alt+R finds cargo test in the history, and Ctrl+Shift+G ripgreps for default_layout, previews a match, and opens it in nvim at that line">
 
-Each binding has two halves. In Lua, a named picker and the pipe allowlist:
+A key can also open a picker of the window's own configuration. That has two
+halves. In Lua, a named picker and the pipe allowlist:
 
 ```lua
 return {
@@ -210,10 +215,11 @@ Set-PSReadLineKeyHandler -Chord Ctrl+o -ScriptBlock {
 }
 ```
 
-The other bindings follow the same pattern: the ripgrep picker is a Command
-source that runs `rg` with the typed text, and the history picker is a File
-source over PSReadLine's history file. On Linux, `npick` opens named pickers
-from bash; see [Opening pickers from the shell](docs/picker-pipe.md).
+The daemon's pickers are made from the same parts, in `nterm-daemon.lua`: the
+ripgrep picker is a Command source that runs `rg` with the text it is given,
+and the history picker is a File source over PSReadLine's history file. On
+Linux, `npick` opens pickers from bash; see
+[Opening pickers from the shell](docs/picker-pipe.md).
 
 #### Example: snippets
 
@@ -226,7 +232,8 @@ the selected snippet.
 
 <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/snippets.gif" width="800" alt="Captioned snippets demo: a git log command is selected in copy mode and saved with Ctrl+Shift+S, then typing git and pressing Ctrl+Shift+B opens the snippets picker, filtering by search selects the saved command, and Enter puts it at the prompt and runs it">
 
-A trimmed version, without the sample's error handling:
+The sample takes both from the bundled `nterm.snippets` module. A trimmed
+version of what it does, without its error handling:
 
 ```lua
 local snippets_path = os.getenv("USERPROFILE") .. "/ghostty-snippets.json"
@@ -286,12 +293,12 @@ The snippets file must exist first; start it as `{"snippets": []}`.
 
 #### Example: command suggestions from Claude Code
 
-[nterm.example.lua](nterm.example.lua) has a `ClaudeSuggestions` picker that
-asks Claude Haiku for commands. At the prompt, type `#` and describe the command
-or start writing it, then press Ctrl+Shift+L. The picker sends the text after
-the `#` and recent terminal output to `claude --print`, which streams ten
-suggestions into the picker as they arrive. Enter replaces the `#` and your text
-with the selected command; it does not run it.
+A picker factory can ask Claude Haiku for commands. With the `ClaudeSuggestions`
+picker below, type `#` at the prompt and describe the command or start writing
+it, then press Ctrl+Shift+L. The picker sends the text after the `#` and recent
+terminal output to `claude --print`, which streams ten suggestions into the
+picker as they arrive. Enter replaces the `#` and your text with the selected
+command; it does not run it.
 
 <img src="https://raw.githubusercontent.com/e82eric/nterm-demo/main/claude-suggestions.gif" width="800" alt="Captioned Claude suggestions demo: after some directory output, typing #find the 5 largest rust files under src and pressing Ctrl+Shift+L fills a picker with ten PowerShell commands from Claude Haiku, Enter replaces the # text with the selected command, and a second Enter runs it and lists the five largest files">
 
@@ -336,9 +343,15 @@ keys = {
 ```
 
 `context.recent_lines` holds up to ten recent nonblank rows, and the Command
-source shows each line of `claude`'s output as it arrives. The sample builds
-`CodexSuggestions` (Ctrl+Shift+A) with the same function and `codex exec` in
-place of `claude`.
+source shows each line of `claude`'s output as it arrives. [nterm.lua](nterm.lua)
+has a `CodexSuggestions` picker (Ctrl+Shift+K) written this way, with
+`codex exec` in place of `claude`.
+
+[nterm.example.lua](nterm.example.lua) uses the bundled
+[`nterm.claude`](docs/pickers.md#lua-modules) module instead, which asks in a
+prompt of its own, with no `#`: Ctrl+Shift+U asks what you want done and
+lists commands that do it, and Ctrl+Shift+A asks a question and shows
+Claude's answer as it is written.
 
 #### Included workflows
 
@@ -473,9 +486,12 @@ nterm reads a Lua file from the first of these that exists:
 3. `nterm.lua` beside the executable
 
 Start from [nterm.lua](nterm.lua), or from [nterm.example.lua](nterm.example.lua)
-for the extended sample with custom pickers, previews, snippets, and Claude and
-Codex suggestions. [profile.example.ps1](profile.example.ps1) adds the PowerShell
-picker bindings shown in the pickers clip. Choose **Reload configuration** in
+for the extended sample with workspaces, the session daemon's file, ripgrep
+and git pickers, snippets, and questions and command suggestions from Claude.
+It goes with [nterm-daemon.example.lua](nterm-daemon.example.lua), the
+daemon's pickers, copied to `~/nterm-daemon.lua`.
+[profile.example.ps1](profile.example.ps1) adds the PowerShell picker bindings
+shown in the pickers clip. Choose **Reload configuration** in
 the command palette to apply changes without restarting. See
 [Configuration](docs/configuration.md) for every setting.
 
@@ -494,9 +510,9 @@ the command palette to apply changes without restarting. See
 | Ctrl+Shift+W | Close the visible floating pane, or else the focused pane |
 
 Workspace and layout keys are listed in [Workspaces](docs/workspaces.md#default-bindings).
-A `keys` table in your Lua configuration replaces these defaults, so the samples
-bind some actions differently: `nterm.example.lua` opens the palette with
-Ctrl+Shift+P and the words picker with Ctrl+Shift+. instead. Every action is
+A `keys` table in your Lua configuration is merged over these defaults by chord,
+and the samples add keys of their own: `nterm.example.lua` opens the words
+picker with Ctrl+Shift+. and has the workspace keys on Alt as well. Every action is
 also in the command palette, whether or not it has a key.
 
 ## Rendering

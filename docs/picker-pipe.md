@@ -70,7 +70,8 @@ Command and Dynamic previews that a plain stream cannot use, and only the name
 needs to be in `named`:
 
 ```powershell
-# ProfileCompletions in nterm.example.lua previews Get-Help for each value.
+# ProfileCompletions: an Items picker of your nterm.lua, such as the one under
+# "Enable and test" below, whose preview shows Get-Help for each value.
 $completions.CompletionMatches |
     Invoke-NtermPicker -Name ProfileCompletions -Parameters @{ commandName = 'Get-Item' } `
         -DisplayProperty ListItemText -ValueProperty CompletionText
@@ -194,10 +195,10 @@ local completions = require("nterm.completions")
 -- pickers = { Completions = completions.powershell(), ... }
 ```
 
-`profile.example.ps1` binds `Files` and `Directories` to Ctrl+Shift+T and
-Ctrl+Shift+O (under the current directory) and to Alt+Shift+T and Alt+Shift+O
-(under the roots), `History` to Alt+Shift+R, and PowerShell's completions,
-through `Completions`, to Ctrl+Shift+Space.
+`profile.example.ps1` binds the pickers of `nterm-daemon.example.lua`:
+`Files` and `Directories` to Ctrl+T and Ctrl+O (under the current
+directory), `History` to Alt+R, and PowerShell's completions to Ctrl+Space,
+through `CompletionsHelp` with `Get-Help` as the preview.
 
 ### Pickers of your own: `nterm-daemon.lua`
 
@@ -214,9 +215,11 @@ The default is `require("nterm.daemon").defaults()`: `Files`, `Directories`,
 machine, and `History` and `Completions` of PowerShell on Windows. They work
 the same on Windows and Linux, so one file serves every machine: what they
 type at the prompt (going to a folder, opening a match in nvim, the git
-commands) is PowerShell on Windows and bash on Linux. A file of your own
-starts from them and changes what it likes; `nterm-daemon.example.lua` is one
-to start from.
+commands) is PowerShell on Windows and bash on Linux. A file of your own is in
+place of them, not added to them. It can start from `defaults()` and change
+what it likes, as the header of `lua/nterm/daemon.lua` shows, or name each
+picker itself from the modules, as `nterm-daemon.example.lua` does for a
+Windows machine.
 
 A picker there is written as one in `nterm.lua` is, under `pickers`, and is
 opened by its name as the daemon's own are:
@@ -384,8 +387,8 @@ file, directory and `$variable` completion.
 See [the protocol](#picker-pipe-protocol-version-1) below and
 [Invoke-NtermPicker.ps1](../Invoke-NtermPicker.ps1) for PSReadLine bindings,
 stream options, protocol limits and cancellation.
-For a portable PowerShell profile with file, directory, history, text-search,
-and completion bindings, see [profile.example.ps1](../profile.example.ps1).
+For a portable PowerShell profile with file, directory, history and
+completion bindings, see [profile.example.ps1](../profile.example.ps1).
 Executable sources and command previews must be defined in allowlisted Lua
 pickers; clients cannot submit executable definitions.
 
@@ -430,8 +433,14 @@ passes its messages to the window showing the pane; see
 ### Enable and test
 
 For a portable set of PowerShell bindings, see [profile.example.ps1](../profile.example.ps1).
-Use `nterm.example.lua`, or merge these entries into your Lua configuration
-(preserving any existing pickers and permissions):
+It opens the session daemon's pickers (`-DaemonPicker`), those of
+`nterm-daemon.example.lua`, so the window's Lua configuration needs no named
+pickers for it: see [Pickers of your own](#pickers-of-your-own-nterm-daemonlua).
+
+The same functions open pickers of the window's own configuration with
+`-Picker NAME` in place of `-DaemonPicker NAME`. For that, merge these entries
+into your Lua configuration (preserving any existing pickers and permissions),
+and name them in the profile's bindings:
 
 ```lua
 picker_pipe = {
@@ -466,7 +475,7 @@ pickers = {
 Then add this to your PowerShell `$PROFILE`, replacing the path:
 
 ```powershell
-. 'C:\src\nterm\profile.example.ps1' -PickerRoots @('C:\your\projects')
+. 'C:\src\nterm\profile.example.ps1'
 ```
 
 What each key does is in the NTerm PowerShell module (`powershell\NTerm`):
@@ -477,29 +486,31 @@ so a profile can copy it and change those. build.ps1 installs the module as
 `share\nterm\powershell\NTerm`, beside the Lua modules, and the session daemon
 names that folder to its shells as `NTERM_SHARE`, on its own machine: one a
 window names is never passed on. The example imports the module from there,
-or from beside itself when it is not set. Omit `-PickerRoots` to use
-the directory where the profile loads. Ctrl+T/Ctrl+O search files/directories
-under the current directory; Alt+T/Alt+O use the configured roots. Alt+R searches
-PSReadLine's saved history, Ctrl+Shift+G searches with `rg` and inserts an `nvim`
-command for review, and Ctrl+Space opens PowerShell completions. Customize the
-editor command and shortcuts as needed; dot-sourcing replaces those bindings.
+or from beside itself when it is not set. Ctrl+T/Ctrl+O search
+files/directories under the current directory, Alt+R searches PSReadLine's
+saved history, and Ctrl+Space opens PowerShell completions. It binds no key
+for text search: `nterm.example.lua` takes Ctrl+Shift+G for its own Grep. To
+search from the shell for what is on the line, bind a key of your own to
+`Set-NtermLineFromRipgrep -DaemonPicker Ripgrep`, which inserts an `nvim`
+command for review. Customize the shortcuts as needed; dot-sourcing replaces
+those bindings.
 
 PowerShell 7.4+ (for `-CommandWithArgs`) and PSReadLine are required. Ripgrep
 is optional for text search.
-The script does nothing outside an nterm pane: it returns unless
-`NTERM_DAEMON_PIPE` is set.
-File and directory bindings use nterm's builtin FileWalker through the named
+The script binds no keys outside an nterm pane, where `NTERM_DAEMON_PIPE` is
+not set. It turns on the prompt marks (`Enable-NtermShellIntegration`)
+wherever the module loads.
+File and directory bindings use nterm's builtin FileWalker through
 FileSystem pickers, passing the selected roots and current directory; no `fd` or
 custom history-reader executable is required.
-History opens the ProfileHistory File picker, which reads PSReadLine's history
+History opens a File picker, which reads PSReadLine's history
 file directly, newest first; the profile passes its `HistorySavePath` as
-`params.history`. Text search opens the ProfileRipgrep Command picker, so nterm
+`params.history`. Text search opens a Command picker, so nterm
 runs `rg` and results appear as they arrive. Completions pipe
-PowerShell's matches into the ProfileCompletions Items picker (a named stream,
-see [Requests](#requests)), so the Lua configuration supplies the preview and
-there is no item cap below the stream limits. Command previews are optional in
-`nterm.example.lua`. The profile sends no client-defined streams, so
-`allow_stream` can stay `false`.
+PowerShell's matches into an Items picker (for a window's named picker, a
+named stream: see [Requests](#requests)), so the Lua configuration supplies
+the preview and there is no item cap below the stream limits. The profile
+sends no client-defined streams, so `allow_stream` can stay `false`.
 
 Add this to the table returned by your nterm Lua configuration:
 

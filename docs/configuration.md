@@ -14,14 +14,17 @@ filename in Messages and starts with defaults for Lua settings, without falling
 back to another file. A persistent configuration indicator remains until restart.
 See `nterm.lua` in this repository for a starting configuration:
 
-[nterm.example.lua](../nterm.example.lua) is an extended Windows sample with
-custom picker callbacks, command previews, snippets, and Codex and Claude
-command suggestion pickers. Its filesystem roots default to `.` and tools are
-resolved from `PATH`. Read its header for dependencies and optional
-integrations. Snippets use `GHOSTTY_SNIPPETS_FILE` or `~/ghostty-snippets.json`;
-initialize the file with `{"snippets": []}`. The suggestion pickers send
-terminal context to `codex exec` and `claude --print`. Run it with
-`--lua-config`:
+[nterm.example.lua](../nterm.example.lua) is an extended Windows sample: a
+configuration in use, with what is of one machine (the workspace roots, the
+remotes) left as a placeholder. It has workspace settings and keys on Alt,
+the session daemon's file, ripgrep and git pickers, snippets, and the `Ask`
+and `Suggest` pickers of `nterm.claude`. It opens the daemon's pickers by the
+names [nterm-daemon.example.lua](../nterm-daemon.example.lua) gives them, so
+copy that file to `~/nterm-daemon.lua`. Tools (`rg`, `git`, `nvim`, `claude`)
+are resolved from `PATH`; read its header for what it needs. Snippets use
+`GHOSTTY_SNIPPETS_FILE` or `~/ghostty-snippets.json`; initialize the file
+with `{"snippets": []}`. `Ask` and `Suggest` send the last rows of the
+terminal to `claude`. Run it with `--lua-config`:
 
 ```powershell
 .\out\bin\nterm.exe --lua-config=nterm.example.lua

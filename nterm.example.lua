@@ -4,6 +4,7 @@
 -- Files, Directories, Ripgrep and Git pickers are the session daemon's, by
 -- the names that file gives them. rg and git have to be on the PATH of the
 -- machine the shell is on. Ripgrep opens a match in nvim.
+-- profile.example.ps1 binds PowerShell's keys to the same daemon's pickers.
 -- Ask and Suggest run claude, and send it the last rows of the terminal.
 -- Snippets use GHOSTTY_SNIPPETS_FILE or ~/ghostty-snippets.json; SaveSnippet
 -- writes to that file, and makes it if it is not there.
