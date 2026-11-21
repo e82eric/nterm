@@ -456,7 +456,7 @@ pickers = {
     position = "Cursor", sort = "Source", line_continuation = "`", unique = true,
   },
   -- The profile streams its completions into this Items picker. For a
-  -- Get-Help preview, copy ProfileCompletions' preview from nterm.example.lua.
+  -- Get-Help preview, use require("nterm.completions").help().
   ProfileCompletions = {
     type = "Items", items = nterm.json_parse("[]"), position = "Cursor",
   },

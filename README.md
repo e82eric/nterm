@@ -433,8 +433,7 @@ These ship with nterm or its samples and are built from the same parts:
 Running nterm needs a GPU with Direct3D 12 drivers on Windows, or Vulkan
 drivers on Linux (or another [wgpu backend](#rendering)). The sample configurations also use
 [PowerShell 7.4+](https://github.com/PowerShell/PowerShell),
-[ripgrep](https://github.com/BurntSushi/ripgrep),
-[bat](https://github.com/sharkdp/bat), [ffmpeg](https://ffmpeg.org), and
+[ripgrep](https://github.com/BurntSushi/ripgrep), [ffmpeg](https://ffmpeg.org), and
 [Neovim](https://neovim.io) for some pickers and previews, and the Claude
 Code or Codex CLI for command suggestions; nterm itself does not need them.
 

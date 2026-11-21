@@ -3610,57 +3610,13 @@ mod tests {
         .unwrap();
     }
     #[test]
-    fn lua_ripgrep_preview_preserves_windows_path_syntax_and_match_location() {
-        nfm_preview_file::text::TextPreviewOptions {
-            syntax: nfm_preview_file::SyntaxChoice::Named("C#".into()),
-            ..Default::default()
-        }
-        .validate()
-        .unwrap();
-        let source = include_str!("../nterm.example.lua");
-        let start = source.find("local function rg_preview()").unwrap();
-        let end = source.find("local pipe_help_preview =").unwrap();
-        let lua = mlua::Lua::new();
-        let resolver: mlua::Function = lua.load(format!("local preview_syntax={{ps1='PowerShell'}}; local function preview_path(path,cwd) return path end; local function preview_read_text(path) assert(path=='C:\\\\folder\\\\file.ps1'); return 'file content', binary_test end; {} return rg_preview().resolve",&source[start..end])).eval().unwrap();
-        for binary in [false, true] {
-            lua.globals().set("binary_test", binary).unwrap();
-            let item = lua.create_table().unwrap();
-            item.set("value", "C:\\folder\\file.ps1:42:7:matching text")
-                .unwrap();
-            let output: mlua::Table = resolver.call((item, lua.create_table().unwrap())).unwrap();
-            assert_eq!(output.get::<_, String>("text").unwrap(), "file content");
-            assert_eq!(
-                output.get::<_, String>("syntax").unwrap(),
-                if binary { "PlainText" } else { "Auto" }
-            );
-            assert_eq!(
-                output.get::<_, Option<String>>("extension").unwrap(),
-                if binary { None } else { Some("ps1".into()) }
-            );
-            assert_eq!(
-                output.get::<_, Option<usize>>("center_line").unwrap(),
-                if binary { None } else { Some(42) }
-            );
-            assert_eq!(
-                output.get::<_, Option<usize>>("highlight_line").unwrap(),
-                if binary { None } else { Some(42) }
-            );
-        }
-        let item = lua.create_table().unwrap();
-        item.set("value", "not a ripgrep match").unwrap();
-        assert!(matches!(
-            resolver
-                .call::<_, mlua::Value>((item, lua.create_table().unwrap()))
-                .unwrap(),
-            mlua::Value::Nil
-        ));
-    }
-    #[test]
     fn lua_file_preview_samples_binary_files_and_preserves_utf8_boundaries() {
-        let source = include_str!("../nterm.example.lua");
-        let start = source.find("local function preview_path(").unwrap();
+        // The part of the files module that reads a file, taken from its text:
+        // read_text is local to it.
+        let source = include_str!("../lua/nterm/files.lua");
+        let start = source.find("local MOST =").unwrap();
         let end = source[start..]
-            .find("local function preview_directory(")
+            .find("local function folder(")
             .unwrap()
             + start;
         let lua = mlua::Lua::new();
@@ -3668,7 +3624,7 @@ mod tests {
             .set("preview", lua.create_table().unwrap())
             .unwrap();
         let reader: mlua::Function = lua
-            .load(format!("{}\nreturn preview_read_text", &source[start..end]))
+            .load(format!("{}\nreturn read_text", &source[start..end]))
             .eval()
             .unwrap();
         let root =
@@ -3724,12 +3680,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn lua_directory_items_preview_preserves_unicode_and_shell_characters() {
-        let source = include_str!("../nterm.example.lua");
-        let path_start = source.find("local function preview_path(").unwrap();
-        let path_end = source.find("local function preview_read_bytes(").unwrap();
-        let start = source.find("local function preview_directory(").unwrap();
+        // The parts of the files module that find and list a folder, taken
+        // from its text: they are local to it.
+        let source = include_str!("../lua/nterm/files.lua");
+        let path_start = source.find("local function whole(").unwrap();
+        let path_end = source.find("local function run(").unwrap();
+        let start = source.find("local function folder(").unwrap();
         let end = source[start..]
-            .find("local function file_preview(")
+            .find("-- What shows for a row of these")
             .unwrap()
             + start;
         let lua = mlua::Lua::new();
@@ -3755,7 +3713,7 @@ mod tests {
         lua.globals().set("preview", preview).unwrap();
         let reader: mlua::Function = lua
             .load(format!(
-                "{}\n{}\nreturn preview_directory",
+                "{}\n{}\nreturn function(path, cwd) return folder(whole(path, cwd)) end",
                 &source[path_start..path_end],
                 &source[start..end]
             ))

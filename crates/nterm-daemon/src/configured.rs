@@ -740,12 +740,14 @@ mod tests {
             std::fs::copy(root.join("lua/nterm").join(module), modules.join(module)).unwrap();
         }
         let configured = Configured::new(Some(path.clone()));
-        for name in ["Commits", "Ripgrep", "Files", "Directories", "Near", "Sources", "Servers", "Git commits"] {
+        for name in [
+            "Files", "FilesHere", "Directories", "SourceDirectories", "Ripgrep", "History",
+            "CompletionsHelp", "Completions", "Git commits", "Git reflog",
+        ] {
             assert!(configured.picker(name).unwrap().is_some(), "{name}");
         }
-        // Its own Commits is in place of the default's.
-        let Lists::Command { args, .. } = configured.picker("Commits").unwrap().unwrap().lists else { panic!() };
-        assert_eq!(args[..2], ["git", "log"]);
+        // It is in place of the defaults: a picker only they have is not there.
+        assert_eq!(configured.picker("Near").unwrap().map(|_| ()), None);
         // The pickers of git have columns, and say what shows for a row.
         let commits = configured.picker("Git commits").unwrap().unwrap();
         let Lists::Command { columns, .. } = &commits.lists else { panic!("not a command") };

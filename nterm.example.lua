@@ -1,256 +1,52 @@
--- Extended Windows sample. Customize tool dependencies and picker names as needed.
--- Lua reads text/images; directory previews use preview.directory_items and video previews use
--- configurable ffmpeg/ffprobe commands. Help/history command previews require pwsh with
--- -CommandWithArgs (history also uses bat). Text search requires rg; ProfileHistory
--- reads the PSReadLine history file directly, newest first.
+-- Extended Windows sample: a working configuration, with what is of one
+-- machine left as a placeholder. Change the roots, the remotes and the keys.
+-- It goes with nterm-daemon.example.lua, copied to ~/nterm-daemon.lua: the
+-- Files, Directories, Ripgrep and Git pickers are the session daemon's, by
+-- the names that file gives them. rg and git have to be on the PATH of the
+-- machine the shell is on. Ripgrep opens a match in nvim.
+-- Ask and Suggest run claude, and send it the last rows of the terminal.
 -- Snippets use GHOSTTY_SNIPPETS_FILE or ~/ghostty-snippets.json; SaveSnippet
 -- writes to that file, and makes it if it is not there.
--- CodexSuggestions invokes codex exec and ClaudeSuggestions invokes claude --print
--- with Haiku; both send the current terminal context.
--- profile.example.ps1 uses the Profile* named pickers and streamed requests.
 
 -- Config lookup: --lua-config=PATH, then ~/nterm.lua, then nterm.lua beside
 -- the executable. Only the first available file is loaded.
 local clipboard = require("nterm.clipboard")
+local ripgrep = require("nterm.ripgrep")
+local claude = require("nterm.claude")
 local snippets = require("nterm.snippets")
 local snippets_path = os.getenv("GHOSTTY_SNIPPETS_FILE")
   or ((os.getenv("USERPROFILE") or os.getenv("HOME") or ".") .. "/ghostty-snippets.json")
 
--- Dynamic previews run in a dedicated Lua state, away from the UI thread.
-local preview_tools = { ffmpeg = "ffmpeg.exe", ffprobe = "ffprobe.exe", video_position = 0.25 }
-local preview_images = {png=true,jpg=true,jpeg=true,gif=true,bmp=true,webp=true,tif=true,tiff=true}
-local preview_videos = {mp4=true,mkv=true,mov=true,avi=true,webm=true,m4v=true,wmv=true}
-local function preview_command(args, cwd)
-  local result = preview.run {args=args,cwd=cwd,timeout_ms=10000}
-  assert(result.exit_code == 0, result.stderr)
-  return result.stdout
-end
-local function preview_path(path, cwd)
-  if not cwd or path:match('^%a:') or path:match('^[\\/]') then return path end
-  return cwd .. '/' .. path
-end
-local function preview_read_bytes(path)
-  local file = assert(io.open(path, 'rb'))
-  local ok, bytes = pcall(function()
-    local bytes, read_error = file:read(10 * 1024 * 1024 + 1)
-    assert(not read_error, read_error)
-    bytes = bytes or ''
-    assert(#bytes <= 10 * 1024 * 1024, 'File preview exceeds 10 MiB')
-    return bytes
-  end)
-  file:close()
-  assert(ok, bytes)
-  return bytes
+-- A picker of the session daemon, run on the machine the pane's shell is on,
+-- so it works the same in a workspace on a remote.
+local function daemon(name, options)
+  local picker = { type = "Daemon", picker = name, position = "Cursor" }
+  for key, value in pairs(options or {}) do picker[key] = value end
+  return picker
 end
 
-local function preview_read_text(path, display_path)
-  local file = assert(io.open(path, 'rb'))
-  local ok, result = pcall(function()
-    local function read(count)
-      local bytes, read_error = file:read(count)
-      assert(not read_error, read_error)
-      return bytes or ''
-    end
-    local function binary(bytes)
-      return bytes:find(string.char(0), 1, true) ~= nil or utf8.len(bytes) == nil
-    end
-    local function metadata()
-      local size = assert(file:seek('end'))
-      return {text='Binary file\n' .. display_path .. '\n' .. size .. ' bytes', binary=true}
-    end
-    local sample = read(4096)
-    -- Finish a UTF-8 character cut by the sample boundary before classifying it.
-    local length, invalid = utf8.len(sample)
-    if not length and invalid > #sample - 3 then
-      local lead = sample:byte(invalid)
-      local width = lead >= 194 and lead <= 223 and 2
-        or lead >= 224 and lead <= 239 and 3
-        or lead >= 240 and lead <= 244 and 4
-      if width and #sample - invalid + 1 < width then
-        sample = sample .. read(width - (#sample - invalid + 1))
-      end
-    end
-    if binary(sample) then return metadata() end
-    assert(file:seek('set', 0))
-    local limit = 10 * 1024 * 1024
-    local bytes = read(limit + 1)
-    local truncated = #bytes > limit
-    local warning = '\n\n[Preview truncated: file exceeds the 10 MiB text limit.]\n'
-    if truncated then
-      bytes = bytes:sub(1, limit - #warning)
-      -- Drop an incomplete final UTF-8 character, not a complete code point.
-      local valid, position = utf8.len(bytes)
-      if not valid and position > #bytes - 3 then
-        local lead = bytes:byte(position)
-        local width = lead >= 194 and lead <= 223 and 2
-          or lead >= 224 and lead <= 239 and 3
-          or lead >= 240 and lead <= 244 and 4
-        if width and #bytes - position + 1 < width then
-          bytes = bytes:sub(1, position - 1)
-        end
-      end
-    end
-    if binary(bytes) then return metadata() end
-    local text = bytes:gsub('^\239\187\191', '')
-    if truncated then text = text .. warning end
-    return {text=text, binary=false}
-  end)
-  file:close()
-  assert(ok, result)
-  return result.text, result.binary
-end
-
-
-local function preview_directory(path, cwd)
-  local items = preview.directory_items(preview_path(path, cwd))
-  if not items then return nil end
-  local lines = {}
-  for _, item in ipairs(items) do
-    lines[#lines + 1] = item.name .. (item.is_directory and "/" or "")
-  end
-  return #lines > 0 and table.concat(lines, "\n") or "[Empty directory]"
-end
-
-local function file_preview()
-  return {
-    type = "Dynamic",
-    resolve = function(item, params)
-      local path = item.value
-      local extension = path:match("%.([^./\\]+)$") or ""
-      -- Windows cannot open a directory as a file. Avoid spawning dir for files.
-      local probe = io.open(preview_path(path, params.cwd), "rb")
-      local directory
-      if probe then probe:close()
-      else directory = preview_directory(path, params.cwd) end
-      if directory then
-        return {type="Text",text=directory,syntax="PlainText",
-          theme="gruvbox-dark"}
-      end
-      if preview_images[extension:lower()] then
-        return {type="Image",bytes=preview_read_bytes(preview_path(path,params.cwd))}
-      end
-      if preview_videos[extension:lower()] then
-        local duration = tonumber(preview_command({preview_tools.ffprobe,"-v","error",
-          "-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",path}, params.cwd))
-        assert(duration and duration >= 0 and duration < math.huge, "Invalid video duration")
-        local seek = string.format("%.3f", duration * preview_tools.video_position)
-        local bytes = preview_command({preview_tools.ffmpeg,"-loglevel","error","-ss",seek,
-          "-i",path,"-frames:v","1","-vf","scale=1280:1280:force_original_aspect_ratio=decrease",
-          "-f","image2pipe","-vcodec","png","pipe:1"}, params.cwd)
-        return {type="Image",bytes=bytes}
-      end
-      local text, binary = preview_read_text(preview_path(path,params.cwd), path)
-      if binary then return {type="Text",text=text,syntax="PlainText",theme="gruvbox-dark"} end
-      return {type="Text",text=text,syntax="Auto",extension=extension,name=path,
-        theme="gruvbox-dark"}
-    end,
-  }
-end
-
-local function rg_preview()
-  return {
-    type = "Dynamic",
-    resolve = function(item, params)
-      local path, line = item.value:match("^(.-):(%d+):%d+:")
-      if not path then return nil end
-      local text, binary = preview_read_text(preview_path(path,params.cwd), path)
-      if binary then return {type="Text",text=text,syntax="PlainText",theme="gruvbox-dark"} end
-      local extension = path:match("%.([^./\\]+)$")
-      return {type="Text",text=text,name=path,
-        syntax="Auto",extension=extension,
-        theme="gruvbox-dark",
-        center_line=tonumber(line),
-        highlight_line=tonumber(line)}
-    end,
-  }
-end
-
-local pipe_help_preview = [==[
-          $commandName = $args[0]
-          $item = $args[1].Trim([char[]]@([char]39, [char]34))
-
-          try {
-              if ($item.StartsWith('-') -and $commandName) {
-                  Get-Help -Name $commandName `
-                      -Parameter $item.TrimStart('-') -ErrorAction Stop |
-                      Out-String -Width 100
-              } else {
-                  Get-Help -Name $item -Full -ErrorAction Stop |
-                      Out-String -Width 100
-              }
-          } catch {
-              "No help available for: $item"
-          }
-]==]
-
-local function profile_preview(script, extra)
-  return {type="Dynamic", resolve=function(item, params)
-    local args={"pwsh.exe","-NoProfile","-CommandWithArgs",script}
-    if extra then args[#args+1]=params[extra] or "" end
-    args[#args+1]=item.value
-    local result = preview.run {args=args,cwd=params.cwd}
-    assert(result.exit_code == 0, "Preview command failed: " .. result.stderr)
-    return {type="Ansi",bytes=result.stdout}
-  end}
-end
-
--- Command suggestions: type # and a description or partial command, then open
--- the picker. args(prompt) returns the CLI that streams one suggestion per line;
--- Enter replaces the # and the text after it with the selection.
-local function command_suggestions(label, args)
-  return function(context)
-    local cursor_row = context.line_before_cursor
-    local input_start = cursor_row:match(".*#()")
-    if not input_start then
-      error(label .. ": the current prompt does not contain a # marker")
-    end
-    local current_input = cursor_row:sub(input_start)
-    local erase_count = (utf8.len(current_input) or #current_input) + 1
-    local terminal_context = table.concat(context.recent_lines, "\n")
-    if terminal_context == "" then
-      error(label .. ": no terminal context is available")
-    end
-    local prompt = table.concat({
-      "Generate exactly 10 likely command completions or alternatives.",
-      "",
-      "In the current cursor row, # marks the beginning of editable input.",
-      "Everything before and including # is non-editable prompt text.",
-      "Return only the completed editable command.",
-      "Never include the prompt or the # marker.",
-      "Return one command per line.",
-      "Do not number the commands.",
-      "Do not use Markdown or code fences.",
-      "",
-      "Current cursor row:", cursor_row,
-      "",
-      "Terminal context:", terminal_context,
-    }, "\n")
-    return {
-      type = "Command",
-      args = args(prompt),
-      position = "Cursor",
-      sort = "SourceOrder",
-      preview_visible = false,
-      action = function(app, item)
-        app:replace_prompt(item.value, erase_count, 0)
-      end,
-    }
-  end
-end
-
-return {
+local config = {
+  -- Prompts of programs that print no OSC 133 marks, for command navigation
+  -- and the prompts picker. The list replaces the default patterns.
+  prompt_patterns = {
+    [[^PS [^>]*>\s*]],
+    [[^\d+:\d+>\s*]],
+    [[^›\s*]],
+    [[^────────────────────*]],
+    [[^> ]],
+  },
   font = {
     size = 12,
   },
   picker_pipe = {
     enabled = true,
     allow_stream = true,
-    named = { "ProfileFiles", "ProfileFilesPreview", "ProfileDirectories", "ProfileRipgrep", "ProfileHistory", "ProfileCompletions" },
+    allow_panes = true,
+    named = {},
   },
   actions = {
     -- The clipboard's picture, sent to the machine the pane's shell is on
-    -- (another, in a --remote window), and its path pasted: for Claude Code
-    -- there. In the command palette; see lua/nterm/clipboard.lua.
+    -- and its path pasted; see lua/nterm/clipboard.lua.
     PasteImage = { label = "Paste picture from clipboard", action = clipboard.paste_image() },
     -- The selection kept in the snippets file; see lua/nterm/snippets.lua.
     SaveSnippet = { label = "Save selection as snippet", action = snippets.save { path = snippets_path } },
@@ -270,30 +66,45 @@ return {
       selection_background = "#3d3937",
       selection_text = "#ebdbb2",
       yank_background = "#fe8019",
+      cursor_line_background = "#a89984",
+      cursor_line_text = "#1d2021",
     },
   },
   colors = {
-    ui = {
-    },
     theme = "Gruvbox Dark",
   },
   floating = {
     padding = { top = 10, bottom = 10, left = 10, right = 10 },
   },
+  workspaces = {
+    default_layout = "horizontal_grid",
+    -- The workspace picker (Alt+W) lists the folders inside these, to start
+    -- a workspace in: for example { "C:/src", "D:/work" }.
+    new_roots = { "~" },
+    new_depth = 1, -- How many levels of folders inside them.
+  },
+  status_bar = { font_size = 16 },
+  -- Machines whose nterm daemon a workspace's shells can run in, reached by
+  -- ssh. Each has a row in the workspace picker. See docs/configuration.md.
+  -- remotes = {
+  --   vm = {
+  --     address = "me@192.168.56.10",
+  --     daemon = "C:\\Program Files\\nterm\\nterm-daemon.exe",
+  --     command = "pwsh -nologo",
+  --     clipboard_read = "allow",
+  --     new_roots = { "C:/src" },
+  --     new_depth = 1,
+  --   },
+  --   linux = {
+  --     address = "me@linux-host",
+  --     daemon = "/home/me/.local/bin/nterm-daemon",
+  --   },
+  -- },
   builtin_pickers = {
-    themes = {
-      position = "Cursor",
-      sort = "Score",
-    },
     command_palette = {
-      scope = "Workspace",
-      position = "Center",
-      preview_visible = false,
+      position = "Bottom",
     },
     lines = {
-      position = "Cursor",
-      enter_action = "Navigate",
-      preview = { type = "Scrollback", rows = 12 },
       keys = {
         {
           key = "Enter",
@@ -311,13 +122,8 @@ return {
       local before = line:match("([%w_./\\%-]+)$") or ""
 
       return {
-        preview_visible = true,
         initial_query = before,
-        enter_action = "SendInput",
-        unique = true,
         position = "Cursor",
-        preview_visible = false,
-        preview = { type = "Scrollback", rows = 12 },
         action = before ~= "" and function(app, item)
           app:replace_prompt(item.value, utf8.len(before) or 0, 0)
         end or nil,
@@ -329,123 +135,109 @@ return {
     },
   },
   pickers = {
-    ProfileFiles = {
-      type = "FileSystem", roots = {"."}, max_depth = 0,
-      position = "Cursor", preview_visible = false,
-      preview = file_preview(),
-    },
-    ProfileFilesPreview = {
-      type = "FileSystem", roots = {"."}, max_depth = 0,
-      position = "Cursor", preview_visible = true,
-      preview = file_preview(),
-    },
-    ProfileDirectories = {
-      type = "FileSystem", roots = {"."}, directories_only = true,
-      max_depth = 0, position = "Cursor", preview_visible = false,
-    },
+    -- Pickers of nterm-daemon.example.lua, which says what they look under:
+    -- copy it to ~/nterm-daemon.lua and change its roots.
+    Files = daemon("Files"),
+    FilesHere = daemon("FilesHere"),
+    Directories = daemon("SourceDirectories", {
+      action = function(app, item)
+        app:send_text("Set-Location -LiteralPath '" .. item.value:gsub("'", "''") .. "'\r")
+      end,
+    }),
     -- Grep asks for a pattern and shows Ripgrep on top with what is found.
-    -- The session daemon runs rg where the pane's shell is, so this works
-    -- the same in a window on another machine (--remote). The shell has to
-    -- report its directory (OSC 7; see profile.example.ps1). Ripgrep is
-    -- the picker of that machine's nterm-daemon.lua, made with
-    -- require("nterm.ripgrep"), which it has by default: see
-    -- lua/nterm/daemon.lua.
     Grep = {
-      type = "Argument", prompt = "Grep:",
-      action = function(app, item) app:push_picker("Ripgrep", { pattern = item.value }) end,
+      type = "Argument",
+      prompt = "Grep:",
+      placeholder = "<text>  Search the working directory",
+      action = function(app, item)
+        if item.value == "" then return end
+        app:push_picker("Ripgrep", { pattern = item.value })
+      end,
     },
     Ripgrep = {
       type = "Daemon", picker = "Ripgrep",
       action = function(app, item)
-        local path, line = item.value:match("^(.-):(%d+):%d+:")
+        local path, line = ripgrep.place(item.value)
         if not path then return end
-        -- Typed for review; change nvim to your preferred editor.
-        app:send_text("nvim +" .. line .. " '" .. path:gsub("'", "''") .. "'")
+        -- Change nvim to your preferred editor.
+        app:send_text("nvim +" .. line .. " '" .. path:gsub("'", "''") .. "'\r")
       end,
     },
-    ProfileRipgrep = {
-      type = "Command", position = "Cursor", success_exit_codes = {0,1},
-      args = {"rg.exe","--crlf","--max-columns=500","--max-columns-preview","--no-messages","--hidden","--color=never","-i","--vimgrep","--","{pattern}"},
-      preview_visible = true,
-      preview = rg_preview(),
+    -- Asks for a question, then shows Claude's answer as a page on top.
+    Ask = claude.ask { page = "Answer" },
+    Answer = claude.answer(),
+    -- Asks what you want done, then shows commands from Claude that do it;
+    -- Enter types one at the shell's cursor.
+    Suggest = claude.suggest { page = "Suggestions", position = "Cursor" },
+    Suggestions = claude.suggestions(),
+    command_history = {
+      type = "Scrollback",
+      preview = { type = "Scrollback", rows = 12 },
+      prompts = true,
     },
-    ProfileHistory = {
-      -- params.history is the PSReadLine history file, read newest first.
-      type = "File", path = "{history}", reverse = true,
-      line_continuation = "`", unique = true, sort = "SourceOrder", position = "Cursor",
-      preview_visible = false,
-      preview = profile_preview([==[$args[0] | & bat.exe --color=always --paging=never --wrap=never --style=plain --language=ps1 --theme="Visual Studio Dark+"]==]),
-    },
-    -- profile.example.ps1 streams CompletionMatches into this Items picker
-    -- (piped into Invoke-NtermPicker -Name); the preview runs Get-Help.
-    ProfileCompletions = {
-      type="Items",items=nterm.json_parse("[]"),position="Cursor",preview_visible=true,
-      preview=profile_preview(pipe_help_preview,"commandName"),
-    },
-
-    CodexSuggestions = command_suggestions("Codex suggestions", function(prompt)
-      return {
-        "codex", "exec", "--ephemeral", "--skip-git-repo-check",
-        "--color", "never", "--model", "gpt-5.6-luna",
-        "--config", 'model_reasoning_effort="none"', prompt,
-      }
-    end),
-    ClaudeSuggestions = command_suggestions("Claude suggestions", function(prompt)
-      return {
-        "claude", "--print", "--model", "claude-haiku-5-5",
-        "--output-format", "text", "--tools", "",
-        "--no-session-persistence", prompt,
-      }
-    end),
+    -- The repository the shell is in; see lua/nterm/git.lua.
+    ["Git commits"] = daemon("Git commits"),
+    ["Git branches"] = daemon("Git branches"),
+    ["Git status"] = daemon("Git status"),
+    ["Git cherry-pick"] = daemon("Git cherry-pick"),
+    ["Git cherry-pick commits"] = daemon("Git cherry-pick commits"),
+    ["Git stashes"] = daemon("Git stashes"),
+    ["Git reflog"] = daemon("Git reflog"),
+    ["Git file history"] = daemon("Git file history"),
+    ["Git file history commits"] = daemon("Git file history commits"),
+    ["Git fixup"] = daemon("Git fixup"),
+    ["Git tags"] = daemon("Git tags"),
     Snippets = snippets.picker { path = snippets_path },
   },
-  -- Quick selects over custom regexes instead of words. Typing a label runs
-  -- `action` (Navigate, the default, enters copy mode at the match; Copy and
-  -- Paste use the text; a function gets the match as item.text); Shift on
-  -- the last letter always pastes. A capture group selects only that group.
-  quick_selects = {
-    -- Debugger addresses, such as GDB's 0x00007ff6a2b1c4d0 or CDB's 00007ff6`a2b1c4d0.
-    addresses = {
-      patterns = { [[\b0x[0-9a-fA-F]+\b]], [[\b[0-9a-fA-F]{8}`[0-9a-fA-F]{8}\b]] },
-      action = "Copy",
-      label = "Copy a memory address",
-    },
-    -- Abbreviated and full git hashes.
-    hashes = {
-      patterns = { [[\b[0-9a-f]{7,40}\b]] },
-      action = "Paste",
-      label = "Paste a git hash",
-    },
-    -- Show a commit from git log or blame output.
-    commits = {
-      patterns = { [[\b[0-9a-f]{7,40}\b]] },
-      action = function(app, item)
-        app:send_text("git show " .. item.text .. "\r")
-      end,
-      label = "Show a git commit",
-    },
-  },
+  -- Merged over the default keys by chord; see docs/configuration.md.
   keys = {
-    { key = "x", mods = "ALT|SHIFT", quick_select = "addresses" },
-    { key = "h", mods = "ALT|SHIFT", quick_select = "hashes" },
-    { key = "g", mods = "ALT|SHIFT", quick_select = "commits" },
     { key = "s", mods = "CTRL|SHIFT", action = "SaveSnippet" },
-    { key = "a", mods = "CTRL|SHIFT", picker = "CodexSuggestions" },
-    { key = "l", mods = "CTRL|SHIFT", picker = "ClaudeSuggestions" },
-    { key = "n", mods = "CTRL|SHIFT", action = "NewWindow" },
-    { key = "e", mods = "CTRL|SHIFT", action = "ToggleFloatingPane" },
-    { key = "w", mods = "CTRL|SHIFT", action = "ClosePane" },
-    { key = "/", mods = "CTRL|SHIFT", action = "OpenSearch" },
-    { key = "m", mods = "CTRL|SHIFT", action = "EnterCopyMode" },
-    { key = "Space", mods = "ALT", action = "OpenQuickSelect" },
-    { key = "ArrowUp", mods = "CTRL|SHIFT", action = "PreviousCommand" },
-    { key = "ArrowDown", mods = "CTRL|SHIFT", action = "NextCommand" },
-    { key = "ArrowUp", mods = "CTRL", action = "ScrollLineUp" },
-    { key = "ArrowDown", mods = "CTRL", action = "ScrollLineDown" },
+    { key = "a", mods = "CTRL|SHIFT", picker = "Ask" },
+    { key = "u", mods = "CTRL|SHIFT", picker = "Suggest" },
+    { key = "g", mods = "CTRL|SHIFT", picker = "Grep" },
     { key = "b", mods = "CTRL|SHIFT", picker = "Snippets" },
-    { key = "f", mods = "CTRL|SHIFT", builtin_picker = "lines" },
     { key = ".", mods = "CTRL|SHIFT", builtin_picker = "words" },
-    { key = "p", mods = "CTRL|SHIFT", builtin_picker = "command_palette" },
-    { key = "z", mods = "CTRL|SHIFT", builtin_picker = "prompts" },
+    { key = "z", mods = "CTRL|SHIFT", picker = "command_history" },
+    { key = "g", mods = "CTRL|ALT", picker = "Git commits" },
+    { key = "b", mods = "CTRL|ALT", picker = "Git branches" },
+    { key = "s", mods = "CTRL|ALT", picker = "Git status" },
+    { key = "t", mods = "ALT|SHIFT", picker = "Files" },
+    { key = "o", mods = "ALT|SHIFT", picker = "Directories" },
   },
 }
+
+-- Workspace keys on Alt, beside the default ones on Ctrl+Alt.
+local workspace_keys = {
+  {key="Left",mods="ALT|SHIFT",action="ResizeLeft"},
+  {key="Right",mods="ALT|SHIFT",action="ResizeRight"},
+  {key="Up",mods="ALT|SHIFT",action="ResizeUp"},
+  {key="Down",mods="ALT|SHIFT",action="ResizeDown"},
+  {key="h",mods="ALT",action="FocusLeft"},
+  {key="j",mods="ALT",action="FocusDown"},
+  {key="k",mods="ALT",action="FocusUp"},
+  {key="l",mods="ALT",action="FocusRight"},
+  {key="h",mods="ALT|SHIFT",action="MoveLeft"},
+  {key="j",mods="ALT|SHIFT",action="MoveDown"},
+  {key="k",mods="ALT|SHIFT",action="MoveUp"},
+  {key="l",mods="ALT|SHIFT",action="MoveRight"},
+  {key="d",mods="ALT",action="SetDeck"},
+  {key="d",mods="ALT|SHIFT",action="SetHorizontalGrid"},
+  {key="g",mods="ALT",action="SetGrid"},
+  {key="m",mods="ALT",action="SetMonocle"},
+  {key="c",mods="ALT",action="CreatePane"},
+  {key="c",mods="ALT|SHIFT",action="ClosePane"},
+  {key="w",mods="ALT",action="WorkspacePicker"},
+  {key="w",mods="ALT|SHIFT",action="CreateWorkspace"},
+  {key="Enter",mods="ALT",action="MoveToMain"},
+  {key="f",mods="ALT",action="FloatOrTilePane"},
+  {key="n",mods="ALT",action="ResetLayout"},
+}
+for index=1,10 do
+  workspace_keys[#workspace_keys+1]={key=tostring(index%10),mods="ALT",action="SelectWorkspace:"..index}
+  workspace_keys[#workspace_keys+1]={key=tostring(index%10),mods="ALT|SHIFT",action="MoveToWorkspace:"..index}
+end
+for _, binding in ipairs(workspace_keys) do
+  config.keys[#config.keys + 1] = binding
+end
+
+return config

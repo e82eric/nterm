@@ -1,88 +1,69 @@
 -- The pickers of this machine, for the session daemon: an example
--- ~/nterm-daemon.lua that starts from the defaults and changes them.
+-- ~/nterm-daemon.lua for a Windows machine with PowerShell. They run where
+-- the pane's shell is, and a window draws the rows. nterm.example.lua opens
+-- them as { type = "Daemon", picker = "<name>" }; a shell opens them with
+-- `npick --daemon <name>` or `Invoke-NtermPicker -DaemonPicker <name>`. An
+-- `action` here is run here, and what it asks of `app` is done to the pane;
+-- without one, the window's is.
 --
 -- The daemon reads the first there is of: the file `--lua-config` names,
 -- ~/nterm-daemon.lua, nterm-daemon.lua beside the daemon program, and the
 -- default installed with it (share/nterm/lua/nterm-daemon.lua). It is read
 -- when a picker of it is first asked for, and again when it has changed:
--- there is nothing to restart.
+-- there is nothing to restart. A file of your own is in place of the
+-- defaults (lua/nterm/daemon.lua), not added to them.
 --
--- The defaults are those of nterm.daemon (lua/nterm/daemon.lua): Files,
--- Directories, Near, Ripgrep, Commits and the "Git ..." pickers on every
--- machine, and History and Completions of PowerShell on Windows. They work
--- the same on Windows and Linux, so one file can go on every machine: the
--- daemon is on the machine the shell is on, and what they type at the
--- prompt is PowerShell on Windows and bash on Linux.
---
--- A picker here is written as one in nterm.lua is, and runs where the
--- daemon is: its program is run on this machine and its files are this
--- machine's. A window draws the rows, on this machine or another.
---
--- Open one by its name:
---   from a window, in nterm.lua:   Commits = { type = "Daemon", picker = "Commits" }
---   from a shell:                  npick --daemon Commits
---                                  Invoke-NtermPicker -DaemonPicker Commits
+-- On another machine, copy this file to its user's home and change the
+-- roots below to that machine's folders.
 --
 -- A program is only ever run because this file names it. What a picker is
 -- opened with fills the arguments written as "{name}", each as one argument
 -- whole, and is never which program is run.
---
--- So far: types Command, File, Items and FileSystem; previews of type
--- Dynamic, whose function runs here; and `action`, run here when a window
--- opened the picker, and `keys`, what they ask of `app` being done to the
--- pane. A picker may be a function of what is at the shell's cursor, a
--- Command may have columns, and modules load: see lua/nterm/git.lua.
--- The name items is the daemon's own: what a program in the shell gives.
-local daemon = require("nterm.daemon")
+local completions = require("nterm.completions")
+local files = require("nterm.files")
+local git = require("nterm.git")
+local history = require("nterm.history")
+local ripgrep = require("nterm.ripgrep")
 
--- The defaults, as a table to change. `prompt` is a Lua pattern for your
--- shell's prompt, which lets the git pickers clear what was typed before
--- typing theirs; `editor` is what Ripgrep opens a match in. Both have
--- defaults that suit PowerShell's and bash's own prompts, and nvim.
-local config = daemon.defaults {
-  -- prompt = daemon.windows and "^[^>]*> ?" or "^[^$#]*[$#] ",
-  -- editor = "nvim",
-}
-local pickers = config.pickers
+-- The PowerShell prompt, so a git picker's Enter can replace what is typed.
+local git_prompt = "^PS [^>]*> "
 
--- The folders under your source folders, five deep; Enter in a window goes
--- to the one chosen. daemon.windows says which machine this is.
-pickers.Sources = daemon.directories {
-  roots = daemon.windows and { "C:\\src" } or { daemon.home .. "/src" },
-  max_depth = 5,
-}
+return {
+  pickers = {
+    -- Files and folders: under the drive, under the shell's folder, or
+    -- under the roots they are opened with. Change the roots to your own.
+    Files = files.all { roots = { "C:\\" }, position = "Cursor", preview = files.preview() },
+    FilesHere = files.all { position = "Cursor", preview = files.preview() },
+    -- Folders: under the shell's, or under your source folders.
+    Directories = files.directories { position = "Cursor" },
+    SourceDirectories = files.directories { roots = { "C:\\src" }, position = "Cursor" },
 
--- The commits of the repository the shell is in, in place of the default.
-pickers.Commits = {
-  type = "Command", sort = "SourceOrder",
-  args = { "git", "log", "--oneline", "--decorate", "-n", "500" },
-  -- What shows for a commit: the daemon runs the program this gives.
-  preview = { type = "Dynamic", resolve = function(item, params)
-    local hash = item.value:match("^(%x+)")
-    if not hash then return nil end
-    return { type = "Command", output = "Ansi", cwd = params.cwd,
-             args = { "git", "show", "--stat", "--patch", "--color=always", hash } }
-  end },
-  preview_visible = false,
-  -- Keys of its own. One leaves the picker open unless its function
-  -- closes it.
-  keys = {
-    { key = "y", mods = "CTRL", description = "Paste the commit's hash",
-      action = function(app, item)
-        app:paste(item.value:match("^(%x+)") or "")
-        app:close_picker()
-      end },
+    -- Grep's matches: the lines a pattern is found on, under the folder the
+    -- shell is in. Opened with `pattern`.
+    Ripgrep = ripgrep.search {},
+
+    -- What was typed at PowerShell, the last first, the whole command as
+    -- its preview (Ctrl+P shows it).
+    History = history.powershell { position = "Cursor", preview_visible = false, preview = history.preview() },
+
+    -- PowerShell's completions, piped in by the profile: Get-Help as the
+    -- preview, pwsh started for the row the cursor is on, or PowerShell's
+    -- tooltip, with no program run.
+    CompletionsHelp = completions.powershell { position = "Cursor", preview = completions.help(), preview_visible = false },
+    Completions = completions.powershell { position = "Cursor" },
+
+    -- git, in the repository the shell is in. Each Enter is the module's,
+    -- run here; cherry-pick and file history open their second step here.
+    ["Git commits"] = git.commits(),
+    ["Git branches"] = git.branches { prompt = git_prompt, require_clean = true },
+    ["Git status"] = git.status { prompt = git_prompt },
+    ["Git cherry-pick"] = git.cherry_pick { prompt = git_prompt },
+    ["Git cherry-pick commits"] = git.cherry_pick_commits { prompt = git_prompt },
+    ["Git stashes"] = git.stashes { prompt = git_prompt },
+    ["Git reflog"] = git.reflog(),
+    ["Git file history"] = git.file_history { prompt = git_prompt },
+    ["Git file history commits"] = git.file_history_commits(),
+    ["Git fixup"] = git.fixups { prompt = git_prompt },
+    ["Git tags"] = git.tags { prompt = git_prompt },
   },
 }
-
--- Rows written here; Enter in a window types the value and runs it.
-pickers.Servers = {
-  type = "Items",
-  items = {
-    { text = "build   the build machine", value = "ssh build" },
-    { text = "db      the database", value = "ssh db" },
-  },
-  action = function(app, item) app:send_text(item.value .. "\r") end,
-}
-
-return config

@@ -688,8 +688,8 @@ the current result. Errors appear in the preview. Pipe clients must use an
 allowlisted named picker for Dynamic previews; inline stream previews remain
 restricted to Text/Ansi.
 
-`nterm.example.lua` demonstrates host-owned image/video extension routing and
-configurable FFmpeg/FFprobe paths.
+`files.preview` in `lua/nterm/files.lua` demonstrates host-owned image/video extension routing and configurable
+FFmpeg/FFprobe paths.
 
 Every picker type accepts an optional preview. `preview = { type = "Text",
 text = "{item}" }` displays literal text; `type = "Ansi"` interprets terminal
