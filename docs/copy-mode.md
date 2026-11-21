@@ -83,7 +83,8 @@ last nonblank cell on the current row. <kbd>w</kbd>, <kbd>b</kbd>, and
 <kbd>e</kbd> move through words across the frozen scrollback.
 <kbd>0</kbd> moves to the start of the row; <kbd>W</kbd>, <kbd>B</kbd>, and
 <kbd>E</kbd> move through whitespace-delimited words. <kbd>gg</kbd> and
-<kbd>G</kbd> move to the top and bottom of scrollback. <kbd>f</kbd>/<kbd>F</kbd>
+<kbd>G</kbd> move to the top of scrollback and to its last row with text, so
+<kbd>yG</kbd> leaves out the empty rows below the prompt. <kbd>f</kbd>/<kbd>F</kbd>
 and <kbd>t</kbd>/<kbd>T</kbd> jump to or before/after a character on the
 current row; <kbd>;</kbd> repeats the jump and <kbd>,</kbd> reverses it.
 <kbd>%</kbd> matches nested parentheses, brackets, or braces across rows.
