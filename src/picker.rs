@@ -805,11 +805,6 @@ impl Picker {
         }
         match output.event {
             Some(nfm_egui::PickerEvent::Cancelled) => Some(Action::Cancel),
-            Some(nfm_egui::PickerEvent::CopyRequested(selection)) => {
-                ctx.copy_text(selection.text);
-                self.shared.notify_copied(ctx);
-                None
-            }
             Some(nfm_egui::PickerEvent::Accepted(selection)) => self.accept(selection),
             Some(nfm_egui::PickerEvent::CustomAction { action, selection }) => {
                 match action.checked_sub(self.keys.len()) {

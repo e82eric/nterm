@@ -171,7 +171,8 @@ impl Fed {
                 let waits = self.shown.asked.is_some();
                 (self.shown.accept(&rows, selection.item) && !waits).then_some(Action::Close)
             }
-            _ => None,
+            // Every event is named, so one the picker gains is answered here.
+            None => None,
         }
     }
 }
@@ -447,6 +448,33 @@ mod tests {
         // The page going says nothing more.
         drop(fed);
         assert_eq!(told(&daemon), []);
+    }
+
+    #[test]
+    fn the_selected_row_is_copied_here_and_the_picker_stays() {
+        let ctx = egui::Context::default();
+        let (shown, daemon) = shown("");
+        let mut fed = Fed::start(ctx.clone(), shown.clone());
+        found(&shown, 1, 0, "", &[(3, "b\\also.rs")]);
+        frame(&ctx, &mut fed, vec![]);
+        frame(&ctx, &mut fed, vec![]);
+        told(&daemon);
+        let mut action = None;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(screen), events: vec![egui::Event::Copy], ..Default::default() },
+            |ui| {
+                let shown = fed.show_scoped(ui.ctx(), ui.ctx().content_rect(), None, true);
+                if shown.is_some() {
+                    action = shown;
+                }
+            },
+        );
+        assert!(output.platform_output.commands.contains(&egui::OutputCommand::CopyText("b\\also.rs".into())));
+        // The picker is left open, and the daemon is told nothing of it.
+        assert!(action.is_none());
+        assert_eq!(told(&daemon), []);
+        assert_eq!(fed.closed(), None);
     }
 
     #[test]
